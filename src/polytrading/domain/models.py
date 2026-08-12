@@ -8,6 +8,12 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, computed_field, field_validator, model_validator
 
 
+def normalize_utc_timestamp(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
+
+
 class StrictRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -18,9 +24,7 @@ class StrictRecord(BaseModel):
     def require_utc(cls, value: datetime | None) -> datetime | None:
         if value is None:
             return value
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("timestamp must be timezone-aware")
-        return value.astimezone(UTC)
+        return normalize_utc_timestamp(value)
 
     @field_validator("source_hash", check_fields=False)
     @classmethod

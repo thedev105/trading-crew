@@ -120,3 +120,34 @@ CREATE TABLE fee_schedules (
     record_hash VARCHAR NOT NULL,
     PRIMARY KEY (venue, tier_name, effective_from, observed_at)
 );
+
+CREATE TABLE experiments (
+    experiment_id UUID PRIMARY KEY,
+    record_json JSON NOT NULL,
+    record_hash VARCHAR NOT NULL
+);
+
+CREATE TABLE journal_transactions (
+    transaction_id UUID PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    description VARCHAR NOT NULL,
+    evidence_ids JSON NOT NULL,
+    record_hash VARCHAR NOT NULL
+);
+
+CREATE TABLE journal_postings (
+    transaction_id UUID NOT NULL,
+    posting_index INTEGER NOT NULL,
+    account VARCHAR NOT NULL,
+    asset VARCHAR NOT NULL,
+    debit DECIMAL(38, 18) NOT NULL,
+    credit DECIMAL(38, 18) NOT NULL,
+    record_hash VARCHAR NOT NULL,
+    PRIMARY KEY (transaction_id, posting_index),
+    FOREIGN KEY (transaction_id) REFERENCES journal_transactions (transaction_id),
+    CHECK (posting_index >= 0),
+    CHECK (debit >= 0),
+    CHECK (credit >= 0),
+    CHECK ((debit > 0 AND credit = 0) OR (credit > 0 AND debit = 0))
+);

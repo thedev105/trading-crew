@@ -9,6 +9,7 @@ from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import duckdb
 from pydantic import BaseModel
@@ -24,7 +25,10 @@ from polytrading.domain.models import (
     MarketSnapshot,
     RawEnvelope,
     Venue,
+    normalize_utc_timestamp,
 )
+from polytrading.ledger.models import JournalTransaction, TrialBalanceRow
+from polytrading.research.models import ExperimentRecord
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -265,6 +269,61 @@ class DuckDBStore:
         )
         return True
 
+    def append_experiment(self, record: ExperimentRecord) -> bool:
+        if self._normalized_retry(
+            "experiment",
+            record,
+            "experiments",
+            "experiment_id = ?",
+            [record.experiment_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO experiments VALUES (?, ?::JSON, ?)",
+            [record.experiment_id, _canonical_json(record), _record_hash(record)],
+        )
+        return True
+
+    def get_experiment(self, experiment_id: UUID) -> ExperimentRecord | None:
+        row = self._connection.execute(
+            "SELECT CAST(record_json AS VARCHAR) FROM experiments WHERE experiment_id = ?",
+            [experiment_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return ExperimentRecord.model_validate_json(row[0])
+
+    def append_journal_transaction(self, record: JournalTransaction) -> bool:
+        if self._in_transaction:
+            return self._append_journal_transaction(record)
+        with self.transaction():
+            return self._append_journal_transaction(record)
+
+    def journal_trial_balance(self, as_of: datetime) -> tuple[TrialBalanceRow, ...]:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        rows = self._connection.execute(
+            """
+            SELECT posting.asset, posting.account, SUM(posting.debit), SUM(posting.credit)
+            FROM journal_postings AS posting
+            JOIN journal_transactions AS transaction
+              ON transaction.transaction_id = posting.transaction_id
+            WHERE transaction.occurred_at <= ? AND transaction.observed_at <= ?
+            GROUP BY posting.asset, posting.account
+            ORDER BY posting.asset, posting.account
+            """,
+            [normalized_as_of, normalized_as_of],
+        ).fetchall()
+        return tuple(
+            TrialBalanceRow(
+                asset=row[0],
+                account=row[1],
+                debit=row[2],
+                credit=row[3],
+                difference=row[2] - row[3],
+            )
+            for row in rows
+        )
+
     def latest_instrument_as_of(
         self, venue: Venue, symbol: str, as_of: datetime
     ) -> InstrumentSpec | None:
@@ -278,7 +337,7 @@ class DuckDBStore:
                    source_hash, schema_version
             FROM instrument_specs
             WHERE venue = ? AND symbol = ? AND observed_at <= ?
-            ORDER BY observed_at DESC
+            ORDER BY observed_at DESC, instrument_id, source_hash
             LIMIT 1
             """,
             [venue.value, symbol, as_of],
@@ -460,6 +519,42 @@ class DuckDBStore:
                         record_hash,
                     ],
                 )
+        return True
+
+    def _append_journal_transaction(self, record: JournalTransaction) -> bool:
+        if self._normalized_retry(
+            "journal transaction",
+            record,
+            "journal_transactions",
+            "transaction_id = ?",
+            [record.transaction_id],
+        ):
+            return False
+        record_hash = _record_hash(record)
+        self._connection.execute(
+            "INSERT INTO journal_transactions VALUES (?, ?, ?, ?, ?::JSON, ?)",
+            [
+                record.transaction_id,
+                record.occurred_at,
+                record.observed_at,
+                record.description,
+                json.dumps(record.evidence_ids, ensure_ascii=False, separators=(",", ":")),
+                record_hash,
+            ],
+        )
+        for index, posting in enumerate(record.postings):
+            self._connection.execute(
+                "INSERT INTO journal_postings VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    record.transaction_id,
+                    index,
+                    posting.account,
+                    posting.asset,
+                    posting.debit,
+                    posting.credit,
+                    record_hash,
+                ],
+            )
         return True
 
     def _normalized_retry(
