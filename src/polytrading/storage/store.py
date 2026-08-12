@@ -381,6 +381,7 @@ class DuckDBStore:
     def latest_book_as_of(
         self, venue: Venue, symbol: str, as_of: datetime
     ) -> Level2BookSnapshot | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
         row = self._connection.execute(
             """
             SELECT book.cycle_id, book.venue, book.symbol, book.asset, book.depth_limit,
@@ -388,13 +389,38 @@ class DuckDBStore:
                    book.source_hash, book.schema_version
             FROM book_snapshots AS book
             LEFT JOIN book_collection_cycles AS cycle ON cycle.cycle_id = book.cycle_id
-            WHERE book.venue = ? AND book.symbol = ? AND book.observed_at <= ?
+            WHERE book.venue = ? AND book.symbol = ?
+              AND book.effective_at <= ? AND book.observed_at <= ?
               AND (cycle.cycle_id IS NULL OR cycle.status = 'complete')
-            ORDER BY book.observed_at DESC
+            ORDER BY book.observed_at DESC, book.effective_at DESC, book.cycle_id
             LIMIT 1
             """,
-            [venue.value, symbol, as_of],
+            [venue.value, symbol, normalized_as_of, normalized_as_of],
         ).fetchone()
+        return self._book_from_row(row)
+
+    def book_for_cycle_as_of(
+        self,
+        cycle_id: UUID,
+        venue: Venue,
+        symbol: str,
+        as_of: datetime,
+    ) -> Level2BookSnapshot | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT cycle_id, venue, symbol, asset, depth_limit, sequence,
+                   epoch_us(effective_at), epoch_us(observed_at), source_hash, schema_version
+            FROM book_snapshots
+            WHERE cycle_id = ? AND venue = ? AND symbol = ?
+              AND effective_at <= ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [cycle_id, venue.value, symbol, normalized_as_of, normalized_as_of],
+        ).fetchone()
+        return self._book_from_row(row)
+
+    def _book_from_row(self, row: tuple[Any, ...] | None) -> Level2BookSnapshot | None:
         if row is None:
             return None
         levels = self._connection.execute(
@@ -446,6 +472,52 @@ class DuckDBStore:
         if row is None:
             return None
         return BookCollectionCycle.model_validate_json(row[0])
+
+    def latest_complete_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM book_collection_cycles
+            WHERE request_completed_at <= ? AND status = 'complete'
+            ORDER BY request_completed_at DESC, cycle_id
+            LIMIT 1
+            """,
+            [normalized_as_of],
+        ).fetchone()
+        if row is None:
+            return None
+        return BookCollectionCycle.model_validate_json(row[0])
+
+    def latest_funding_as_of(
+        self, venue: Venue, symbol: str, as_of: datetime
+    ) -> FundingObservation | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT venue, symbol, asset, rate, interval_hours, epoch_us(effective_at),
+                   epoch_us(observed_at), source_hash, schema_version
+            FROM funding_observations
+            WHERE venue = ? AND symbol = ?
+              AND effective_at <= ? AND observed_at <= ?
+            ORDER BY effective_at DESC, observed_at DESC, source_hash
+            LIMIT 1
+            """,
+            [venue.value, symbol, normalized_as_of, normalized_as_of],
+        ).fetchone()
+        if row is None:
+            return None
+        return FundingObservation(
+            venue=Venue(row[0]),
+            symbol=row[1],
+            asset=Asset(row[2]),
+            rate=row[3],
+            interval_hours=row[4],
+            effective_at=_utc_from_epoch_us(row[5]),
+            observed_at=_utc_from_epoch_us(row[6]),
+            source_hash=row[7],
+            schema_version=row[8],
+        )
 
     def latest_fee_as_of(
         self, venue: Venue, tier_name: str, as_of: datetime
