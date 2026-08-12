@@ -378,8 +378,13 @@ def test_failed_or_partial_cycles_never_become_executable_book_evidence(
     btc = _auditor(store).audit(AS_OF).assets[0]
 
     assert btc.book_ready is False
-    assert btc.book_evidence == ()
     assert "BOOK_EVIDENCE_MISSING" in btc.reason_codes
+    if cycle_case == "failed":
+        assert btc.book_evidence == ()
+    else:
+        assert len(btc.book_evidence) == 1
+        assert btc.book_evidence[0].venue is Venue.BYBIT
+        assert btc.book_evidence[0].common_depth_levels is None
     store.close()
 
 
@@ -503,6 +508,50 @@ def test_high_skew_and_stale_books_report_all_reasons_and_safe_depth(
     assert btc.book_ready is False
     assert len(btc.book_evidence) == 2
     assert all(item.common_depth_levels == 2 for item in btc.book_evidence)
+    store.close()
+
+
+def test_partial_cycle_preserves_present_stale_book_without_claiming_common_depth(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "partial-stale.duckdb")
+    for venue in VENUES:
+        store.append_instrument(_compatible_instrument(venue, Asset.BTC))
+        store.append_funding(_funding(venue, Asset.BTC))
+    bybit_book = _book(
+        Venue.BYBIT,
+        Asset.BTC,
+        effective_at=AS_OF - timedelta(seconds=30),
+    )
+    store.append_book_snapshot(bybit_book)
+    store.append_book_collection_cycle(
+        book_collection_cycle(
+            cycle_id=CYCLE_ID,
+            assets=(Asset.BTC,),
+            request_started_at=AS_OF - timedelta(seconds=31),
+            request_completed_at=AS_OF - timedelta(seconds=29),
+            effective_timestamps=(bybit_book.effective_at,),
+            source_hashes=(OLD_HASH,),
+        )
+    )
+
+    btc = _auditor(store).audit(AS_OF).assets[0]
+
+    assert btc.status is AuditStatus.STALE
+    assert btc.reason_codes[-2:] == (
+        "BOOK_EVIDENCE_MISSING",
+        "BOOK_EVIDENCE_STALE",
+    )
+    assert btc.book_ready is False
+    assert len(btc.book_evidence) == 1
+    evidence = btc.book_evidence[0]
+    assert evidence.venue is Venue.BYBIT
+    assert evidence.source_hash == bybit_book.source_hash
+    assert evidence.book_age_ms == Decimal("30000")
+    assert evidence.top_level_spread == Decimal("2")
+    assert evidence.common_depth_levels is None
+    assert evidence.cumulative_bid_notional is None
+    assert evidence.cumulative_ask_notional is None
     store.close()
 
 

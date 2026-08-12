@@ -52,9 +52,9 @@ class BookEvidence(StrictRecord):
     observed_at: datetime
     book_age_ms: Decimal
     top_level_spread: Decimal
-    common_depth_levels: int
-    cumulative_bid_notional: Decimal
-    cumulative_ask_notional: Decimal
+    common_depth_levels: int | None
+    cumulative_bid_notional: Decimal | None
+    cumulative_ask_notional: Decimal | None
 
 
 class AssetCarryAudit(StrictRecord):
@@ -224,12 +224,15 @@ class CarryAuditor:
             self._store.book_for_cycle_as_of(cycle.cycle_id, venue, _symbol(venue, asset), as_of)
             for venue in _VENUES
         )
-        if any(book is None for book in books):
-            return cycle.cycle_id, skew_ms, (), ("BOOK_EVIDENCE_MISSING",)
         selected_books = tuple(book for book in books if book is not None)
-        common_depth = min(
-            20,
-            *(len(side) for book in selected_books for side in (book.bids, book.asks)),
+        complete_pair = len(selected_books) == len(_VENUES)
+        common_depth = (
+            min(
+                20,
+                *(len(side) for book in selected_books for side in (book.bids, book.asks)),
+            )
+            if complete_pair
+            else None
         )
         evidence = tuple(_summarize_book(book, as_of, common_depth) for book in selected_books)
         is_stale = any(
@@ -238,6 +241,8 @@ class CarryAuditor:
             for book in selected_books
         )
         reasons: list[str] = []
+        if not complete_pair:
+            reasons.append("BOOK_EVIDENCE_MISSING")
         if _milliseconds(self._max_book_cycle_skew) < skew_ms:
             reasons.append("BOOK_CYCLE_SKEW_EXCEEDED")
         if is_stale:
@@ -255,7 +260,9 @@ def _milliseconds(value: timedelta) -> Decimal:
     )
 
 
-def _summarize_book(book: Level2BookSnapshot, as_of: datetime, common_depth: int) -> BookEvidence:
+def _summarize_book(
+    book: Level2BookSnapshot, as_of: datetime, common_depth: int | None
+) -> BookEvidence:
     return BookEvidence(
         schema_version=1,
         venue=book.venue,
@@ -266,10 +273,20 @@ def _summarize_book(book: Level2BookSnapshot, as_of: datetime, common_depth: int
         book_age_ms=_milliseconds(as_of - book.effective_at),
         top_level_spread=book.asks[0].price - book.bids[0].price,
         common_depth_levels=common_depth,
-        cumulative_bid_notional=sum(
-            (level.price * level.quantity for level in book.bids[:common_depth]), Decimal(0)
+        cumulative_bid_notional=(
+            sum(
+                (level.price * level.quantity for level in book.bids[:common_depth]),
+                Decimal(0),
+            )
+            if common_depth is not None
+            else None
         ),
-        cumulative_ask_notional=sum(
-            (level.price * level.quantity for level in book.asks[:common_depth]), Decimal(0)
+        cumulative_ask_notional=(
+            sum(
+                (level.price * level.quantity for level in book.asks[:common_depth]),
+                Decimal(0),
+            )
+            if common_depth is not None
+            else None
         ),
     )
