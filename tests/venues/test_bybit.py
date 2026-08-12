@@ -93,12 +93,14 @@ def make_adapter(
     *,
     wall_times: list[datetime],
     monotonic_times: list[int] | None = None,
+    max_funding_pages: int = 10_000,
 ) -> BybitPublicAdapter:
     return BybitPublicAdapter(
         httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         wall_clock=SequenceClock(wall_times),
         monotonic_ns=SequenceClock(monotonic_times or list(range(100, 5000, 100))),
         instrument_registry=registry,
+        max_funding_pages=max_funding_pages,
     )
 
 
@@ -498,6 +500,85 @@ def test_fetch_funding_history_rejects_unchanged_earliest_timestamp(
 
     with pytest.raises(PaginationStalledError, match="progress"):
         asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
+
+
+def test_fetch_funding_history_stops_at_configured_page_cap(tmp_path: Path) -> None:
+    # Catches a time-range-derived request budget that permits excessive requests even while
+    # each nonempty response advances backward without reaching the requested start.
+    timestamps = iter(
+        [
+            ("1786464000000", "1786435200000"),
+            ("1786431600000", "1786420800000"),
+        ]
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        latest, earliest = next(timestamps)
+        document = {
+            "retCode": 0,
+            "retMsg": "OK",
+            "result": {
+                "category": "linear",
+                "list": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "fundingRate": "0.0001",
+                        "fundingRateTimestamp": latest,
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "fundingRate": "-0.0001",
+                        "fundingRateTimestamp": earliest,
+                    },
+                ],
+            },
+            "retExtInfo": {},
+            "time": 1786528800000,
+        }
+        return response(json.dumps(document).encode())
+
+    adapter = make_adapter(
+        handler,
+        make_registry(
+            tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))
+        ),
+        wall_times=[RECEIVED_1, RECEIVED_2],
+        max_funding_pages=2,
+    )
+
+    with pytest.raises(PaginationStalledError, match="budget exhausted"):
+        asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
+
+    assert requests == 2
+
+
+@pytest.mark.parametrize(
+    ("max_funding_pages", "error_type", "message"),
+    [
+        (0, ValueError, "positive"),
+        (-1, ValueError, "positive"),
+        (True, TypeError, "integer"),
+        (1.5, TypeError, "integer"),
+        ("2", TypeError, "integer"),
+    ],
+)
+def test_constructor_requires_strict_positive_funding_page_cap(
+    tmp_path: Path,
+    max_funding_pages: Any,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    # Catches accepting unbounded, non-positive, bool-coerced, or non-integer page caps.
+    with pytest.raises(error_type, match=message):
+        make_adapter(
+            lambda request: response(fixture_bytes("funding_history_page_1.json")),
+            make_registry(tmp_path),
+            wall_times=[RECEIVED_1],
+            max_funding_pages=max_funding_pages,
+        )
 
 
 def test_fetch_order_books_preserves_engine_time_and_sequence(tmp_path: Path) -> None:

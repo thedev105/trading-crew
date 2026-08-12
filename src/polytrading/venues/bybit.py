@@ -100,11 +100,17 @@ class BybitPublicAdapter:
         monotonic_ns: Callable[[], int],
         *,
         instrument_registry: InstrumentRegistry,
+        max_funding_pages: int = 10_000,
     ) -> None:
+        if isinstance(max_funding_pages, bool) or not isinstance(max_funding_pages, int):
+            raise TypeError("max_funding_pages must be an integer")
+        if max_funding_pages <= 0:
+            raise ValueError("max_funding_pages must be positive")
         self._client = client
         self._wall_clock = wall_clock
         self._monotonic_ns = monotonic_ns
         self._instrument_registry = instrument_registry
+        self._max_funding_pages = max_funding_pages
 
     async def fetch_instruments(
         self, assets: frozenset[Asset], observed_at: datetime
@@ -235,9 +241,7 @@ class BybitPublicAdapter:
         previous_earliest: int | None = None
         raws: list[RawEnvelope] = []
         observations: dict[int, tuple[FundingObservation, Decimal, Decimal]] = {}
-        request_budget = end_ms - start_ms + 2
-
-        for _request_number in range(request_budget):
+        for _request_number in range(self._max_funding_pages):
             received = await self._get(
                 _FUNDING_ENDPOINT,
                 {
