@@ -1,0 +1,15 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {"symbol": "BTCUSDT", "lastPrice": "119000.10", "indexPrice": "118995.25", "markPrice": "118998.75", "prevPrice24h": "117000.00", "price24hPcnt": "0.017095", "highPrice24h": "120500.00", "lowPrice24h": "116500.00", "prevPrice1h": "118800.00", "openInterest": "81234.567", "openInterestValue": "9666342088.52", "turnover24h": "1234567890.12", "volume24h": "10415.678", "fundingRate": "0.0000125", "nextFundingTime": "1786550400000", "predictedDeliveryPrice": "", "basisRate": "", "deliveryFeeRate": "", "deliveryTime": "0", "ask1Size": "1.250", "bid1Price": "118999.90", "ask1Price": "119000.10", "bid1Size": "2.500", "basis": ""},
+      {"symbol": "ETHUSDT", "lastPrice": "4500.00", "indexPrice": "4499.50", "markPrice": "4499.75", "prevPrice24h": "4400.00", "price24hPcnt": "0.022727", "highPrice24h": "4550.00", "lowPrice24h": "4380.00", "prevPrice1h": "4480.00", "openInterest": "602345.12", "openInterestValue": "2710401560.27", "turnover24h": "500000000.00", "volume24h": "112345.67", "fundingRate": "-0.0000030", "nextFundingTime": "1786550400000", "predictedDeliveryPrice": "", "basisRate": "", "deliveryFeeRate": "", "deliveryTime": "0", "ask1Size": "12.34", "bid1Price": "4499.90", "ask1Price": "4500.00", "bid1Size": "23.45", "basis": ""},
+      {"symbol": "SOLUSDT", "lastPrice": "210.100", "indexPrice": "209.980", "markPrice": "210.010", "prevPrice24h": "205.000", "price24hPcnt": "0.024878", "highPrice24h": "215.000", "lowPrice24h": "202.000", "prevPrice1h": "209.000", "openInterest": "9034567.8", "openInterestValue": "1897340778.68", "turnover24h": "300000000.00", "volume24h": "1456789.0", "fundingRate": "0.000100", "nextFundingTime": "1786532400000", "predictedDeliveryPrice": "", "basisRate": "", "deliveryFeeRate": "", "deliveryTime": "0", "ask1Size": "123.4", "bid1Price": "210.000", "ask1Price": "210.100", "bid1Size": "234.5", "basis": ""},
+      {"symbol": "DOGEUSDT", "lastPrice": "0.25", "indexPrice": "0.24999", "markPrice": "0.25001", "prevPrice24h": "0.24", "price24hPcnt": "0.0416", "highPrice24h": "0.26", "lowPrice24h": "0.23", "prevPrice1h": "0.249", "openInterest": "1000000", "openInterestValue": "250000", "turnover24h": "5000000", "volume24h": "20000000", "fundingRate": "0.0001", "nextFundingTime": "1786550400000", "predictedDeliveryPrice": "", "basisRate": "", "deliveryFeeRate": "", "deliveryTime": "0", "ask1Size": "100", "bid1Price": "0.25000", "ask1Price": "0.25001", "bid1Size": "200", "basis": ""}
+    ]
+  },
+  "retExtInfo": {},
+  "time": 1786528800000
+}

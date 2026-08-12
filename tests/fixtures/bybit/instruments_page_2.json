@@ -1,0 +1,56 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "nextPageCursor": "",
+    "list": [
+      {
+        "symbol": "SOLUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "SOL",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1617580800000",
+        "deliveryTime": "0",
+        "deliveryFeeRate": "",
+        "priceScale": "3",
+        "leverageFilter": {"minLeverage": "1", "maxLeverage": "50.00", "leverageStep": "0.01"},
+        "priceFilter": {"minPrice": "0.001", "maxPrice": "19999.998", "tickSize": "0.001"},
+        "lotSizeFilter": {"maxOrderQty": "300000.0", "minOrderQty": "0.1", "qtyStep": "0.1", "postOnlyMaxOrderQty": "300000.0", "maxMktOrderQty": "30000.0", "minNotionalValue": "5"},
+        "unifiedMarginTrade": true,
+        "fundingInterval": 60,
+        "copyTrading": "both",
+        "upperFundingRate": "0.005",
+        "lowerFundingRate": "-0.005",
+        "isPreListing": false,
+        "preListingInfo": null
+      },
+      {
+        "symbol": "ETHUSDT-PRE",
+        "contractType": "LinearPerpetual",
+        "status": "PreLaunch",
+        "baseCoin": "ETH",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1787133600000",
+        "deliveryTime": "0",
+        "deliveryFeeRate": "",
+        "priceScale": "2",
+        "leverageFilter": {"minLeverage": "1", "maxLeverage": "10", "leverageStep": "0.01"},
+        "priceFilter": {"minPrice": "0.01", "maxPrice": "199999.98", "tickSize": "0.01"},
+        "lotSizeFilter": {"maxOrderQty": "100.00", "minOrderQty": "0.01", "qtyStep": "0.01", "postOnlyMaxOrderQty": "100.00", "maxMktOrderQty": "10.00", "minNotionalValue": "5"},
+        "unifiedMarginTrade": true,
+        "fundingInterval": 480,
+        "copyTrading": "none",
+        "upperFundingRate": "0.00375",
+        "lowerFundingRate": "-0.00375",
+        "isPreListing": true,
+        "preListingInfo": {"curAuctionPhase": "NotStarted", "phases": [], "auctionFeeInfo": {}}
+      }
+    ]
+  },
+  "retExtInfo": {},
+  "time": 1786528800500
+}

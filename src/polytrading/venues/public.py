@@ -21,9 +21,26 @@ type NormalizedRecord = (
 
 
 @dataclass(frozen=True)
+class AdapterWarning:
+    code: str
+    venue: Venue
+    endpoint: str
+    symbol: str
+    message: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("code", "endpoint", "symbol", "message"):
+            if not isinstance(getattr(self, field_name), str):
+                raise TypeError(f"{field_name} must be a string")
+        if not isinstance(self.venue, Venue):
+            raise TypeError("venue must be a Venue")
+
+
+@dataclass(frozen=True)
 class AdapterBatch:
     raw: tuple[RawEnvelope, ...]
     normalized: tuple[NormalizedRecord, ...]
+    warnings: tuple[AdapterWarning, ...] = ()
 
 
 class PublicVenueAdapter(Protocol):
