@@ -131,6 +131,47 @@ def test_fetch_instruments_rejects_universe_context_length_mismatch() -> None:
         asyncio.run(adapter.fetch_instruments(frozenset({Asset.BTC}), REQUEST_CONTEXT))
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "remove", "message"),
+    [
+        ("markPx", None, True, "markPx"),
+        ("oraclePx", 118995, False, "string"),
+        ("funding", "NaN", False, "finite"),
+        ("openInterest", "not-a-decimal", False, "decimal"),
+    ],
+)
+def test_fetch_instruments_rejects_malformed_selected_asset_context_numerics(
+    field: str, value: object, remove: bool, message: str
+) -> None:
+    # Catches accepting malformed selected context evidence just because instruments do not
+    # populate compatibility fields from it.
+    document = json.loads(fixture_bytes("meta_and_asset_ctxs.json"))
+    btc_context = document[1][0]
+    if remove:
+        del btc_context[field]
+    else:
+        btc_context[field] = value
+    adapter = make_adapter(
+        lambda request: response(json.dumps(document).encode()), wall_times=[RECEIVED_1]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(adapter.fetch_instruments(frozenset({Asset.BTC}), REQUEST_CONTEXT))
+
+
+def test_fetch_instruments_ignores_malformed_context_for_unrequested_unsupported_asset() -> None:
+    # Catches validating unsupported/unrequested DOGE beyond the exact requested asset filter.
+    document = json.loads(fixture_bytes("meta_and_asset_ctxs.json"))
+    document[1][3] = {"markPx": None}
+    adapter = make_adapter(
+        lambda request: response(json.dumps(document).encode()), wall_times=[RECEIVED_1]
+    )
+
+    batch = asyncio.run(adapter.fetch_instruments(frozenset({Asset.BTC}), REQUEST_CONTEXT))
+
+    assert [item.asset for item in batch.normalized] == [Asset.BTC]
+
+
 def test_fetch_funding_history_paginates_deduplicates_and_preserves_page_evidence() -> None:
     # Catches wrong request bounds, lost raw pages, duplicate emissions, or backdated receipt time.
     pages = iter(
@@ -391,6 +432,7 @@ def malformed_book(**overrides: Any) -> bytes:
         ),
         (malformed_book(coin="ETH"), "coin"),
         (malformed_book(time=9999999999999), "receipt"),
+        (malformed_book(time=-1), "non-negative"),
         (malformed_book(levels="bad"), "must be a list"),
         (malformed_book(levels=[[], [], []]), "bid and ask"),
         (

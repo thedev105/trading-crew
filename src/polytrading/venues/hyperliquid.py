@@ -88,8 +88,8 @@ class HyperliquidPublicAdapter:
         universe, contexts = _parse_meta_and_contexts(received.document)
         selected = _select_universe(universe, contexts, assets)
         instruments = tuple(
-            _instrument_spec(entry, asset, received.observed_at, raw.source_hash)
-            for entry, _context, asset in selected
+            _instrument_spec(entry, context, asset, received.observed_at, raw.source_hash)
+            for entry, context, asset in selected
         )
         return AdapterBatch(raw=(raw,), normalized=instruments)
 
@@ -337,11 +337,19 @@ def _select_universe(
 
 
 def _instrument_spec(
-    entry: Mapping[str, object], asset: Asset, observed_at: datetime, source_hash: str
+    entry: Mapping[str, object],
+    context: Mapping[str, object],
+    asset: Asset,
+    observed_at: datetime,
+    source_hash: str,
 ) -> InstrumentSpec:
     size_decimals = _require_integer(entry, "szDecimals", "metadata universe entry")
     if size_decimals < 0:
         raise ValueError("szDecimals must be non-negative")
+    # Context validation applies only after exact requested-asset selection. Unsupported or
+    # unrequested contexts remain outside this adapter's evidence boundary.
+    for field in ("markPx", "oraclePx", "funding", "openInterest"):
+        _require_decimal(context, field, f"{asset.value} asset context")
     return InstrumentSpec(
         schema_version=1,
         instrument_id=f"hyperliquid:{asset.value}",
@@ -378,6 +386,8 @@ def _parse_l2_payload(
     if coin != expected_asset.value:
         raise ValueError(f"l2Book coin {coin!r} does not match {expected_asset.value!r}")
     timestamp_ms = _require_integer(mapping, "time", "l2Book response")
+    if timestamp_ms < 0:
+        raise ValueError("l2Book timestamp must be non-negative milliseconds")
     effective_at = _datetime_from_milliseconds(timestamp_ms)
     if effective_at > observed_at:
         raise ValueError("l2Book timestamp is after response receipt")
