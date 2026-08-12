@@ -391,6 +391,121 @@ def test_crossed_book_is_rejected_before_it_can_become_audit_evidence() -> None:
         )
 
 
+def test_stale_instrument_and_missing_funding_are_both_reported(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "combined.duckdb")
+    store.append_instrument(
+        _compatible_instrument(Venue.BYBIT, Asset.BTC, observed_at=AS_OF - timedelta(hours=2))
+    )
+    store.append_instrument(_compatible_instrument(Venue.HYPERLIQUID, Asset.BTC))
+    store.append_funding(_funding(Venue.HYPERLIQUID, Asset.BTC))
+
+    btc = _auditor(store).audit(AS_OF).assets[0]
+
+    assert btc.status is AuditStatus.STALE
+    assert "INSTRUMENT_STALE:bybit" in btc.reason_codes
+    assert "FUNDING_MISSING:bybit" in btc.reason_codes
+    bybit = btc.funding_evidence[0]
+    assert bybit.instrument_source_hash == OLD_HASH
+    assert bybit.funding_source_hash is None
+    assert bybit.hourly_rate is None
+    store.close()
+
+
+def test_incompatible_instruments_remain_ineligible_when_funding_is_missing(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "combined.duckdb")
+    store.append_instrument(_compatible_instrument(Venue.BYBIT, Asset.BTC))
+    store.append_instrument(
+        _compatible_instrument(
+            Venue.HYPERLIQUID,
+            Asset.BTC,
+            collateral_asset="USDC",
+            pnl_asset="USDC",
+        )
+    )
+    store.append_funding(_funding(Venue.BYBIT, Asset.BTC))
+
+    btc = _auditor(store).audit(AS_OF).assets[0]
+
+    assert btc.status is AuditStatus.INELIGIBLE
+    assert "collateral_mismatch" in btc.reason_codes
+    assert "pnl_asset_mismatch" in btc.reason_codes
+    assert "FUNDING_MISSING:hyperliquid" in btc.reason_codes
+    assert btc.diagnostic is None
+    store.close()
+
+
+def test_present_funding_stays_visible_when_its_instrument_is_missing(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "combined.duckdb")
+    store.append_instrument(_compatible_instrument(Venue.BYBIT, Asset.BTC))
+    store.append_funding(_funding(Venue.BYBIT, Asset.BTC))
+    hyperliquid_funding = _funding(Venue.HYPERLIQUID, Asset.BTC)
+    store.append_funding(hyperliquid_funding)
+
+    btc = _auditor(store).audit(AS_OF).assets[0]
+
+    assert btc.status is AuditStatus.INSUFFICIENT_DATA
+    hyperliquid = btc.funding_evidence[1]
+    assert hyperliquid.instrument_source_hash is None
+    assert hyperliquid.instrument_observed_at is None
+    assert hyperliquid.funding_source_hash == hyperliquid_funding.source_hash
+    assert hyperliquid.funding_effective_at == hyperliquid_funding.effective_at
+    assert hyperliquid.funding_observed_at == hyperliquid_funding.observed_at
+    assert hyperliquid.hourly_rate == hyperliquid_funding.hourly_rate
+    store.close()
+
+
+def test_high_skew_and_stale_books_report_all_reasons_and_safe_depth(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "combined.duckdb")
+    for venue in VENUES:
+        store.append_instrument(_compatible_instrument(venue, Asset.BTC))
+        store.append_funding(_funding(venue, Asset.BTC))
+    books = tuple(
+        _book(
+            venue,
+            Asset.BTC,
+            effective_at=AS_OF
+            - timedelta(seconds=30, milliseconds=400 if venue is Venue.BYBIT else 0),
+        )
+        for venue in VENUES
+    )
+    for book in books:
+        store.append_book_snapshot(book)
+    store.append_book_collection_cycle(
+        book_collection_cycle(
+            cycle_id=CYCLE_ID,
+            assets=(Asset.BTC,),
+            request_started_at=AS_OF - timedelta(seconds=31),
+            request_completed_at=AS_OF - timedelta(seconds=29),
+            effective_timestamps=tuple(book.effective_at for book in books),
+            max_effective_skew_ms=Decimal("400"),
+            source_hashes=(OLD_HASH,),
+        )
+    )
+
+    btc = (
+        _auditor(
+            store,
+            max_book_cycle_skew=timedelta(milliseconds=100),
+        )
+        .audit(AS_OF)
+        .assets[0]
+    )
+
+    assert btc.status is AuditStatus.STALE
+    assert btc.reason_codes[-2:] == (
+        "BOOK_CYCLE_SKEW_EXCEEDED",
+        "BOOK_EVIDENCE_STALE",
+    )
+    assert btc.book_ready is False
+    assert len(btc.book_evidence) == 2
+    assert all(item.common_depth_levels == 2 for item in btc.book_evidence)
+    store.close()
+
+
 def _all_keys(value: object) -> set[str]:
     if isinstance(value, dict):
         return set(value).union(*(map(_all_keys, value.values())), set())
