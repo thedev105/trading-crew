@@ -44,8 +44,24 @@ def test_naive_timestamp_fails_closed() -> None:
 
 
 def test_unknown_fields_are_rejected() -> None:
-    with pytest.raises(ValidationError):
-        FundingObservation.model_validate({"unexpected": "field"})
+    payload = {
+        "schema_version": 1,
+        "venue": Venue.BYBIT,
+        "symbol": "BTCUSDT",
+        "asset": Asset.BTC,
+        "rate": Decimal("0.0001"),
+        "interval_hours": Decimal("8"),
+        "effective_at": NOW,
+        "observed_at": NOW,
+        "source_hash": SOURCE_HASH,
+    }
+
+    with pytest.raises(ValidationError) as exception:
+        FundingObservation.model_validate({**payload, "unexpected": "field"})
+
+    error = exception.value.errors()[0]
+    assert error["type"] == "extra_forbidden"
+    assert error["loc"] == ("unexpected",)
 
 
 @given(
