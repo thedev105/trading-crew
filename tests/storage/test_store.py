@@ -1,5 +1,5 @@
 import importlib.resources
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -304,6 +304,114 @@ def test_latest_instrument_as_of_excludes_later_observations(tmp_path: Path) -> 
 
     assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW - timedelta(minutes=3)) is None
     assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW) == early
+
+    store.close()
+
+
+def test_instrument_logical_version_rejects_a_different_instrument_id(tmp_path: Path) -> None:
+    path = tmp_path / "research.duckdb"
+    store = open_store(path)
+    original = instrument_spec()
+    store.append_instrument(original)
+
+    with pytest.raises(
+        ConflictingRecordError,
+        match=r"^conflicting instrument spec for immutable identity$",
+    ):
+        store.append_instrument(
+            instrument_spec(
+                instrument_id="alternate-id-for-the-same-logical-version",
+                source_hash=OTHER_SOURCE_HASH,
+            )
+        )
+
+    assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW) == original
+    assert store.append_instrument(original) is False
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM instrument_specs").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("reader", ["latest_instrument_as_of", "latest_fee_as_of"])
+def test_direct_as_of_readers_reject_naive_cutoffs(tmp_path: Path, reader: str) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    lookup = getattr(store, reader)
+    identity = (
+        (Venue.BYBIT, "BTCUSDT")
+        if reader == "latest_instrument_as_of"
+        else (
+            Venue.BYBIT,
+            "VIP 0",
+        )
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        lookup(*identity, datetime(2026, 8, 12, 12))
+
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (datetime(2026, 8, 12, 10), NOW),
+        (NOW - timedelta(hours=2), datetime(2026, 8, 12, 12)),
+    ],
+)
+def test_funding_between_rejects_naive_bounds(
+    tmp_path: Path, start: datetime, end: datetime
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.funding_between(Venue.BYBIT, "BTCUSDT", start, end)
+
+    store.close()
+
+
+def test_funding_between_rejects_reversed_range(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+
+    with pytest.raises(ValueError, match="start must be less than or equal to end"):
+        store.funding_between(Venue.BYBIT, "BTCUSDT", NOW, NOW - timedelta(seconds=1))
+
+    store.close()
+
+
+def test_funding_between_returns_latest_revision_known_by_end(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    effective_at = NOW - timedelta(hours=1)
+    initial = funding_observation(
+        effective_at=effective_at,
+        observed_at=NOW - timedelta(minutes=30),
+        rate=Decimal("0.0001"),
+    )
+    latest_known = funding_observation(
+        effective_at=effective_at,
+        observed_at=NOW - timedelta(minutes=10),
+        rate=Decimal("0.0002"),
+        source_hash=OTHER_SOURCE_HASH,
+    )
+    late_revision = funding_observation(
+        effective_at=effective_at,
+        observed_at=NOW + timedelta(minutes=1),
+        rate=Decimal("0.0003"),
+        source_hash="c" * 64,
+    )
+    earlier_effective = funding_observation(
+        effective_at=NOW - timedelta(hours=2),
+        observed_at=NOW - timedelta(minutes=20),
+        rate=Decimal("0.0004"),
+        source_hash="d" * 64,
+    )
+    for record in (late_revision, initial, latest_known, earlier_effective):
+        store.append_funding(record)
+
+    assert store.funding_between(Venue.BYBIT, "BTCUSDT", NOW - timedelta(hours=2), NOW) == (
+        earlier_effective,
+        latest_known,
+    )
 
     store.close()
 

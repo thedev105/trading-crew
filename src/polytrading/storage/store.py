@@ -141,6 +141,14 @@ class DuckDBStore:
             "instrument spec",
             record,
             "instrument_specs",
+            "venue = ? AND symbol = ? AND observed_at = ?",
+            [record.venue.value, record.symbol, record.observed_at],
+        ):
+            return False
+        if self._normalized_retry(
+            "instrument spec",
+            record,
+            "instrument_specs",
             "instrument_id = ? AND observed_at = ?",
             [record.instrument_id, record.observed_at],
         ):
@@ -332,6 +340,7 @@ class DuckDBStore:
     def latest_instrument_as_of(
         self, venue: Venue, symbol: str, as_of: datetime
     ) -> InstrumentSpec | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
         row = self._connection.execute(
             """
             SELECT instrument_id, venue, symbol, asset, kind, contract_multiplier,
@@ -345,7 +354,7 @@ class DuckDBStore:
             ORDER BY observed_at DESC, instrument_id, source_hash
             LIMIT 1
             """,
-            [venue.value, symbol, as_of],
+            [venue.value, symbol, normalized_as_of],
         ).fetchone()
         if row is None:
             return None
@@ -518,6 +527,7 @@ class DuckDBStore:
         )
 
     def latest_fee_as_of(self, venue: Venue, tier_name: str, as_of: datetime) -> FeeSchedule | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
         row = self._connection.execute(
             """
             SELECT venue, tier_name, maker_rate, taker_rate, epoch_us(effective_from),
@@ -528,7 +538,7 @@ class DuckDBStore:
             ORDER BY effective_from DESC, observed_at DESC
             LIMIT 1
             """,
-            [venue.value, tier_name, as_of, as_of],
+            [venue.value, tier_name, normalized_as_of, normalized_as_of],
         ).fetchone()
         if row is None:
             return None
@@ -547,15 +557,28 @@ class DuckDBStore:
     def funding_between(
         self, venue: Venue, symbol: str, start: datetime, end: datetime
     ) -> tuple[FundingObservation, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
         rows = self._connection.execute(
             """
             SELECT venue, symbol, asset, rate, interval_hours, epoch_us(effective_at),
                    epoch_us(observed_at), source_hash, schema_version
-            FROM funding_observations
-            WHERE venue = ? AND symbol = ? AND effective_at >= ? AND effective_at <= ?
-            ORDER BY effective_at, observed_at
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY effective_at
+                    ORDER BY observed_at DESC, source_hash DESC
+                ) AS revision_rank
+                FROM funding_observations
+                WHERE venue = ? AND symbol = ?
+                  AND effective_at >= ? AND effective_at <= ?
+                  AND observed_at <= ?
+            ) AS known_revisions
+            WHERE revision_rank = 1
+            ORDER BY effective_at, observed_at, source_hash
             """,
-            [venue.value, symbol, start, end],
+            [venue.value, symbol, normalized_start, normalized_end, normalized_end],
         ).fetchall()
         return tuple(
             FundingObservation(
@@ -649,13 +672,19 @@ class DuckDBStore:
             return False
         record_hash = _record_hash(record)
         self._connection.execute(
-            "INSERT INTO journal_transactions VALUES (?, ?, ?, ?, ?::JSON, ?)",
+            """
+            INSERT INTO journal_transactions (
+                transaction_id, occurred_at, observed_at, description, evidence_ids,
+                schema_version, record_hash
+            ) VALUES (?, ?, ?, ?, ?::JSON, ?, ?)
+            """,
             [
                 record.transaction_id,
                 record.occurred_at,
                 record.observed_at,
                 record.description,
                 json.dumps(record.evidence_ids, ensure_ascii=False, separators=(",", ":")),
+                record.schema_version,
                 record_hash,
             ],
         )

@@ -2,10 +2,26 @@ import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, computed_field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+Decimal38x18 = Annotated[
+    Decimal,
+    Field(max_digits=38, decimal_places=18, allow_inf_nan=False),
+]
+LatencyDecimal18x6 = Annotated[
+    Decimal,
+    Field(max_digits=18, decimal_places=6, ge=Decimal(0), allow_inf_nan=False),
+]
 
 
 def normalize_utc_timestamp(value: datetime) -> datetime:
@@ -57,7 +73,7 @@ class RawEnvelope(StrictRecord):
     venue_timestamp: datetime | None
     observed_at: datetime
     received_monotonic_ns: int
-    request_latency_ms: Decimal
+    request_latency_ms: LatencyDecimal18x6
     source_version: str
     payload_json: str
     source_hash: str
@@ -70,7 +86,7 @@ class InstrumentSpec(StrictRecord):
     symbol: str
     asset: Asset
     kind: InstrumentKind
-    contract_multiplier: Decimal
+    contract_multiplier: Decimal38x18
     index_family: str | None
     oracle_family: str | None
     mark_method: str | None
@@ -78,12 +94,12 @@ class InstrumentSpec(StrictRecord):
     collateral_asset: str | None
     pnl_asset: str | None
     funding_formula_id: str | None
-    funding_cap: Decimal | None
-    funding_interval_hours: Decimal
+    funding_cap: Decimal38x18 | None
+    funding_interval_hours: Decimal38x18
     funding_payment_offset_minutes: int | None
-    min_notional: Decimal | None
-    quantity_step: Decimal | None
-    price_tick: Decimal | None
+    min_notional: Decimal38x18 | None
+    quantity_step: Decimal38x18 | None
+    price_tick: Decimal38x18 | None
     is_inverse: bool
     is_prelaunch: bool
     observed_at: datetime
@@ -102,8 +118,8 @@ class FundingObservation(StrictRecord):
     venue: Venue
     symbol: str
     asset: Asset
-    rate: Decimal
-    interval_hours: Decimal
+    rate: Decimal38x18
+    interval_hours: Decimal38x18
     effective_at: datetime
     observed_at: datetime
     source_hash: str
@@ -126,11 +142,11 @@ class MarketSnapshot(StrictRecord):
     venue: Venue
     symbol: str
     asset: Asset
-    bid: Decimal
-    ask: Decimal
-    mark: Decimal
-    index: Decimal
-    open_interest: Decimal | None
+    bid: Decimal38x18
+    ask: Decimal38x18
+    mark: Decimal38x18
+    index: Decimal38x18
+    open_interest: Decimal38x18 | None
     effective_at: datetime
     observed_at: datetime
     source_hash: str
@@ -150,8 +166,8 @@ class MarketSnapshot(StrictRecord):
 
 
 class BookLevel(StrictRecord):
-    price: Decimal
-    quantity: Decimal
+    price: Decimal38x18
+    quantity: Decimal38x18
     order_count: int | None
 
     @field_validator("price", "quantity")
@@ -199,8 +215,8 @@ class FeeSchedule(StrictRecord):
     schema_version: Literal[1]
     venue: Venue
     tier_name: str
-    maker_rate: Decimal
-    taker_rate: Decimal
+    maker_rate: Decimal38x18
+    taker_rate: Decimal38x18
     effective_from: datetime
     observed_at: datetime
     source_url: str

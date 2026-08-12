@@ -43,7 +43,8 @@ CREATE TABLE instrument_specs (
     source_hash VARCHAR NOT NULL,
     schema_version INTEGER NOT NULL,
     record_hash VARCHAR NOT NULL,
-    PRIMARY KEY (instrument_id, observed_at)
+    PRIMARY KEY (instrument_id, observed_at),
+    UNIQUE (venue, symbol, observed_at)
 );
 
 CREATE TABLE funding_observations (
@@ -144,6 +145,7 @@ CREATE TABLE journal_transactions (
     observed_at TIMESTAMPTZ NOT NULL,
     description VARCHAR NOT NULL,
     evidence_ids JSON NOT NULL,
+    schema_version INTEGER NOT NULL,
     record_hash VARCHAR NOT NULL
 );
 

@@ -1,12 +1,12 @@
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from polytrading.domain.models import StrictRecord, normalize_utc_timestamp
+from polytrading.domain.models import Decimal38x18, StrictRecord, normalize_utc_timestamp
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 
@@ -14,8 +14,8 @@ NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 class JournalPosting(StrictRecord):
     account: NonEmptyString
     asset: NonEmptyString
-    debit: Decimal = Decimal(0)
-    credit: Decimal = Decimal(0)
+    debit: Decimal38x18 = Decimal(0)
+    credit: Decimal38x18 = Decimal(0)
 
     @model_validator(mode="after")
     def require_one_positive_side(self) -> "JournalPosting":
@@ -25,6 +25,7 @@ class JournalPosting(StrictRecord):
 
 
 class JournalTransaction(StrictRecord):
+    schema_version: Literal[1]
     transaction_id: UUID
     occurred_at: datetime
     observed_at: datetime

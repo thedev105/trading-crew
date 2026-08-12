@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 
@@ -13,6 +14,7 @@ from tests.domain.factories import NOW
 
 def journal_transaction(**overrides: object) -> JournalTransaction:
     values: dict[str, object] = {
+        "schema_version": 1,
         "transaction_id": UUID("00000000-0000-0000-0000-000000000001"),
         "occurred_at": NOW,
         "observed_at": NOW,
@@ -30,6 +32,7 @@ def journal_transaction(**overrides: object) -> JournalTransaction:
 def test_unbalanced_transaction_is_rejected() -> None:
     with pytest.raises(ValidationError, match="debits must equal credits"):
         JournalTransaction(
+            schema_version=1,
             transaction_id=UUID("00000000-0000-0000-0000-000000000001"),
             occurred_at=NOW,
             observed_at=NOW,
@@ -40,6 +43,30 @@ def test_unbalanced_transaction_is_rejected() -> None:
             ),
             evidence_ids=("funding:bybit:BTCUSDT:2026-08-12T12:00:00Z",),
         )
+
+
+@pytest.mark.parametrize("payload_change", ["absent", "wrong"])
+def test_journal_requires_schema_version_one(payload_change: str) -> None:
+    payload = journal_transaction().model_dump()
+    if payload_change == "absent":
+        payload.pop("schema_version")
+    else:
+        payload["schema_version"] = 2
+
+    with pytest.raises(ValidationError):
+        JournalTransaction.model_validate(payload)
+
+
+@pytest.mark.parametrize("side", ["debit", "credit"])
+def test_journal_posting_rejects_values_below_duckdb_decimal_scale(side: str) -> None:
+    with pytest.raises(ValidationError) as exception:
+        JournalPosting(
+            account="research:cash",
+            asset="USD",
+            **{side: Decimal("6E-19")},
+        )
+
+    assert exception.value.errors()[0]["type"] == "decimal_max_places"
 
 
 def test_each_asset_must_balance_independently() -> None:
@@ -79,7 +106,8 @@ def test_journal_requires_evidence_and_timezone_aware_timestamps() -> None:
 
 
 def test_journal_round_trip_is_atomic_idempotent_and_conflict_safe(tmp_path: Path) -> None:
-    store = DuckDBStore(tmp_path / "research.duckdb")
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
     record = journal_transaction()
 
     assert store.append_journal_transaction(record) is True
@@ -88,6 +116,12 @@ def test_journal_round_trip_is_atomic_idempotent_and_conflict_safe(tmp_path: Pat
         store.append_journal_transaction(journal_transaction(description="changed"))
 
     store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM journal_transactions WHERE transaction_id = ?",
+            [record.transaction_id],
+        ).fetchone() == (1,)
 
 
 def test_trial_balance_is_exact_deterministic_and_excludes_future_transactions(
