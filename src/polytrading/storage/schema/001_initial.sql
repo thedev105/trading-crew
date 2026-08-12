@@ -12,7 +12,7 @@ CREATE TABLE raw_envelopes (
     received_monotonic_ns UBIGINT NOT NULL,
     request_latency_ms DECIMAL(18, 6) NOT NULL,
     source_version VARCHAR NOT NULL,
-    payload_json JSON NOT NULL,
+    payload_json VARCHAR NOT NULL,
     source_hash VARCHAR NOT NULL,
     schema_version INTEGER NOT NULL
 );
@@ -89,11 +89,13 @@ CREATE TABLE book_snapshots (
     source_hash VARCHAR NOT NULL,
     schema_version INTEGER NOT NULL,
     record_hash VARCHAR NOT NULL,
-    PRIMARY KEY (cycle_id, observed_at)
+    PRIMARY KEY (cycle_id, venue, symbol)
 );
 
 CREATE TABLE book_levels (
     cycle_id UUID NOT NULL,
+    venue VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     side VARCHAR NOT NULL,
     level_index INTEGER NOT NULL,
@@ -101,10 +103,19 @@ CREATE TABLE book_levels (
     quantity DECIMAL(38, 18) NOT NULL,
     order_count INTEGER,
     record_hash VARCHAR NOT NULL,
-    PRIMARY KEY (cycle_id, observed_at, side, level_index),
-    FOREIGN KEY (cycle_id, observed_at) REFERENCES book_snapshots (cycle_id, observed_at),
+    PRIMARY KEY (cycle_id, venue, symbol, side, level_index),
+    FOREIGN KEY (cycle_id, venue, symbol) REFERENCES book_snapshots (cycle_id, venue, symbol),
     CHECK (side IN ('bid', 'ask')),
     CHECK (level_index >= 0)
+);
+
+CREATE TABLE book_collection_cycles (
+    cycle_id UUID PRIMARY KEY,
+    request_completed_at TIMESTAMPTZ NOT NULL,
+    status VARCHAR NOT NULL,
+    record_json JSON NOT NULL,
+    record_hash VARCHAR NOT NULL,
+    CHECK (status IN ('complete', 'failed', 'skew_exceeds_research_target'))
 );
 
 CREATE TABLE fee_schedules (

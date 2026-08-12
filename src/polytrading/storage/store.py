@@ -29,6 +29,7 @@ from polytrading.domain.models import (
 )
 from polytrading.ledger.models import JournalTransaction, TrialBalanceRow
 from polytrading.research.models import ExperimentRecord
+from polytrading.venues.synchronized import BookCollectionCycle
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -91,7 +92,7 @@ class DuckDBStore:
             """
             SELECT event_id, venue, endpoint, epoch_us(venue_timestamp), epoch_us(observed_at),
                    received_monotonic_ns, request_latency_ms, source_version,
-                   CAST(payload_json AS VARCHAR), source_hash, schema_version
+                   payload_json, source_hash, schema_version
             FROM raw_envelopes
             WHERE event_id = ?
             """,
@@ -119,7 +120,7 @@ class DuckDBStore:
 
         self._connection.execute(
             """
-            INSERT INTO raw_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::JSON, ?, ?)
+            INSERT INTO raw_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 record.event_id,
@@ -242,6 +243,12 @@ class DuckDBStore:
             return self._append_book_snapshot(record)
         with self.transaction():
             return self._append_book_snapshot(record)
+
+    def append_book_collection_cycle(self, record: BookCollectionCycle) -> bool:
+        if self._in_transaction:
+            return self._append_book_collection_cycle(record)
+        with self.transaction():
+            return self._append_book_collection_cycle(record)
 
     def append_fee_schedule(self, record: FeeSchedule) -> bool:
         if self._normalized_retry(
@@ -376,11 +383,14 @@ class DuckDBStore:
     ) -> Level2BookSnapshot | None:
         row = self._connection.execute(
             """
-            SELECT cycle_id, venue, symbol, asset, depth_limit, sequence,
-                   epoch_us(effective_at), epoch_us(observed_at), source_hash, schema_version
-            FROM book_snapshots
-            WHERE venue = ? AND symbol = ? AND observed_at <= ?
-            ORDER BY observed_at DESC
+            SELECT book.cycle_id, book.venue, book.symbol, book.asset, book.depth_limit,
+                   book.sequence, epoch_us(book.effective_at), epoch_us(book.observed_at),
+                   book.source_hash, book.schema_version
+            FROM book_snapshots AS book
+            LEFT JOIN book_collection_cycles AS cycle ON cycle.cycle_id = book.cycle_id
+            WHERE book.venue = ? AND book.symbol = ? AND book.observed_at <= ?
+              AND (cycle.cycle_id IS NULL OR cycle.status = 'complete')
+            ORDER BY book.observed_at DESC
             LIMIT 1
             """,
             [venue.value, symbol, as_of],
@@ -391,10 +401,10 @@ class DuckDBStore:
             """
             SELECT side, price, quantity, order_count
             FROM book_levels
-            WHERE cycle_id = ? AND epoch_us(observed_at) = ?
+            WHERE cycle_id = ? AND venue = ? AND symbol = ? AND epoch_us(observed_at) = ?
             ORDER BY CASE side WHEN 'bid' THEN 0 ELSE 1 END, level_index
             """,
-            [row[0], row[7]],
+            [row[0], row[1], row[2], row[7]],
         ).fetchall()
         bids = tuple(
             BookLevel(price=level[1], quantity=level[2], order_count=level[3])
@@ -420,6 +430,22 @@ class DuckDBStore:
             source_hash=row[8],
             schema_version=row[9],
         )
+
+    def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM book_collection_cycles
+            WHERE request_completed_at <= ?
+            ORDER BY request_completed_at DESC, cycle_id
+            LIMIT 1
+            """,
+            [normalized_as_of],
+        ).fetchone()
+        if row is None:
+            return None
+        return BookCollectionCycle.model_validate_json(row[0])
 
     def latest_fee_as_of(
         self, venue: Venue, tier_name: str, as_of: datetime
@@ -483,8 +509,8 @@ class DuckDBStore:
             "book snapshot",
             record,
             "book_snapshots",
-            "cycle_id = ? AND observed_at = ?",
-            [record.cycle_id, record.observed_at],
+            "cycle_id = ? AND venue = ? AND symbol = ?",
+            [record.cycle_id, record.venue.value, record.symbol],
         ):
             return False
         record_hash = _record_hash(record)
@@ -507,9 +533,11 @@ class DuckDBStore:
         for side, side_levels in (("bid", record.bids), ("ask", record.asks)):
             for index, level in enumerate(side_levels):
                 self._connection.execute(
-                    "INSERT INTO book_levels VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO book_levels VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         record.cycle_id,
+                        record.venue.value,
+                        record.symbol,
                         record.observed_at,
                         side,
                         index,
@@ -519,6 +547,27 @@ class DuckDBStore:
                         record_hash,
                     ],
                 )
+        return True
+
+    def _append_book_collection_cycle(self, record: BookCollectionCycle) -> bool:
+        if self._normalized_retry(
+            "book collection cycle",
+            record,
+            "book_collection_cycles",
+            "cycle_id = ?",
+            [record.cycle_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO book_collection_cycles VALUES (?, ?, ?, ?::JSON, ?)",
+            [
+                record.cycle_id,
+                record.request_completed_at,
+                record.status,
+                _canonical_json(record),
+                _record_hash(record),
+            ],
+        )
         return True
 
     def _append_journal_transaction(self, record: JournalTransaction) -> bool:
