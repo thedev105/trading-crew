@@ -137,6 +137,49 @@ class ImmediateBookAdapter:
         )
 
 
+class WrongVenueBatchAdapter:
+    venue = Venue.HYPERLIQUID
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        return AdapterBatch(
+            raw=(raw_envelope(self.venue),),
+            normalized=tuple(
+                book_snapshot(
+                    Venue.BYBIT,
+                    asset,
+                    cycle_id,
+                    NOW + timedelta(seconds=10),
+                )
+                for asset in sorted(assets, key=lambda item: item.value)
+            ),
+        )
+
+
+class DuplicateBookIdentityAdapter:
+    venue = Venue.HYPERLIQUID
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        return AdapterBatch(
+            raw=(raw_envelope(self.venue),),
+            normalized=tuple(
+                book_snapshot(self.venue, asset, cycle_id, NOW).model_copy(
+                    update={"symbol": "DUPLICATE"}
+                )
+                for asset in sorted(assets, key=lambda item: item.value)
+            ),
+        )
+
+
 class SequenceClock:
     def __init__(self, *values: datetime) -> None:
         self._values = iter(values)
@@ -253,6 +296,62 @@ def test_adapter_failure_persists_only_successful_raw_and_failed_cycle_atomicall
             )
         )
     assert counts == (1, 0, 0, 1)
+
+
+def test_invalid_batch_evidence_is_excluded_while_failed_cycle_persists(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
+
+    cycle = asyncio.run(
+        collector(store).collect_once(
+            (ImmediateBookAdapter(Venue.BYBIT), WrongVenueBatchAdapter()), ASSETS, NOW
+        )
+    )
+
+    assert cycle.status == "failed"
+    assert cycle.failure_codes == ("hyperliquid:venue_mismatch",)
+    assert cycle.effective_timestamps == (NOW, NOW, NOW)
+    assert cycle.max_effective_skew_ms == Decimal("0")
+    assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+    assert store.latest_book_cycle_as_of(NOW + timedelta(seconds=1)) == cycle
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT venue, source_hash FROM raw_envelopes"
+        ).fetchall() == [(Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])]
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
+
+
+def test_duplicate_book_identity_is_failed_cycle_instead_of_database_rollback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
+
+    cycle = asyncio.run(
+        collector(store).collect_once(
+            (ImmediateBookAdapter(Venue.BYBIT), DuplicateBookIdentityAdapter()), ASSETS, NOW
+        )
+    )
+
+    assert cycle.status == "failed"
+    assert cycle.failure_codes == ("hyperliquid:duplicate_book_identity",)
+    assert cycle.effective_timestamps == (NOW, NOW, NOW)
+    assert cycle.max_effective_skew_ms == Decimal("0")
+    assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+    assert store.latest_book_cycle_as_of(NOW + timedelta(seconds=1)) == cycle
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT venue, source_hash FROM raw_envelopes"
+        ).fetchall() == [(Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])]
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
 
 
 class CycleFailingStore(DuckDBStore):

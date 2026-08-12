@@ -127,6 +127,7 @@ class SynchronizedBookCollector:
             )
             if batch_failure is not None:
                 failure_codes.append(f"{adapter.venue.value}:{batch_failure}")
+                continue
             successful_batches.append((adapter.venue, result))
 
         raw_records = tuple(
@@ -197,6 +198,9 @@ class SynchronizedBookCollector:
             return "venue_mismatch"
         if any(record.cycle_id != cycle_id for record in typed_books):
             return "cycle_id_mismatch"
+        book_identities = tuple((record.venue, record.symbol) for record in typed_books)
+        if len(set(book_identities)) != len(book_identities):
+            return "duplicate_book_identity"
         returned_assets = tuple(record.asset for record in typed_books)
         if (
             len(returned_assets) != len(requested_assets)
