@@ -338,6 +338,19 @@ async def _record_delay(delays: list[float], delay: float) -> None:
     delays.append(delay)
 
 
+class _AdvancingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+        self.delays: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.value
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.value += delay
+
+
 class _BookAdapter:
     def __init__(self, venue: Venue, starts: list[Venue], *, fail_first: bool = False) -> None:
         self.venue = venue
@@ -443,6 +456,41 @@ def test_book_loop_runs_both_venues_concurrently_and_continues_after_failure(
             "SELECT count(*) FROM book_snapshots WHERE cycle_id = ?", [cycles[0][0]]
         ).fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (6,)
+
+
+@pytest.mark.parametrize(
+    ("failed", "interval_seconds", "max_failure_backoff_seconds"),
+    [(False, 5, 30), (True, 60, 30)],
+)
+def test_book_loop_caps_normal_interval_and_failure_backoff_at_remaining_duration(
+    tmp_path: Path,
+    failed: bool,
+    interval_seconds: float,
+    max_failure_backoff_seconds: float,
+) -> None:
+    starts: list[Venue] = []
+    adapter = _BookAdapter(Venue.HYPERLIQUID, starts, fail_first=failed)
+    clock = _AdvancingClock()
+    store = DuckDBStore(tmp_path / f"deadline-{failed}.duckdb")
+
+    asyncio.run(
+        collect_book_cycles(
+            (adapter,),
+            frozenset({Asset.BTC}),
+            store,
+            duration_seconds=1,
+            interval_seconds=interval_seconds,
+            monotonic=clock.monotonic,
+            wall_clock=lambda: NOW,
+            sleep=clock.sleep,
+            max_failure_backoff_seconds=max_failure_backoff_seconds,
+        )
+    )
+
+    assert clock.delays == [1]
+    assert clock.value == 1
+    assert adapter.calls == 1
+    store.close()
 
 
 class _PublicAdapter:

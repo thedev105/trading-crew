@@ -309,9 +309,10 @@ async def collect_book_cycles(
     ordered_adapters = tuple(adapters)
     collector = SynchronizedBookCollector(store, clock=wall_clock)
     started = monotonic()
+    deadline = started + duration_seconds if duration_seconds is not None else math.inf
     consecutive_failures = 0
     while True:
-        if duration_seconds is not None and monotonic() >= started + duration_seconds:
+        if monotonic() >= deadline:
             return
         cycle = await collector.collect_once(
             ordered_adapters, assets, normalize_utc_timestamp(wall_clock())
@@ -319,7 +320,8 @@ async def collect_book_cycles(
         if duration_seconds is None:
             return
         consecutive_failures = consecutive_failures + 1 if cycle.status == "failed" else 0
-        if monotonic() >= started + duration_seconds:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
             return
         delay = interval_seconds
         if consecutive_failures:
@@ -327,4 +329,4 @@ async def collect_book_cycles(
                 max_failure_backoff_seconds,
                 interval_seconds * 2 ** (consecutive_failures - 1),
             )
-        await sleep(delay)
+        await sleep(min(delay, remaining))
