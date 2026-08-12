@@ -19,6 +19,8 @@ The initial live-eligible engines are:
 
 **Class S — Statistical relative value** remains research-only. No Class S signal may authorize live risk until it passes a later design review and activation gate.
 
+AI-assisted discovery, forecasting, and model governance are defined in the companion [AI Augmentation Design](2026-08-12-ai-augmentation-design.md). AI components are sidecars and have no order, credential, proof, or risk-limit authority.
+
 The design does not promise profit or a target return. The first goal is to determine whether either engine has repeatable, executable economics after all costs and failure risks.
 
 ## 2. Constraints and Decisions
@@ -323,6 +325,10 @@ Before a backtest, the registry records the hypothesis, permitted features, para
 
 Monitoring alerts on stale data, rule changes, funding anomalies, hedge rejection, delta drift, margin deterioration, collateral depeg, balance mismatch, venue outage, withdrawal suspension, and unknown orders. Local and remote controls cancel orders and disable new submissions.
 
+### 9.12 AI sidecars
+
+AI components may generate structured candidate evidence, conservative risk forecasts, execution forecasts, and research records. They communicate through versioned schemas and cannot emit an approved `TradeProposal`. Deterministic services independently validate every AI-derived field before it can affect a proposal. The companion AI design defines permissions, validation gates, prompt-injection defenses, model governance, and rollout scope.
+
 ## 10. Data Requirements
 
 ### 10.1 Common data
@@ -522,6 +528,8 @@ This specification defines the complete research architecture but intentionally 
 8. **Class S review:** consider a separate design only after the barbell has stable attribution.
 
 The first implementation plan must cover only Step 1 and the read-only portion of Step 2. It must not include live credentials, deposits, or order submission.
+
+The first AI implementation plan is separately limited to gold-dataset construction, the model registry, and offline semantic-scanner evaluation. It may share read-only schemas with Step 1 but must not expand the live-trading scope.
 
 ## 17. Success and Stop Conditions
 
