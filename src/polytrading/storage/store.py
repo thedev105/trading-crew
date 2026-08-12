@@ -107,7 +107,10 @@ class DuckDBStore:
                 source_hash=existing[9],
                 schema_version=existing[10],
             )
-            self._ensure_exact_retry("raw envelope", record, _record_hash(stored))
+            if stored != record:
+                raise ConflictingRecordError(
+                    "conflicting raw envelope for immutable identity"
+                )
             return False
 
         self._connection.execute(

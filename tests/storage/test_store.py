@@ -241,6 +241,16 @@ def test_exact_retry_is_an_idempotent_no_op(
     store.close()
 
 
+def test_raw_retry_ignores_decimal_storage_scale_normalization(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    record = raw_envelope(request_latency_ms=Decimal("1.0"))
+
+    assert store.append_raw(record) is True
+    assert store.append_raw(record) is False
+
+    store.close()
+
+
 @pytest.mark.parametrize(
     ("append_name", "original", "conflict"),
     [
