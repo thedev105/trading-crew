@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
 
@@ -16,6 +17,12 @@ from polytrading.domain.models import (
 )
 
 type NormalizedRecord = InstrumentSpec | FundingObservation | MarketSnapshot | Level2BookSnapshot
+
+
+class AdapterBatchIntegrityError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,30 @@ class AdapterBatch:
     raw: tuple[RawEnvelope, ...]
     normalized: tuple[NormalizedRecord, ...]
     warnings: tuple[AdapterWarning, ...] = ()
+
+
+def validate_adapter_batch(batch: AdapterBatch) -> None:
+    for raw in batch.raw:
+        actual_hash = sha256(raw.payload_json.encode("utf-8")).hexdigest()
+        if raw.source_hash != actual_hash:
+            raise AdapterBatchIntegrityError(
+                "raw_source_hash_mismatch",
+                "raw source hash does not match exact UTF-8 payload",
+            )
+    raw_lineage = {(item.venue, item.source_hash) for item in batch.raw}
+    for item in batch.normalized:
+        if type(item) not in (
+            InstrumentSpec,
+            FundingObservation,
+            MarketSnapshot,
+            Level2BookSnapshot,
+        ):
+            raise TypeError(f"unsupported normalized record type: {type(item).__name__}")
+        if (item.venue, item.source_hash) not in raw_lineage:
+            raise AdapterBatchIntegrityError(
+                "normalized_lineage_mismatch",
+                "normalized lineage must reference a same-venue raw source hash in its batch",
+            )
 
 
 class PublicVenueAdapter(Protocol):

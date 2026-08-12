@@ -366,7 +366,8 @@ class _BookAdapter:
         await asyncio.sleep(0)
         if self.fail_first and self.calls == 1:
             raise TimeoutError("first cycle failed")
-        source_hash = ("b" if self.venue is Venue.BYBIT else "c") * 64
+        payload_json = "{}"
+        source_hash = sha256(payload_json.encode()).hexdigest()
         raw = RawEnvelope(
             schema_version=1,
             event_id=UUID(int=self.calls * 10 + (1 if self.venue is Venue.BYBIT else 2)),
@@ -377,7 +378,7 @@ class _BookAdapter:
             received_monotonic_ns=self.calls,
             request_latency_ms=Decimal("1"),
             source_version="test-public-v1",
-            payload_json="{}",
+            payload_json=payload_json,
             source_hash=source_hash,
         )
         books = tuple(

@@ -18,7 +18,8 @@ from polytrading.venues.public import AdapterBatch
 from polytrading.venues.recorder import PublicRecorder, make_raw_envelope
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
-SOURCE_HASH = "a" * 64
+PAYLOAD_JSON = '{ "result": {"rate": "0.0001"} }\n'
+SOURCE_HASH = hashlib.sha256(PAYLOAD_JSON.encode()).hexdigest()
 
 
 def raw_envelope(**overrides: object) -> RawEnvelope:
@@ -32,7 +33,7 @@ def raw_envelope(**overrides: object) -> RawEnvelope:
         "received_monotonic_ns": 12_345_678_901,
         "request_latency_ms": Decimal("1.234567"),
         "source_version": "v5",
-        "payload_json": '{ "result": {"rate": "0.0001"} }\n',
+        "payload_json": PAYLOAD_JSON,
         "source_hash": SOURCE_HASH,
     }
     values.update(overrides)
@@ -53,6 +54,10 @@ def funding_observation(**overrides: object) -> FundingObservation:
     }
     values.update(overrides)
     return FundingObservation(**values)
+
+
+class FundingObservationSubclass(FundingObservation):
+    pass
 
 
 class StoreSpy:
@@ -80,6 +85,43 @@ class StoreSpy:
     def append_funding(self, record: FundingObservation) -> bool:
         self.calls.append("append_funding")
         return True
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized", "message"),
+    [
+        (raw_envelope(source_hash="f" * 64), funding_observation(), "source hash"),
+        (raw_envelope(), funding_observation(source_hash="f" * 64), "lineage"),
+        (
+            raw_envelope(venue=Venue.HYPERLIQUID),
+            funding_observation(),
+            "same-venue",
+        ),
+    ],
+)
+def test_recorder_rejects_invalid_batch_before_any_store_side_effect(
+    raw: RawEnvelope,
+    normalized: FundingObservation,
+    message: str,
+) -> None:
+    store = StoreSpy()
+
+    with pytest.raises(ValueError, match=message):
+        PublicRecorder(store).record(AdapterBatch(raw=(raw,), normalized=(normalized,)))
+
+    assert store.calls == []
+
+
+def test_recorder_rejects_normalized_subclass_before_any_store_side_effect() -> None:
+    store = StoreSpy()
+    subclass = FundingObservationSubclass.model_validate(
+        funding_observation().model_dump(exclude_computed_fields=True)
+    )
+
+    with pytest.raises(TypeError, match="unsupported normalized record type"):
+        PublicRecorder(store).record(AdapterBatch(raw=(raw_envelope(),), normalized=(subclass,)))
+
+    assert store.calls == []
 
 
 class FakeFundingAdapter:
@@ -166,7 +208,7 @@ def test_normalized_failure_rolls_back_raw_insert_as_one_unit(tmp_path: Path) ->
     path = tmp_path / "research.duckdb"
     store = DuckDBStore(path)
     original = funding_observation()
-    conflicting = funding_observation(rate=Decimal("0.0002"), source_hash="b" * 64)
+    conflicting = funding_observation(rate=Decimal("0.0002"))
     store.append_funding(original)
 
     with pytest.raises(ConflictingRecordError):
@@ -178,7 +220,7 @@ def test_normalized_failure_rolls_back_raw_insert_as_one_unit(tmp_path: Path) ->
         assert connection.execute("SELECT count(*) FROM funding_observations").fetchone() == (1,)
 
 
-def test_unknown_normalized_type_rolls_back_raw_insert(tmp_path: Path) -> None:
+def test_unknown_normalized_type_fails_before_raw_insert(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     store = DuckDBStore(path)
 

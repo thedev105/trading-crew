@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,7 @@ from polytrading.domain.models import (
     MarketSnapshot,
     RawEnvelope,
 )
-from polytrading.venues.public import AdapterBatch, AdapterWarning
+from polytrading.venues.public import AdapterBatch, AdapterWarning, validate_adapter_batch
 from polytrading.venues.recorder import PublicRecordStore, append_normalized
 
 
@@ -58,16 +57,9 @@ def _parse_batch(value: object) -> AdapterBatch:
     raw = tuple(_validate_json(RawEnvelope, item) for item in raw_values)
     normalized = tuple(_parse_normalized(item) for item in normalized_values)
     warnings = tuple(_parse_warning(item) for item in warning_values)
-    for envelope in raw:
-        actual_hash = sha256(envelope.payload_json.encode("utf-8")).hexdigest()
-        if envelope.source_hash != actual_hash:
-            raise ValueError("raw source hash does not match exact UTF-8 payload")
-    raw_lineage = {(item.venue, item.source_hash) for item in raw}
-    if any((item.venue, item.source_hash) not in raw_lineage for item in normalized):
-        raise ValueError(
-            "normalized lineage must reference a same-venue raw source hash in its batch"
-        )
-    return AdapterBatch(raw=raw, normalized=normalized, warnings=warnings)
+    batch = AdapterBatch(raw=raw, normalized=normalized, warnings=warnings)
+    validate_adapter_batch(batch)
+    return batch
 
 
 def _parse_normalized(value: object):

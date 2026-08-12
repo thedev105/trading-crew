@@ -15,7 +15,7 @@ from polytrading.domain.models import (
     RawEnvelope,
     Venue,
 )
-from polytrading.venues.public import AdapterBatch, NormalizedRecord
+from polytrading.venues.public import AdapterBatch, NormalizedRecord, validate_adapter_batch
 
 
 class PublicRecordStore(Protocol):
@@ -80,6 +80,7 @@ class PublicRecorder:
         self._store = store
 
     def record(self, batch: AdapterBatch) -> None:
+        validate_adapter_batch(batch)
         with self._store.transaction() as transaction:
             for raw in batch.raw:
                 transaction.append_raw(raw)

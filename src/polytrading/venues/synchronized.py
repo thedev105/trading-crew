@@ -16,7 +16,12 @@ from polytrading.domain.models import (
     Venue,
     normalize_utc_timestamp,
 )
-from polytrading.venues.public import AdapterBatch, PublicVenueAdapter
+from polytrading.venues.public import (
+    AdapterBatch,
+    AdapterBatchIntegrityError,
+    PublicVenueAdapter,
+    validate_adapter_batch,
+)
 from polytrading.venues.recorder import PublicRecordStore, append_normalized
 
 
@@ -125,6 +130,11 @@ class SynchronizedBookCollector:
             )
             if batch_failure is not None:
                 failure_codes.append(f"{adapter.venue.value}:{batch_failure}")
+                continue
+            try:
+                validate_adapter_batch(result)
+            except AdapterBatchIntegrityError as error:
+                failure_codes.append(f"{adapter.venue.value}:{error.code}")
                 continue
             successful_batches.append((adapter.venue, result))
 

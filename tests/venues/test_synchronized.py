@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -24,7 +25,12 @@ from polytrading.venues.synchronized import SynchronizedBookCollector
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 CYCLE_ID = UUID("00000000-0000-0000-0000-000000000777")
 ASSETS = frozenset({Asset.SOL, Asset.BTC, Asset.ETH})
-VENUE_HASHES = {Venue.BYBIT: "b" * 64, Venue.HYPERLIQUID: "c" * 64}
+VENUE_PAYLOADS = {
+    venue: f'{{"venue":"{venue.value}"}}' for venue in (Venue.BYBIT, Venue.HYPERLIQUID)
+}
+VENUE_HASHES = {
+    venue: hashlib.sha256(payload.encode()).hexdigest() for venue, payload in VENUE_PAYLOADS.items()
+}
 
 
 def raw_envelope(venue: Venue) -> RawEnvelope:
@@ -38,9 +44,13 @@ def raw_envelope(venue: Venue) -> RawEnvelope:
         received_monotonic_ns=123_456_789,
         request_latency_ms=Decimal("1.25"),
         source_version="public-v1",
-        payload_json=f'{{"venue":"{venue.value}"}}',
+        payload_json=VENUE_PAYLOADS[venue],
         source_hash=VENUE_HASHES[venue],
     )
+
+
+def distinct_raw_envelope(venue: Venue, event_id: UUID) -> RawEnvelope:
+    return raw_envelope(venue).model_copy(update={"event_id": event_id})
 
 
 def book_snapshot(
@@ -147,7 +157,13 @@ class WrongVenueBatchAdapter:
         cycle_id: UUID,
     ) -> AdapterBatch:
         return AdapterBatch(
-            raw=(raw_envelope(self.venue),),
+            raw=(
+                raw_envelope(self.venue),
+                distinct_raw_envelope(
+                    Venue.BYBIT,
+                    UUID("00000000-0000-0000-0000-000000000003"),
+                ),
+            ),
             normalized=tuple(
                 book_snapshot(
                     Venue.BYBIT,
@@ -177,6 +193,49 @@ class DuplicateBookIdentityAdapter:
                 )
                 for asset in sorted(assets, key=lambda item: item.value)
             ),
+        )
+
+
+class InvalidEvidenceBatchAdapter:
+    venue = Venue.HYPERLIQUID
+
+    def __init__(self, corruption: str) -> None:
+        self.corruption = corruption
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        raw = raw_envelope(self.venue)
+        books = tuple(
+            book_snapshot(self.venue, asset, cycle_id, NOW)
+            for asset in sorted(assets, key=lambda item: item.value)
+        )
+        if self.corruption == "bad_digest":
+            raw = raw.model_copy(update={"source_hash": "f" * 64})
+        elif self.corruption == "orphan_lineage":
+            books = tuple(book.model_copy(update={"source_hash": "f" * 64}) for book in books)
+        elif self.corruption == "cross_venue_lineage":
+            raw = raw.model_copy(update={"venue": Venue.BYBIT})
+        else:
+            raise AssertionError(f"unknown corruption: {self.corruption}")
+        return AdapterBatch(raw=(raw,), normalized=books)
+
+
+class UnsupportedNormalizedBatchAdapter:
+    venue = Venue.HYPERLIQUID
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        return AdapterBatch(
+            raw=(raw_envelope(self.venue),),
+            normalized=(object(),),  # type: ignore[arg-type]
         )
 
 
@@ -344,6 +403,70 @@ def test_duplicate_book_identity_is_failed_cycle_instead_of_database_rollback(
     assert cycle.max_effective_skew_ms == Decimal("0")
     assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
     assert store.latest_book_cycle_as_of(NOW + timedelta(seconds=1)) == cycle
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT venue, source_hash FROM raw_envelopes").fetchall() == [
+            (Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])
+        ]
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "failure"),
+    [
+        ("bad_digest", "raw_source_hash_mismatch"),
+        ("orphan_lineage", "normalized_lineage_mismatch"),
+        ("cross_venue_lineage", "normalized_lineage_mismatch"),
+    ],
+)
+def test_invalid_evidence_batch_is_venue_failure_without_persisted_evidence(
+    tmp_path: Path,
+    corruption: str,
+    failure: str,
+) -> None:
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
+
+    cycle = asyncio.run(
+        collector(store).collect_once(
+            (ImmediateBookAdapter(Venue.BYBIT), InvalidEvidenceBatchAdapter(corruption)),
+            ASSETS,
+            NOW,
+        )
+    )
+
+    assert cycle.status == "failed"
+    assert cycle.failure_codes == (f"hyperliquid:{failure}",)
+    assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT venue, source_hash FROM raw_envelopes").fetchall() == [
+            (Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])
+        ]
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
+
+
+def test_unsupported_normalized_record_is_failed_cycle_without_invalid_evidence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
+
+    cycle = asyncio.run(
+        collector(store).collect_once(
+            (ImmediateBookAdapter(Venue.BYBIT), UnsupportedNormalizedBatchAdapter()),
+            ASSETS,
+            NOW,
+        )
+    )
+
+    assert cycle.status == "failed"
+    assert cycle.failure_codes == ("hyperliquid:invalid_normalized_record",)
+    assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
     store.close()
 
     with duckdb.connect(str(path), read_only=True) as connection:
