@@ -39,9 +39,7 @@ def experiment_record(**overrides: object) -> ExperimentRecord:
         "benchmark": "cash-after-operational-costs-v1",
         "success_criteria": (
             SuccessCriterion(metric="net_return", operator="gt", threshold=Decimal("0")),
-            SuccessCriterion(
-                metric="maximum_drawdown", operator="lt", threshold=Decimal("0.08")
-            ),
+            SuccessCriterion(metric="maximum_drawdown", operator="lt", threshold=Decimal("0.08")),
         ),
         "code_revision": "0123456789abcdef",
         "data_cutoff": NOW,

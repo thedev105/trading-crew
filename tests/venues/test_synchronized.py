@@ -319,9 +319,9 @@ def test_invalid_batch_evidence_is_excluded_while_failed_cycle_persists(
     store.close()
 
     with duckdb.connect(str(path), read_only=True) as connection:
-        assert connection.execute(
-            "SELECT venue, source_hash FROM raw_envelopes"
-        ).fetchall() == [(Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])]
+        assert connection.execute("SELECT venue, source_hash FROM raw_envelopes").fetchall() == [
+            (Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])
+        ]
         assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
 
@@ -347,9 +347,9 @@ def test_duplicate_book_identity_is_failed_cycle_instead_of_database_rollback(
     store.close()
 
     with duckdb.connect(str(path), read_only=True) as connection:
-        assert connection.execute(
-            "SELECT venue, source_hash FROM raw_envelopes"
-        ).fetchall() == [(Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])]
+        assert connection.execute("SELECT venue, source_hash FROM raw_envelopes").fetchall() == [
+            (Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])
+        ]
         assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
 

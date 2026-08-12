@@ -170,9 +170,7 @@ def test_normalized_failure_rolls_back_raw_insert_as_one_unit(tmp_path: Path) ->
     store.append_funding(original)
 
     with pytest.raises(ConflictingRecordError):
-        PublicRecorder(store).record(
-            AdapterBatch(raw=(raw_envelope(),), normalized=(conflicting,))
-        )
+        PublicRecorder(store).record(AdapterBatch(raw=(raw_envelope(),), normalized=(conflicting,)))
     store.close()
 
     with duckdb.connect(str(path), read_only=True) as connection:

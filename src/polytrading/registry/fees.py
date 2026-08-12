@@ -15,17 +15,13 @@ class FeeRegistry:
         return self._store.append_fee_schedule(schedule)
 
     def as_of(self, venue: Venue, tier_name: str, as_of: datetime) -> FeeSchedule | None:
-        return self._store.latest_fee_as_of(
-            venue, tier_name, normalize_utc_timestamp(as_of)
-        )
+        return self._store.latest_fee_as_of(venue, tier_name, normalize_utc_timestamp(as_of))
 
     def require_as_of(self, venue: Venue, tier_name: str, as_of: datetime) -> FeeSchedule:
         normalized_as_of = normalize_utc_timestamp(as_of)
         schedule = self.as_of(venue, tier_name, normalized_as_of)
         if schedule is None:
-            raise MissingPointInTimeRecordError(
-                ("fee", venue.value, tier_name), normalized_as_of
-            )
+            raise MissingPointInTimeRecordError(("fee", venue.value, tier_name), normalized_as_of)
         return schedule
 
     def calculate(

@@ -224,9 +224,7 @@ class HyperliquidPublicAdapter:
                     ask=l2.asks[0].price,
                     mark=_require_decimal(context, "markPx", "asset context"),
                     index=_require_decimal(context, "oraclePx", "asset context"),
-                    open_interest=_require_decimal(
-                        context, "openInterest", "asset context"
-                    ),
+                    open_interest=_require_decimal(context, "openInterest", "asset context"),
                     effective_at=l2.effective_at,
                     observed_at=l2_response.observed_at,
                     source_hash=meta_raw.source_hash,
@@ -378,9 +376,7 @@ def _instrument_spec(
     )
 
 
-def _parse_l2_payload(
-    document: object, expected_asset: Asset, observed_at: datetime
-) -> _L2Payload:
+def _parse_l2_payload(document: object, expected_asset: Asset, observed_at: datetime) -> _L2Payload:
     mapping = _require_mapping(document, "l2Book response")
     coin = _require_string(mapping, "coin", "l2Book response")
     if coin != expected_asset.value:

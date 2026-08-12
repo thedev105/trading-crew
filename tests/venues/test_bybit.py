@@ -141,9 +141,7 @@ def test_fetch_instruments_paginates_and_normalizes_only_supported_active_perpet
         monotonic_times=[1_000_000, 2_500_000, 3_000_000, 5_000_000],
     )
     batch = asyncio.run(
-        adapter.fetch_instruments(
-            frozenset({Asset.BTC, Asset.ETH, Asset.SOL}), REQUEST_CONTEXT
-        )
+        adapter.fetch_instruments(frozenset({Asset.BTC, Asset.ETH, Asset.SOL}), REQUEST_CONTEXT)
     )
 
     assert requests == [
@@ -162,9 +160,9 @@ def test_fetch_instruments_paginates_and_normalizes_only_supported_active_perpet
         fixture_bytes("instruments_page_1.json").decode(),
         fixture_bytes("instruments_page_2.json").decode(),
     ]
-    assert batch.raw[0].source_hash == hashlib.sha256(
-        batch.raw[0].payload_json.encode()
-    ).hexdigest()
+    assert (
+        batch.raw[0].source_hash == hashlib.sha256(batch.raw[0].payload_json.encode()).hexdigest()
+    )
     assert batch.raw[0].observed_at == RECEIVED_1
     assert batch.raw[0].received_monotonic_ns == 2_500_000
     assert batch.raw[0].request_latency_ms == Decimal("1.5")
@@ -262,9 +260,7 @@ def test_fetch_market_snapshots_uses_one_ticker_response_and_exact_symbols(
         )
     )
 
-    assert requests == [
-        ("GET", "/v5/market/tickers", {"category": "linear"})
-    ]
+    assert requests == [("GET", "/v5/market/tickers", {"category": "linear"})]
     assert batch.raw[0].payload_json == payload.decode()
     assert batch.raw[0].venue_timestamp == REQUEST_CONTEXT
     assert [item.symbol for item in batch.normalized] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
@@ -379,9 +375,7 @@ def test_fetch_funding_history_paginates_backward_and_uses_historical_specs(
         wall_times=[RECEIVED_1, RECEIVED_2],
         monotonic_times=[100, 200, 300, 450],
     )
-    batch = asyncio.run(
-        adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT)
-    )
+    batch = asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
 
     assert requests == [
         (
@@ -475,9 +469,7 @@ def test_fetch_funding_history_rejects_invalid_rows(
     # Catches cross-symbol/range contamination and mutable overwrite of funding identity.
     adapter = make_adapter(
         lambda request: response(changed_fixture("funding_history_page_1.json", mutate)),
-        make_registry(
-            tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))
-        ),
+        make_registry(tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))),
         wall_times=[RECEIVED_1],
     )
 
@@ -492,9 +484,7 @@ def test_fetch_funding_history_rejects_unchanged_earliest_timestamp(
     payload = fixture_bytes("funding_history_page_1.json")
     adapter = make_adapter(
         lambda request: response(payload),
-        make_registry(
-            tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))
-        ),
+        make_registry(tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))),
         wall_times=[RECEIVED_1, RECEIVED_2],
     )
 
@@ -542,9 +532,7 @@ def test_fetch_funding_history_stops_at_configured_page_cap(tmp_path: Path) -> N
 
     adapter = make_adapter(
         handler,
-        make_registry(
-            tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))
-        ),
+        make_registry(tmp_path, registry_spec(observed_at=datetime(2026, 8, 10, tzinfo=UTC))),
         wall_times=[RECEIVED_1, RECEIVED_2],
         max_funding_pages=2,
     )
@@ -635,15 +623,11 @@ def test_fetch_order_books_preserves_engine_time_and_sequence(tmp_path: Path) ->
     [
         (lambda document: document["result"].pop("cts"), "cts"),
         (
-            lambda document: document["result"].update(
-                b=[["118999.80", "1"], ["118999.90", "1"]]
-            ),
+            lambda document: document["result"].update(b=[["118999.80", "1"], ["118999.90", "1"]]),
             "descending",
         ),
         (
-            lambda document: document["result"].update(
-                a=[["119000.20", "1"], ["119000.10", "1"]]
-            ),
+            lambda document: document["result"].update(a=[["119000.20", "1"], ["119000.10", "1"]]),
             "ascending",
         ),
         (
@@ -687,9 +671,7 @@ def test_fetch_order_books_rejects_repeated_sequence_pair_within_cycle(
 
     with pytest.raises(ValueError, match=r"repeated.*sequence"):
         asyncio.run(
-            adapter.fetch_order_books(
-                frozenset({Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID
-            )
+            adapter.fetch_order_books(frozenset({Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID)
         )
 
 
@@ -771,8 +753,6 @@ def test_collection_context_must_be_timezone_aware_before_request(tmp_path: Path
 
     with pytest.raises(ValueError, match="timezone-aware"):
         asyncio.run(
-            adapter.fetch_market_snapshots(
-                frozenset({Asset.BTC}), datetime(2026, 8, 12, 10)
-            )
+            adapter.fetch_market_snapshots(frozenset({Asset.BTC}), datetime(2026, 8, 12, 10))
         )
     assert calls == 0

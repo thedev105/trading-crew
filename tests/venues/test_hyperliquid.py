@@ -78,9 +78,7 @@ def test_fetch_instruments_uses_meta_contract_and_keeps_unknown_compatibility_fi
         monotonic_times=[1_000_000, 2_500_000],
     )
     batch = asyncio.run(
-        adapter.fetch_instruments(
-            frozenset({Asset.BTC, Asset.ETH, Asset.SOL}), REQUEST_CONTEXT
-        )
+        adapter.fetch_instruments(frozenset({Asset.BTC, Asset.ETH, Asset.SOL}), REQUEST_CONTEXT)
     )
 
     assert requests == [{"type": "metaAndAssetCtxs"}]
@@ -191,9 +189,7 @@ def test_fetch_funding_history_paginates_deduplicates_and_preserves_page_evidenc
         wall_times=[RECEIVED_1, RECEIVED_2],
         monotonic_times=[100, 200, 300, 450],
     )
-    batch = asyncio.run(
-        adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT)
-    )
+    batch = asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
 
     assert requests == [
         {
@@ -237,9 +233,7 @@ def test_fetch_funding_history_stops_on_empty_page() -> None:
         return response(b"[]\n")
 
     adapter = make_adapter(handler, wall_times=[RECEIVED_1])
-    batch = asyncio.run(
-        adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT)
-    )
+    batch = asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
 
     assert calls == 1
     assert len(batch.raw) == 1
@@ -300,10 +294,7 @@ def test_fetch_funding_history_rejects_rows_outside_closed_range() -> None:
         ([{"coin": "BTC", "fundingRate": "bad", "time": 1786449600000}], "decimal"),
         ([{"coin": "BTC", "fundingRate": "0.0001"}], "time"),
         (
-            [
-                {"coin": "BTC", "fundingRate": "0.0001", "time": 1786449600000}
-                for _ in range(501)
-            ],
+            [{"coin": "BTC", "fundingRate": "0.0001", "time": 1786449600000} for _ in range(501)],
             "500-row",
         ),
     ],
@@ -322,9 +313,7 @@ def test_fetch_funding_history_fails_closed_on_malformed_page(
 def test_fetch_funding_history_rejects_page_without_timestamp_progress() -> None:
     # Catches infinite/redundant pagination when the endpoint repeats the same page.
     payload = fixture_bytes("funding_history_page_1.json")
-    adapter = make_adapter(
-        lambda request: response(payload), wall_times=[RECEIVED_1, RECEIVED_2]
-    )
+    adapter = make_adapter(lambda request: response(payload), wall_times=[RECEIVED_1, RECEIVED_2])
 
     with pytest.raises(PaginationStalledError, match="progress"):
         asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
@@ -464,16 +453,12 @@ def malformed_book(**overrides: Any) -> bytes:
         ),
     ],
 )
-def test_fetch_order_books_fails_closed_on_malformed_payload(
-    payload: bytes, message: str
-) -> None:
+def test_fetch_order_books_fails_closed_on_malformed_payload(payload: bytes, message: str) -> None:
     # Catches acceptance of structurally impossible or untrustworthy book evidence.
     adapter = make_adapter(lambda request: response(payload), wall_times=[RECEIVED_1])
 
     with pytest.raises(ValueError, match=message):
-        asyncio.run(
-            adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID)
-        )
+        asyncio.run(adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID))
 
 
 def test_fetch_market_snapshots_combines_aligned_context_with_public_l2_quote() -> None:
@@ -488,9 +473,7 @@ def test_fetch_market_snapshots_combines_aligned_context_with_public_l2_quote() 
         return response(meta if body["type"] == "metaAndAssetCtxs" else book)
 
     adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
-    batch = asyncio.run(
-        adapter.fetch_market_snapshots(frozenset({Asset.BTC}), REQUEST_CONTEXT)
-    )
+    batch = asyncio.run(adapter.fetch_market_snapshots(frozenset({Asset.BTC}), REQUEST_CONTEXT))
 
     assert requests == [
         {"type": "metaAndAssetCtxs"},
@@ -505,9 +488,7 @@ def test_fetch_market_snapshots_combines_aligned_context_with_public_l2_quote() 
     assert snapshot.mark == Decimal("119000.0")
     assert snapshot.index == Decimal("118995.0")
     assert snapshot.open_interest == Decimal("24567.89012")
-    assert snapshot.effective_at == datetime(
-        2026, 8, 11, 13, 0, 0, 123000, tzinfo=UTC
-    )
+    assert snapshot.effective_at == datetime(2026, 8, 11, 13, 0, 0, 123000, tzinfo=UTC)
     assert snapshot.observed_at == RECEIVED_2
     assert snapshot.source_hash == batch.raw[0].source_hash
     assert batch.raw[1].source_hash == hashlib.sha256(book).hexdigest()
@@ -526,9 +507,7 @@ def test_protocol_observed_at_must_be_aware_but_does_not_trigger_request() -> No
 
     with pytest.raises(ValueError, match="timezone-aware"):
         asyncio.run(
-            adapter.fetch_instruments(
-                frozenset({Asset.BTC}), datetime(2026, 8, 12, 10, 0, 0)
-            )
+            adapter.fetch_instruments(frozenset({Asset.BTC}), datetime(2026, 8, 12, 10, 0, 0))
         )
     assert called is False
 
@@ -556,9 +535,7 @@ def test_response_receipt_clocks_wrap_request_and_wall_clock_follows_body() -> N
         monotonic_ns=monotonic_ns,
     )
 
-    batch = asyncio.run(
-        adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT)
-    )
+    batch = asyncio.run(adapter.fetch_funding_history(Asset.BTC, START, END, REQUEST_CONTEXT))
 
     assert events == ["monotonic", "response-body", "monotonic", "wall"]
     assert batch.raw[0].received_monotonic_ns == 25

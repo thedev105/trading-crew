@@ -52,12 +52,12 @@ def test_calculate_reports_exact_maker_rebate_and_taker_fee(tmp_path: Path) -> N
     registry = FeeRegistry(store)
     registry.record(fee_schedule())
 
-    assert registry.calculate(
-        Venue.BYBIT, "VIP 0", "maker", Decimal("123.45"), NOW
-    ) == Decimal("-0.0123450")
-    assert registry.calculate(
-        Venue.BYBIT, "VIP 0", "taker", Decimal("123.45"), NOW
-    ) == Decimal("0.0678975")
+    assert registry.calculate(Venue.BYBIT, "VIP 0", "maker", Decimal("123.45"), NOW) == Decimal(
+        "-0.0123450"
+    )
+    assert registry.calculate(Venue.BYBIT, "VIP 0", "taker", Decimal("123.45"), NOW) == Decimal(
+        "0.0678975"
+    )
     assert registry.calculate(Venue.BYBIT, "VIP 0", "maker", Decimal("0"), NOW) == Decimal(0)
     store.close()
 

@@ -50,9 +50,7 @@ class BookCollectionCycle(StrictRecord):
 
     @field_validator("effective_timestamps")
     @classmethod
-    def require_effective_timestamps_utc(
-        cls, values: tuple[datetime, ...]
-    ) -> tuple[datetime, ...]:
+    def require_effective_timestamps_utc(cls, values: tuple[datetime, ...]) -> tuple[datetime, ...]:
         return tuple(sorted(normalize_utc_timestamp(value) for value in values))
 
     @field_validator("max_effective_skew_ms")
@@ -215,6 +213,6 @@ def _max_timestamp_skew_ms(values: tuple[datetime, ...]) -> Decimal:
         return Decimal(0)
     elapsed: timedelta = max(values) - min(values)
     elapsed_microseconds = (
-        (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
-    )
+        elapsed.days * 86_400 + elapsed.seconds
+    ) * 1_000_000 + elapsed.microseconds
     return Decimal(elapsed_microseconds) / Decimal(1_000)

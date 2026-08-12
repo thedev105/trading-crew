@@ -113,9 +113,7 @@ class DuckDBStore:
                 schema_version=existing[10],
             )
             if stored != record:
-                raise ConflictingRecordError(
-                    "conflicting raw envelope for immutable identity"
-                )
+                raise ConflictingRecordError("conflicting raw envelope for immutable identity")
             return False
 
         self._connection.execute(
@@ -519,9 +517,7 @@ class DuckDBStore:
             schema_version=row[8],
         )
 
-    def latest_fee_as_of(
-        self, venue: Venue, tier_name: str, as_of: datetime
-    ) -> FeeSchedule | None:
+    def latest_fee_as_of(self, venue: Venue, tier_name: str, as_of: datetime) -> FeeSchedule | None:
         row = self._connection.execute(
             """
             SELECT venue, tier_name, maker_rate, taker_rate, epoch_us(effective_from),

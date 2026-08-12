@@ -15,9 +15,7 @@ from polytrading.domain.models import (
     Venue,
 )
 
-type NormalizedRecord = (
-    InstrumentSpec | FundingObservation | MarketSnapshot | Level2BookSnapshot
-)
+type NormalizedRecord = InstrumentSpec | FundingObservation | MarketSnapshot | Level2BookSnapshot
 
 
 @dataclass(frozen=True)

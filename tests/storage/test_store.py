@@ -160,9 +160,7 @@ def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
 
 
 def test_migration_sql_is_available_as_packaged_data() -> None:
-    migration = importlib.resources.files("polytrading.storage.schema").joinpath(
-        "001_initial.sql"
-    )
+    migration = importlib.resources.files("polytrading.storage.schema").joinpath("001_initial.sql")
 
     assert migration.is_file()
     assert "CREATE TABLE schema_migrations" in migration.read_text(encoding="utf-8")
@@ -194,9 +192,7 @@ def test_all_record_types_round_trip_without_float_conversion(tmp_path: Path) ->
     store.close()
 
     with duckdb.connect(str(path), read_only=True) as connection:
-        stored_raw = connection.execute(
-            "SELECT request_latency_ms FROM raw_envelopes"
-        ).fetchone()
+        stored_raw = connection.execute("SELECT request_latency_ms FROM raw_envelopes").fetchone()
         stored_market = connection.execute(
             "SELECT bid, open_interest FROM market_snapshots"
         ).fetchone()
@@ -306,10 +302,7 @@ def test_latest_instrument_as_of_excludes_later_observations(tmp_path: Path) -> 
     store.append_instrument(early)
     store.append_instrument(late)
 
-    assert (
-        store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW - timedelta(minutes=3))
-        is None
-    )
+    assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW - timedelta(minutes=3)) is None
     assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW) == early
 
     store.close()
@@ -347,9 +340,10 @@ def test_range_and_as_of_readers_return_ordered_point_in_time_records(tmp_path: 
     store.append_fee_schedule(early_fee)
     store.append_fee_schedule(late_fee)
 
-    assert store.funding_between(
-        Venue.BYBIT, "BTCUSDT", NOW - timedelta(hours=3), NOW
-    ) == (first_funding, second_funding)
+    assert store.funding_between(Venue.BYBIT, "BTCUSDT", NOW - timedelta(hours=3), NOW) == (
+        first_funding,
+        second_funding,
+    )
     assert store.latest_book_as_of(Venue.BYBIT, "BTCUSDT", NOW) == early_book
     assert store.latest_fee_as_of(Venue.BYBIT, "VIP 0", NOW) == early_fee
 
@@ -390,9 +384,10 @@ def test_nested_transactions_are_rejected_without_committing_outer_work(tmp_path
     path = tmp_path / "research.duckdb"
     store = open_store(path)
 
-    with pytest.raises(
-        RuntimeError, match="nested transactions are not supported"
-    ), store.transaction():
+    with (
+        pytest.raises(RuntimeError, match="nested transactions are not supported"),
+        store.transaction(),
+    ):
         store.append_instrument(instrument_spec())
         with store.transaction():
             pass

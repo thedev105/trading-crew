@@ -207,17 +207,13 @@ class BybitPublicAdapter:
                     ask=_require_decimal(ticker, "ask1Price", f"{symbol} ticker row"),
                     mark=_require_decimal(ticker, "markPrice", f"{symbol} ticker row"),
                     index=_require_decimal(ticker, "indexPrice", f"{symbol} ticker row"),
-                    open_interest=_require_decimal(
-                        ticker, "openInterest", f"{symbol} ticker row"
-                    ),
+                    open_interest=_require_decimal(ticker, "openInterest", f"{symbol} ticker row"),
                     effective_at=received.venue_timestamp,
                     observed_at=received.observed_at,
                     source_hash=raw.source_hash,
                 )
             )
-        return AdapterBatch(
-            raw=(raw,), normalized=tuple(snapshots), warnings=tuple(warnings)
-        )
+        return AdapterBatch(raw=(raw,), normalized=tuple(snapshots), warnings=tuple(warnings))
 
     async def fetch_funding_history(
         self,
@@ -278,9 +274,7 @@ class BybitPublicAdapter:
                 rate = _require_decimal(row, "fundingRate", "funding history row")
                 earliest = timestamp_ms if earliest is None else min(earliest, timestamp_ms)
                 effective_at = _datetime_from_milliseconds(timestamp_ms)
-                spec = self._instrument_registry.require_as_of(
-                    self.venue, symbol, effective_at
-                )
+                spec = self._instrument_registry.require_as_of(self.venue, symbol, effective_at)
                 if spec.asset is not asset:
                     raise ValueError("historical instrument asset does not match funding asset")
                 interval = spec.funding_interval_hours
@@ -310,14 +304,10 @@ class BybitPublicAdapter:
             if earliest <= start_ms:
                 break
             if previous_earliest is not None and earliest >= previous_earliest:
-                raise PaginationStalledError(
-                    "funding history page made no timestamp progress"
-                )
+                raise PaginationStalledError("funding history page made no timestamp progress")
             next_end = earliest - 1
             if next_end >= cursor_end:
-                raise PaginationStalledError(
-                    "funding history page made no timestamp progress"
-                )
+                raise PaginationStalledError("funding history page made no timestamp progress")
             previous_earliest = earliest
             cursor_end = next_end
         else:
@@ -361,9 +351,7 @@ class BybitPublicAdapter:
                     bids=parsed.bids,
                     asks=parsed.asks,
                     depth_limit=20,
-                    sequence=(
-                        f"u={parsed.update_id};seq={parsed.cross_sequence}"
-                    ),
+                    sequence=(f"u={parsed.update_id};seq={parsed.cross_sequence}"),
                     effective_at=parsed.effective_at,
                     observed_at=received.observed_at,
                     source_hash=raw.source_hash,
@@ -371,9 +359,7 @@ class BybitPublicAdapter:
             )
         return AdapterBatch(raw=tuple(raws), normalized=tuple(books))
 
-    async def _get(
-        self, endpoint: str, params: Mapping[str, str | int]
-    ) -> _ReceivedResponse:
+    async def _get(self, endpoint: str, params: Mapping[str, str | int]) -> _ReceivedResponse:
         monotonic_started_ns = self._monotonic_ns()
         response = await self._client.get(f"{_BASE_URL}{endpoint}", params=params)
         payload = response.content
@@ -454,12 +440,8 @@ def _parse_instrument(
         funding_cap=funding_cap,
         funding_interval_hours=Decimal(funding_minutes) / Decimal(60),
         funding_payment_offset_minutes=None,
-        min_notional=_require_decimal(
-            lot_filter, "minNotionalValue", "instrument lotSizeFilter"
-        ),
-        quantity_step=_require_decimal(
-            lot_filter, "qtyStep", "instrument lotSizeFilter"
-        ),
+        min_notional=_require_decimal(lot_filter, "minNotionalValue", "instrument lotSizeFilter"),
+        quantity_step=_require_decimal(lot_filter, "qtyStep", "instrument lotSizeFilter"),
         price_tick=_require_decimal(price_filter, "tickSize", "instrument priceFilter"),
         is_inverse=False,
         is_prelaunch=False,
@@ -525,9 +507,7 @@ def _parse_book_side(value: object, label: str) -> tuple[BookLevel, ...]:
     return tuple(levels)
 
 
-def _result_mapping(
-    document: Mapping[str, object], endpoint: str
-) -> Mapping[str, object]:
+def _result_mapping(document: Mapping[str, object], endpoint: str) -> Mapping[str, object]:
     return _require_mapping(_require_key(document, "result", endpoint), f"{endpoint} result")
 
 
@@ -581,9 +561,7 @@ def _require_integer(mapping: Mapping[str, object], key: str, label: str) -> int
     return value
 
 
-def _require_millisecond_string(
-    mapping: Mapping[str, object], key: str, label: str
-) -> int:
+def _require_millisecond_string(mapping: Mapping[str, object], key: str, label: str) -> int:
     value = _require_string(mapping, key, label)
     if not value or not value.isascii() or not value.isdigit():
         raise ValueError(f"{label} key {key!r} must be a non-negative millisecond string")

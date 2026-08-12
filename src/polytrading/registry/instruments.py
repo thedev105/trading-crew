@@ -13,9 +13,7 @@ class InstrumentRegistry:
         return self._store.append_instrument(spec)
 
     def as_of(self, venue: Venue, symbol: str, as_of: datetime) -> InstrumentSpec | None:
-        return self._store.latest_instrument_as_of(
-            venue, symbol, normalize_utc_timestamp(as_of)
-        )
+        return self._store.latest_instrument_as_of(venue, symbol, normalize_utc_timestamp(as_of))
 
     def require_as_of(self, venue: Venue, symbol: str, as_of: datetime) -> InstrumentSpec:
         normalized_as_of = normalize_utc_timestamp(as_of)
