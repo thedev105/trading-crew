@@ -20,20 +20,20 @@ _METADATA_COMPARISONS = (
 
 def compare_contracts(left: InstrumentSpec, right: InstrumentSpec) -> CompatibilityResult:
     """Return every proven incompatibility, or missing evidence, in stable order."""
-    reasons: list[CompatibilityReason] = []
+    reasons: list[str] = []
     missing_metadata: list[str] = []
 
     if left.asset != right.asset:
-        reasons.append(CompatibilityReason.ASSET_MISMATCH)
+        reasons.append(CompatibilityReason.ASSET_MISMATCH.value)
     if (
         left.kind is not InstrumentKind.LINEAR_PERPETUAL
         or right.kind is not InstrumentKind.LINEAR_PERPETUAL
     ):
-        reasons.append(CompatibilityReason.KIND_MISMATCH)
+        reasons.append(CompatibilityReason.KIND_MISMATCH.value)
     if left.contract_multiplier != right.contract_multiplier:
-        reasons.append(CompatibilityReason.MULTIPLIER_MISMATCH)
+        reasons.append(CompatibilityReason.MULTIPLIER_MISMATCH.value)
     if left.is_inverse or right.is_inverse:
-        reasons.append(CompatibilityReason.INVERSE_UNSUPPORTED)
+        reasons.append(CompatibilityReason.INVERSE_UNSUPPORTED.value)
 
     for field, mismatch_reason in _METADATA_COMPARISONS:
         left_value = getattr(left, field)
@@ -41,10 +41,10 @@ def compare_contracts(left: InstrumentSpec, right: InstrumentSpec) -> Compatibil
         if left_value is None or right_value is None:
             missing_metadata.append(f"missing_metadata:{field}")
         elif left_value != right_value:
-            reasons.append(mismatch_reason)
+            reasons.append(mismatch_reason.value)
 
     if left.is_prelaunch or right.is_prelaunch:
-        reasons.append(CompatibilityReason.PRELAUNCH_UNSUPPORTED)
+        reasons.append(CompatibilityReason.PRELAUNCH_UNSUPPORTED.value)
 
     all_reasons = tuple(reasons + missing_metadata)
     return CompatibilityResult(compatible=not all_reasons, reasons=all_reasons)

@@ -4,6 +4,7 @@ from typing import Any, cast
 import pytest
 
 from polytrading.carry.compatibility import CompatibilityReason, compare_contracts
+from polytrading.carry.models import CompatibilityResult
 from polytrading.domain.models import Asset, InstrumentSpec, Venue
 from tests.domain.factories import instrument_spec
 
@@ -143,6 +144,31 @@ def test_contract_reasons_have_deterministic_enum_then_missing_order() -> None:
         CompatibilityReason.PRELAUNCH_UNSUPPORTED,
         "missing_metadata:funding_payment_offset_minutes",
     )
+
+
+def test_reason_values_serialize_as_exact_builtin_strings() -> None:
+    # Catches retaining StrEnum instances, which makes the diagnostic's dump and schema ambiguous.
+    result = compare_contracts(
+        instrument_spec(asset=Asset.ETH, funding_payment_offset_minutes=None),
+        instrument_spec(),
+    )
+
+    dumped = result.model_dump()
+
+    assert dumped["reasons"] == (
+        "asset_mismatch",
+        "missing_metadata:funding_payment_offset_minutes",
+    )
+    assert all(type(reason) is str for reason in dumped["reasons"])
+    assert result.model_dump_json() == (
+        '{"compatible":false,"reasons":['
+        '"asset_mismatch","missing_metadata:funding_payment_offset_minutes"]}'
+    )
+    assert CompatibilityResult.model_json_schema()["properties"]["reasons"] == {
+        "items": {"type": "string"},
+        "title": "Reasons",
+        "type": "array",
+    }
 
 
 def test_hyperliquid_usdc_and_bybit_usdt_are_ineligible() -> None:

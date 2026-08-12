@@ -125,6 +125,36 @@ def test_equal_hourly_rates_choose_long_by_venue_then_symbol() -> None:
     assert diagnostic.hourly_spread == Decimal("0")
 
 
+@pytest.mark.parametrize("identical_identity", [False, True])
+def test_same_venue_funding_comparison_is_rejected(identical_identity: bool) -> None:
+    # Catches generating a self-spread from either duplicate identities or distinct venue symbols.
+    first = funding_observation(
+        venue=Venue.BYBIT,
+        symbol="BTCUSDT",
+        rate=Decimal("0.0001"),
+        interval_hours=Decimal("1"),
+    )
+    first_instrument = paired_instrument(venue=Venue.BYBIT, symbol="BTCUSDT")
+    second = (
+        first
+        if identical_identity
+        else funding_observation(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDC",
+            rate=Decimal("0.0002"),
+            interval_hours=Decimal("1"),
+        )
+    )
+    second_instrument = (
+        first_instrument
+        if identical_identity
+        else paired_instrument(venue=Venue.BYBIT, symbol="BTCUSDC")
+    )
+
+    with pytest.raises(ValueError, match="funding comparison requires distinct venues"):
+        compare_latest_funding(first, first_instrument, second, second_instrument, NOW)
+
+
 @given(
     long_rate=st.decimals(min_value=Decimal("-1"), max_value=Decimal("1"), places=6),
     short_rate=st.decimals(min_value=Decimal("-1"), max_value=Decimal("1"), places=6),

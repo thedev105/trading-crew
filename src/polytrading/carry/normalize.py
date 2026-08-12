@@ -28,6 +28,8 @@ def compare_latest_funding(
     _require_current_and_aligned(second_observation, second_instrument, normalized_as_of)
     if first_observation.asset != second_observation.asset:
         raise ValueError("funding observations and instruments must align")
+    if first_observation.venue == second_observation.venue:
+        raise ValueError("funding comparison requires distinct venues")
 
     ordered = sorted(
         ((first_observation, first_instrument), (second_observation, second_instrument)),

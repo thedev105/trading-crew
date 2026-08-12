@@ -28,7 +28,7 @@ class CompatibilityReason(StrEnum):
 
 class CompatibilityResult(StrictRecord):
     compatible: bool
-    reasons: tuple[CompatibilityReason | str, ...]
+    reasons: tuple[str, ...]
 
 
 class FundingSpreadDiagnostic(StrictRecord):
