@@ -5,7 +5,10 @@ from pathlib import Path
 from uuid import UUID
 
 from polytrading.carry.audit import AuditStatus
-from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.dossier import (
+    evaluate_dossier,
+    load_bundled_dossier,
+)
 from polytrading.carry.dossier_models import DossierStatus
 from polytrading.domain.models import Asset, BookLevel, Venue
 from polytrading.storage.store import DuckDBStore
@@ -22,6 +25,7 @@ SOURCE_HASH = "a" * 64
 FUTURE_HASH = "f" * 64
 BOOK_CYCLE_ID = UUID("00000000-0000-0000-0000-000000000a01")
 DOSSIER_AT = datetime(2026, 8, 13, 15, 58, 12, tzinfo=UTC)
+DISCOVERY_AT = datetime(2026, 8, 13, 16, 23, 8, tzinfo=UTC)
 
 
 def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Path) -> None:
@@ -49,6 +53,9 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
     assert set(snapshot.evidence_counts.model_dump().values()) == {0}
     assert snapshot.compatibility_dossier is not None
     assert snapshot.compatibility_dossier.status is DossierStatus.INELIGIBLE
+    assert snapshot.venue_discovery is not None
+    assert snapshot.venue_discovery.selected_dossier_id is None
+    assert len(snapshot.venue_discovery.candidates) == 1
     store.close()
 
 
@@ -58,15 +65,31 @@ def test_builder_excludes_dossier_until_its_point_in_time_cutoff(tmp_path: Path)
 
     before = DashboardBuilder(store, path).build(DOSSIER_AT - timedelta(microseconds=1))
     at_cutoff = DashboardBuilder(store, path).build(DOSSIER_AT)
+    after_discovery = DashboardBuilder(store, path).build(DISCOVERY_AT)
 
     assert before.compatibility_dossier is None
+    assert before.venue_discovery is None
     assert at_cutoff.compatibility_dossier == evaluate_dossier(load_bundled_dossier())
     assert at_cutoff.compatibility_dossier.primary_reason_code == "quanto_structure_excluded"
     assert len(at_cutoff.compatibility_dossier.checks) == 14
+    assert at_cutoff.venue_discovery is not None
+    assert at_cutoff.venue_discovery.selected_dossier_id is None
+    assert tuple(item.dossier_id for item in at_cutoff.venue_discovery.candidates) == (
+        "hyperliquid-dydx-core-v1",
+    )
+    assert after_discovery.venue_discovery is not None
+    assert after_discovery.venue_discovery.selected_dossier_id == "lighter-dydx-core-v1"
+    assert tuple(item.dossier_id for item in after_discovery.venue_discovery.candidates) == (
+        "lighter-dydx-core-v1",
+        "hyperliquid-dydx-core-v1",
+    )
     assert json.loads(render_dashboard_json(before))["compatibility_dossier"] is None
-    document = json.loads(render_dashboard_json(at_cutoff))["compatibility_dossier"]
-    assert document["status"] == "ineligible"
-    assert document["observed_at"] == "2026-08-13T15:58:12Z"
+    at_document = json.loads(render_dashboard_json(at_cutoff))
+    assert at_document["compatibility_dossier"]["status"] == "ineligible"
+    assert at_document["compatibility_dossier"]["observed_at"] == "2026-08-13T15:58:12Z"
+    assert at_document["venue_discovery"]["selected_dossier_id"] is None
+    after_document = json.loads(render_dashboard_json(after_discovery))
+    assert after_document["venue_discovery"]["selected_dossier_id"] == "lighter-dydx-core-v1"
     store.close()
 
 

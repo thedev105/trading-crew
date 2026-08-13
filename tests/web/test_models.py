@@ -5,7 +5,12 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.carry.audit import AuditStatus
-from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.discovery import evaluate_discovery
+from polytrading.carry.dossier import (
+    evaluate_dossier,
+    load_bundled_dossier,
+    load_bundled_dossiers,
+)
 from polytrading.domain.models import Asset, Venue
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
 from polytrading.web.models import (
@@ -83,6 +88,7 @@ def _snapshot_values() -> dict[str, object]:
         "latest_funding_cycle": None,
         "latest_book_cycle": None,
         "compatibility_dossier": None,
+        "venue_discovery": None,
         "markets": _market_rows(),
         "carry_rows": _carry_rows(),
         "evidence_counts": EvidenceCounts(
@@ -197,4 +203,38 @@ def test_snapshot_rejects_dossier_observed_after_snapshot_cutoff() -> None:
     values["compatibility_dossier"] = report
 
     with pytest.raises(ValidationError, match="dossier must not follow dashboard as-of"):
+        DashboardSnapshot(**values)
+
+
+def test_snapshot_rejects_discovery_observed_after_snapshot_cutoff() -> None:
+    values = _snapshot_values()
+    discovery = evaluate_discovery(
+        tuple(evaluate_dossier(dossier) for dossier in load_bundled_dossiers())
+    )
+    values["as_of"] = discovery.observed_at - datetime.resolution
+    values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
+    values["venue_discovery"] = discovery
+
+    with pytest.raises(ValidationError, match="discovery must not follow dashboard as-of"):
+        DashboardSnapshot(**values)
+
+
+def test_snapshot_requires_legacy_dossier_to_match_discovery_candidate() -> None:
+    values = _snapshot_values()
+    legacy = evaluate_dossier(load_bundled_dossier())
+    discovery = evaluate_discovery(
+        tuple(evaluate_dossier(dossier) for dossier in load_bundled_dossiers())
+    )
+    values["as_of"] = discovery.observed_at
+    values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
+    values["compatibility_dossier"] = legacy.model_copy(
+        update={"primary_reason_code": "different_reason"}
+    )
+    values["venue_discovery"] = discovery
+
+    with pytest.raises(ValidationError, match="legacy dossier must match discovery candidate"):
         DashboardSnapshot(**values)

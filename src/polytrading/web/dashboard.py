@@ -13,7 +13,8 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from polytrading.carry.audit import CarryAuditor
-from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.discovery import evaluate_discovery
+from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossiers
 from polytrading.carry.dossier_models import ContractCompatibilityDossier
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
@@ -46,11 +47,13 @@ class DashboardBuilder:
         self,
         store: DuckDBStore,
         database_path: Path,
-        dossier_loader: Callable[[], ContractCompatibilityDossier] = load_bundled_dossier,
+        dossier_catalog_loader: Callable[
+            [], tuple[ContractCompatibilityDossier, ...]
+        ] = load_bundled_dossiers,
     ) -> None:
         self._store = store
         self._database_path = database_path
-        self._dossier_loader = dossier_loader
+        self._dossier_catalog_loader = dossier_catalog_loader
 
     def build(self, as_of: datetime) -> DashboardSnapshot:
         normalized_as_of = normalize_utc_timestamp(as_of)
@@ -64,7 +67,20 @@ class DashboardBuilder:
             max_book_age=timedelta(seconds=30),
             max_book_cycle_skew=timedelta(seconds=1),
         ).audit(normalized_as_of)
-        dossier = self._dossier_loader()
+        dossiers = tuple(
+            dossier
+            for dossier in self._dossier_catalog_loader()
+            if dossier.observed_at <= normalized_as_of
+        )
+        dossier_reports = tuple(evaluate_dossier(dossier) for dossier in dossiers)
+        legacy_report = next(
+            (
+                report
+                for report in dossier_reports
+                if report.dossier_id == "hyperliquid-dydx-core-v1"
+            ),
+            None,
+        )
 
         return DashboardSnapshot(
             schema_version=1,
@@ -94,9 +110,8 @@ class DashboardBuilder:
                     max_effective_skew_ms=book_cycle.max_effective_skew_ms,
                 )
             ),
-            compatibility_dossier=(
-                evaluate_dossier(dossier) if dossier.observed_at <= normalized_as_of else None
-            ),
+            compatibility_dossier=legacy_report,
+            venue_discovery=(evaluate_discovery(dossier_reports) if dossier_reports else None),
             markets=tuple(
                 self._market_row(venue, asset, normalized_as_of)
                 for venue in _VENUES

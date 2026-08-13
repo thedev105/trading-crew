@@ -31,6 +31,10 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
     assert document["as_of"] == "2026-08-13T16:06:00Z"
     assert document["compatibility_dossier"]["status"] == "ineligible"
     assert document["compatibility_dossier"]["primary_reason_code"] == "quanto_structure_excluded"
+    assert document["venue_discovery"]["selected_dossier_id"] is None
+    assert [item["dossier_id"] for item in document["venue_discovery"]["candidates"]] == [
+        "hyperliquid-dydx-core-v1"
+    ]
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"
