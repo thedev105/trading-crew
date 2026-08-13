@@ -36,7 +36,7 @@
 - Consumes: exact response `bytes`, request URL/cursor/page ordinal, explicit UTC timestamps, and selected response headers.
 - Produces: `parse_page(...) -> ParsedPage`, where `ParsedPage.raw` is `RawPageCapture` and `ParsedPage.candidates` is `tuple[CorpusCandidate, ...]`.
 
-- [ ] **Step 1: Write failing parser tests**
+- [x] **Step 1: Write failing parser tests**
 
 Cover exact-body SHA-256, required identity/question fields, optional-field warnings, event-family extraction, stable candidate IDs, and deterministic routing tags. The central assertion is:
 
@@ -54,12 +54,12 @@ assert page.raw.body_sha256 == sha256(fixture.read_bytes()).hexdigest()
 assert {item.retention_status for item in page.candidates} == {"review_required"}
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run: `python -m pytest tests/corpus_intake/test_polymarket.py -q`  
 Expected: FAIL because `polytrading.corpus_intake` does not exist.
 
-- [ ] **Step 3: Implement immutable models and parser**
+- [x] **Step 3: Implement immutable models and parser**
 
 Define:
 
@@ -109,12 +109,12 @@ class CorpusCandidate:
 
 `parse_page` must strictly decode UTF-8, require a JSON object with `markets: list`, require a non-empty string `next_cursor` when present, reject booleans as IDs, allowlist normalized fields, and preserve all unknown fields only through `body_text`.
 
-- [ ] **Step 4: Run the focused tests and confirm GREEN**
+- [x] **Step 4: Run the focused tests and confirm GREEN**
 
 Run: `python -m pytest tests/corpus_intake/test_polymarket.py -q`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit the parser slice**
+- [x] **Step 5: Commit the parser slice**
 
 ```bash
 git add src/polytrading/corpus_intake tests/corpus_intake tests/fixtures/polymarket
@@ -131,7 +131,7 @@ git commit -m "feat(corpus): parse public Polymarket candidates"
 - Consumes: `httpx.AsyncClient`, `AcquisitionRequest`, and `Callable[[RawPageCapture], None]`.
 - Produces: `acquire_polymarket(...) -> AcquisitionResult` with candidates and diagnostics.
 
-- [ ] **Step 1: Write failing mocked-transport tests**
+- [x] **Step 1: Write failing mocked-transport tests**
 
 Test two-page traversal using `next_cursor` as `after_cursor`, max-candidate truncation, cursor-loop rejection, conflicting same-ID rejection, exact duplicate diagnostics, response-size rejection, content-type/status rejection, and an empty terminal page.
 
@@ -142,12 +142,12 @@ assert len(result.candidates) == 3
 assert seen_requests[1].url.params["after_cursor"] == "cursor-2"
 ```
 
-- [ ] **Step 2: Run the collector tests and confirm RED**
+- [x] **Step 2: Run the collector tests and confirm RED**
 
 Run: `python -m pytest tests/corpus_intake/test_polymarket.py -q`  
 Expected: FAIL because `acquire_polymarket` is absent.
 
-- [ ] **Step 3: Implement the bounded collector**
+- [x] **Step 3: Implement the bounded collector**
 
 Add `AcquisitionRequest`, `AcquisitionDiagnostics`, `AcquisitionResult`, and:
 
@@ -164,12 +164,12 @@ async def acquire_polymarket(
 
 Always request `closed=false`, `include_tag=true`, and a limit no greater than 100. Validate the requested/returned cursor set before the next request. Keep same-event contracts distinct, drop byte-identical duplicate candidates, and fail on same-ID conflicts. Sort the final candidates by `(source, event_family_id, source_market_id)`.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `python -m pytest tests/corpus_intake/test_polymarket.py -q`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit the collector slice**
+- [x] **Step 5: Commit the collector slice**
 
 ```bash
 git add src/polytrading/corpus_intake/polymarket.py tests/corpus_intake/test_polymarket.py
@@ -187,7 +187,7 @@ git commit -m "feat(corpus): collect bounded keyset pages"
 - Consumes: output path, `AcquisitionRequest`, streamed `RawPageCapture` records, and completed `AcquisitionResult`.
 - Produces: `raw_pages.jsonl`, `candidates.jsonl`, `coverage.json`, and last-written `manifest.json`.
 
-- [ ] **Step 1: Write failing artifact tests**
+- [x] **Step 1: Write failing artifact tests**
 
 Prove canonical JSONL, hash correctness, deterministic candidate order, count/tag/category/event-family coverage, manifest-last behavior, non-empty-directory rejection, and rejection of gold paths after symlink-aware resolution.
 
@@ -200,16 +200,16 @@ assert manifest["retention_status"] == "review_required"
 assert manifest["files"]["candidates.jsonl"]["sha256"] == file_sha256(...)
 ```
 
-- [ ] **Step 2: Run the artifact tests and confirm RED**
+- [x] **Step 2: Run the artifact tests and confirm RED**
 
 Run: `python -m pytest tests/corpus_intake/test_artifacts.py -q`  
 Expected: FAIL because `CorpusRunWriter` is absent.
 
-- [ ] **Step 3: Implement atomic, manifest-last output**
+- [x] **Step 3: Implement atomic, manifest-last output**
 
 Use `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. Stream raw records to a newly created `raw_pages.jsonl`; flush after each page. Write each remaining file to a sibling `.tmp` path and atomically replace its final path. Include schema version `corpus-intake-v2`, official endpoint/documentation URLs, `retention_status: review_required`, no retention basis, explicit run inputs, diagnostics, counts, source-provided tags, and file hashes.
 
-- [ ] **Step 4: Add quarantine outputs to `.gitignore`**
+- [x] **Step 4: Add quarantine outputs to `.gitignore`**
 
 Add exactly:
 
@@ -217,12 +217,12 @@ Add exactly:
 var/corpus-intake/
 ```
 
-- [ ] **Step 5: Run focused tests and confirm GREEN**
+- [x] **Step 5: Run focused tests and confirm GREEN**
 
 Run: `python -m pytest tests/corpus_intake/test_artifacts.py -q`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit the artifact slice**
+- [x] **Step 6: Commit the artifact slice**
 
 ```bash
 git add .gitignore src/polytrading/corpus_intake/artifacts.py tests/corpus_intake/test_artifacts.py
@@ -239,7 +239,7 @@ git commit -m "feat(corpus): write quarantined intake artifacts"
 - Consumes: `polytrading collect corpus` arguments and the existing retrying public HTTP client.
 - Produces: exit `0` and a non-sensitive count summary, exit `2` for input/policy errors, or exit `1` for acquisition failures.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Add parser/dispatch tests for required timestamps, UTC normalization, cutoff order, `1..5000` candidates, `1..100` page size, `1..100` pages, source allowlist containing only `polymarket`, output quarantine enforcement, and injected acquisition success/failure.
 
@@ -253,21 +253,21 @@ assert main([
 ]) == 0
 ```
 
-- [ ] **Step 2: Run CLI tests and confirm RED**
+- [x] **Step 2: Run CLI tests and confirm RED**
 
 Run: `python -m pytest tests/test_cli.py -q`  
 Expected: FAIL because `collect corpus` is not registered.
 
-- [ ] **Step 3: Register and dispatch the command**
+- [x] **Step 3: Register and dispatch the command**
 
 Add the `corpus` subparser beneath `collect`, validate arguments before opening the network client, construct `AcquisitionRequest`, start `CorpusRunWriter`, invoke `acquire_polymarket`, and call `complete` only after acquisition succeeds. Keep source body text out of stdout/stderr.
 
-- [ ] **Step 4: Run CLI and boundary tests and confirm GREEN**
+- [x] **Step 4: Run CLI and boundary tests and confirm GREEN**
 
 Run: `python -m pytest tests/test_cli.py tests/ai/test_package.py tests/ai/test_security.py -q`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit the CLI slice**
+- [x] **Step 5: Commit the CLI slice**
 
 ```bash
 git add src/polytrading/cli.py tests/test_cli.py
@@ -284,7 +284,7 @@ git commit -m "feat(cli): acquire public corpus candidates"
 - Consumes: official public Gamma API and completed CLI.
 - Produces: actual quarantined candidate/run artifacts and checked plan evidence.
 
-- [ ] **Step 1: Run the full local quality gate**
+- [x] **Step 1: Run the full local quality gate**
 
 ```bash
 python -m pytest -q
@@ -296,35 +296,67 @@ git diff --check
 
 Expected: all tests pass, coverage is at least 90%, lint/format/diff checks pass.
 
-- [ ] **Step 2: Acquire 500 real candidates**
+Observed after the final code change: 440 tests passed, total coverage was 91.54%, and
+Ruff lint, Ruff format, Git diff, AI network-boundary, credential vocabulary, and
+gold-data comparisons all passed.
+
+- [x] **Step 2: Acquire real open and historical candidates**
 
 ```bash
 polytrading collect corpus \
   --source polymarket \
-  --output var/corpus-intake/2026-08-12-polymarket-active \
-  --retrieved-at 2026-08-12T16:00:00Z \
-  --information-cutoff 2026-08-12T16:00:00Z \
+  --output var/corpus-intake/2026-08-12-polymarket-open-v2 \
+  --retrieved-at 2026-08-13T02:46:31Z \
+  --information-cutoff 2026-08-13T02:46:31Z \
   --max-candidates 500 \
   --market-state open \
   --page-size 100 \
   --max-pages 10
+
+polytrading collect corpus \
+  --source polymarket \
+  --output var/corpus-intake/2026-08-12-polymarket-closed-v2 \
+  --retrieved-at 2026-08-13T02:46:31Z \
+  --information-cutoff 2026-08-13T02:46:31Z \
+  --max-candidates 500 \
+  --market-state closed \
+  --page-size 100 \
+  --max-pages 10
 ```
 
-Expected: exit `0`, exactly the observed count up to 500, and no authenticated request.
+Observed: both public-only commands exited `0`. The open cohort contains 500 candidates
+across 124 event families in five raw pages. The closed cohort contains 500 candidates
+across 500 event families in five raw pages. The cohorts have zero candidate-ID overlap.
 
-- [ ] **Step 3: Verify artifact integrity without printing source text**
+- [x] **Step 3: Verify artifact integrity without printing source text**
 
 Run a repository utility/test entry point that checks every raw body hash, output-file manifest hash, candidate lineage hash, candidate count, unique source-market ID, and `review_required` retention status. Expected: no mismatches and no gold files changed.
 
-- [ ] **Step 4: Record factual run evidence in this plan**
+- [x] **Step 4: Record factual run evidence in this plan**
 
 Check the completed boxes and append the command exit statuses, candidate count, event-family count, routing-tag/category counts, and manifest SHA-256. Do not paste market questions or descriptions into the plan.
 
-- [ ] **Step 5: Self-review the committed diff**
+Run evidence:
+
+- Open cohort manifest SHA-256: `172af3c9c3f2d302f01422ae38a6cad321f51aa27c859806df33cd01c65c5c77`.
+- Closed cohort manifest SHA-256: `53d1de61fb4e35c4a523d4b7adf59fcd8435f7418e9052b6c65bf957067839ea`.
+- Open routing counts: ambiguous resolution 500, bounded range 34, crypto 14,
+  deadline/date 500, numeric threshold 43, politics 431, sports 33.
+- Closed routing counts: ambiguous resolution 57, bounded range 182, crypto 96,
+  deadline/date 500, named source 313, numeric threshold 166, politics 78, sports 99.
+- Both run verifiers passed every raw-body, file, lineage, uniqueness, count, and retention check.
+- `data/gold` remained byte-identical to `main`; neither candidate run is tracked by Git.
+
+- [x] **Step 5: Self-review the committed diff**
 
 Inspect `git diff main...HEAD`, run a credential/provider/order vocabulary scan in `src/polytrading/corpus_intake`, confirm `data/gold` is byte-identical to `main`, and fix every concrete issue before the final commit.
 
-- [ ] **Step 6: Commit implementation records only**
+The self-review found and fixed three concrete issues: source taxonomy was present in API
+tags rather than the empty legacy category field; candidate verification needed to
+re-derive exact normalized rows from raw bodies; and the response byte bound needed to be
+enforced while streaming rather than after full download.
+
+- [x] **Step 6: Commit implementation records only**
 
 ```bash
 git add docs/superpowers/plans/2026-08-12-public-corpus-acquisition.md
