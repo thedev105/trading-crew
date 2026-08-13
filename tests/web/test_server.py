@@ -30,6 +30,7 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Connection"] == "close"
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
