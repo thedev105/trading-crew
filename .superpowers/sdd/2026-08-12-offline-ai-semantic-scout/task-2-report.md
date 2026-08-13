@@ -49,3 +49,25 @@ Migration verification is covered by reopening a fresh DuckDB database and asser
 ## Concerns
 
 None. `RuleFieldSet` uses direct snake-case names for every approved category because the approved design declared categories, rather than separate literal Python identifiers.
+
+## Code Review Corrections
+
+- Changed artifact validation to require an explicitly `validated` model card. Existing absent, revoked, and expired diagnostics remain unchanged; draft cards now fail with `model card is not validated`.
+- Bound relationship evidence structurally to the relationship members. Evidence contract IDs must be unique and set-equal to `member_contract_ids`; missing members, duplicate evidence IDs, and non-member evidence each have a diagnostic regression.
+
+Review RED command and evidence:
+
+```text
+.venv/bin/python -m pytest tests/ai/test_model_registry.py::test_registry_rejects_draft_model_cards tests/ai/test_models.py::test_relationship_artifact_rejects_missing_member_evidence tests/ai/test_models.py::test_relationship_artifact_rejects_duplicate_evidence_contract_ids tests/ai/test_models.py::test_relationship_artifact_rejects_non_member_evidence -q
+4 failed in 0.38s: each invalid object was accepted instead of raising its expected error
+```
+
+Review GREEN and final verification:
+
+```text
+same four-test command: 4 passed in 0.39s
+focused Task 2 tests: 17 passed in 0.53s
+full suite: 296 passed in 5.54s
+Ruff: All checks passed!
+git diff --check: exit 0 (no output)
+```

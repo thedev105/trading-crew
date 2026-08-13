@@ -313,6 +313,21 @@ class RelationshipCandidateArtifact(AIRecord):
             raise ValueError("relationship artifact must contain at least two members")
         if len(self.member_contract_ids) != len(set(self.member_contract_ids)):
             raise ValueError("relationship artifact members must be unique")
+        evidence_ids = tuple(evidence.contract_id for evidence in self.supporting_evidence)
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("relationship evidence contract IDs must be unique")
+        unexpected = set(evidence_ids).difference(self.member_contract_ids)
+        if unexpected:
+            raise ValueError(
+                "relationship evidence contains non-member contract IDs: "
+                + ", ".join(sorted(unexpected))
+            )
+        missing = set(self.member_contract_ids).difference(evidence_ids)
+        if missing:
+            raise ValueError(
+                "relationship evidence is missing member contract IDs: "
+                + ", ".join(sorted(missing))
+            )
         if self.uncertainty < 0:
             raise ValueError("uncertainty must be nonnegative")
         if self.expires_at <= self.created_at:

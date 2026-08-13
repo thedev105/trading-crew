@@ -6,9 +6,11 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.ai.models import (
+    ContractSpanEvidence,
     CriticalField,
     GoldContract,
     ModelCard,
+    RelationshipCandidateArtifact,
     RuleExtractionArtifact,
     RuleFieldSet,
     SourceSpan,
@@ -91,6 +93,32 @@ def artifact(**overrides: object) -> RuleExtractionArtifact:
     return RuleExtractionArtifact(**values)
 
 
+def relationship_evidence(contract_id: str) -> ContractSpanEvidence:
+    return ContractSpanEvidence(contract_id=contract_id, supporting_spans=known().supporting_spans)
+
+
+def relationship_artifact(**overrides: object) -> RelationshipCandidateArtifact:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "artifact_id": UUID("00000000-0000-0000-0000-000000000112"),
+        "member_contract_ids": ("contract-001", "contract-002"),
+        "proposed_relationship": "nested but verify oracle",
+        "supporting_evidence": (
+            relationship_evidence("contract-001"),
+            relationship_evidence("contract-002"),
+        ),
+        "model_id": "relationship-baseline",
+        "model_version": "1.0.0",
+        "information_cutoff": NOW,
+        "uncertainty": Decimal("0.2"),
+        "abstention_reason": None,
+        "created_at": NOW,
+        "expires_at": NOW.replace(year=2027),
+    }
+    values.update(overrides)
+    return RelationshipCandidateArtifact(**values)
+
+
 def test_known_critical_field_requires_evidence() -> None:
     with pytest.raises(ValidationError, match="known field requires supporting spans"):
         CriticalField(status="known", value=">=", supporting_spans=())
@@ -151,3 +179,38 @@ def test_artifact_rejects_negative_or_nonfinite_cost_and_expired_lifetime() -> N
         artifact(inference_latency_ms=Decimal("NaN"))
     with pytest.raises(ValidationError, match="artifact must expire after creation"):
         artifact(expires_at=NOW)
+
+
+def test_relationship_artifact_rejects_missing_member_evidence() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="relationship evidence is missing member contract IDs",
+    ):
+        relationship_artifact(supporting_evidence=(relationship_evidence("contract-001"),))
+
+
+def test_relationship_artifact_rejects_duplicate_evidence_contract_ids() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="relationship evidence contract IDs must be unique",
+    ):
+        relationship_artifact(
+            supporting_evidence=(
+                relationship_evidence("contract-001"),
+                relationship_evidence("contract-001"),
+            )
+        )
+
+
+def test_relationship_artifact_rejects_non_member_evidence() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="relationship evidence contains non-member contract IDs",
+    ):
+        relationship_artifact(
+            supporting_evidence=(
+                relationship_evidence("contract-001"),
+                relationship_evidence("contract-002"),
+                relationship_evidence("contract-003"),
+            )
+        )

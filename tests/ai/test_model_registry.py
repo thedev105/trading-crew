@@ -115,6 +115,17 @@ def test_registry_rejects_revoked_model_cards(tmp_path: Path) -> None:
     store.close()
 
 
+def test_registry_rejects_draft_model_cards(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "registry.duckdb")
+    registry = ModelRegistry(store)
+    registry.register(card(status="draft", approved_at=None))
+
+    with pytest.raises(UnregisteredModelError, match="model card is not validated"):
+        registry.validate_artifact(artifact())
+
+    store.close()
+
+
 def test_registry_rejects_an_artifact_model_version_that_is_not_registered(tmp_path: Path) -> None:
     store = DuckDBStore(tmp_path / "registry.duckdb")
     registry = ModelRegistry(store)

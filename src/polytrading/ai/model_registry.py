@@ -36,6 +36,8 @@ class ModelRegistry:
             card.expires_at is not None and card.expires_at <= artifact.created_at
         ):
             raise UnregisteredModelError("model card is expired")
+        if card.status != "validated":
+            raise UnregisteredModelError("model card is not validated")
         if artifact.information_cutoff > artifact.created_at:
             raise ValueError("artifact information cutoff must not be after creation")
         if artifact.created_at >= artifact.expires_at:
