@@ -195,8 +195,8 @@ class ContractImport(AIRecord):
     def require_lineage_not_self_referential(self) -> ContractImport:
         if self.revision_of == self.contract_id or self.derivative_of == self.contract_id:
             raise ValueError("a contract cannot derive from or revise itself")
-        if self.information_cutoff > self.source_retrieved_at:
-            raise ValueError("information cutoff must not follow source retrieval")
+        if self.source_retrieved_at > self.information_cutoff:
+            raise ValueError("source retrieval must not follow information cutoff")
         return self
 
 
@@ -205,6 +205,25 @@ class CorpusContract(GoldContract):
     provenance: tuple[NonEmptyString, ...]
     revision_of: NonEmptyString | None = None
     derivative_of: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def require_derived_text_integrity(self) -> CorpusContract:
+        if self.source_retrieved_at > self.information_cutoff:
+            raise ValueError("source retrieval must not follow information cutoff")
+        canonical = canonicalize_rule_text(self.raw_text)
+        if self.raw_text_hash != canonical.raw_text_hash:
+            raise ValueError("raw text hash does not match raw text")
+        if self.canonical_text != canonical.text:
+            raise ValueError("canonical text does not match deterministic canonicalization")
+        if self.canonical_text_hash != canonical.text_hash:
+            raise ValueError("canonical text hash does not match canonical text")
+        return self
+
+
+def item_input_hash(item: CorpusContract | GoldRelationship) -> str:
+    item_type = "contract" if isinstance(item, CorpusContract) else "relationship"
+    payload = {"item_type": item_type, "item": item.model_dump(mode="json")}
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
 class ImportedContract(StrictRecord):
@@ -534,9 +553,21 @@ def _review_completion(
     relationships: Sequence[GoldRelationship],
     reviews: Sequence[ReviewRecord],
 ) -> dict[Literal["complete", "unresolved"], int]:
+    items: dict[tuple[str, str], CorpusContract | GoldRelationship] = {
+        **{("contract", item.contract_id): item for item in contracts},
+        **{("relationship", item.relationship_id): item for item in relationships},
+    }
     grouped: defaultdict[tuple[str, str], list[ReviewRecord]] = defaultdict(list)
     for record in reviews:
-        grouped[(record.item_type, record.item_id)].append(record)
+        key = (record.item_type, record.item_id)
+        item = items.get(key)
+        if item is None:
+            raise ValueError(f"review references unknown {record.item_type} {record.item_id!r}")
+        if record.input_hash != item_input_hash(item):
+            raise ValueError(
+                f"review input hash does not match {record.item_type} {record.item_id!r}"
+            )
+        grouped[key].append(record)
     complete = 0
     unresolved = 0
     for item_type, item_id in [
@@ -548,12 +579,6 @@ def _review_completion(
             complete += 1
         else:
             unresolved += 1
-    unexpected = set(grouped).difference(
-        {("contract", item.contract_id) for item in contracts}
-        | {("relationship", item.relationship_id) for item in relationships}
-    )
-    if unexpected:
-        raise ValueError(f"reviews reference unknown items: {sorted(unexpected)!r}")
     return {"complete": complete, "unresolved": unresolved}
 
 
@@ -641,18 +666,27 @@ def load_contract_imports(path: Path) -> tuple[ContractImport, ...]:
 
 
 def write_imported_contracts(path: Path, imported: Sequence[ImportedContract]) -> None:
-    contracts = tuple(item.contract for item in imported)
+    candidates = tuple(item.contract for item in imported)
+    existing: tuple[CorpusContract, ...] = ()
+    existing_bytes = b""
     if path.exists() and path.read_bytes().strip():
+        existing_bytes = path.read_bytes()
         existing = tuple(_validate_json_record(CorpusContract, row) for row in _read_jsonl(path))
-        by_id = {contract.contract_id: contract for contract in existing}
-        for candidate in contracts:
-            prior = by_id.get(candidate.contract_id)
-            if prior is not None and prior != candidate:
+    by_id = {contract.contract_id: contract for contract in existing}
+    additions: list[CorpusContract] = []
+    for candidate in candidates:
+        prior = by_id.get(candidate.contract_id)
+        if prior is not None:
+            if prior != candidate:
                 raise ValueError(f"immutable contract ID {candidate.contract_id!r} already exists")
-            by_id[candidate.contract_id] = candidate
-        contracts = tuple(by_id[key] for key in sorted(by_id))
-    validate_split_integrity(contracts, ())
-    atomic_write(path, _jsonl_bytes(contracts))
+            continue
+        by_id[candidate.contract_id] = candidate
+        additions.append(candidate)
+    validate_split_integrity((*existing, *additions), ())
+    if not additions:
+        return
+    separator = b"\n" if existing_bytes and not existing_bytes.endswith(b"\n") else b""
+    atomic_write(path, existing_bytes + separator + _jsonl_bytes(additions))
 
 
 def append_review(path: Path, candidate: ReviewRecord) -> None:

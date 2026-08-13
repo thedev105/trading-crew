@@ -91,3 +91,57 @@ production corpus source, label, review, adjudication, or human-completion claim
   it is conservative and is not a Unicode spoofing classifier.
 - Review/adjudication CLI writes to the exact checked-in `data/gold/reviews.jsonl` workflow path
   because the required command contract does not include a corpus-directory option.
+
+## Code Review Corrections
+
+Four review findings were fixed test-first in a separate follow-up commit:
+
+- Corrected the point-in-time relation to require
+  `source_retrieved_at <= information_cutoff`; equality and earlier retrieval are accepted, while
+  after-cutoff retrieval is rejected on both import and loaded corpus rows.
+- Made `CorpusContract` recompute and compare the raw UTF-8 SHA-256, deterministic canonical text,
+  and canonical-text SHA-256. Manually tampered JSONL now fails during ordinary corpus loading,
+  before a manifest can be frozen.
+- Exported one deterministic `item_input_hash` for immutable contract and relationship records and
+  bound every loaded review to that actual item hash before review resolution. Stale contract and
+  changed-membership relationship reviews fail closed.
+- Changed contract persistence to preserve the exact existing byte prefix and append only validated
+  new rows through the atomic temporary-file rename. Exact retries do not write; immutable-identity
+  conflicts fail without changing file bytes.
+
+Review RED evidence:
+
+```text
+.venv/bin/python -m pytest tests/ai/test_corpus.py -q
+8 failed, 23 passed in 0.41s
+
+Failures: accepted after-cutoff retrieval; rejected valid earlier retrieval; accepted tampered raw
+hash, canonical text, and canonical hash; accepted stale contract review hash; failed to diagnose
+stale relationship review hash; reordered existing JSONL bytes during append.
+```
+
+Review GREEN evidence:
+
+```text
+.venv/bin/python -m pytest tests/ai/test_corpus.py -q
+32 passed
+
+.venv/bin/python -m pytest tests/ai -q
+50 passed in 0.65s
+
+.venv/bin/python -m pytest -q
+328 passed in 6.45s
+
+.venv/bin/ruff check src tests
+All checks passed!
+
+.venv/bin/ruff format --check src tests
+55 files already formatted
+
+git diff --check
+exit 0 (no output)
+```
+
+Deferred minor: active URL-bearing attributes remain outside this correction's requested scope.
+The sanitizer continues to remove active element contents and event/style/srcdoc attributes; a
+future change should add warnings for active URL attributes without translating or executing them.

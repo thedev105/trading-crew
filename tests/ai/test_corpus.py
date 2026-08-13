@@ -16,8 +16,11 @@ from polytrading.ai.corpus import (
     freeze_manifest,
     hash_raw_text,
     import_contract_rows,
+    item_input_hash,
     preregister_corpus,
+    validate_corpus,
     validate_split_integrity,
+    write_imported_contracts,
 )
 from polytrading.ai.models import GoldRelationship
 from polytrading.ai.review import ReviewRecord, resolve_reviews, validate_review_append
@@ -56,15 +59,18 @@ def review(
     proposed_label_hash: str,
     *,
     role: str = "reviewer",
+    item_type: str = "contract",
+    item_id: str = "contract-001",
+    input_hash: str = HASH_A,
 ) -> ReviewRecord:
     return ReviewRecord(
         schema_version=1,
         review_id=review_id,
-        item_type="contract",
-        item_id="contract-001",
+        item_type=item_type,
+        item_id=item_id,
         reviewer_id=reviewer_id,
         reviewer_role=role,
-        input_hash=HASH_A,
+        input_hash=input_hash,
         proposed_label_hash=proposed_label_hash,
         decision="accept",
         corrections_json=None,
@@ -104,6 +110,45 @@ def test_import_requires_source_times_exact_rule_template_and_provenance() -> No
     ):
         with pytest.raises(ValidationError):
             ContractImport(**{key: value for key, value in complete.items() if key != required})
+
+
+def test_import_allows_retrieval_at_or_before_information_cutoff() -> None:
+    common = {
+        "schema_version": 1,
+        "contract_id": "contract-001",
+        "source_url": "https://example.test/contract-001",
+        "information_cutoff": NOW,
+        "raw_text": "Rule text",
+        "event_family": "event-001",
+        "sampling_stratum": "threshold",
+        "split": "train",
+        "rule_template": "binary_threshold",
+        "provenance": ("public rules page",),
+    }
+
+    assert ContractImport(**(common | {"source_retrieved_at": NOW})).source_retrieved_at == NOW
+    before = NOW.replace(hour=11)
+    imported = ContractImport(**(common | {"source_retrieved_at": before}))
+    assert imported.source_retrieved_at == before
+
+
+def test_import_rejects_source_retrieved_after_information_cutoff() -> None:
+    with pytest.raises(
+        ValidationError, match="source retrieval must not follow information cutoff"
+    ):
+        ContractImport(
+            schema_version=1,
+            contract_id="contract-001",
+            source_url="https://example.test/contract-001",
+            source_retrieved_at=NOW.replace(hour=13),
+            information_cutoff=NOW,
+            raw_text="Rule text",
+            event_family="event-001",
+            sampling_stratum="threshold",
+            split="train",
+            rule_template="binary_threshold",
+            provenance=("public rules page",),
+        )
 
 
 def test_raw_hash_changes_for_a_single_byte_and_raw_text_is_preserved() -> None:
@@ -168,8 +213,26 @@ def test_canonicalization_warning_offsets_refer_to_unmodified_crlf_source() -> N
     ("left", "right", "message"),
     [
         (
-            contract("a", "train", raw_text_hash=HASH_A),
-            contract("b", "test", raw_text_hash=HASH_A),
+            contract(
+                "a",
+                "train",
+                raw_text="duplicate",
+                raw_text_hash="e24a5a32c9b8c8637ee33cd72bff6a05a140a48891a1c1a3b06447e1900b6446",
+                canonical_text="duplicate",
+                canonical_text_hash=(
+                    "e24a5a32c9b8c8637ee33cd72bff6a05a140a48891a1c1a3b06447e1900b6446"
+                ),
+            ),
+            contract(
+                "b",
+                "test",
+                raw_text="duplicate",
+                raw_text_hash="e24a5a32c9b8c8637ee33cd72bff6a05a140a48891a1c1a3b06447e1900b6446",
+                canonical_text="duplicate",
+                canonical_text_hash=(
+                    "e24a5a32c9b8c8637ee33cd72bff6a05a140a48891a1c1a3b06447e1900b6446"
+                ),
+            ),
             "raw duplicate",
         ),
         (
@@ -215,6 +278,92 @@ def test_relationship_members_must_exist_and_share_the_relationship_split() -> N
     )
     with pytest.raises(ValueError, match="missing contract"):
         validate_split_integrity(contracts, (missing,))
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered", "message"),
+    [
+        ("raw_text_hash", HASH_A, "raw text hash"),
+        ("canonical_text", "tampered canonical text", "canonical text"),
+        ("canonical_text_hash", HASH_B, "canonical text hash"),
+    ],
+)
+def test_corpus_validation_recomputes_derived_text_fields(
+    tmp_path: Path, field: str, tampered: str, message: str
+) -> None:
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    row = contract("a", "train").model_dump(mode="json")
+    row[field] = tampered
+    write_jsonl(gold / "contracts.jsonl", [row])
+    write_jsonl(gold / "relationships.jsonl", [])
+    write_jsonl(gold / "labels.jsonl", [])
+    write_jsonl(gold / "reviews.jsonl", [])
+
+    with pytest.raises(ValueError, match=message):
+        validate_corpus(gold)
+
+
+def test_freeze_rejects_review_hash_for_different_contract_content(tmp_path: Path) -> None:
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    item = contract("contract-001", "train")
+    write_jsonl(gold / "contracts.jsonl", [item.model_dump(mode="json")])
+    write_jsonl(gold / "relationships.jsonl", [])
+    write_jsonl(gold / "labels.jsonl", [])
+    write_jsonl(
+        gold / "reviews.jsonl",
+        [
+            review("review-001", "alice", HASH_B, input_hash=HASH_A).model_dump(mode="json"),
+            review("review-002", "bob", HASH_B, input_hash=HASH_A).model_dump(mode="json"),
+        ],
+    )
+
+    assert item_input_hash(item) != HASH_A
+    with pytest.raises(ValueError, match="input hash does not match contract"):
+        freeze_manifest(gold, created_at=NOW)
+
+
+def test_validation_rejects_review_hash_for_different_relationship_membership(
+    tmp_path: Path,
+) -> None:
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    items = (contract("a", "train"), contract("b", "train"))
+    relationship = GoldRelationship(
+        schema_version=1,
+        relationship_id="relationship-001",
+        member_contract_ids=("a", "b"),
+        split="train",
+    )
+    write_jsonl(gold / "contracts.jsonl", [item.model_dump(mode="json") for item in items])
+    write_jsonl(gold / "relationships.jsonl", [relationship.model_dump(mode="json")])
+    write_jsonl(gold / "labels.jsonl", [])
+    write_jsonl(
+        gold / "reviews.jsonl",
+        [
+            review(
+                "review-001",
+                "alice",
+                HASH_B,
+                item_type="relationship",
+                item_id="relationship-001",
+                input_hash=HASH_A,
+            ).model_dump(mode="json"),
+            review(
+                "review-002",
+                "bob",
+                HASH_B,
+                item_type="relationship",
+                item_id="relationship-001",
+                input_hash=HASH_A,
+            ).model_dump(mode="json"),
+        ],
+    )
+
+    assert item_input_hash(relationship) != HASH_A
+    with pytest.raises(ValueError, match="input hash does not match relationship"):
+        validate_corpus(gold, require_reviews=True)
 
 
 def test_reviewer_cannot_review_one_item_under_two_review_ids() -> None:
@@ -337,9 +486,25 @@ def test_freeze_replaces_an_unfrozen_placeholder_once(tmp_path: Path) -> None:
 def test_freeze_rejects_unresolved_reviews_and_split_leakage(tmp_path: Path) -> None:
     gold = tmp_path / "gold"
     gold.mkdir()
+    duplicate_text = "exact duplicate source bytes"
+    duplicate_hash = hashlib.sha256(duplicate_text.encode()).hexdigest()
     rows = [
-        contract("a", "train", raw_text_hash=HASH_A).model_dump(mode="json"),
-        contract("b", "test", raw_text_hash=HASH_A).model_dump(mode="json"),
+        contract(
+            "a",
+            "train",
+            raw_text=duplicate_text,
+            raw_text_hash=duplicate_hash,
+            canonical_text=duplicate_text,
+            canonical_text_hash=duplicate_hash,
+        ).model_dump(mode="json"),
+        contract(
+            "b",
+            "test",
+            raw_text=duplicate_text,
+            raw_text_hash=duplicate_hash,
+            canonical_text=duplicate_text,
+            canonical_text_hash=duplicate_hash,
+        ).model_dump(mode="json"),
     ]
     write_jsonl(gold / "contracts.jsonl", rows)
     write_jsonl(gold / "relationships.jsonl", [])
@@ -348,6 +513,100 @@ def test_freeze_rejects_unresolved_reviews_and_split_leakage(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="raw duplicate"):
         freeze_manifest(gold, created_at=NOW)
+
+
+def test_contract_import_append_preserves_existing_bytes_and_exact_retry_is_noop(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "contracts.jsonl"
+    first = import_contract_rows(
+        (
+            ContractImport(
+                schema_version=1,
+                contract_id="contract-002",
+                source_url="https://example.test/contract-002",
+                source_retrieved_at=NOW,
+                information_cutoff=NOW,
+                raw_text="Second contract",
+                event_family="event-002",
+                sampling_stratum="threshold",
+                split="train",
+                rule_template="binary_threshold",
+                provenance=("public rules page",),
+            ),
+        )
+    )
+    second = import_contract_rows(
+        (
+            ContractImport(
+                schema_version=1,
+                contract_id="contract-001",
+                source_url="https://example.test/contract-001",
+                source_retrieved_at=NOW,
+                information_cutoff=NOW,
+                raw_text="First contract",
+                event_family="event-001",
+                sampling_stratum="threshold",
+                split="train",
+                rule_template="binary_threshold",
+                provenance=("public rules page",),
+            ),
+        )
+    )
+
+    write_imported_contracts(output, first)
+    old_bytes = output.read_bytes()
+    write_imported_contracts(output, second)
+    appended_bytes = output.read_bytes()
+    write_imported_contracts(output, first)
+
+    assert appended_bytes.startswith(old_bytes)
+    assert output.read_bytes() == appended_bytes
+
+
+def test_contract_import_rejects_conflicting_immutable_identity(tmp_path: Path) -> None:
+    output = tmp_path / "contracts.jsonl"
+    original = import_contract_rows(
+        (
+            ContractImport(
+                schema_version=1,
+                contract_id="contract-001",
+                source_url="https://example.test/contract-001",
+                source_retrieved_at=NOW,
+                information_cutoff=NOW,
+                raw_text="Original contract",
+                event_family="event-001",
+                sampling_stratum="threshold",
+                split="train",
+                rule_template="binary_threshold",
+                provenance=("public rules page",),
+            ),
+        )
+    )
+    conflicting = import_contract_rows(
+        (
+            ContractImport(
+                schema_version=1,
+                contract_id="contract-001",
+                source_url="https://example.test/contract-001",
+                source_retrieved_at=NOW,
+                information_cutoff=NOW,
+                raw_text="Changed contract",
+                event_family="event-001",
+                sampling_stratum="threshold",
+                split="train",
+                rule_template="binary_threshold",
+                provenance=("public rules page",),
+            ),
+        )
+    )
+    write_imported_contracts(output, original)
+    original_bytes = output.read_bytes()
+
+    with pytest.raises(ValueError, match="immutable contract ID"):
+        write_imported_contracts(output, conflicting)
+
+    assert output.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize(
