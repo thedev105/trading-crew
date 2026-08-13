@@ -12,7 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 from polytrading.ai.artifact_import import ArtifactEnvelope, ArtifactImportResult
-from polytrading.ai.corpus import freeze_manifest
+from polytrading.ai.corpus import CorpusContract, freeze_manifest, item_input_hash
 from polytrading.ai.evaluate import (
     BooleanCaseResult,
     EvaluationAttempt,
@@ -42,6 +42,7 @@ from polytrading.ai.models import (
 from polytrading.ai.prompt_packets import PromptPacket
 from polytrading.ai.report import SemanticScoutReport
 from polytrading.ai.retrieval import RetrievalCandidate, RetrievalDocument
+from polytrading.ai.review import CorpusReviewAssignment, ReviewRecord
 from polytrading.cli import main
 from polytrading.storage.store import DuckDBStore
 
@@ -218,6 +219,89 @@ def test_production_corpus_deficits_fail_closed_with_exit_one(
     assert "contracts: 0/500" in message
     assert "relationships: 0/250" in message
     assert "independent review" in message
+
+
+def test_review_cli_writes_only_selected_mutable_corpus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    corpus = tmp_path / "mutable-corpus"
+    shutil.copytree(FIXTURE, corpus)
+    (corpus / "manifest.json").write_text('{"frozen":false}\n')
+    first_contract_line = (corpus / "contracts.jsonl").read_text().splitlines()[0]
+    item = CorpusContract.model_validate_json(first_contract_line)
+    review = ReviewRecord(
+        schema_version=1,
+        review_id="review-cli-001",
+        item_type="contract",
+        item_id=item.contract_id,
+        reviewer_id="reviewer-a",
+        reviewer_role="reviewer",
+        input_hash=item_input_hash(item),
+        proposed_label_hash="a" * 64,
+        decision="accept",
+        corrections_json=None,
+        reviewed_at=NOW,
+    )
+    assignment = CorpusReviewAssignment(
+        schema_version=1,
+        item_type="contract",
+        item_id=item.contract_id,
+        reviewer_id="reviewer-a",
+        input_hash=item_input_hash(item),
+    )
+    review_path = tmp_path / "review.json"
+    assignment_path = tmp_path / "assignment.json"
+    review_path.write_text(review.model_dump_json())
+    assignment_path.write_text(assignment.model_dump_json())
+    production_reviews = Path("data/gold/reviews.jsonl")
+    production_before = production_reviews.read_bytes()
+
+    exit_code = main(
+        [
+            "ai",
+            "corpus",
+            "review",
+            "--dir",
+            str(corpus),
+            "--item-type",
+            "contract",
+            "--item-id",
+            item.contract_id,
+            "--review-file",
+            str(review_path),
+            "--assignment-file",
+            str(assignment_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert "review-cli-001" in (corpus / "reviews.jsonl").read_text()
+    assert production_reviews.read_bytes() == production_before
+    assert "recorded immutable reviewer" in capsys.readouterr().out
+
+
+def test_review_cli_requires_explicit_corpus_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review_path = tmp_path / "review.json"
+    review_path.write_text("{}")
+
+    exit_code = main(
+        [
+            "ai",
+            "corpus",
+            "review",
+            "--item-type",
+            "contract",
+            "--item-id",
+            "contract-0001",
+            "--review-file",
+            str(review_path),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "--dir" in capsys.readouterr().err
 
 
 def test_ai_invalid_input_is_exit_one_and_usage_error_is_exit_two(

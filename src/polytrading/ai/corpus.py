@@ -21,7 +21,7 @@ from polytrading.ai.models import (
     GoldRelationship,
     GoldRelationshipLabel,
 )
-from polytrading.ai.review import ReviewRecord, resolve_reviews
+from polytrading.ai.review import CorpusReviewAssignment, ReviewRecord, resolve_reviews
 from polytrading.domain.models import StrictRecord, normalize_utc_timestamp
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
@@ -801,3 +801,51 @@ def append_review(path: Path, candidate: ReviewRecord) -> None:
     if candidate in existing:
         return
     atomic_write(path, _jsonl_bytes((*existing, candidate)))
+
+
+def append_corpus_review(
+    directory: Path,
+    candidate: ReviewRecord,
+    *,
+    assignment: CorpusReviewAssignment | None = None,
+) -> None:
+    manifest_path = directory / "manifest.json"
+    if manifest_path.exists() and manifest_path.read_bytes().strip():
+        try:
+            manifest = json.loads(manifest_path.read_bytes())
+        except json.JSONDecodeError as error:
+            raise ValueError("corpus manifest is malformed") from error
+        if not isinstance(manifest, dict):
+            raise ValueError("corpus manifest must contain an object")
+        if manifest.get("frozen") is True:
+            raise ValueError("cannot append reviews to a frozen corpus")
+
+    contracts = tuple(
+        _validate_json_record(CorpusContract, row)
+        for row in _read_jsonl(directory / "contracts.jsonl")
+    )
+    relationships = tuple(
+        _validate_json_record(GoldRelationship, row)
+        for row in _read_jsonl(directory / "relationships.jsonl")
+    )
+    validate_split_integrity(contracts, relationships)
+    items: dict[tuple[str, str], CorpusContract | GoldRelationship] = {
+        **{("contract", item.contract_id): item for item in contracts},
+        **{("relationship", item.relationship_id): item for item in relationships},
+    }
+    item = items.get((candidate.item_type, candidate.item_id))
+    if item is None:
+        raise ValueError(f"review references unknown {candidate.item_type} {candidate.item_id!r}")
+    expected_hash = item_input_hash(item)
+    if candidate.input_hash != expected_hash:
+        raise ValueError(
+            f"review input hash does not match {candidate.item_type} {candidate.item_id!r}"
+        )
+    if assignment is not None and (
+        assignment.item_type != candidate.item_type
+        or assignment.item_id != candidate.item_id
+        or assignment.reviewer_id != candidate.reviewer_id
+        or assignment.input_hash != candidate.input_hash
+    ):
+        raise ValueError("review does not match supplied immutable assignment")
+    append_review(directory / "reviews.jsonl", candidate)

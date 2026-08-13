@@ -14,7 +14,7 @@ from polytrading.ai.artifact_import import ArtifactEnvelope, ArtifactImporter
 from polytrading.ai.corpus import (
     FrozenCorpus,
     Split,
-    append_review,
+    append_corpus_review,
     atomic_write,
     freeze_manifest,
     import_contract_rows,
@@ -46,7 +46,7 @@ from polytrading.ai.retrieval import (
     TfidfCandidateRetriever,
     build_tfidf_model_card,
 )
-from polytrading.ai.review import ReviewRecord
+from polytrading.ai.review import CorpusReviewAssignment, ReviewRecord
 from polytrading.ai.security import find_untrusted_text_markers
 from polytrading.ai.spans import SourceSpanValidationError, validate_rule_fields
 from polytrading.research.models import EvaluationWindow, ExperimentRecord, SuccessCriterion
@@ -77,9 +77,11 @@ def add_ai_subcommands(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
     for command in ("review", "adjudicate"):
         parser = corpus_commands.add_parser(command, help=f"append a {command} record")
+        parser.add_argument("--dir", required=True, type=Path)
         parser.add_argument("--item-type", choices=("contract", "relationship"), required=True)
         parser.add_argument("--item-id", required=True)
         parser.add_argument("--review-file", required=True, type=Path)
+        parser.add_argument("--assignment-file", type=Path)
 
     validate = corpus_commands.add_parser("validate", help="validate local corpus state")
     validate.add_argument("--dir", required=True, type=Path)
@@ -181,7 +183,12 @@ def _run_corpus_command(arguments: argparse.Namespace) -> int:
             raise ValueError(f"{arguments.corpus_command} requires reviewer role {expected_role!r}")
         if record.item_type != arguments.item_type or record.item_id != arguments.item_id:
             raise ValueError("review file item identity does not match command arguments")
-        append_review(Path("data/gold/reviews.jsonl"), record)
+        assignment = (
+            CorpusReviewAssignment.model_validate_json(arguments.assignment_file.read_bytes())
+            if arguments.assignment_file is not None
+            else None
+        )
+        append_corpus_review(arguments.dir, record, assignment=assignment)
         print(f"recorded immutable {expected_role} record {record.review_id}")
         return 0
     if arguments.corpus_command == "validate":

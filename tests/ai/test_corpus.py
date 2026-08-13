@@ -12,6 +12,7 @@ from polytrading.ai.cli import build_parser
 from polytrading.ai.corpus import (
     ContractImport,
     CorpusContract,
+    append_corpus_review,
     canonicalize_rule_text,
     freeze_manifest,
     hash_raw_text,
@@ -23,7 +24,12 @@ from polytrading.ai.corpus import (
     write_imported_contracts,
 )
 from polytrading.ai.models import GoldRelationship
-from polytrading.ai.review import ReviewRecord, resolve_reviews, validate_review_append
+from polytrading.ai.review import (
+    CorpusReviewAssignment,
+    ReviewRecord,
+    resolve_reviews,
+    validate_review_append,
+)
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 HASH_A = "a" * 64
@@ -372,6 +378,115 @@ def test_reviewer_cannot_review_one_item_under_two_review_ids() -> None:
         validate_review_append((prior,), review("review-002", "alice", HASH_A))
 
 
+def mutable_corpus(tmp_path: Path, contracts: tuple[CorpusContract, ...]) -> Path:
+    directory = tmp_path / "mutable-corpus"
+    directory.mkdir()
+    write_jsonl(directory / "contracts.jsonl", [item.model_dump(mode="json") for item in contracts])
+    write_jsonl(directory / "relationships.jsonl", [])
+    write_jsonl(directory / "labels.jsonl", [])
+    write_jsonl(directory / "reviews.jsonl", [])
+    return directory
+
+
+def test_append_corpus_review_validates_item_and_hash_before_mutation(tmp_path: Path) -> None:
+    item = contract("a", "train")
+    directory = mutable_corpus(tmp_path, (item,))
+    exact = review(
+        "review-001",
+        "alice",
+        HASH_B,
+        item_id="a",
+        input_hash=item_input_hash(item),
+    )
+    append_corpus_review(directory, exact)
+    before = (directory / "reviews.jsonl").read_bytes()
+
+    with pytest.raises(ValueError, match="unknown contract"):
+        append_corpus_review(
+            directory,
+            review(
+                "review-002",
+                "bob",
+                HASH_B,
+                item_id="missing",
+                input_hash=item_input_hash(item),
+            ),
+        )
+    with pytest.raises(ValueError, match="input hash"):
+        append_corpus_review(
+            directory,
+            review("review-003", "bob", HASH_B, item_id="a", input_hash=HASH_A),
+        )
+
+    assert (directory / "reviews.jsonl").read_bytes() == before
+
+
+def test_append_corpus_review_validates_relationship_and_assignment(tmp_path: Path) -> None:
+    first = contract("a", "train")
+    second = contract("b", "train")
+    directory = mutable_corpus(tmp_path, (first, second))
+    relationship = GoldRelationship(
+        schema_version=1,
+        relationship_id="relationship-001",
+        member_contract_ids=("a", "b"),
+        split="train",
+    )
+    write_jsonl(directory / "relationships.jsonl", [relationship.model_dump(mode="json")])
+    candidate = review(
+        "review-001",
+        "alice",
+        HASH_B,
+        item_type="relationship",
+        item_id="relationship-001",
+        input_hash=item_input_hash(relationship),
+    )
+    assignment = CorpusReviewAssignment(
+        schema_version=1,
+        item_type="relationship",
+        item_id="relationship-001",
+        reviewer_id="alice",
+        input_hash=item_input_hash(relationship),
+    )
+    append_corpus_review(directory, candidate, assignment=assignment)
+    before = (directory / "reviews.jsonl").read_bytes()
+
+    with pytest.raises(ValueError, match="assignment"):
+        append_corpus_review(
+            directory,
+            review(
+                "review-002",
+                "bob",
+                HASH_B,
+                item_type="relationship",
+                item_id="relationship-001",
+                input_hash=item_input_hash(relationship),
+            ),
+            assignment=assignment,
+        )
+
+    assert (directory / "reviews.jsonl").read_bytes() == before
+
+
+def test_append_corpus_review_rejects_frozen_corpus(tmp_path: Path) -> None:
+    item = contract("a", "train")
+    directory = mutable_corpus(tmp_path, (item,))
+    (directory / "manifest.json").write_text('{"frozen":true}\n')
+
+    with pytest.raises(ValueError, match="frozen"):
+        append_corpus_review(
+            directory,
+            review(
+                "review-001",
+                "alice",
+                HASH_B,
+                item_id="a",
+                input_hash=item_input_hash(item),
+            ),
+        )
+
+    assert (directory / "reviews.jsonl").read_bytes() == b""
+
+
 def test_equal_independent_reviews_close_without_adjudication() -> None:
     resolution = resolve_reviews(
         (review("review-001", "alice", HASH_B), review("review-002", "bob", HASH_B))
@@ -618,6 +733,8 @@ def test_contract_import_rejects_conflicting_immutable_identity(tmp_path: Path) 
             "ai",
             "corpus",
             "review",
+            "--dir",
+            "gold",
             "--item-type",
             "contract",
             "--item-id",
@@ -629,6 +746,8 @@ def test_contract_import_rejects_conflicting_immutable_identity(tmp_path: Path) 
             "ai",
             "corpus",
             "adjudicate",
+            "--dir",
+            "gold",
             "--item-type",
             "relationship",
             "--item-id",

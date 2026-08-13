@@ -13,6 +13,21 @@ NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+class CorpusReviewAssignment(StrictRecord):
+    schema_version: Literal[1]
+    item_type: Literal["contract", "relationship"]
+    item_id: NonEmptyString
+    reviewer_id: NonEmptyString
+    input_hash: str
+
+    @field_validator("input_hash")
+    @classmethod
+    def require_sha256(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("assignment hash must contain 64 lowercase hexadecimal characters")
+        return value
+
+
 class ReviewRecord(StrictRecord):
     schema_version: Literal[1]
     review_id: NonEmptyString
