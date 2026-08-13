@@ -17,6 +17,12 @@ import pytest
 
 import polytrading.cli as cli
 from polytrading.cli import RetryingTransport, collect_book_cycles, main
+from polytrading.corpus_intake.models import (
+    AcquisitionDiagnostics,
+    AcquisitionResult,
+    CorpusIntakeError,
+)
+from polytrading.corpus_intake.polymarket import parse_page
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -138,6 +144,138 @@ def test_cli_validation_errors_exit_two_without_tracebacks(
     )
     assert "traceback" not in capsys.readouterr().err.lower()
 
+
+def test_collect_corpus_requires_explicit_bounded_quarantine_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    base = [
+        "collect",
+        "corpus",
+        "--source",
+        "polymarket",
+        "--output",
+        str(tmp_path / "var" / "corpus-intake" / "run"),
+        "--retrieved-at",
+        "2026-08-12T16:00:00Z",
+        "--information-cutoff",
+        "2026-08-12T15:00:00Z",
+        "--max-candidates",
+        "500",
+    ]
+
+    assert main(base[:-2]) == 2
+    assert "required" in capsys.readouterr().err.lower()
+    assert main([*base, "--page-size", "101"]) == 2
+    assert "page size" in capsys.readouterr().err.lower()
+    assert main([*base, "--max-pages", "0"]) == 2
+    assert "max pages" in capsys.readouterr().err.lower()
+    assert main([*base, "--information-cutoff", "2026-08-12T17:00:00Z"]) == 2
+    assert "cutoff" in capsys.readouterr().err.lower()
+
+    outside = [*base]
+    outside[outside.index("--output") + 1] = str(tmp_path / "outside")
+    assert main(outside) == 2
+    assert "var/corpus-intake" in capsys.readouterr().err
+
+
+def test_collect_corpus_writes_verified_public_only_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "polymarket" / "markets_keyset_page_1.json"
+    observed = {}
+
+    async def acquire(client, request, on_raw_page):
+        observed["request"] = request
+        page = parse_page(
+            body=fixture.read_bytes(),
+            request_url="https://gamma-api.polymarket.com/markets/keyset?limit=100",
+            requested_cursor=None,
+            page_ordinal=1,
+            retrieved_at=request.retrieved_at,
+            information_cutoff=request.information_cutoff,
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+        on_raw_page(page.raw)
+        return AcquisitionResult(
+            candidates=page.candidates,
+            diagnostics=AcquisitionDiagnostics(
+                page_count=1,
+                received_market_count=2,
+                exact_duplicate_count=0,
+                canonical_duplicate_count=0,
+                truncated_at_candidate_limit=False,
+                truncated_at_page_limit=False,
+            ),
+        )
+
+    monkeypatch.setattr(cli, "acquire_polymarket", acquire)
+    output = tmp_path / "var" / "corpus-intake" / "run"
+
+    assert (
+        main(
+            [
+                "collect",
+                "corpus",
+                "--source",
+                "polymarket",
+                "--output",
+                str(output),
+                "--retrieved-at",
+                "2026-08-12T18:00:00+02:00",
+                "--information-cutoff",
+                "2026-08-12T15:00:00Z",
+                "--max-candidates",
+                "500",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["request"].retrieved_at == NOW.replace(hour=16)
+    assert (output / "manifest.json").exists()
+    output_text = capsys.readouterr().out
+    assert "2 review candidates" in output_text
+    assert "Bitcoin" not in output_text
+
+
+def test_collect_corpus_source_failure_is_exit_one_and_has_no_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    async def fail(client, request, on_raw_page):
+        raise CorpusIntakeError("public source returned HTTP 503")
+
+    monkeypatch.setattr(cli, "acquire_polymarket", fail)
+    output = tmp_path / "var" / "corpus-intake" / "failed"
+    status = main(
+        [
+            "collect",
+            "corpus",
+            "--source",
+            "polymarket",
+            "--output",
+            str(output),
+            "--retrieved-at",
+            "2026-08-12T16:00:00Z",
+            "--information-cutoff",
+            "2026-08-12T15:00:00Z",
+            "--max-candidates",
+            "500",
+        ]
+    )
+
+    assert status == 1
+    assert "HTTP 503" in capsys.readouterr().err
+    assert not (output / "manifest.json").exists()
+
+
+def test_public_collection_cli_validation_errors_exit_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert (
         main(
             [

@@ -15,6 +15,9 @@ import httpx
 from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.report import render_json, render_text
+from polytrading.corpus_intake.artifacts import CorpusRunWriter, verify_run
+from polytrading.corpus_intake.models import AcquisitionRequest, CorpusIntakeError
+from polytrading.corpus_intake.polymarket import acquire_polymarket
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
@@ -63,6 +66,10 @@ class CliUsageError(ValueError):
     """A user-facing command validation error."""
 
 
+class CorpusCollectionError(RuntimeError):
+    """A public corpus source or integrity failure."""
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -100,6 +107,19 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--duration-seconds", type=float)
     books.add_argument("--interval-seconds", type=float, default=5.0)
     books.add_argument("--db", required=True, type=Path)
+
+    corpus = collect_commands.add_parser(
+        "corpus", help="collect quarantined public corpus review candidates"
+    )
+    corpus.add_argument("--source", choices=("polymarket",), required=True)
+    corpus.add_argument("--output", required=True, type=Path)
+    corpus.add_argument("--retrieved-at", required=True)
+    corpus.add_argument("--information-cutoff", required=True)
+    corpus.add_argument("--max-candidates", required=True, type=int)
+    corpus.add_argument("--page-size", type=int, default=100)
+    corpus.add_argument("--max-pages", type=int, default=10)
+    corpus.add_argument("--max-response-bytes", type=int, default=16 * 1024 * 1024)
+    corpus.add_argument("--request-delay-seconds", type=float, default=0.05)
     add_ai_subcommands(commands)
     return parser
 
@@ -115,6 +135,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
             return asyncio.run(_collect_public(arguments))
+        if arguments.collect_command == "corpus":
+            return asyncio.run(_collect_corpus(arguments))
         return asyncio.run(_collect_books(arguments))
     except AIInputError as error:
         print(f"polytrading: AI input rejected: {error}", file=sys.stderr)
@@ -260,6 +282,32 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
     print(
         f"completed public collection for {len(assets)} assets across {len(venues)} venues; "
         "see warnings for skipped evidence"
+    )
+    return 0
+
+
+async def _collect_corpus(arguments: argparse.Namespace) -> int:
+    request = AcquisitionRequest(
+        retrieved_at=_parse_timestamp(arguments.retrieved_at),
+        information_cutoff=_parse_timestamp(arguments.information_cutoff),
+        max_candidates=arguments.max_candidates,
+        page_size=arguments.page_size,
+        max_pages=arguments.max_pages,
+        max_response_bytes=arguments.max_response_bytes,
+        request_delay_seconds=arguments.request_delay_seconds,
+    )
+    writer = CorpusRunWriter(arguments.output, project_root=Path.cwd(), request=request)
+    try:
+        async with make_public_http_client() as client:
+            result = await acquire_polymarket(client, request, writer.append_raw_page)
+        writer.complete(result)
+        summary = verify_run(writer.output)
+    except CorpusIntakeError as error:
+        raise CorpusCollectionError(str(error)) from error
+    print(
+        f"captured {summary.candidate_count} review candidates across "
+        f"{summary.event_family_count} event families and {summary.raw_page_count} raw pages; "
+        "retention review is still required"
     )
     return 0
 
