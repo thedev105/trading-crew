@@ -1559,7 +1559,7 @@ def test_public_adapter_session_routes_every_venue_to_its_concrete_adapter(
 
     async def exercise() -> tuple[tuple[str, Venue], ...]:
         async with cli.public_adapter_session(
-            store, (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+            store, (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
         ) as adapters:
             return tuple((type(adapter).__name__, adapter.venue) for adapter in adapters)
 
@@ -1567,6 +1567,7 @@ def test_public_adapter_session_routes_every_venue_to_its_concrete_adapter(
         ("BybitPublicAdapter", Venue.BYBIT),
         ("HyperliquidPublicAdapter", Venue.HYPERLIQUID),
         ("DydxPublicAdapter", Venue.DYDX),
+        ("LighterPublicAdapter", Venue.LIGHTER),
     )
     store.close()
 
@@ -1581,6 +1582,18 @@ def test_generic_collection_parsers_accept_dydx(command: str, tmp_path: Path) ->
     parsed = cli.build_parser().parse_args(arguments)
 
     assert parsed.venue == "dydx"
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+def test_generic_collection_parsers_accept_lighter(command: str, tmp_path: Path) -> None:
+    # Catches a public adapter that is implemented but unreachable through the CLI.
+    arguments = ["collect", command, "--venue", "lighter", "--db", str(tmp_path / "x.duckdb")]
+    if command == "books":
+        arguments.append("--once")
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.venue == "lighter"
 
 
 async def _record_delay(delays: list[float], delay: float) -> None:
@@ -1625,6 +1638,7 @@ class _BookAdapter:
                     Venue.BYBIT: 1,
                     Venue.HYPERLIQUID: 2,
                     Venue.DYDX: 3,
+                    Venue.LIGHTER: 4,
                 }[self.venue]
             ),
             venue=self.venue,
@@ -1833,6 +1847,7 @@ class _PersistingPublicAdapter(_PublicAdapter):
                     Venue.BYBIT: 1000,
                     Venue.HYPERLIQUID: 2000,
                     Venue.DYDX: 3000,
+                    Venue.LIGHTER: 4000,
                 }[self.venue]
                 + suffix
             ),
@@ -1920,11 +1935,17 @@ def test_collect_public_cli_uses_all_public_adapters_and_seven_day_default(
         _PublicAdapter(Venue.BYBIT, calls),
         _PublicAdapter(Venue.HYPERLIQUID, calls),
         _PublicAdapter(Venue.DYDX, calls),
+        _PublicAdapter(Venue.LIGHTER, calls),
     )
 
     @asynccontextmanager
     async def session(store: object, venues: object):
-        assert tuple(venues) == (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+        assert tuple(venues) == (
+            Venue.BYBIT,
+            Venue.HYPERLIQUID,
+            Venue.DYDX,
+            Venue.LIGHTER,
+        )
         yield adapters
 
     monkeypatch.setattr(cli, "public_adapter_session", session)
@@ -1946,13 +1967,14 @@ def test_collect_public_cli_uses_all_public_adapters_and_seven_day_default(
         )
         == 0
     )
-    assert [(call[0], call[1]) for call in calls[:3]] == [
+    assert [(call[0], call[1]) for call in calls[:4]] == [
         (Venue.BYBIT, "instruments"),
         (Venue.HYPERLIQUID, "instruments"),
         (Venue.DYDX, "instruments"),
+        (Venue.LIGHTER, "instruments"),
     ]
     funding_calls = [call for call in calls if call[1] == "funding"]
-    assert len(funding_calls) == 9
+    assert len(funding_calls) == 12
     assert all(call[3] == NOW - timedelta(days=7) and call[4] == NOW for call in funding_calls)
 
 
@@ -2123,11 +2145,17 @@ def test_collect_books_once_cli_launches_all_venues_in_one_cycle(
         _BookAdapter(Venue.BYBIT, starts),
         _BookAdapter(Venue.HYPERLIQUID, starts),
         _BookAdapter(Venue.DYDX, starts),
+        _BookAdapter(Venue.LIGHTER, starts),
     )
 
     @asynccontextmanager
     async def session(store: object, venues: object):
-        assert tuple(venues) == (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+        assert tuple(venues) == (
+            Venue.BYBIT,
+            Venue.HYPERLIQUID,
+            Venue.DYDX,
+            Venue.LIGHTER,
+        )
         yield adapters
 
     monkeypatch.setattr(cli, "public_adapter_session", session)
@@ -2150,10 +2178,10 @@ def test_collect_books_once_cli_launches_all_venues_in_one_cycle(
         )
         == 0
     )
-    assert starts == [Venue.BYBIT, Venue.DYDX, Venue.HYPERLIQUID]
+    assert starts == [Venue.BYBIT, Venue.DYDX, Venue.HYPERLIQUID, Venue.LIGHTER]
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
-        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (9,)
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (12,)
 
 
 def test_collect_books_cli_prints_validated_adapter_warning(

@@ -65,6 +65,7 @@ from polytrading.venues.funding_health_report import (
     render_funding_health_text,
 )
 from polytrading.venues.hyperliquid import HyperliquidPublicAdapter
+from polytrading.venues.lighter import LighterPublicAdapter
 from polytrading.venues.public import AdapterBatch, AdapterWarning, PublicVenueAdapter
 from polytrading.venues.recorder import PublicRecorder
 from polytrading.venues.synchronized import SynchronizedBookCollector
@@ -169,7 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
     public = collect_commands.add_parser("public", help="collect public instruments and funding")
-    public.add_argument("--venue", choices=("hyperliquid", "bybit", "dydx", "all"), required=True)
+    public.add_argument(
+        "--venue",
+        choices=("hyperliquid", "bybit", "dydx", "lighter", "all"),
+        required=True,
+    )
     public.add_argument("--assets", default="BTC,ETH,SOL")
     public.add_argument("--start")
     public.add_argument("--end")
@@ -186,7 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
     funding_cycle.add_argument("--format", choices=("text", "json"), default="text")
 
     books = collect_commands.add_parser("books", help="collect synchronized public books")
-    books.add_argument("--venue", choices=("hyperliquid", "bybit", "dydx", "all"), required=True)
+    books.add_argument(
+        "--venue",
+        choices=("hyperliquid", "bybit", "dydx", "lighter", "all"),
+        required=True,
+    )
     books.add_argument("--assets", default="BTC,ETH,SOL")
     mode = books.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
@@ -370,7 +379,7 @@ def _parse_assets(value: str) -> frozenset[Asset]:
 
 def _parse_venues(value: str) -> tuple[Venue, ...]:
     if value == "all":
-        return (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+        return (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
     return (Venue(value),)
 
 
@@ -411,6 +420,8 @@ async def public_adapter_session(
                 adapters.append(HyperliquidPublicAdapter(client, _utc_now, time.monotonic_ns))
             elif venue is Venue.DYDX:
                 adapters.append(DydxPublicAdapter(client, _utc_now, time.monotonic_ns))
+            elif venue is Venue.LIGHTER:
+                adapters.append(LighterPublicAdapter(client, _utc_now, time.monotonic_ns))
             else:
                 raise ValueError(f"unsupported public venue: {venue.value}")
         yield tuple(adapters)
