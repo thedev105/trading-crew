@@ -33,6 +33,15 @@ from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.bybit import BybitPublicAdapter
+from polytrading.venues.funding_cycle import (
+    PointInTimeFundingCollector,
+    record_late_funding_cycle,
+)
+from polytrading.venues.funding_cycle_models import validate_cycle_timing
+from polytrading.venues.funding_cycle_report import (
+    render_funding_cycle_json,
+    render_funding_cycle_text,
+)
 from polytrading.venues.hyperliquid import HyperliquidPublicAdapter
 from polytrading.venues.public import PublicVenueAdapter
 from polytrading.venues.recorder import PublicRecorder
@@ -118,6 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
     public.add_argument("--end")
     public.add_argument("--db", required=True, type=Path)
 
+    funding_cycle = collect_commands.add_parser(
+        "funding-cycle", help="collect one point-in-time funding boundary"
+    )
+    funding_cycle.add_argument("--db", required=True, type=Path)
+    funding_cycle.add_argument("--assets", default="BTC,ETH,SOL")
+    funding_cycle.add_argument("--cycle-end", required=True)
+    funding_cycle.add_argument("--format", choices=("text", "json"), default="text")
+
     books = collect_commands.add_parser("books", help="collect synchronized public books")
     books.add_argument("--venue", choices=("hyperliquid", "bybit", "all"), required=True)
     books.add_argument("--assets", default="BTC,ETH,SOL")
@@ -179,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
             return asyncio.run(_collect_public(arguments))
+        if arguments.collect_command == "funding-cycle":
+            return asyncio.run(_collect_funding_cycle(arguments))
         if arguments.collect_command == "corpus":
             return asyncio.run(_collect_corpus(arguments))
         if arguments.collect_command == "source-use":
@@ -349,6 +368,31 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
         f"completed public collection for {len(assets)} assets across {len(venues)} venues; "
         "see warnings for skipped evidence"
     )
+    return 0
+
+
+async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
+    assets = _parse_assets(arguments.assets)
+    cycle_end = _parse_timestamp(arguments.cycle_end)
+    now = _utc_now()
+    _, _, is_late = validate_cycle_timing(cycle_end, now)
+
+    store = DuckDBStore(arguments.db)
+    try:
+        if is_late:
+            cycle = record_late_funding_cycle(store, assets, cycle_end, now)
+        else:
+            async with public_adapter_session(store, (Venue.BYBIT, Venue.HYPERLIQUID)) as adapters:
+                cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
+                    adapters, assets, cycle_end
+                )
+    finally:
+        store.close()
+
+    renderer = (
+        render_funding_cycle_json if arguments.format == "json" else render_funding_cycle_text
+    )
+    print(renderer(cycle))
     return 0
 
 

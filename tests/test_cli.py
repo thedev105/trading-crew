@@ -42,6 +42,17 @@ from polytrading.storage.store import DuckDBStore
 from polytrading.venues.public import AdapterBatch
 from tests.carry.study_helpers import at, complete_block
 from tests.domain.factories import funding_observation, instrument_spec
+from tests.venues.funding_cycle_helpers import (
+    CYCLE_END as FUNDING_CYCLE_END,
+)
+from tests.venues.funding_cycle_helpers import (
+    FakeFundingAdapter,
+    funding_batch,
+    instrument_batch,
+)
+from tests.venues.funding_cycle_helpers import (
+    instrument_spec as cycle_instrument_spec,
+)
 
 FIXTURE = Path("tests/fixtures/replay/public_snapshot.jsonl")
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
@@ -712,6 +723,244 @@ def test_public_collection_cli_validation_errors_exit_two(
         == 2
     )
     assert "traceback" not in capsys.readouterr().err.lower()
+
+
+def test_funding_cycle_cli_requires_db_and_cycle_end_without_a_venue_option(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["collect", "funding-cycle", "--cycle-end", FUNDING_CYCLE_END.isoformat()]) == 2
+    assert "--db" in capsys.readouterr().err
+    assert main(["collect", "funding-cycle", "--db", str(tmp_path / "missing.duckdb")]) == 2
+    assert "--cycle-end" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(tmp_path / "venue.duckdb"),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--venue",
+                "all",
+            ]
+        )
+        == 2
+    )
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cycle_end", ["invalid", "2026-08-13T17:00:01Z"])
+def test_funding_cycle_cli_rejects_invalid_or_non_hour_boundary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    cycle_end: str,
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: FUNDING_CYCLE_END)
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(tmp_path / "invalid.duckdb"),
+                "--cycle-end",
+                cycle_end,
+            ]
+        )
+        == 2
+    )
+    assert "polytrading: error:" in capsys.readouterr().err
+
+
+def test_funding_cycle_cli_rejects_early_clock_before_db_or_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "early.duckdb"
+    entered = False
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        nonlocal entered
+        entered = True
+        yield ()
+
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: FUNDING_CYCLE_END - timedelta(microseconds=1))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(database),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+            ]
+        )
+        == 2
+    )
+    assert "precedes cycle end" in capsys.readouterr().err
+    assert entered is False
+    assert not database.exists()
+
+
+def test_funding_cycle_cli_records_late_attempt_without_network(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "late.duckdb"
+    entered = False
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        nonlocal entered
+        entered = True
+        yield ()
+
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: FUNDING_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(database),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert output.startswith("Point-in-time funding cycle v1")
+    assert "late_not_collected" in output
+    assert entered is False
+    store = DuckDBStore(database, read_only=True)
+    cycles = store.funding_collection_cycles_between(FUNDING_CYCLE_END, FUNDING_CYCLE_END)
+    store.close()
+    assert len(cycles) == 1
+    assert cycles[0].status == "late"
+    assert len(cycles[0].items) == 6
+
+
+def test_funding_cycle_cli_collects_complete_exact_boundary_evidence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "complete.duckdb"
+    assets = frozenset({Asset.BTC, Asset.ETH, Asset.SOL})
+    instrument_observed_at = FUNDING_CYCLE_END + timedelta(minutes=1)
+    funding_observed_at = FUNDING_CYCLE_END + timedelta(minutes=2)
+    bybit = FakeFundingAdapter(
+        Venue.BYBIT,
+        instrument_batch(
+            Venue.BYBIT,
+            assets,
+            observed_at=instrument_observed_at,
+            event_int=4100,
+        ),
+        {
+            asset: funding_batch(
+                Venue.BYBIT,
+                asset,
+                effective_at=FUNDING_CYCLE_END,
+                observed_at=funding_observed_at,
+                event_int=4200 + index,
+            )
+            for index, asset in enumerate(sorted(assets, key=lambda item: item.value))
+        },
+    )
+    hyperliquid = FakeFundingAdapter(
+        Venue.HYPERLIQUID,
+        instrument_batch(
+            Venue.HYPERLIQUID,
+            assets,
+            observed_at=instrument_observed_at,
+            event_int=4300,
+        ),
+        {
+            asset: funding_batch(
+                Venue.HYPERLIQUID,
+                asset,
+                effective_at=FUNDING_CYCLE_END,
+                observed_at=funding_observed_at,
+                event_int=4400 + index,
+            )
+            for index, asset in enumerate(sorted(assets, key=lambda item: item.value))
+        },
+    )
+    for adapter in (bybit, hyperliquid):
+        adapter.fetch_positions = lambda: pytest.fail("private positions were accessed")  # type: ignore[attr-defined]
+        adapter.place_order = lambda: pytest.fail("an order method was accessed")  # type: ignore[attr-defined]
+
+    seed = DuckDBStore(database)
+    for asset in assets:
+        seed.append_instrument(
+            cycle_instrument_spec(
+                Venue.BYBIT,
+                asset,
+                observed_at=FUNDING_CYCLE_END - timedelta(hours=1),
+                source_hash="a" * 64,
+            )
+        )
+    seed.close()
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        assert tuple(venues) == (Venue.BYBIT, Venue.HYPERLIQUID)
+        yield (hyperliquid, bybit)
+
+    times = iter(
+        [
+            FUNDING_CYCLE_END + timedelta(seconds=30),
+            FUNDING_CYCLE_END + timedelta(seconds=30),
+            FUNDING_CYCLE_END + timedelta(minutes=2),
+        ]
+    )
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(times))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(database),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "complete"
+    assert len(payload["items"]) == 6
+    assert all(call[1] == call[2] == FUNDING_CYCLE_END for call in bybit.funding_calls)
+    assert all(call[1] == call[2] == FUNDING_CYCLE_END for call in hyperliquid.funding_calls)
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM raw_envelopes").fetchone() == (8,)
+        assert connection.execute("SELECT count(*) FROM instrument_specs").fetchone() == (9,)
+        assert connection.execute("SELECT count(*) FROM funding_observations").fetchone() == (6,)
+        assert connection.execute("SELECT count(*) FROM funding_collection_cycles").fetchone() == (
+            1,
+        )
 
 
 class _ReplayOrderStore:
