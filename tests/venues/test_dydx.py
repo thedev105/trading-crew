@@ -179,6 +179,20 @@ def test_fetch_instruments_rejects_invalid_response_document(payload: bytes, mes
         asyncio.run(adapter.fetch_instruments(frozenset({Asset.BTC}), REQUEST_CONTEXT))
 
 
+def test_fetch_instruments_rejects_duplicate_json_market_key_before_normalization() -> None:
+    # Catches the JSON decoder silently selecting the last of two contradictory market records.
+    document = json.loads(fixture_bytes("perpetual_markets.json"))
+    active = json.dumps(document["markets"]["BTC-USD"], separators=(",", ":"))
+    paused_row = dict(document["markets"]["BTC-USD"])
+    paused_row["status"] = "PAUSED"
+    paused = json.dumps(paused_row, separators=(",", ":"))
+    payload = f'{{"markets":{{"BTC-USD":{active},"BTC-USD":{paused}}}}}'.encode()
+    adapter = make_adapter(lambda request: response(payload), wall_times=[RECEIVED_1])
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        asyncio.run(adapter.fetch_instruments(frozenset({Asset.BTC}), REQUEST_CONTEXT))
+
+
 def test_fetch_market_snapshots_preserves_raw_and_warns_instead_of_inventing_mark() -> None:
     # Catches an oracle/midpoint substitution into the required mark-price field.
     payload = fixture_bytes("perpetual_markets.json")

@@ -186,7 +186,7 @@ polytrading collect books --venue dydx ...
 
 The point-in-time funding-cycle command and its health report remain exactly the legacy Bybit/Hyperliquid pair. Carry audit and persistence study remain unchanged. This prevents a new venue enum value from silently altering established evidence semantics.
 
-Before recording any batch, CLI collection prints each structured `AdapterWarning` to standard error in stable order with venue, code, symbol, endpoint, and message. Warnings do not turn valid raw evidence into a failed transaction, but they remain visible to an operator and testable.
+After batch-integrity validation and successful recording, CLI collection prints each structured `AdapterWarning` to standard error in stable order with venue, code, symbol, endpoint, and message. Warnings do not turn valid raw evidence into a failed transaction, but they remain visible to an operator and testable.
 
 ## 12. Failure Semantics
 

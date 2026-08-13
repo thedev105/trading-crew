@@ -273,7 +273,7 @@ class DydxPublicAdapter:
         except UnicodeDecodeError as error:
             raise ValueError(f"dYdX endpoint {endpoint} response is not valid UTF-8") from error
         try:
-            value = json.loads(decoded)
+            value = json.loads(decoded, object_pairs_hook=_unique_json_object)
         except json.JSONDecodeError as error:
             raise ValueError(f"dYdX endpoint {endpoint} response is not valid JSON") from error
         document = _require_mapping(value, f"dYdX endpoint {endpoint} response")
@@ -289,6 +289,15 @@ class DydxPublicAdapter:
 
 def _require_collection_context(observed_at: datetime) -> None:
     normalize_utc_timestamp(observed_at)
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("dYdX response contains a duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _select_requested_markets(

@@ -3,10 +3,10 @@
 ## 1. Research purpose and no-profit disclaimer
 
 `polytrading` is point-in-time, market-neutral market research software. This first increment
-collects authenticated-free public evidence for BTC, ETH, and SOL linear perpetuals on Bybit and
-Hyperliquid, then produces deterministic carry diagnostics. It does not promise profit, prevent
-loss, forecast returns, or recommend a trade. A large displayed spread is an instantaneous
-observation, not an investable return.
+collects authenticated-free public evidence for BTC, ETH, and SOL linear perpetuals on Bybit,
+Hyperliquid, and dYdX, then produces deterministic carry diagnostics for the separately defined
+legacy venue pair. It does not promise profit, prevent loss, forecast returns, or recommend a
+trade. A large displayed spread is an instantaneous observation, not an investable return.
 
 ## 2. Setup and pinned environment
 
@@ -70,6 +70,23 @@ venue, asset, requested range, and the fact that funding was not collected; othe
 data is still stored. Never backdate a newly observed specification. Build this basis by retaining
 the database across public collections over time, or replay previously captured raw-first batches;
 once a specification exists at the requested start, later Bybit collections normalize that range.
+
+dYdX can also be collected separately:
+
+```bash
+.venv/bin/polytrading collect public \
+  --venue dydx \
+  --assets BTC,ETH,SOL \
+  --db var/dydx-public.duckdb
+```
+
+This records exact public market metadata and realized hourly funding. The observed dYdX market
+response exposes an oracle price but no documented mark-price field, while this project's
+`MarketSnapshot` requires both. The adapter therefore emits a structured
+`DYDX_MARK_PRICE_UNAVAILABLE` warning and stores no dYdX market snapshot; it never substitutes the
+oracle, midpoint, or last trade as a mark. dYdX and Hyperliquid both documenting USDC margin makes
+them a compatibility-research candidate, not proof that their contracts, failure domains, costs,
+or access rules are compatible—and not evidence of profit or live eligibility.
 
 ## 5. Prospective hourly funding-cycle collection
 
@@ -167,6 +184,21 @@ bounded backoff. Bybit exposes snapshot sequence evidence; Hyperliquid's public 
 not expose a REST sequence number, so its sequence is recorded as absent. Even where a REST
 snapshot includes an identifier, repeated snapshots do not prove continuous sequence integrity,
 atomic cross-venue state, or the absence of unseen book changes between requests.
+
+For a dYdX-only REST snapshot:
+
+```bash
+.venv/bin/polytrading collect books \
+  --venue dydx \
+  --assets BTC,ETH,SOL \
+  --once \
+  --db var/dydx-books.duckdb
+```
+
+The dYdX REST book response exposes neither a venue timestamp nor a sequence. Its normalized
+`effective_at` is therefore the local post-response receipt time, its sequence is absent, and the
+CLI prints `DYDX_REST_BOOK_LOCAL_TIMESTAMP`. These snapshots can support coarse receipt-skew and
+depth research, but not exchange-time simultaneity, continuous-sequence, or queue-position claims.
 
 ## 7. Carry audit interpretation
 
