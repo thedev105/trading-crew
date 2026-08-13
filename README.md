@@ -71,7 +71,39 @@ data is still stored. Never backdate a newly observed specification. Build this 
 the database across public collections over time, or replay previously captured raw-first batches;
 once a specification exists at the requested start, later Bybit collections normalize that range.
 
-## 5. Synchronized 20-level book collection
+## 5. Prospective hourly funding-cycle collection
+
+The prospective collector records one named UTC-hour boundary across both venues. An external
+scheduler must pass the hour that just ended and invoke the command no later than five minutes
+after that boundary:
+
+```bash
+.venv/bin/polytrading collect funding-cycle \
+  --db var/forward.duckdb \
+  --assets BTC,ETH,SOL \
+  --cycle-end 2026-08-13T17:00:00Z \
+  --format json
+```
+
+The command does not install or configure a scheduler. Before the named hour it rejects the
+invocation without creating a database or opening a network session. After the five-minute cutoff
+it makes no venue requests and appends an explicit `late_not_collected` cycle. A delayed historical
+download cannot be relabeled as point-in-time evidence.
+
+The first cycle in a fresh database can be `degraded` because Bybit funding intervals must come
+from instrument specifications already known at the boundary. That cycle stores the newly observed
+specifications for later hours but never backdates them. `degraded` and `late` are successfully
+persisted diagnostics, not complete evidence; process exit zero means a cycle was recorded, so
+operators must inspect its status.
+
+Each attempt appends a new cycle UUID, even when another attempt names the same boundary. Valid raw
+responses, normalized records, and the cycle are committed atomically. Successful empty funding
+responses retain their raw source hashes and response-observation time so a missing or delayed
+response cannot appear on time. Keep raw data local and review venue terms for the intended use.
+This command neither authorizes live collection nor enables trading, account access, credentials,
+or redistribution.
+
+## 6. Synchronized 20-level book collection
 
 Book cycles start the selected venue requests concurrently and request exactly 20 levels for each
 asset. Run one cycle with `--once`, or collect for a bounded duration:
@@ -92,7 +124,7 @@ not expose a REST sequence number, so its sequence is recorded as absent. Even w
 snapshot includes an identifier, repeated snapshots do not prove continuous sequence integrity,
 atomic cross-venue state, or the absence of unseen book changes between requests.
 
-## 6. Carry audit interpretation
+## 7. Carry audit interpretation
 
 Every audit requires an explicit point-in-time cutoff. Text and canonical JSON always order assets
 as BTC, ETH, and SOL and report research-only warnings. `DIAGNOSTIC_ONLY` means current compatible
@@ -105,7 +137,7 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 7. Cross-venue funding persistence study
+## 8. Cross-venue funding persistence study
 
 The read-only study tests one frozen direction: long the Bybit perpetual and short the
 Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
@@ -143,7 +175,7 @@ create a commercial data product. The current Bybit API agreement and any applic
 terms must be reviewed for the exact intended use before expanding collection or proprietary
 deployment.
 
-## 8. Database backup, replay, and schema versions
+## 9. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -155,7 +187,7 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
-## 9. Explicit read-only boundary
+## 10. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -163,7 +195,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 10. Evidence still required by the Class C activation gate
+## 11. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
@@ -179,7 +211,7 @@ requires all of the following evidence:
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
 
-## 11. Offline semantic scout experiment
+## 12. Offline semantic scout experiment
 
 The semantic scout is an offline research layer. AI-like components may retrieve similar rule
 text and propose structured interpretations; only deterministic schema, source-span, corpus,

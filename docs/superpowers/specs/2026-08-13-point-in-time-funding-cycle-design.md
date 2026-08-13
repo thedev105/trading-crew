@@ -117,7 +117,7 @@ Every requested venue/asset pair produces one `FundingCycleItem` with:
 - a funding outcome;
 - zero or one instrument observation timestamp;
 - zero or one funding effective timestamp;
-- zero or one funding observation timestamp;
+- zero or one funding-response observation timestamp;
 - sorted unique instrument source hashes;
 - sorted unique funding source hashes; and
 - sorted unique reason codes for every non-successful component.
@@ -136,6 +136,12 @@ Hyperliquid documents hourly funding, so an empty response is not treated as a v
 no-settlement result. Bybit intervals are instrument-specific, and version 1 deliberately does
 not guess a historical offset; an empty exact-boundary result is recorded without claiming a gap.
 The carry study remains responsible for block completeness.
+
+`funding_observed_at` is the conservative latest observation time of the successful raw response,
+not merely the timestamp of a normalized funding row. It is therefore present for `captured`,
+`no_settlement`, and `missing_expected`; only `captured` also has `funding_effective_at`. Requiring
+raw response evidence for an empty result prevents a missing or delayed response from looking like
+an on-time no-settlement outcome.
 
 An instrument response can fail while funding succeeds from a previously known specification, or
 the reverse. Keeping the two outcomes separate prevents a single label from hiding either fact.
@@ -163,10 +169,10 @@ Allowed statuses are:
 
 - `complete`: every instrument item was captured, every Hyperliquid funding item was captured,
   every Bybit funding item was either captured or a successful no-settlement response, and every
-  captured instrument and funding item was observed within five minutes;
+  successful instrument and funding response was observed within five minutes;
 - `degraded`: at least one item failed, was missing, or required bootstrap; or
-- `late`: no request was made because the command started late, or at least one captured
-  instrument or funding component was observed after the five-minute cutoff.
+- `late`: no request was made because the command started late, or at least one successful
+  instrument or funding response was observed after the five-minute cutoff.
 
 Model validators enforce canonical item order, exact pair coverage, timestamp order, outcome
 field consistency, status derivation, and equality between cycle source hashes and the union of
@@ -187,7 +193,8 @@ injectable UTC clock. A separate pure late-cycle constructor requires no adapter
 6. Skip Bybit funding when that historical basis is absent; query every other exact-boundary
    venue/asset pair concurrently.
 7. Convert exceptions to stable failure codes, re-raising cancellation.
-8. Validate successful batches, exact-boundary identities, raw lineage, and cardinality.
+8. Validate successful batches, exact-boundary identities, raw lineage, raw response observation
+   timestamps, and cardinality. A nominally successful batch without raw response evidence fails.
 9. Build the cycle and append every successful raw response, normalized instrument, normalized
    funding observation, and the cycle itself in one DuckDB transaction.
 10. Render the immutable cycle from the value returned by the collector.
@@ -258,7 +265,7 @@ below the currently documented Bybit and Hyperliquid limits.
 
 JSON is sorted, versioned, and uses RFC 3339 UTC timestamps. Decimal values, if introduced later,
 remain strings. Text begins with the cycle boundary and status, then prints one stable row ordered
-by venue and asset, followed by source-hash count and two warnings:
+by venue and asset, followed by two warnings:
 
 ```text
 Research only: this cycle does not model costs, basis P&L, or executable returns.

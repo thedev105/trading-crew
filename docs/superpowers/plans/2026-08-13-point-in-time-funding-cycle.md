@@ -70,8 +70,9 @@
 
 Test exact whole-hour alignment, a naive timestamp, before-boundary rejection, the inclusive
 five-minute edge, and the first late microsecond. Define a valid captured item and prove that a
-captured funding outcome requires both exact timestamps, while every other funding outcome
-requires both timestamps to be absent.
+captured funding outcome requires both exact timestamps; successful `no_settlement` and
+`missing_expected` responses require a funding-response observation timestamp but no effective
+timestamp; and failed, bootstrap, or uncollected outcomes require both timestamps to be absent.
 
 ```python
 assert validate_cycle_timing(CYCLE_END, CYCLE_END + timedelta(minutes=5))[2] is False
@@ -117,6 +118,7 @@ Canonicalize UTC optional timestamps and both sorted-unique hash tuples. Validat
 ```text
 instrument_outcome=captured <=> instrument_observed_at is present
 funding_outcome=captured <=> both funding timestamps are present
+funding_outcome in (no_settlement, missing_expected) <=> response observation is present and effective time is absent
 instrument_outcome=failed => an INSTRUMENT_FAILED:* reason exists
 funding_outcome=failed => a FUNDING_FAILED:* reason exists
 missing_expected => FUNDING_MISSING_EXPECTED
@@ -128,15 +130,15 @@ late_not_collected => COLLECTION_WINDOW_MISSED
 
 Construct all six venue/asset pairs in deliberately shuffled order. Assert the model rejects that
 order, missing pairs, duplicate pairs, request completion before request start, source hashes not
-equal to the union of all item instrument/funding hashes, an item funding timestamp not equal to
-`cycle_end`, and a status that does not match the items.
+equal to the union of all item instrument/funding hashes, an item funding effective timestamp not
+equal to `cycle_end`, and a status that does not match the items.
 
 Prove the status derivation rules:
 
 ```text
 all instruments captured on time + all HL funding captured on time + Bybit captured/no_settlement => complete
 any bootstrap/failed/missing instrument or funding component => degraded
-all items late_not_collected, or any captured instrument/funding observed after cutoff => late
+all items late_not_collected, or any successful instrument/funding response observed after cutoff => late
 ```
 
 - [ ] **Step 5: Implement `FundingCollectionCycle` validation**
@@ -344,10 +346,14 @@ only FundingObservation records
 zero or one normalized record
 exact adapter venue, asset, expected symbol, and effective_at == cycle_end
 valid raw lineage
+at least one raw response with observation-time lineage for every normalized record
 ```
 
-An empty Hyperliquid batch becomes `missing_expected`; an empty Bybit batch becomes
-`no_settlement`. A thrown or invalid batch becomes `failed`. A valid singleton becomes `captured`.
+An empty normalized Hyperliquid response with valid raw evidence becomes `missing_expected`; an
+empty normalized Bybit response with valid raw evidence becomes `no_settlement`. A batch without
+raw response evidence, a thrown exception, or another invalid batch becomes `failed`. A valid
+singleton becomes `captured`. Successful funding outcomes record the conservative latest raw
+response observation time so an empty or delayed response cannot appear on time.
 
 - [ ] **Step 6: Implement item assembly, status, and atomic persistence**
 
@@ -383,9 +389,11 @@ Cover:
 
 - first cycle records new Bybit specs but marks Bybit funding `bootstrap_required`;
 - a later boundary uses those committed specs and captures Bybit funding;
-- empty Hyperliquid is `missing_expected`, empty Bybit is `no_settlement`;
+- empty normalized Hyperliquid with raw response evidence is `missing_expected`, while empty
+  normalized Bybit with raw response evidence is `no_settlement`;
 - instrument failure and funding success remain two distinct outcomes;
-- an instrument or funding observation after `cycle_end + 5 minutes` makes the cycle `late`;
+- an instrument or funding-response observation after `cycle_end + 5 minutes` makes the cycle
+  `late`, including an otherwise valid empty funding response;
 - wrong venue, symbol, asset, timestamp, duplicate record, or raw lineage fails that item;
 - one venue timeout retains other valid batches;
 - cancellation escapes; and
@@ -581,8 +589,8 @@ orders. Prove:
 
 - canonical items always equal the venue/asset Cartesian product;
 - cycle source hashes equal the sorted union of every item instrument/funding hash;
-- moving a captured instrument or funding observation from the cutoff to one microsecond after it
-  changes required status from complete/degraded to late; and
+- moving a captured instrument or successful funding-response observation from the cutoff to one
+  microsecond after it changes required status from complete/degraded to late; and
 - no permutation changes persisted normalized identities.
 
 Use bounded lists and deterministic UUID/hash factories so the suite stays fast.

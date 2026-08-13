@@ -7,6 +7,8 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from polytrading.domain.models import Asset, FundingObservation, Venue
 from polytrading.storage.store import DuckDBStore
@@ -27,6 +29,7 @@ from tests.venues.funding_cycle_helpers import (
     SequenceClock,
     funding_batch,
     instrument_batch,
+    instrument_spec,
 )
 
 
@@ -133,9 +136,7 @@ def test_collector_queries_only_the_exact_boundary_and_persists_complete_cycle(
         (Venue.HYPERLIQUID, Asset.ETH),
         (Venue.HYPERLIQUID, Asset.SOL),
     ]
-    assert all(
-        item.instrument_outcome is InstrumentCaptureOutcome.CAPTURED for item in cycle.items
-    )
+    assert all(item.instrument_outcome is InstrumentCaptureOutcome.CAPTURED for item in cycle.items)
     assert [item.funding_outcome for item in cycle.items] == [
         FundingCaptureOutcome.NO_SETTLEMENT,
         FundingCaptureOutcome.NO_SETTLEMENT,
@@ -207,9 +208,7 @@ def test_instrument_and_funding_requests_start_concurrently_by_phase(tmp_path: P
                 CYCLE_END + timedelta(minutes=2),
             ),
         )
-        cycle = await asyncio.wait_for(
-            collector.collect_once(gated, ASSETS, CYCLE_END), timeout=1
-        )
+        cycle = await asyncio.wait_for(collector.collect_once(gated, ASSETS, CYCLE_END), timeout=1)
         assert instrument_started == 2
         assert funding_started == 6
         return cycle.status
@@ -239,14 +238,11 @@ def test_first_cycle_bootstraps_bybit_without_backdating_new_instruments(tmp_pat
         FundingCaptureOutcome.BOOTSTRAP_REQUIRED,
     ]
     assert all(
-        item.reason_codes == ("BYBIT_INSTRUMENT_BOOTSTRAP_REQUIRED",)
-        for item in cycle.items[:3]
+        item.reason_codes == ("BYBIT_INSTRUMENT_BOOTSTRAP_REQUIRED",) for item in cycle.items[:3]
     )
     assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", CYCLE_END) is None
     assert (
-        store.latest_instrument_as_of(
-            Venue.BYBIT, "BTCUSDT", CYCLE_END + timedelta(minutes=2)
-        )
+        store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", CYCLE_END + timedelta(minutes=2))
         is not None
     )
     store.close()
@@ -284,9 +280,7 @@ def test_later_cycle_uses_previously_committed_bybit_basis(tmp_path: Path) -> No
     cycle = asyncio.run(second.collect_once((next_bybit, next_hyperliquid), ASSETS, next_end))
 
     assert cycle.status is FundingCycleStatus.COMPLETE
-    assert all(
-        item.funding_outcome is FundingCaptureOutcome.CAPTURED for item in cycle.items
-    )
+    assert all(item.funding_outcome is FundingCaptureOutcome.CAPTURED for item in cycle.items)
     assert len(next_bybit.funding_calls) == 3
     store.close()
 
@@ -315,9 +309,7 @@ def test_empty_hyperliquid_response_is_missing_expected_but_raw_is_retained(
 
     cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
     eth = next(
-        item
-        for item in cycle.items
-        if item.venue is Venue.HYPERLIQUID and item.asset is Asset.ETH
+        item for item in cycle.items if item.venue is Venue.HYPERLIQUID and item.asset is Asset.ETH
     )
 
     assert cycle.status is FundingCycleStatus.DEGRADED
@@ -343,9 +335,7 @@ def test_empty_batch_without_raw_response_fails_the_item(tmp_path: Path) -> None
 
     cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
     eth = next(
-        item
-        for item in cycle.items
-        if item.venue is Venue.HYPERLIQUID and item.asset is Asset.ETH
+        item for item in cycle.items if item.venue is Venue.HYPERLIQUID and item.asset is Asset.ETH
     )
 
     assert eth.funding_outcome is FundingCaptureOutcome.FAILED
@@ -367,9 +357,7 @@ def test_instrument_failure_does_not_hide_successful_funding(tmp_path: Path) -> 
     )
 
     cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
-    hyperliquid_items = tuple(
-        item for item in cycle.items if item.venue is Venue.HYPERLIQUID
-    )
+    hyperliquid_items = tuple(item for item in cycle.items if item.venue is Venue.HYPERLIQUID)
 
     assert cycle.status is FundingCycleStatus.DEGRADED
     assert all(
@@ -391,9 +379,7 @@ def test_instrument_failure_does_not_hide_successful_funding(tmp_path: Path) -> 
         lambda record: record.model_copy(update={"venue": Venue.BYBIT}),
         lambda record: record.model_copy(update={"symbol": "ETHUSDT"}),
         lambda record: record.model_copy(update={"asset": Asset.ETH}),
-        lambda record: record.model_copy(
-            update={"effective_at": CYCLE_END - timedelta(hours=1)}
-        ),
+        lambda record: record.model_copy(update={"effective_at": CYCLE_END - timedelta(hours=1)}),
     ],
 )
 def test_invalid_funding_identity_fails_only_that_item(
@@ -421,9 +407,7 @@ def test_invalid_funding_identity_fails_only_that_item(
 
     cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
     btc = next(
-        item
-        for item in cycle.items
-        if item.venue is Venue.HYPERLIQUID and item.asset is Asset.BTC
+        item for item in cycle.items if item.venue is Venue.HYPERLIQUID and item.asset is Asset.BTC
     )
 
     assert btc.funding_outcome is FundingCaptureOutcome.FAILED
@@ -533,3 +517,125 @@ def test_cycle_transaction_rolls_back_every_new_evidence_when_cycle_append_fails
         assert connection.execute("SELECT count(*) FROM funding_collection_cycles").fetchone() == (
             0,
         )
+
+
+def _collect_property_identities(
+    asset_order: tuple[Asset, ...],
+    asset_count: int,
+    *,
+    reverse_adapters: bool,
+    reverse_instruments: bool,
+) -> tuple[tuple[tuple[Venue, Asset], ...], tuple[tuple[str, ...], ...]]:
+    requested = frozenset(asset_order[:asset_count])
+    store = DuckDBStore(":memory:")
+    for asset in requested:
+        store.append_instrument(
+            instrument_spec(
+                Venue.BYBIT,
+                asset,
+                observed_at=CYCLE_END - timedelta(hours=1),
+                source_hash="a" * 64,
+            )
+        )
+
+    built: list[FakeFundingAdapter] = []
+    for venue, offset in ((Venue.BYBIT, 5_000), (Venue.HYPERLIQUID, 6_000)):
+        instruments = instrument_batch(
+            venue,
+            requested,
+            observed_at=CYCLE_END + timedelta(minutes=1),
+            event_int=offset,
+        )
+        if reverse_instruments:
+            instruments = AdapterBatch(
+                raw=instruments.raw,
+                normalized=tuple(reversed(instruments.normalized)),
+            )
+        built.append(
+            FakeFundingAdapter(
+                venue,
+                instruments,
+                {
+                    asset: funding_batch(
+                        venue,
+                        asset,
+                        effective_at=CYCLE_END,
+                        observed_at=CYCLE_END + timedelta(minutes=2),
+                        event_int=offset + 10 + index,
+                    )
+                    for index, asset in enumerate(asset_order)
+                    if asset in requested
+                },
+            )
+        )
+    adapters_input = tuple(reversed(built)) if reverse_adapters else tuple(built)
+    cycle_result = asyncio.run(
+        PointInTimeFundingCollector(
+            store,
+            clock=SequenceClock(
+                CYCLE_END + timedelta(seconds=30),
+                CYCLE_END + timedelta(minutes=3),
+            ),
+            cycle_id_factory=lambda: UUID("00000000-0000-0000-0000-000000000952"),
+        ).collect_once(adapters_input, requested, CYCLE_END)
+    )
+
+    identities: list[tuple[str, ...]] = []
+    for venue in (Venue.BYBIT, Venue.HYPERLIQUID):
+        for asset in sorted(requested, key=lambda item: item.value):
+            symbol = f"{asset.value}USDT" if venue is Venue.BYBIT else asset.value
+            stored_instrument = store.latest_instrument_as_of(
+                venue, symbol, CYCLE_END + timedelta(minutes=5)
+            )
+            assert stored_instrument is not None
+            identities.append(
+                ("instrument", venue.value, asset.value, stored_instrument.source_hash)
+            )
+            stored_funding = store.funding_revisions_between(
+                venue,
+                symbol,
+                CYCLE_END - timedelta(microseconds=1),
+                CYCLE_END,
+                CYCLE_END + timedelta(minutes=5),
+            )
+            assert len(stored_funding) == 1
+            identities.append(("funding", venue.value, asset.value, stored_funding[0].source_hash))
+    store.close()
+    return (
+        tuple((current.venue, current.asset) for current in cycle_result.items),
+        tuple(sorted(identities)),
+    )
+
+
+@given(
+    asset_order=st.permutations(tuple(Asset)),
+    asset_count=st.integers(min_value=1, max_value=3),
+    reverse_adapters=st.booleans(),
+    reverse_instruments=st.booleans(),
+)
+@settings(max_examples=25, deadline=None)
+def test_collector_properties_canonicalize_input_and_preserve_persisted_identities(
+    asset_order: tuple[Asset, ...],
+    asset_count: int,
+    reverse_adapters: bool,
+    reverse_instruments: bool,
+) -> None:
+    baseline_pairs, baseline_identities = _collect_property_identities(
+        asset_order,
+        asset_count,
+        reverse_adapters=False,
+        reverse_instruments=False,
+    )
+    shuffled_pairs, shuffled_identities = _collect_property_identities(
+        asset_order,
+        asset_count,
+        reverse_adapters=reverse_adapters,
+        reverse_instruments=reverse_instruments,
+    )
+    assets = tuple(sorted(asset_order[:asset_count], key=lambda item: item.value))
+    expected_pairs = tuple(
+        (venue, asset) for venue in (Venue.BYBIT, Venue.HYPERLIQUID) for asset in assets
+    )
+
+    assert baseline_pairs == shuffled_pairs == expected_pairs
+    assert baseline_identities == shuffled_identities

@@ -1,7 +1,10 @@
 from datetime import UTC, datetime, timedelta, timezone
+from hashlib import sha256
 from uuid import UUID
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from polytrading.domain.models import Asset, Venue
@@ -79,9 +82,7 @@ def cycle(**overrides: object) -> FundingCollectionCycle:
 
 
 def test_cycle_timing_accepts_the_inclusive_point_in_time_cutoff() -> None:
-    cycle_end, now, is_late = validate_cycle_timing(
-        CYCLE_END, CYCLE_END + timedelta(minutes=5)
-    )
+    cycle_end, now, is_late = validate_cycle_timing(CYCLE_END, CYCLE_END + timedelta(minutes=5))
 
     assert cycle_end == CYCLE_END
     assert now == CYCLE_END + timedelta(minutes=5)
@@ -282,3 +283,77 @@ def test_late_cycle_requires_every_component_to_be_explicitly_missed() -> None:
     )
 
     assert result.status is FundingCycleStatus.LATE
+
+
+@given(
+    selected=st.sets(st.sampled_from(tuple(Asset)), min_size=1, max_size=3),
+    late_pair_index=st.integers(min_value=0, max_value=5),
+    late_component=st.sampled_from(("instrument", "funding")),
+)
+@settings(max_examples=50)
+def test_cycle_properties_conserve_hashes_and_flip_at_first_late_microsecond(
+    selected: set[Asset], late_pair_index: int, late_component: str
+) -> None:
+    assets = tuple(sorted(selected, key=lambda asset: asset.value))
+    cutoff = CYCLE_END + timedelta(minutes=5)
+    items = tuple(
+        item(
+            venue=venue,
+            asset=asset,
+            symbol=f"{asset.value}USDT" if venue is Venue.BYBIT else asset.value,
+            funding_outcome=(
+                FundingCaptureOutcome.NO_SETTLEMENT
+                if venue is Venue.BYBIT
+                else FundingCaptureOutcome.CAPTURED
+            ),
+            instrument_observed_at=cutoff,
+            funding_effective_at=None if venue is Venue.BYBIT else CYCLE_END,
+            funding_observed_at=cutoff,
+            instrument_source_hashes=(
+                sha256(f"{venue.value}:{asset.value}:instrument".encode()).hexdigest(),
+            ),
+            funding_source_hashes=(
+                sha256(f"{venue.value}:{asset.value}:funding".encode()).hexdigest(),
+            ),
+        )
+        for venue in (Venue.BYBIT, Venue.HYPERLIQUID)
+        for asset in assets
+    )
+    hashes = tuple(
+        sorted(
+            source_hash
+            for current in items
+            for source_hash in (
+                *current.instrument_source_hashes,
+                *current.funding_source_hashes,
+            )
+        )
+    )
+    complete = cycle(
+        assets=assets,
+        request_completed_at=cutoff + timedelta(microseconds=1),
+        items=items,
+        source_hashes=hashes,
+    )
+
+    assert tuple((current.venue, current.asset) for current in complete.items) == tuple(
+        (venue, asset) for venue in (Venue.BYBIT, Venue.HYPERLIQUID) for asset in assets
+    )
+    assert complete.source_hashes == hashes
+    assert complete.status is FundingCycleStatus.COMPLETE
+
+    index = late_pair_index % len(items)
+    field = "instrument_observed_at" if late_component == "instrument" else "funding_observed_at"
+    late_items = list(items)
+    late_items[index] = late_items[index].model_copy(
+        update={field: cutoff + timedelta(microseconds=1)}
+    )
+    late = cycle(
+        assets=assets,
+        request_completed_at=cutoff + timedelta(microseconds=1),
+        items=tuple(late_items),
+        status=FundingCycleStatus.LATE,
+        source_hashes=hashes,
+    )
+
+    assert late.status is FundingCycleStatus.LATE
