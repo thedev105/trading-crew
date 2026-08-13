@@ -88,7 +88,7 @@ def test_writer_streams_raw_then_writes_canonical_manifest_last(tmp_path: Path) 
     assert coverage["routing_tags"]["deadline_or_date"] == 2
 
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["schema_version"] == "corpus-intake-v1"
+    assert manifest["schema_version"] == "corpus-intake-v2"
     assert manifest["status"] == "complete"
     assert manifest["retention_status"] == "review_required"
     assert manifest["retention_basis"] is None

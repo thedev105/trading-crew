@@ -207,7 +207,7 @@ Expected: FAIL because `CorpusRunWriter` is absent.
 
 - [ ] **Step 3: Implement atomic, manifest-last output**
 
-Use `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. Stream raw records to a newly created `raw_pages.jsonl`; flush after each page. Write each remaining file to a sibling `.tmp` path and atomically replace its final path. Include schema version `corpus-intake-v1`, official endpoint/documentation URLs, `retention_status: review_required`, no retention basis, explicit run inputs, diagnostics, counts, and file hashes.
+Use `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. Stream raw records to a newly created `raw_pages.jsonl`; flush after each page. Write each remaining file to a sibling `.tmp` path and atomically replace its final path. Include schema version `corpus-intake-v2`, official endpoint/documentation URLs, `retention_status: review_required`, no retention basis, explicit run inputs, diagnostics, counts, source-provided tags, and file hashes.
 
 - [ ] **Step 4: Add quarantine outputs to `.gitignore`**
 

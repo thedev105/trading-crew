@@ -18,7 +18,7 @@ from polytrading.corpus_intake.models import (
 )
 from polytrading.corpus_intake.polymarket import DOCUMENTATION_URL, ENDPOINT, SOURCE
 
-SCHEMA_VERSION = "corpus-intake-v1"
+SCHEMA_VERSION = "corpus-intake-v2"
 
 
 @dataclass(frozen=True)
