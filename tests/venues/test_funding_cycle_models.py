@@ -228,6 +228,15 @@ def test_cycle_rejects_component_observations_before_the_named_boundary() -> Non
         cycle(items=(early_bybit, complete_items()[1]))
 
 
+def test_cycle_rejects_component_observations_before_request_start() -> None:
+    before_start = complete_items()[0].model_copy(
+        update={"instrument_observed_at": CYCLE_END + timedelta(seconds=29)}
+    )
+
+    with pytest.raises(ValidationError, match="item observation must not precede request start"):
+        cycle(items=(before_start, complete_items()[1]))
+
+
 def test_cycle_status_is_degraded_for_bootstrap_and_late_after_the_cutoff() -> None:
     bootstrap = item(
         instrument_source_hashes=(HASH_A,),
@@ -283,6 +292,18 @@ def test_late_cycle_requires_every_component_to_be_explicitly_missed() -> None:
     )
 
     assert result.status is FundingCycleStatus.LATE
+
+    with pytest.raises(ValidationError, match="late invocation requires every component missed"):
+        cycle(
+            request_started_at=CYCLE_END + timedelta(minutes=6),
+            request_completed_at=CYCLE_END + timedelta(minutes=6),
+        )
+    with pytest.raises(ValidationError, match="late invocation requires every component missed"):
+        cycle(
+            items=late_items,
+            status=FundingCycleStatus.LATE,
+            source_hashes=(),
+        )
 
 
 @given(

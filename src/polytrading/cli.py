@@ -31,7 +31,7 @@ from polytrading.corpus_intake.source_policy import IntendedUseScope, SourceUseA
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
-from polytrading.storage.store import DuckDBStore
+from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.bybit import BybitPublicAdapter
 from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
@@ -87,6 +87,10 @@ class CliUsageError(ValueError):
 
 class CorpusCollectionError(RuntimeError):
     """A public corpus source or integrity failure."""
+
+
+class FundingCycleCollectionError(RuntimeError):
+    """A point-in-time funding cycle could not be durably recorded."""
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -379,13 +383,18 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
 
     store = DuckDBStore(arguments.db)
     try:
-        if is_late:
-            cycle = record_late_funding_cycle(store, assets, cycle_end, now)
-        else:
-            async with public_adapter_session(store, (Venue.BYBIT, Venue.HYPERLIQUID)) as adapters:
-                cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
-                    adapters, assets, cycle_end
-                )
+        try:
+            if is_late:
+                cycle = record_late_funding_cycle(store, assets, cycle_end, now)
+            else:
+                async with public_adapter_session(
+                    store, (Venue.BYBIT, Venue.HYPERLIQUID)
+                ) as adapters:
+                    cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
+                        adapters, assets, cycle_end
+                    )
+        except ConflictingRecordError as error:
+            raise FundingCycleCollectionError(str(error)) from error
     finally:
         store.close()
 

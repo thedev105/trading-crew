@@ -45,9 +45,7 @@ class FundingCycleStatus(StrEnum):
     LATE = "late"
 
 
-def validate_cycle_timing(
-    cycle_end: datetime, now: datetime
-) -> tuple[datetime, datetime, bool]:
+def validate_cycle_timing(cycle_end: datetime, now: datetime) -> tuple[datetime, datetime, bool]:
     normalized_cycle_end = normalize_utc_timestamp(cycle_end)
     normalized_now = normalize_utc_timestamp(now)
     if any(
@@ -81,9 +79,7 @@ class FundingCycleItem(StrictRecord):
     funding_source_hashes: tuple[Sha256, ...]
     reason_codes: tuple[str, ...]
 
-    @field_validator(
-        "instrument_observed_at", "funding_effective_at", "funding_observed_at"
-    )
+    @field_validator("instrument_observed_at", "funding_effective_at", "funding_observed_at")
     @classmethod
     def require_utc_optional_timestamp(cls, value: datetime | None) -> datetime | None:
         return None if value is None else normalize_utc_timestamp(value)
@@ -170,9 +166,7 @@ class FundingCycleItem(StrictRecord):
         )
         if (self.instrument_outcome is InstrumentCaptureOutcome.FAILED) != (
             len(instrument_failures) == 1
-        ) or (self.funding_outcome is FundingCaptureOutcome.FAILED) != (
-            len(funding_failures) == 1
-        ):
+        ) or (self.funding_outcome is FundingCaptureOutcome.FAILED) != (len(funding_failures) == 1):
             raise ValueError("reason codes do not match component outcomes")
         recognized = expected_exact | set(instrument_failures) | set(funding_failures)
         if set(self.reason_codes) != recognized:
@@ -231,13 +225,28 @@ class FundingCollectionCycle(StrictRecord):
 
     @model_validator(mode="after")
     def require_consistent_cycle(self) -> FundingCollectionCycle:
-        validate_cycle_timing(self.cycle_end, self.request_started_at)
+        _, _, invocation_started_late = validate_cycle_timing(
+            self.cycle_end, self.request_started_at
+        )
         if self.request_completed_at < self.request_started_at:
             raise ValueError("request completion must not precede request start")
 
-        expected_pairs = tuple(
-            (venue, asset) for venue in self.venues for asset in self.assets
+        all_components_missed = all(
+            item.instrument_outcome is InstrumentCaptureOutcome.LATE_NOT_COLLECTED
+            and item.funding_outcome is FundingCaptureOutcome.LATE_NOT_COLLECTED
+            for item in self.items
         )
+        any_component_missed = any(
+            item.instrument_outcome is InstrumentCaptureOutcome.LATE_NOT_COLLECTED
+            or item.funding_outcome is FundingCaptureOutcome.LATE_NOT_COLLECTED
+            for item in self.items
+        )
+        if (invocation_started_late and not all_components_missed) or (
+            not invocation_started_late and any_component_missed
+        ):
+            raise ValueError("late invocation requires every component missed")
+
+        expected_pairs = tuple((venue, asset) for venue in self.venues for asset in self.assets)
         actual_pairs = tuple((item.venue, item.asset) for item in self.items)
         if actual_pairs != expected_pairs:
             raise ValueError("items must cover every requested venue and asset")
@@ -252,6 +261,8 @@ class FundingCollectionCycle(StrictRecord):
             for observed_at in (item.instrument_observed_at, item.funding_observed_at):
                 if observed_at is not None and observed_at < self.cycle_end:
                     raise ValueError("item observation must not precede cycle end")
+                if observed_at is not None and observed_at < self.request_started_at:
+                    raise ValueError("item observation must not precede request start")
                 if observed_at is not None and observed_at > self.request_completed_at:
                     raise ValueError("item observation must not follow request completion")
 
@@ -275,10 +286,7 @@ class FundingCollectionCycle(StrictRecord):
         has_late_component = any(
             item.instrument_outcome is InstrumentCaptureOutcome.LATE_NOT_COLLECTED
             or item.funding_outcome is FundingCaptureOutcome.LATE_NOT_COLLECTED
-            or (
-                item.instrument_observed_at is not None
-                and item.instrument_observed_at > cutoff
-            )
+            or (item.instrument_observed_at is not None and item.instrument_observed_at > cutoff)
             or (item.funding_observed_at is not None and item.funding_observed_at > cutoff)
             for item in self.items
         )

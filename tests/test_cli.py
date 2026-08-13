@@ -38,7 +38,7 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.replay import replay_file
-from polytrading.storage.store import DuckDBStore
+from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.public import AdapterBatch
 from tests.carry.study_helpers import at, complete_block
 from tests.domain.factories import funding_observation, instrument_spec
@@ -961,6 +961,52 @@ def test_funding_cycle_cli_collects_complete_exact_boundary_evidence(
         assert connection.execute("SELECT count(*) FROM funding_collection_cycles").fetchone() == (
             1,
         )
+
+
+def test_funding_cycle_cli_classifies_persistence_conflict_as_collection_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RejectingCollector:
+        def __init__(self, store: object, *, clock: object) -> None:
+            del store, clock
+
+        async def collect_once(self, adapters: object, assets: object, cycle_end: object) -> object:
+            del adapters, assets, cycle_end
+            raise ConflictingRecordError("conflicting funding cycle persistence")
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        del store, venues
+        yield ()
+
+    times = iter(
+        [
+            FUNDING_CYCLE_END + timedelta(seconds=30),
+            FUNDING_CYCLE_END + timedelta(seconds=30),
+        ]
+    )
+    monkeypatch.setattr(cli, "PointInTimeFundingCollector", RejectingCollector)
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(times))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(tmp_path / "conflict.duckdb"),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+            ]
+        )
+        == 1
+    )
+    message = capsys.readouterr().err
+    assert "collection failed" in message
+    assert "conflicting funding cycle persistence" in message
 
 
 class _ReplayOrderStore:

@@ -11,7 +11,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from polytrading.domain.models import Asset, FundingObservation, Venue
-from polytrading.storage.store import DuckDBStore
+from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
     record_late_funding_cycle,
@@ -30,6 +30,7 @@ from tests.venues.funding_cycle_helpers import (
     funding_batch,
     instrument_batch,
     instrument_spec,
+    raw_envelope,
 )
 
 
@@ -343,6 +344,76 @@ def test_empty_batch_without_raw_response_fails_the_item(tmp_path: Path) -> None
     store.close()
 
 
+def test_raw_response_before_boundary_fails_the_component_not_the_cycle(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "research.duckdb")
+    preseed_bybit_basis(store)
+    bybit, hyperliquid = adapters()
+    original = hyperliquid.instrument_result
+    assert isinstance(original, AdapterBatch)
+    early = CYCLE_END - timedelta(microseconds=1)
+    hyperliquid.instrument_result = AdapterBatch(
+        raw=tuple(raw.model_copy(update={"observed_at": early}) for raw in original.raw),
+        normalized=tuple(
+            record.model_copy(update={"observed_at": early}) for record in original.normalized
+        ),
+    )
+    collector = PointInTimeFundingCollector(
+        store,
+        clock=SequenceClock(
+            CYCLE_END + timedelta(seconds=30),
+            CYCLE_END + timedelta(minutes=2),
+        ),
+    )
+
+    cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
+
+    assert cycle.status is FundingCycleStatus.DEGRADED
+    assert all(
+        item.instrument_outcome is InstrumentCaptureOutcome.FAILED
+        and item.reason_codes == ("INSTRUMENT_FAILED:hyperliquid:ValueError",)
+        for item in cycle.items
+        if item.venue is Venue.HYPERLIQUID
+    )
+    store.close()
+
+
+def test_unrelated_cross_venue_raw_response_fails_only_that_funding_item(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "research.duckdb")
+    preseed_bybit_basis(store)
+    bybit, hyperliquid = adapters()
+    original = hyperliquid.funding_results[Asset.BTC]
+    assert isinstance(original, AdapterBatch)
+    unrelated = raw_envelope(
+        Venue.BYBIT,
+        label="unrelated",
+        observed_at=CYCLE_END + timedelta(minutes=1),
+        event_int=9_991,
+    )
+    hyperliquid.funding_results[Asset.BTC] = AdapterBatch(
+        raw=(*original.raw, unrelated),
+        normalized=original.normalized,
+    )
+    collector = PointInTimeFundingCollector(
+        store,
+        clock=SequenceClock(
+            CYCLE_END + timedelta(seconds=30),
+            CYCLE_END + timedelta(minutes=2),
+        ),
+    )
+
+    cycle = asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
+    btc = next(
+        item for item in cycle.items if item.venue is Venue.HYPERLIQUID and item.asset is Asset.BTC
+    )
+
+    assert btc.funding_outcome is FundingCaptureOutcome.FAILED
+    assert btc.funding_source_hashes == ()
+    assert btc.reason_codes == ("FUNDING_FAILED:hyperliquid:BTC:ValueError",)
+    store.close()
+
+
 def test_instrument_failure_does_not_hide_successful_funding(tmp_path: Path) -> None:
     store = DuckDBStore(tmp_path / "research.duckdb")
     preseed_bybit_basis(store)
@@ -507,6 +578,39 @@ def test_cycle_transaction_rolls_back_every_new_evidence_when_cycle_append_fails
 
     monkeypatch.setattr(store, "append_funding_collection_cycle", fail_cycle_append)
     with pytest.raises(RuntimeError, match="cycle append failed"):
+        asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM raw_envelopes").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM instrument_specs").fetchone() == (3,)
+        assert connection.execute("SELECT count(*) FROM funding_observations").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM funding_collection_cycles").fetchone() == (
+            0,
+        )
+
+
+def test_conflicting_raw_event_ids_are_not_silently_collapsed(tmp_path: Path) -> None:
+    path = tmp_path / "research.duckdb"
+    store = DuckDBStore(path)
+    preseed_bybit_basis(store)
+    bybit, hyperliquid = adapters()
+    hyperliquid.funding_results[Asset.BTC] = funding_batch(
+        Venue.HYPERLIQUID,
+        Asset.BTC,
+        effective_at=CYCLE_END,
+        observed_at=CYCLE_END + timedelta(minutes=1),
+        event_int=200,
+    )
+    collector = PointInTimeFundingCollector(
+        store,
+        clock=SequenceClock(
+            CYCLE_END + timedelta(seconds=30),
+            CYCLE_END + timedelta(minutes=2),
+        ),
+    )
+
+    with pytest.raises(ConflictingRecordError, match="conflicting raw envelope"):
         asyncio.run(collector.collect_once((bybit, hyperliquid), ASSETS, CYCLE_END))
     store.close()
 

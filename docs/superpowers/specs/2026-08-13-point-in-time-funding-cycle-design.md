@@ -176,7 +176,9 @@ Allowed statuses are:
 
 Model validators enforce canonical item order, exact pair coverage, timestamp order, outcome
 field consistency, status derivation, and equality between cycle source hashes and the union of
-all item instrument and funding source hashes.
+all item instrument and funding source hashes. Every observation must fall between request start
+and request completion. A late invocation is valid only when every component is explicitly
+`late_not_collected`; an on-time invocation cannot use that outcome.
 
 ## 6. Collection data flow
 
@@ -194,7 +196,8 @@ injectable UTC clock. A separate pure late-cycle constructor requires no adapter
    venue/asset pair concurrently.
 7. Convert exceptions to stable failure codes, re-raising cancellation.
 8. Validate successful batches, exact-boundary identities, raw lineage, raw response observation
-   timestamps, and cardinality. A nominally successful batch without raw response evidence fails.
+   timestamps, venue ownership, and cardinality. A nominally successful batch without raw response
+   evidence fails.
 9. Build the cycle and append every successful raw response, normalized instrument, normalized
    funding observation, and the cycle itself in one DuckDB transaction.
 10. Render the immutable cycle from the value returned by the collector.
@@ -256,7 +259,8 @@ below the currently documented Bybit and Hyperliquid limits.
 - Exception messages are not persisted; stable `venue:asset:ExceptionType` codes avoid leaking
   payloads or machine details.
 - Invalid successful batches become `failed` items and their raw data is not persisted.
-- Database conflicts or transaction failures fail the command and roll back the entire cycle.
+- Conflicting raw UUIDs, other database conflicts, or transaction failures fail the command,
+  roll back the entire cycle, and use the collection-failure exit path rather than an input error.
 - A late invocation does not attempt a historical repair disguised as forward evidence.
 - Missing Bybit point-in-time instrument basis remains `bootstrap_required`, even if the same
   invocation fetched today's specification.

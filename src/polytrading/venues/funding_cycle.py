@@ -98,9 +98,7 @@ class PointInTimeFundingCollector:
             raise ValueError("both Bybit and Hyperliquid adapters are required")
 
         request_started_at = normalize_utc_timestamp(self._clock())
-        normalized_cycle_end, _, is_late = validate_cycle_timing(
-            cycle_end, request_started_at
-        )
+        normalized_cycle_end, _, is_late = validate_cycle_timing(cycle_end, request_started_at)
         if is_late:
             raise ValueError("on-time collector requires collection clock within five minutes")
 
@@ -128,7 +126,12 @@ class PointInTimeFundingCollector:
                     )
                 continue
             try:
-                specs = _validate_instrument_batch(result, adapter.venue, requested_assets)
+                specs = _validate_instrument_batch(
+                    result,
+                    adapter.venue,
+                    requested_assets,
+                    normalized_cycle_end,
+                )
             except (TypeError, ValueError, AdapterBatchIntegrityError) as error:
                 reason = f"INSTRUMENT_FAILED:{adapter.venue.value}:{_failure_token(error)}"
                 for asset in requested_assets:
@@ -155,11 +158,15 @@ class PointInTimeFundingCollector:
         funding_by_pair: dict[tuple[Venue, Asset], _FundingResult] = {}
         for adapter in ordered_adapters:
             for asset in sorted(requested_assets, key=lambda item: item.value):
-                if adapter.venue is Venue.BYBIT and self._store.latest_instrument_as_of(
-                    Venue.BYBIT,
-                    _EXPECTED_SYMBOL[Venue.BYBIT][asset],
-                    normalized_cycle_end,
-                ) is None:
+                if (
+                    adapter.venue is Venue.BYBIT
+                    and self._store.latest_instrument_as_of(
+                        Venue.BYBIT,
+                        _EXPECTED_SYMBOL[Venue.BYBIT][asset],
+                        normalized_cycle_end,
+                    )
+                    is None
+                ):
                     funding_by_pair[(adapter.venue, asset)] = _FundingResult(
                         outcome=FundingCaptureOutcome.BOOTSTRAP_REQUIRED,
                         effective_at=None,
@@ -270,10 +277,9 @@ class PointInTimeFundingCollector:
             warnings=FUNDING_CYCLE_WARNINGS,
         )
 
-        raws_by_id = {raw.event_id: raw for raw in valid_raws}
         ordered_raws = tuple(
             sorted(
-                raws_by_id.values(),
+                valid_raws,
                 key=lambda raw: (
                     raw.venue.value,
                     raw.endpoint,
@@ -369,13 +375,14 @@ def _validate_instrument_batch(
     batch: AdapterBatch,
     venue: Venue,
     assets: frozenset[Asset],
+    cycle_end: datetime,
 ) -> tuple[InstrumentSpec, ...]:
     if any(type(record) is not InstrumentSpec for record in batch.normalized):
         raise TypeError("instrument batch contains an invalid normalized record")
     specs = tuple(record for record in batch.normalized if type(record) is InstrumentSpec)
     if any(record.venue is not venue for record in specs):
         raise ValueError("instrument venue does not match adapter")
-    _require_response_raw(batch)
+    _validate_response_raw(batch, venue, cycle_end)
     identities = tuple((record.asset, record.symbol) for record in specs)
     expected = tuple(
         (asset, _EXPECTED_SYMBOL[venue][asset])
@@ -400,7 +407,7 @@ def _validate_funding_batch(
     observations = tuple(
         record for record in batch.normalized if type(record) is FundingObservation
     )
-    _require_response_raw(batch)
+    _validate_response_raw(batch, venue, cycle_end)
     if len(observations) > 1:
         raise ValueError("funding batch contains more than one exact-boundary record")
     for record in observations:
@@ -417,18 +424,20 @@ def _validate_funding_batch(
     return observations
 
 
-def _require_response_raw(batch: AdapterBatch) -> None:
+def _validate_response_raw(batch: AdapterBatch, venue: Venue, cycle_end: datetime) -> None:
     if not batch.raw:
         raise ValueError("successful adapter batch requires a raw response")
+    if any(raw.venue is not venue for raw in batch.raw):
+        raise ValueError("raw response venue does not match adapter")
+    if any(raw.observed_at < cycle_end for raw in batch.raw):
+        raise ValueError("raw response observation precedes cycle end")
 
 
 def _require_normalized_observation_lineage(
     batch: AdapterBatch,
     records: tuple[InstrumentSpec, ...] | tuple[FundingObservation, ...],
 ) -> None:
-    raw_observations = {
-        (raw.source_hash, raw.observed_at) for raw in batch.raw
-    }
+    raw_observations = {(raw.source_hash, raw.observed_at) for raw in batch.raw}
     if any((record.source_hash, record.observed_at) not in raw_observations for record in records):
         raise ValueError("normalized observation time does not match raw lineage")
 
@@ -443,9 +452,7 @@ def _funding_failure(venue: Venue, asset: Asset, error: BaseException) -> _Fundi
         effective_at=None,
         observed_at=None,
         source_hashes=(),
-        reason_codes=(
-            f"FUNDING_FAILED:{venue.value}:{asset.value}:{_failure_token(error)}",
-        ),
+        reason_codes=(f"FUNDING_FAILED:{venue.value}:{asset.value}:{_failure_token(error)}",),
     )
 
 
@@ -471,9 +478,7 @@ def _make_item(
     )
 
 
-def _cycle_status(
-    items: tuple[FundingCycleItem, ...], cycle_end: datetime
-) -> FundingCycleStatus:
+def _cycle_status(items: tuple[FundingCycleItem, ...], cycle_end: datetime) -> FundingCycleStatus:
     cutoff = cycle_end + FUNDING_POINT_IN_TIME_LAG
     if any(
         (item.instrument_observed_at is not None and item.instrument_observed_at > cutoff)
