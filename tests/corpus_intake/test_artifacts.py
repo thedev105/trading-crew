@@ -175,3 +175,47 @@ def test_writer_rejects_second_completion(tmp_path: Path) -> None:
 
     with pytest.raises(CorpusIntakeError, match="already complete"):
         writer.complete(_result())
+
+
+def test_verifier_rederives_candidates_from_exact_raw_pages(tmp_path: Path) -> None:
+    output = _output(tmp_path)
+    writer = CorpusRunWriter(output, project_root=tmp_path, request=_request())
+    writer.append_raw_page(_page().raw)
+    writer.complete(_result())
+
+    candidate_path = output / "candidates.jsonl"
+    rows = [json.loads(line) for line in candidate_path.read_text().splitlines()]
+    rows[0]["question"] = "A coordinated but unsupported edit"
+    candidate_path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+            for row in rows
+        )
+    )
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    candidate_bytes = candidate_path.read_bytes()
+    manifest["files"]["candidates.jsonl"] = {
+        "bytes": len(candidate_bytes),
+        "sha256": sha256(candidate_bytes).hexdigest(),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    )
+
+    with pytest.raises(CorpusIntakeError, match="exact raw page"):
+        verify_run(output)
+
+
+def test_verifier_rejects_a_manifest_retention_basis_for_unapproved_schema(tmp_path: Path) -> None:
+    output = _output(tmp_path)
+    writer = CorpusRunWriter(output, project_root=tmp_path, request=_request())
+    writer.append_raw_page(_page().raw)
+    writer.complete(_result())
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["retention_basis"] = {"claimed": "approval"}
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+
+    with pytest.raises(CorpusIntakeError, match="retention basis"):
+        verify_run(output)

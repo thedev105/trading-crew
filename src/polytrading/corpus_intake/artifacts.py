@@ -16,7 +16,7 @@ from polytrading.corpus_intake.models import (
     CorpusIntakeError,
     RawPageCapture,
 )
-from polytrading.corpus_intake.polymarket import DOCUMENTATION_URL, ENDPOINT, SOURCE
+from polytrading.corpus_intake.polymarket import DOCUMENTATION_URL, ENDPOINT, SOURCE, parse_page
 
 SCHEMA_VERSION = "corpus-intake-v2"
 
@@ -108,6 +108,14 @@ def verify_run(output: Path) -> VerifiedRun:
         raise CorpusIntakeError("run manifest is not a completed supported intake run")
     if manifest.get("retention_status") != "review_required":
         raise CorpusIntakeError("run manifest has an unexpected retention status")
+    if manifest.get("retention_basis") is not None:
+        raise CorpusIntakeError("unapproved intake schema cannot contain a retention basis")
+    if (
+        manifest.get("source") != SOURCE
+        or manifest.get("endpoint") != ENDPOINT
+        or manifest.get("documentation_url") != DOCUMENTATION_URL
+    ):
+        raise CorpusIntakeError("run manifest source identity is not supported")
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise CorpusIntakeError("run manifest files must be an object")
@@ -121,6 +129,7 @@ def verify_run(output: Path) -> VerifiedRun:
 
     raw_rows = _read_jsonl(output / "raw_pages.jsonl")
     raw_hashes: set[str] = set()
+    expected_candidates: dict[tuple[str, str], dict[str, Any]] = {}
     for ordinal, row in enumerate(raw_rows, start=1):
         if row.get("page_ordinal") != ordinal:
             raise CorpusIntakeError("raw page ordinals are not contiguous")
@@ -130,10 +139,17 @@ def verify_run(output: Path) -> VerifiedRun:
             raise CorpusIntakeError("raw page body evidence is malformed")
         if sha256(body_text.encode("utf-8")).hexdigest() != body_hash:
             raise CorpusIntakeError("raw page body hash mismatch")
+        for candidate in _rederive_page_candidates(row, body_text):
+            key = (candidate["candidate_id"], candidate["raw_body_sha256"])
+            prior = expected_candidates.get(key)
+            if prior is not None and prior != candidate:
+                raise CorpusIntakeError("raw pages derive conflicting candidates")
+            expected_candidates[key] = candidate
         raw_hashes.add(body_hash)
 
     candidate_rows = _read_jsonl(output / "candidates.jsonl")
     candidate_ids: set[str] = set()
+    market_ids: set[tuple[str, str]] = set()
     event_families: set[str] = set()
     for row in candidate_rows:
         candidate_id = row.get("candidate_id")
@@ -146,8 +162,26 @@ def verify_run(output: Path) -> VerifiedRun:
             raise CorpusIntakeError("candidate has an unexpected retention status")
         if row.get("raw_body_sha256") not in raw_hashes:
             raise CorpusIntakeError("candidate lineage does not reference a captured raw page")
+        source = row.get("source")
+        market_id = row.get("source_market_id")
+        if not isinstance(source, str) or not isinstance(market_id, str):
+            raise CorpusIntakeError("candidate source-market identity is malformed")
+        market_identity = (source, market_id)
+        if market_identity in market_ids:
+            raise CorpusIntakeError("candidate source-market identities must be unique")
+        expected = expected_candidates.get((candidate_id, row["raw_body_sha256"]))
+        if expected != row:
+            raise CorpusIntakeError("candidate does not match its exact raw page")
         candidate_ids.add(candidate_id)
+        market_ids.add(market_identity)
         event_families.add(event_family_id)
+
+    ordered_rows = sorted(
+        candidate_rows,
+        key=lambda row: (row["source"], row["event_family_id"], row["source_market_id"]),
+    )
+    if candidate_rows != ordered_rows:
+        raise CorpusIntakeError("candidate rows are not in deterministic order")
 
     counts = manifest.get("counts")
     expected_counts = {
@@ -163,6 +197,62 @@ def verify_run(output: Path) -> VerifiedRun:
         raw_page_count=len(raw_rows),
         manifest_sha256=sha256(manifest_path.read_bytes()).hexdigest(),
     )
+
+
+def _rederive_page_candidates(row: dict[str, Any], body_text: str) -> tuple[dict[str, Any], ...]:
+    if row.get("source") != SOURCE or row.get("endpoint") != ENDPOINT:
+        raise CorpusIntakeError("raw page source identity is not supported")
+    request_url = row.get("request_url")
+    requested_cursor = row.get("requested_cursor")
+    page_ordinal = row.get("page_ordinal")
+    status_code = row.get("status_code")
+    response_headers = row.get("response_headers")
+    if (
+        not isinstance(request_url, str)
+        or (requested_cursor is not None and not isinstance(requested_cursor, str))
+        or isinstance(page_ordinal, bool)
+        or not isinstance(page_ordinal, int)
+        or isinstance(status_code, bool)
+        or not isinstance(status_code, int)
+        or not isinstance(response_headers, list)
+    ):
+        raise CorpusIntakeError("raw page acquisition metadata is malformed")
+    header_map: dict[str, str] = {}
+    for pair in response_headers:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(value, str) for value in pair)
+        ):
+            raise CorpusIntakeError("raw page response headers are malformed")
+        header_map[pair[0]] = pair[1]
+    parsed = parse_page(
+        body=body_text.encode("utf-8"),
+        request_url=request_url,
+        requested_cursor=requested_cursor,
+        page_ordinal=page_ordinal,
+        retrieved_at=_parse_json_timestamp(row.get("retrieved_at"), "retrieved_at"),
+        information_cutoff=_parse_json_timestamp(
+            row.get("information_cutoff"), "information_cutoff"
+        ),
+        status_code=status_code,
+        headers=header_map,
+    )
+    if parsed.raw.returned_cursor != row.get("returned_cursor"):
+        raise CorpusIntakeError("raw page returned cursor does not match its exact body")
+    return tuple(_json_value(candidate) for candidate in parsed.candidates)
+
+
+def _parse_json_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise CorpusIntakeError(f"raw page {label} is malformed")
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError
+        return timestamp.astimezone(UTC)
+    except ValueError as error:
+        raise CorpusIntakeError(f"raw page {label} is malformed") from error
 
 
 def _validated_output_path(output: Path, project_root: Path) -> Path:
