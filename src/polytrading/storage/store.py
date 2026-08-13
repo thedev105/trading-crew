@@ -60,11 +60,12 @@ def _utc_from_epoch_us(value: int | None) -> datetime | None:
 
 
 class DuckDBStore:
-    def __init__(self, path: Path) -> None:
-        self._connection = duckdb.connect(str(path))
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        self._connection = duckdb.connect(str(path), read_only=read_only)
         self._in_transaction = False
         try:
-            self._apply_migrations()
+            if not read_only:
+                self._apply_migrations()
         except BaseException:
             self._connection.close()
             raise

@@ -40,6 +40,7 @@ from polytrading.domain.models import (
 from polytrading.replay import replay_file
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.public import AdapterBatch
+from tests.carry.study_helpers import at, complete_block
 from tests.domain.factories import funding_observation, instrument_spec
 
 FIXTURE = Path("tests/fixtures/replay/public_snapshot.jsonl")
@@ -149,6 +150,143 @@ def test_cli_validation_errors_exit_two_without_tracebacks(
         == 2
     )
     assert "traceback" not in capsys.readouterr().err.lower()
+
+
+def test_carry_study_requires_explicit_research_window(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "carry",
+                "study",
+                "--db",
+                str(tmp_path / "study.duckdb"),
+                "--asset",
+                "BTC",
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-01-01T08:00:00Z",
+            ]
+        )
+        == 2
+    )
+    assert "known-as-of" in capsys.readouterr().err
+
+
+def test_carry_study_is_deterministic_read_only_and_offline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "study.duckdb"
+    start = at("2026-01-01T00:00:00Z")
+    store = DuckDBStore(database)
+    for row in complete_block(start):
+        store.append_funding(row)
+    store.close()
+    before_hash = sha256(database.read_bytes()).hexdigest()
+    before_rows = _stored_funding_rows(database)
+
+    def reject_network(**_kwargs: object) -> None:
+        raise AssertionError("carry study must not create a network client")
+
+    monkeypatch.setattr(cli, "make_public_http_client", reject_network)
+    arguments = [
+        "carry",
+        "study",
+        "--db",
+        str(database),
+        "--asset",
+        "BTC",
+        "--start",
+        "2026-01-01T00:00:00Z",
+        "--end",
+        "2026-01-01T08:00:00Z",
+        "--known-as-of",
+        "2026-01-01T08:05:00Z",
+        "--format",
+        "json",
+    ]
+
+    assert main(arguments) == 0
+    first = capsys.readouterr().out
+    assert main(arguments) == 0
+    second = capsys.readouterr().out
+
+    assert first == second
+    assert json.loads(first)["decision"] == "INSUFFICIENT_DATA"
+    assert before_rows == _stored_funding_rows(database)
+    assert before_hash == sha256(database.read_bytes()).hexdigest()
+
+
+def test_carry_study_validation_is_sanitized_exit_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "carry",
+                "study",
+                "--db",
+                str(tmp_path / "study.duckdb"),
+                "--asset",
+                "BTC",
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-01-01T08:00:00Z",
+                "--known-as-of",
+                "2026-01-01T07:59:59Z",
+            ]
+        )
+        == 2
+    )
+    error = capsys.readouterr().err
+    assert "polytrading: error:" in error
+    assert "known_as_of must not precede end" in error
+    assert "traceback" not in error.lower()
+
+
+def test_carry_study_missing_database_fails_without_creating_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "missing.duckdb"
+
+    assert (
+        main(
+            [
+                "carry",
+                "study",
+                "--db",
+                str(database),
+                "--asset",
+                "BTC",
+                "--start",
+                "2026-01-01T00:00:00Z",
+                "--end",
+                "2026-01-01T08:00:00Z",
+                "--known-as-of",
+                "2026-01-01T08:05:00Z",
+            ]
+        )
+        == 1
+    )
+    assert not database.exists()
+    assert "collection failed" in capsys.readouterr().err
+
+
+def _stored_funding_rows(database: Path) -> list[tuple[object, ...]]:
+    with duckdb.connect(str(database), read_only=True) as connection:
+        return connection.execute(
+            """
+            SELECT venue, symbol, asset, rate, interval_hours, epoch_us(effective_at),
+                   epoch_us(observed_at), source_hash, schema_version, record_hash
+            FROM funding_observations
+            ORDER BY venue, symbol, effective_at, observed_at
+            """
+        ).fetchall()
 
 
 def test_collect_corpus_requires_explicit_bounded_quarantine_inputs(

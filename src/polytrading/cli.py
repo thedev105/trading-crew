@@ -15,6 +15,8 @@ import httpx
 from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.report import render_json, render_text
+from polytrading.carry.study import CarryPersistenceStudy, validate_study_window
+from polytrading.carry.study_report import render_study_json, render_study_text
 from polytrading.corpus_intake.artifacts import CorpusRunWriter, verify_run
 from polytrading.corpus_intake.evidence import (
     POLYMARKET_EVIDENCE_TARGETS,
@@ -97,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--db", required=True, type=Path)
     audit.add_argument("--as-of", required=True)
     audit.add_argument("--format", choices=("text", "json"), default="text")
+    study = carry_commands.add_parser(
+        "study", help="study fixed-direction cross-venue funding persistence"
+    )
+    study.add_argument("--db", required=True, type=Path)
+    study.add_argument("--asset", required=True, choices=("BTC", "ETH", "SOL"))
+    study.add_argument("--start", required=True)
+    study.add_argument("--end", required=True)
+    study.add_argument("--known-as-of", required=True)
+    study.add_argument("--format", choices=("text", "json"), default="text")
 
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
@@ -159,7 +170,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "replay":
             return _replay(arguments)
         if arguments.command == "carry":
-            return _carry_audit(arguments)
+            return (
+                _carry_audit(arguments)
+                if arguments.carry_command == "audit"
+                else _carry_study(arguments)
+            )
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
@@ -206,6 +221,21 @@ def _carry_audit(arguments: argparse.Namespace) -> int:
     finally:
         store.close()
     renderer = render_json if arguments.format == "json" else render_text
+    print(renderer(report))
+    return 0
+
+
+def _carry_study(arguments: argparse.Namespace) -> int:
+    start = _parse_timestamp(arguments.start)
+    end = _parse_timestamp(arguments.end)
+    known_as_of = _parse_timestamp(arguments.known_as_of)
+    start, end, known_as_of = validate_study_window(start, end, known_as_of)
+    store = DuckDBStore(arguments.db, read_only=True)
+    try:
+        report = CarryPersistenceStudy(store).run(Asset(arguments.asset), start, end, known_as_of)
+    finally:
+        store.close()
+    renderer = render_study_json if arguments.format == "json" else render_study_text
     print(renderer(report))
     return 0
 

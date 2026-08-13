@@ -349,7 +349,7 @@ def _prepare_blocks(
     bybit_rows: tuple[FundingObservation, ...],
     hyperliquid_rows: tuple[FundingObservation, ...],
 ) -> _PreparedStudy:
-    normalized_start, normalized_end, normalized_known_as_of = _validate_window(
+    normalized_start, normalized_end, normalized_known_as_of = validate_study_window(
         start, end, known_as_of
     )
     bybit, bybit_hashes = _prepare_settlements(
@@ -435,7 +435,7 @@ def _prepare_blocks(
     )
 
 
-def _validate_window(
+def validate_study_window(
     start: datetime, end: datetime, known_as_of: datetime
 ) -> tuple[datetime, datetime, datetime]:
     normalized_start = normalize_utc_timestamp(start)
