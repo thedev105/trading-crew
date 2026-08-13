@@ -56,3 +56,23 @@ def complete_block(
         for hour in range(1, 9)
     )
     return (bybit, *hyperliquid)
+
+
+def history_from_spreads(
+    start: datetime,
+    spreads: tuple[Decimal, ...],
+    *,
+    observation_lag: timedelta,
+) -> tuple[FundingObservation, ...]:
+    rows: list[FundingObservation] = []
+    for index, spread in enumerate(spreads):
+        block_start = start + timedelta(hours=8 * index)
+        rows.extend(
+            complete_block(
+                block_start,
+                bybit_rate=Decimal(0),
+                hyperliquid_hourly_rate=spread / Decimal(8),
+                observation_lag=observation_lag,
+            )
+        )
+    return tuple(rows)
