@@ -246,4 +246,3 @@ async function refreshSnapshot() {
 
 nodes.refresh.addEventListener("click", refreshSnapshot);
 refreshSnapshot();
-
