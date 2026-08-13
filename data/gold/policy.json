@@ -1,0 +1,40 @@
+{
+  "dataset_prefix": "offline-semantic-scout-gold",
+  "information_cutoff": "2026-08-12T12:00:00Z",
+  "reviewer_roles": {
+    "adjudicators_per_disagreement": 1,
+    "reviewers_per_item": 2
+  },
+  "sampling_counts": {
+    "contracts": 500,
+    "relationships": 250
+  },
+  "schema_version": 1,
+  "split_policy": {
+    "test": 100,
+    "train": 300,
+    "validation": 100
+  },
+  "template_taxonomy": [
+    "binary_outcome",
+    "inclusive_threshold",
+    "exclusive_threshold",
+    "nested_threshold",
+    "nested_deadline",
+    "range_identity",
+    "exhaustive_set",
+    "logical_implication",
+    "oracle_specific_threshold",
+    "timezone_specific_deadline",
+    "precision_specific_threshold",
+    "rounding_specific_threshold",
+    "cancellation_clause",
+    "postponement_clause",
+    "substitution_clause",
+    "dispute_clause",
+    "clarification_clause",
+    "fallback_clause",
+    "set_membership",
+    "non_equivalent_boundary"
+  ]
+}

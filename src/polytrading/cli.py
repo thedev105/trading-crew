@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from polytrading.ai.cli import add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.report import render_json, render_text
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--duration-seconds", type=float)
     books.add_argument("--interval-seconds", type=float, default=5.0)
     books.add_argument("--db", required=True, type=Path)
+    add_ai_subcommands(commands)
     return parser
 
 
@@ -109,6 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _replay(arguments)
         if arguments.command == "carry":
             return _carry_audit(arguments)
+        if arguments.command == "ai":
+            return run_ai_command(arguments)
         if arguments.collect_command == "public":
             return asyncio.run(_collect_public(arguments))
         return asyncio.run(_collect_books(arguments))

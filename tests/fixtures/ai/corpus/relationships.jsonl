@@ -1,0 +1,3 @@
+{"member_contract_ids":["contract-0001","contract-0002"],"relationship_id":"relationship-0001","schema_version":1,"split":"train"}
+{"member_contract_ids":["contract-0003","contract-0004"],"relationship_id":"relationship-0002","schema_version":1,"split":"validation"}
+{"member_contract_ids":["contract-0005","contract-0006"],"relationship_id":"relationship-0003","schema_version":1,"split":"test"}

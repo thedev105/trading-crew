@@ -1,0 +1,3 @@
+{"adjudication_id":null,"adversarial_tags":[],"label":"complement","label_version":1,"relationship_id":"relationship-0001","review_ids":[],"schema_version":1,"supported_template":true}
+{"adjudication_id":null,"adversarial_tags":[],"label":"nested_threshold","label_version":1,"relationship_id":"relationship-0002","review_ids":[],"schema_version":1,"supported_template":true}
+{"adjudication_id":null,"adversarial_tags":["oracle_mismatch","direct_prompt_injection"],"label":"non_equivalent","label_version":1,"relationship_id":"relationship-0003","review_ids":[],"schema_version":1,"supported_template":false}
