@@ -156,7 +156,7 @@ def funding_collection_cycle(**overrides: object) -> FundingCollectionCycle:
             funding_outcome=FundingCaptureOutcome.NO_SETTLEMENT,
             instrument_observed_at=cycle_end + timedelta(minutes=1),
             funding_effective_at=None,
-            funding_observed_at=None,
+            funding_observed_at=cycle_end + timedelta(minutes=1),
             instrument_source_hashes=(SOURCE_HASH,),
             funding_source_hashes=(OTHER_SOURCE_HASH,),
             reason_codes=(),

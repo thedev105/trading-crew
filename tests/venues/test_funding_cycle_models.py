@@ -47,7 +47,7 @@ def complete_items() -> tuple[FundingCycleItem, ...]:
         item(
             funding_outcome=FundingCaptureOutcome.NO_SETTLEMENT,
             funding_effective_at=None,
-            funding_observed_at=None,
+            funding_observed_at=CYCLE_END + timedelta(minutes=1),
         ),
         item(
             venue=Venue.HYPERLIQUID,
@@ -140,6 +140,7 @@ def test_cycle_timing_rejects_invalid_boundaries(
         {"funding_observed_at": None},
         {
             "funding_outcome": FundingCaptureOutcome.NO_SETTLEMENT,
+            "funding_effective_at": None,
             "funding_observed_at": None,
         },
     ],
@@ -177,7 +178,7 @@ def test_item_outcomes_require_consistent_component_timestamps(
                 "symbol": "BTC",
                 "funding_outcome": FundingCaptureOutcome.NO_SETTLEMENT,
                 "funding_effective_at": None,
-                "funding_observed_at": None,
+                "funding_observed_at": CYCLE_END + timedelta(minutes=1),
             },
             "funding outcome is invalid for venue",
         ),
@@ -215,6 +216,15 @@ def test_cycle_rejects_wrong_boundary_status_and_request_order() -> None:
         cycle(status=FundingCycleStatus.DEGRADED)
     with pytest.raises(ValidationError, match="request completion must not precede request start"):
         cycle(request_completed_at=CYCLE_END)
+
+
+def test_cycle_rejects_component_observations_before_the_named_boundary() -> None:
+    early_bybit = complete_items()[0].model_copy(
+        update={"instrument_observed_at": CYCLE_END - timedelta(microseconds=1)}
+    )
+
+    with pytest.raises(ValidationError, match="item observation must not precede cycle end"):
+        cycle(items=(early_bybit, complete_items()[1]))
 
 
 def test_cycle_status_is_degraded_for_bootstrap_and_late_after_the_cutoff() -> None:

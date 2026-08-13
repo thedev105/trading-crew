@@ -111,15 +111,15 @@ class FundingCycleItem(StrictRecord):
         if instrument_captured != (self.instrument_observed_at is not None):
             raise ValueError("outcome timestamps are inconsistent")
 
-        funding_timestamps = (
-            self.funding_effective_at is not None and self.funding_observed_at is not None
+        funding_captured = self.funding_outcome is FundingCaptureOutcome.CAPTURED
+        funding_has_valid_response = self.funding_outcome in (
+            FundingCaptureOutcome.CAPTURED,
+            FundingCaptureOutcome.NO_SETTLEMENT,
+            FundingCaptureOutcome.MISSING_EXPECTED,
         )
-        funding_partial = (self.funding_effective_at is None) != (
-            self.funding_observed_at is None
-        )
-        if funding_partial or (
-            self.funding_outcome is FundingCaptureOutcome.CAPTURED
-        ) != funding_timestamps:
+        if funding_captured != (self.funding_effective_at is not None) or (
+            funding_has_valid_response != (self.funding_observed_at is not None)
+        ):
             raise ValueError("outcome timestamps are inconsistent")
         if (
             self.funding_effective_at is not None
@@ -130,11 +130,6 @@ class FundingCycleItem(StrictRecord):
 
         if instrument_captured != bool(self.instrument_source_hashes):
             raise ValueError("instrument source hashes do not match outcome")
-        funding_has_valid_response = self.funding_outcome in (
-            FundingCaptureOutcome.CAPTURED,
-            FundingCaptureOutcome.NO_SETTLEMENT,
-            FundingCaptureOutcome.MISSING_EXPECTED,
-        )
         if funding_has_valid_response != bool(self.funding_source_hashes):
             raise ValueError("funding source hashes do not match outcome")
 
@@ -255,6 +250,8 @@ class FundingCollectionCycle(StrictRecord):
             ):
                 raise ValueError("funding effective time must equal cycle end")
             for observed_at in (item.instrument_observed_at, item.funding_observed_at):
+                if observed_at is not None and observed_at < self.cycle_end:
+                    raise ValueError("item observation must not precede cycle end")
                 if observed_at is not None and observed_at > self.request_completed_at:
                     raise ValueError("item observation must not follow request completion")
 
