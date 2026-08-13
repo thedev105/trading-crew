@@ -14,6 +14,7 @@ from uuid import UUID
 import duckdb
 from pydantic import BaseModel
 
+from polytrading.ai.models import ModelCard, RelationshipCandidateArtifact, RuleExtractionArtifact
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -294,6 +295,63 @@ class DuckDBStore:
         self._connection.execute(
             "INSERT INTO experiments VALUES (?, ?::JSON, ?)",
             [record.experiment_id, _canonical_json(record), _record_hash(record)],
+        )
+        return True
+
+    def append_model_card(self, record: ModelCard) -> bool:
+        record_json = _canonical_json(record)
+        existing = self._connection.execute(
+            """
+            SELECT record_json FROM model_cards
+            WHERE model_id = ? AND version = ?
+            """,
+            [record.model_id, record.version],
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != record_json:
+                raise ConflictingRecordError("conflicting model card for immutable identity")
+            return False
+        self._connection.execute(
+            "INSERT INTO model_cards VALUES (?, ?, ?, ?)",
+            [record.model_id, record.version, record_json, _record_hash(record)],
+        )
+        return True
+
+    def get_model_card(self, model_id: str, version: str) -> ModelCard | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM model_cards
+            WHERE model_id = ? AND version = ?
+            """,
+            [model_id, version],
+        ).fetchone()
+        if row is None:
+            return None
+        return ModelCard.model_validate_json(row[0])
+
+    def append_ai_artifact(
+        self, record: RuleExtractionArtifact | RelationshipCandidateArtifact
+    ) -> bool:
+        record_json = _canonical_json(record)
+        existing = self._connection.execute(
+            "SELECT record_json FROM ai_artifacts WHERE artifact_id = ?", [record.artifact_id]
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != record_json:
+                raise ConflictingRecordError("conflicting AI artifact for immutable identity")
+            return False
+        self._connection.execute(
+            "INSERT INTO ai_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                record.artifact_id,
+                type(record).__name__,
+                record.model_id,
+                record.model_version,
+                record.created_at,
+                record.expires_at,
+                record_json,
+                _record_hash(record),
+            ],
         )
         return True
 

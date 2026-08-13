@@ -146,7 +146,7 @@ def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Pat
     with duckdb.connect(str(path), read_only=True) as connection:
         assert connection.execute(
             "SELECT version, count(*) FROM schema_migrations GROUP BY version"
-        ).fetchall() == [(1, 1)]
+        ).fetchall() == [(1, 1), (2, 1)]
 
 
 def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
