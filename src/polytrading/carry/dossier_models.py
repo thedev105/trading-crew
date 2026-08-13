@@ -8,18 +8,32 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
+from polytrading.domain.models import Asset, StrictRecord, normalize_utc_timestamp
 
 _TOKEN_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
 _DOSSIER_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ASSET_ORDER = (Asset.BTC, Asset.ETH, Asset.SOL)
+
+
+class ResearchVenue(StrEnum):
+    HYPERLIQUID = "hyperliquid"
+    DYDX = "dydx"
+    LIGHTER = "lighter"
+
+
 _OFFICIAL_SOURCE_PREFIXES = {
-    Venue.HYPERLIQUID: ("https://hyperliquid.gitbook.io/hyperliquid-docs/",),
-    Venue.DYDX: (
+    ResearchVenue.HYPERLIQUID: ("https://hyperliquid.gitbook.io/hyperliquid-docs/",),
+    ResearchVenue.DYDX: (
         "https://help.dydx.trade/",
         "https://github.com/dydxprotocol/",
         "https://docs.dydx.community/",
         "https://docs.dydx.xyz/",
+    ),
+    ResearchVenue.LIGHTER: (
+        "https://docs.lighter.xyz/",
+        "https://apidocs.lighter.xyz/",
+        "https://lighter.xyz/",
+        "https://assets.lighter.xyz/",
     ),
 }
 RESEARCH_ONLY_WARNING = "Research only — no trading authority."
@@ -62,7 +76,7 @@ class DossierStatus(StrEnum):
 class DossierSource(StrictRecord):
     schema_version: Literal[1]
     source_id: str
-    venue: Venue
+    venue: ResearchVenue
     url: str
     title: str
     observed_at: datetime
@@ -145,8 +159,8 @@ class DossierCheck(StrictRecord):
 class ContractCompatibilityDossier(StrictRecord):
     schema_version: Literal[1]
     dossier_id: str
-    left_venue: Venue
-    right_venue: Venue
+    left_venue: ResearchVenue
+    right_venue: ResearchVenue
     assets: tuple[Asset, ...]
     observed_at: datetime
     decision_scope: Literal["research_only"]
@@ -216,8 +230,8 @@ class DossierJudgmentCounts(StrictRecord):
 class ContractDossierReport(StrictRecord):
     schema_version: Literal[1]
     dossier_id: str
-    left_venue: Venue
-    right_venue: Venue
+    left_venue: ResearchVenue
+    right_venue: ResearchVenue
     assets: tuple[Asset, ...]
     observed_at: datetime
     warning: Literal["Research only — no trading authority."]

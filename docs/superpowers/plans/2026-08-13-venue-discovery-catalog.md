@@ -6,7 +6,7 @@
 
 **Architecture:** Keep research-only venue identities in the dossier domain instead of widening the market-data adapter enum. Load two explicitly named package resources, evaluate each with the existing fail-closed logic, then rank their immutable reports in a separate discovery model. Expose that report through offline CLI renderers and the point-in-time dashboard without adding network, account, or execution behavior.
 
-**Tech Stack:** Python 3.12–3.14, Pydantic v2 strict/frozen models, `importlib.resources`, argparse, pytest, vanilla JavaScript/CSS, Hatchling wheel packaging, Ruff.
+**Tech Stack:** Python 3.12–3.14, Pydantic v2 strict/frozen models, `importlib.resources`, argparse, pytest, vanilla JavaScript/CSS, Setuptools wheel packaging, Ruff.
 
 ## Global Constraints
 
@@ -153,9 +153,9 @@ Keep catalog IDs explicit; do not glob arbitrary package JSON.
 
 - [ ] **Step 5: Add the immutable Lighter/dYdX artifact**
 
-Use `observed_at="2026-08-13T16:23:08Z"`, core assets in BTC/ETH/SOL order, and 16 source
-records: the eight Lighter and eight dYdX URLs listed in the design. Keep every excerpt under 25
-words. Required Lighter excerpts include these exact page strings:
+Use `observed_at="2026-08-13T16:23:08Z"`, core assets in BTC/ETH/SOL order, and 17 source
+records: nine Lighter records across the eight Lighter URLs and eight dYdX records from the design.
+Keep every excerpt under 25 words. Required Lighter excerpts include these exact page strings:
 
 ```text
 Currently each deployed market has a funding period of 1 hour.
@@ -168,8 +168,8 @@ Standard Account (Default) — Trade for free.
 The Company may suspend or terminate your access, without prior notice
 ```
 
-Add the sequence-continuity source as a ninth Lighter record if needed so both order constraints
-and failure domains cite direct evidence. Reuse the seven current dYdX technical excerpts from the
+Use the sequence-continuity excerpt as the ninth Lighter record so order constraints cite direct
+evidence. Reuse the seven current dYdX technical excerpts from the
 legacy artifact and add the geo-restriction excerpt from the official help page. Generate each
 `excerpt_sha256` from the exact JSON string bytes; never hand-edit a hash.
 

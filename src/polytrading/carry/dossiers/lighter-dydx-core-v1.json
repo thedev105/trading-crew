@@ -1,0 +1,310 @@
+{
+  "schema_version": 1,
+  "dossier_id": "lighter-dydx-core-v1",
+  "left_venue": "lighter",
+  "right_venue": "dydx",
+  "assets": ["BTC", "ETH", "SOL"],
+  "observed_at": "2026-08-13T16:23:08Z",
+  "decision_scope": "research_only",
+  "warning": "Research only — no trading authority.",
+  "sources": [
+    {
+      "schema_version": 1,
+      "source_id": "lighter_contract_specifications",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/trading/contract-specifications",
+      "title": "Contract Specifications",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "Currently each deployed market has a funding period of 1 hour.",
+      "excerpt_sha256": "4ed29414c46c52f9bb51955a9e8844bbb2c5a5347f0de4c5081ea0c3b27b83ad"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_pnl_account_value",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/trading/pnl-and-total-account-value",
+      "title": "PnL And Total Account Value",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "It is calculated based on the difference in USDC value between your average entry price and exit price.",
+      "excerpt_sha256": "17e90c4d8a1a77fa0a79bc26192725ce4cd0ed9d711f7e6bc713207fdbc0894d"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_fair_price_marking",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/perpetual-futures/fair-price-marking",
+      "title": "Fair Price Marking",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "Lighter uses a combination of oracles (Chainlink, Stork, Pyth) to determine the index price.",
+      "excerpt_sha256": "1de9033752d247f17f95faa7a481842f8f2806ca578ba54b0354f618596cd99d"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_liquidations",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/trading/liquidations-and-llp-insurance-fund",
+      "title": "Liquidations & LLP (Insurance Fund)",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "liquidation engine first cancels all of the open orders of the user.",
+      "excerpt_sha256": "eb4688dc8b084700cdab3a95e0d8f2d8d1f1189dbfecbec2c3cc925e536a01e0"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_funding",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/trading/funding",
+      "title": "Funding",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "fundingRate = clamp(smallClampedPremium, -BigClamp, +BigClamp) / 8",
+      "excerpt_sha256": "e20c4f71400115b3be4356af374158f6b6629b5e9a27382fea2eb69271a59f87"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_trading_fees",
+      "venue": "lighter",
+      "url": "https://docs.lighter.xyz/trading/trading-fees",
+      "title": "Trading Fees",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "Standard Account (Default) — Trade for free.",
+      "excerpt_sha256": "0ea33588924111fee241e4ccb6286104c50b52ece4732f32a534f7ba3c9949f9"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_websocket_orderbook",
+      "venue": "lighter",
+      "url": "https://apidocs.lighter.xyz/docs/websocket-reference",
+      "title": "WebSocket",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "To verify the continuity of the data, you can check that `begin_nonce` on the current update matches the `nonce`",
+      "excerpt_sha256": "7ec20b3ff675be0f83b18da5008791a2eb5d65f877e1f40ce40bedb6cf03d86f"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_terms_architecture",
+      "venue": "lighter",
+      "url": "https://lighter.xyz/terms",
+      "title": "Terms of Service",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "the Protocol, which is autonomous software running on a Layer 2 Ethereum blockchain",
+      "excerpt_sha256": "99d14faa0b8b48cb860737d5ae22c3518830b7b748a9f51e37e6e9d7f21eed9f"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "lighter_terms_access",
+      "venue": "lighter",
+      "url": "https://lighter.xyz/terms",
+      "title": "Terms of Service — access restrictions",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "The Company may suspend or terminate your access, without prior notice",
+      "excerpt_sha256": "47d4c68539c6e5087a584f8e6cfaebeb58ce559d9cba39b540f08757b8afeebb"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_perpetual_protocol",
+      "venue": "dydx",
+      "url": "https://github.com/dydxprotocol/v4-chain/blob/main/proto/dydxprotocol/perpetuals/perpetual.proto",
+      "title": "Perpetual protocol definition",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "It acts as the oracle price for the purposes of calculating collateral, margin requirements, and funding rates.",
+      "excerpt_sha256": "dcf8942be134c299ed935f66e451153e923f7f1e1dc39d17ebdbe83fd3a61709"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_oracle_prices",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166990-oracle-prices-on-dydx-chain",
+      "title": "Oracle prices on dYdX Chain",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "The oracle price for each trading pair is used for the following:",
+      "excerpt_sha256": "65f0d6038df1c0d1640597c8199a7d23cc4546ef4ad9715926449110a166bed2"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_funding",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166992-default-funding-rates-on-dydx",
+      "title": "Default funding rates on dYdX",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "We charge funding rates every hour on our platform.",
+      "excerpt_sha256": "690ea65254607e28d31e239134362e8157f48b2f9c27e65ca6df2d37bd7d03d0"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_liquidity_tiers",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166993-default-liquidity-tiers-on-dydx-chain",
+      "title": "Default Liquidity Tiers on dYdX Chain",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "Each market has a Lower Cap and Upper Cap denominated in USDC.",
+      "excerpt_sha256": "ec3eb038f43366a0f503d58db21af3db6750647abf9310e92c3921d117255f38"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_liquidations",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166991-liquidations-on-dydx-chain",
+      "title": "Liquidations on dYdX Chain",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "Positions are closed via protocol-generated liquidation matches",
+      "excerpt_sha256": "7aaf1b48d8fffb6fa130af5fdf53deb04c15a9039e365aab4fa172e0a6e3d36e"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_contract_loss",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166973-contract-loss-mechanisms-on-dydx-chain",
+      "title": "Contract loss mechanisms on dYdX Chain",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "If an account’s value turns negative, deleveraging occurs immediately against randomly chosen offsetting positions",
+      "excerpt_sha256": "4c31e68838e71bdeeda581f9d2a6ad33c11d82acce5569a77914a4a3dfe8290d"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_fees",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166995-trading-fees-on-dydx",
+      "title": "Trading fees on dYdX",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "dYdX uses a maker-taker fee model for determining trade fees.",
+      "excerpt_sha256": "413fa32d07d07760e056ef2501da83744737e472cbaf6953ef04c6048cc145b6"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_geo_restrictions",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166970-geo-restrictions-site-access",
+      "title": "Geo Restrictions & Site Access",
+      "observed_at": "2026-08-13T16:23:08Z",
+      "evidence_excerpt": "frontends operated by dYdX Operations Services Ltd. (DOS) are not available to users in certain restricted jurisdictions",
+      "excerpt_sha256": "21275f74a378de9152f35a7a3e1ef3c90dc5a5cad047bd7661503632c6d9e5cc"
+    }
+  ],
+  "checks": [
+    {
+      "schema_version": 1,
+      "kind": "asset_and_quantity",
+      "judgment": "matched",
+      "reason_code": "base_quantity_semantics_match",
+      "left_summary": "Core BTC, ETH, and SOL contract specifications use base-asset amount steps.",
+      "right_summary": "Protocol positions use base quantums convertible to full underlying units.",
+      "source_ids": ["lighter_contract_specifications", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "payoff_and_quote",
+      "judgment": "matched",
+      "reason_code": "linear_usd_payoff_matches",
+      "left_summary": "Position P&L is the base position times the USD exit-to-entry price difference.",
+      "right_summary": "The protocol definition models base positions against quote quantums without inverse or quanto treatment.",
+      "source_ids": ["lighter_pnl_account_value", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "collateral_and_pnl",
+      "judgment": "matched",
+      "reason_code": "usdc_accounting_matches",
+      "left_summary": "Realized P&L and total account value are denominated in USDC for the selected perpetual account.",
+      "right_summary": "Margin caps and quote accounting are denominated in USDC.",
+      "source_ids": ["lighter_pnl_account_value", "dydx_liquidity_tiers", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "oracle_construction",
+      "judgment": "model_required",
+      "reason_code": "oracle_construction_differs",
+      "left_summary": "The index combines Chainlink, Stork, and Pyth oracle inputs.",
+      "right_summary": "Validator-consensus oracle prices feed collateral, margin, liquidations, and funding.",
+      "source_ids": ["lighter_fair_price_marking", "dydx_oracle_prices", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "mark_and_margin",
+      "judgment": "model_required",
+      "reason_code": "mark_and_margin_differs",
+      "left_summary": "A composite fair mark combines impact and external price components for P&L and margin.",
+      "right_summary": "The documented oracle drives collateral and liquidation while liquidity tiers scale margin.",
+      "source_ids": ["lighter_fair_price_marking", "dydx_oracle_prices", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "liquidation",
+      "judgment": "model_required",
+      "reason_code": "liquidation_mechanism_differs",
+      "left_summary": "The engine cancels orders, attempts protected IOC closes, and can transfer positions to LLP.",
+      "right_summary": "Protocol-generated liquidation orders match resting order-book liquidity with governance-controlled rules.",
+      "source_ids": ["lighter_liquidations", "dydx_liquidations"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "auto_deleveraging",
+      "judgment": "model_required",
+      "reason_code": "deleveraging_mechanism_differs",
+      "left_summary": "ADL uses opposite positions when LLP cannot cover a bankrupt account and ranks counterparties by leverage and unrealized P&L.",
+      "right_summary": "Randomly chosen offsetting positions can be deleveraged when an account becomes negative.",
+      "source_ids": ["lighter_liquidations", "dydx_contract_loss"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_interval",
+      "judgment": "matched",
+      "reason_code": "hourly_funding_matches",
+      "left_summary": "Selected deployed markets have a one-hour funding period.",
+      "right_summary": "Funding is charged every hour.",
+      "source_ids": ["lighter_contract_specifications", "dydx_funding"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_formula",
+      "judgment": "model_required",
+      "reason_code": "funding_formula_differs",
+      "left_summary": "The formula samples impact premiums and applies interest and two clamps before dividing by eight.",
+      "right_summary": "The formula uses proposer-voted premiums and governance-adjustable sampling and clamp parameters.",
+      "source_ids": ["lighter_funding", "dydx_funding"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_cap",
+      "judgment": "model_required",
+      "reason_code": "funding_caps_differ",
+      "left_summary": "The documented big clamp is converted to a per-hour rate by the funding formula.",
+      "right_summary": "The cap depends on governance-controlled initial and maintenance margin parameters.",
+      "source_ids": ["lighter_funding", "dydx_funding", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "order_constraints",
+      "judgment": "model_required",
+      "reason_code": "point_in_time_constraints_required",
+      "left_summary": "Core steps and margins are documented, and sequence continuity is observable, but parameters and executable depth require point-in-time capture.",
+      "right_summary": "Governance-controlled liquidity tiers and account rate limits require point-in-time capture.",
+      "source_ids": ["lighter_contract_specifications", "lighter_websocket_orderbook", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "fee_schedule",
+      "judgment": "model_required",
+      "reason_code": "effective_fee_and_latency_model_required",
+      "left_summary": "Standard and Premium account types trade fee against enforced maker, taker, and cancellation latency.",
+      "right_summary": "Maker-taker fees are tiered and governance-adjustable, so effective costs require current account state.",
+      "source_ids": ["lighter_trading_fees", "dydx_fees"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "venue_failure_domain",
+      "judgment": "model_required",
+      "reason_code": "failure_domain_model_required",
+      "left_summary": "The protocol runs on an Ethereum Layer 2 and retains operator API, oracle, USDC, and LLP dependencies.",
+      "right_summary": "dYdX Chain has separate consensus but retains oracle, USDC, validator, and interface dependencies.",
+      "source_ids": ["lighter_terms_architecture", "lighter_fair_price_marking", "dydx_perpetual_protocol", "dydx_oracle_prices"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "access_eligibility",
+      "judgment": "model_required",
+      "reason_code": "eligibility_review_required",
+      "left_summary": "Official terms impose location, sanctions, wallet-ownership, API-use, and discretionary access restrictions requiring independent review.",
+      "right_summary": "The operated frontend restricts certain jurisdictions and can enforce close-only or blocked access, requiring independent review.",
+      "source_ids": ["lighter_terms_access", "dydx_geo_restrictions"]
+    }
+  ]
+}

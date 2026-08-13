@@ -18,20 +18,42 @@ _STATUS_PRECEDENCE = (
     (DossierJudgment.MODEL_REQUIRED, DossierStatus.MODEL_REQUIRED),
 )
 
-_BUNDLED_DOSSIER = "hyperliquid-dydx-core-v1.json"
+BUNDLED_DOSSIER_IDS = (
+    "hyperliquid-dydx-core-v1",
+    "lighter-dydx-core-v1",
+)
 
 
-def load_bundled_dossier() -> ContractCompatibilityDossier:
+def load_bundled_dossier(
+    dossier_id: str = "hyperliquid-dydx-core-v1",
+) -> ContractCompatibilityDossier:
     """Load and validate the immutable contract dossier packaged with the application."""
+    if dossier_id not in BUNDLED_DOSSIER_IDS:
+        raise ValueError(f"unknown bundled dossier: {dossier_id}")
     try:
         payload = (
             files("polytrading.carry.dossiers")
-            .joinpath(_BUNDLED_DOSSIER)
+            .joinpath(f"{dossier_id}.json")
             .read_text(encoding="utf-8")
         )
-        return ContractCompatibilityDossier.model_validate_json(payload)
+        dossier = ContractCompatibilityDossier.model_validate_json(payload)
     except (OSError, UnicodeError, ValidationError) as error:
-        raise ValueError("invalid bundled dossier: hyperliquid-dydx-core-v1") from error
+        raise ValueError(f"invalid bundled dossier: {dossier_id}") from error
+    if dossier.dossier_id != dossier_id:
+        raise ValueError(f"invalid bundled dossier: {dossier_id}")
+    return dossier
+
+
+def load_bundled_dossiers() -> tuple[ContractCompatibilityDossier, ...]:
+    """Load the explicit research catalog and reject ambiguous catalog identity."""
+    dossiers = tuple(load_bundled_dossier(dossier_id) for dossier_id in BUNDLED_DOSSIER_IDS)
+    dossier_ids = tuple(dossier.dossier_id for dossier in dossiers)
+    pairs = tuple((dossier.left_venue, dossier.right_venue) for dossier in dossiers)
+    if len(set(dossier_ids)) != len(dossier_ids):
+        raise ValueError("invalid bundled dossier catalog: duplicate dossier ID")
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("invalid bundled dossier catalog: duplicate venue pair")
+    return dossiers
 
 
 def evaluate_dossier(dossier: ContractCompatibilityDossier) -> ContractDossierReport:

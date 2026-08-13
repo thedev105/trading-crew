@@ -13,6 +13,7 @@ from polytrading.carry.dossier_models import (
     DossierJudgment,
     DossierSource,
     DossierStatus,
+    ResearchVenue,
 )
 from polytrading.domain.models import Asset, Venue
 
@@ -27,7 +28,7 @@ def dossier_source(**overrides: object) -> DossierSource:
     values: dict[str, object] = {
         "schema_version": 1,
         "source_id": SOURCE_ID,
-        "venue": Venue.HYPERLIQUID,
+        "venue": ResearchVenue.HYPERLIQUID,
         "url": SOURCE_URL,
         "title": "Contract specifications",
         "observed_at": DOSSIER_AT,
@@ -41,7 +42,7 @@ def dossier_source(**overrides: object) -> DossierSource:
 def right_dossier_source(**overrides: object) -> DossierSource:
     values: dict[str, object] = {
         "source_id": RIGHT_SOURCE_ID,
-        "venue": Venue.DYDX,
+        "venue": ResearchVenue.DYDX,
         "url": (
             "https://github.com/dydxprotocol/v4-chain/blob/main/"
             "proto/dydxprotocol/perpetuals/perpetual.proto"
@@ -82,8 +83,8 @@ def contract_dossier(
     values: dict[str, object] = {
         "schema_version": 1,
         "dossier_id": "hyperliquid-dydx-core-v1",
-        "left_venue": Venue.HYPERLIQUID,
-        "right_venue": Venue.DYDX,
+        "left_venue": ResearchVenue.HYPERLIQUID,
+        "right_venue": ResearchVenue.DYDX,
         "assets": (Asset.BTC, Asset.ETH, Asset.SOL),
         "observed_at": DOSSIER_AT,
         "decision_scope": "research_only",
@@ -118,6 +119,26 @@ def test_source_rejects_unverifiable_or_noncanonical_evidence(
 ) -> None:
     with pytest.raises(ValidationError, match=match):
         dossier_source(**change)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.lighter.xyz/trading/funding",
+        "https://apidocs.lighter.xyz/docs/websocket-reference",
+        "https://lighter.xyz/terms",
+        "https://assets.lighter.xyz/whitepaper.pdf",
+    ],
+)
+def test_lighter_source_accepts_only_documented_official_domains(url: str) -> None:
+    source = dossier_source(venue=ResearchVenue.LIGHTER, url=url)
+
+    assert source.venue is ResearchVenue.LIGHTER
+
+
+def test_research_venues_do_not_expand_market_data_adapter_support() -> None:
+    assert tuple(Venue) == (Venue.HYPERLIQUID, Venue.BYBIT, Venue.DYDX)
+    assert ResearchVenue.LIGHTER.value == "lighter"
 
 
 def test_dossier_rejects_source_observed_after_its_cutoff() -> None:
@@ -163,7 +184,7 @@ def test_dossier_rejects_unknown_and_uncited_sources() -> None:
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"right_venue": Venue.HYPERLIQUID}, "distinct"),
+        ({"right_venue": ResearchVenue.HYPERLIQUID}, "distinct"),
         ({"assets": (Asset.BTC, Asset.BTC)}, "unique canonical order"),
         ({"assets": (Asset.ETH, Asset.BTC)}, "unique canonical order"),
         ({"dossier_id": "Upper Case"}, "dossier ID"),
