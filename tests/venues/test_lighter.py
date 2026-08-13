@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ RECEIVED_1 = datetime(2026, 8, 13, 12, 0, 1, tzinfo=UTC)
 RECEIVED_2 = datetime(2026, 8, 13, 12, 0, 2, tzinfo=UTC)
 FUNDING_START = datetime(2026, 8, 13, 10, tzinfo=UTC)
 FUNDING_END = datetime(2026, 8, 13, 12, tzinfo=UTC)
+CYCLE_ID = UUID("00000000-0000-0000-0000-000000000813")
 
 
 def fixture_bytes(name: str) -> bytes:
@@ -580,3 +582,247 @@ def test_fetch_funding_history_rejects_conflicting_duplicate() -> None:
                 Asset.BTC, FUNDING_START, FUNDING_START + timedelta(hours=1), REQUEST_CONTEXT
             )
         )
+
+
+def test_fetch_order_books_aggregates_orders_and_uses_local_receipt_time() -> None:
+    # Catches response-order leakage, missing price aggregation, hard-coded IDs, or invented timing.
+    market_payload = fixture_bytes("order_books.json")
+    book_payload = fixture_bytes("order_book_orders.json")
+    requests: list[httpx.Request] = []
+    receipts = [
+        RECEIVED_1,
+        datetime(2026, 8, 13, 12, 1, 1, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 1, 2, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 1, 3, tzinfo=UTC),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(market_payload if request.url.path.endswith("orderBooks") else book_payload)
+
+    adapter = make_adapter(handler, wall_times=receipts)
+    batch = asyncio.run(
+        adapter.fetch_order_books(
+            frozenset({Asset.SOL, Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID
+        )
+    )
+
+    assert [request.url.path for request in requests] == [
+        "/api/v1/orderBooks",
+        "/api/v1/orderBookOrders",
+        "/api/v1/orderBookOrders",
+        "/api/v1/orderBookOrders",
+    ]
+    assert [dict(request.url.params) for request in requests] == [
+        {"filter": "perp"},
+        {"market_id": "1", "limit": "100"},
+        {"market_id": "0", "limit": "100"},
+        {"market_id": "2", "limit": "100"},
+    ]
+    assert [raw.payload_json for raw in batch.raw] == [
+        market_payload.decode(),
+        book_payload.decode(),
+        book_payload.decode(),
+        book_payload.decode(),
+    ]
+    assert all(raw.venue_timestamp is None for raw in batch.raw)
+    assert [book.asset for book in batch.normalized] == [Asset.BTC, Asset.ETH, Asset.SOL]
+    assert [book.symbol for book in batch.normalized] == ["BTC", "ETH", "SOL"]
+    for index, book in enumerate(batch.normalized):
+        assert book.cycle_id == CYCLE_ID
+        assert book.depth_limit == 20
+        assert book.sequence is None
+        assert book.effective_at == receipts[index + 1]
+        assert book.observed_at == receipts[index + 1]
+        assert book.source_hash == batch.raw[index + 1].source_hash
+        assert [(level.price, level.quantity, level.order_count) for level in book.bids] == [
+            (Decimal("99.00"), Decimal("1.5000"), 2),
+            (Decimal("98.00"), Decimal("2.0000"), 1),
+            (Decimal("97.00"), Decimal("1.2500"), 1),
+        ]
+        assert [(level.price, level.quantity, level.order_count) for level in book.asks] == [
+            (Decimal("101.00"), Decimal("1.2500"), 2),
+            (Decimal("102.00"), Decimal("2.0000"), 1),
+            (Decimal("103.00"), Decimal("3.0000"), 1),
+        ]
+    assert batch.warnings == tuple(
+        AdapterWarning(
+            code="LIGHTER_REST_BOOK_LOCAL_TIMESTAMP",
+            venue=Venue.LIGHTER,
+            endpoint="/api/v1/orderBookOrders",
+            symbol=symbol,
+            message=(
+                "Lighter REST book has no venue snapshot timestamp or sequence; "
+                "local receipt time was used"
+            ),
+        )
+        for symbol in ("BTC", "ETH", "SOL")
+    )
+
+
+def test_fetch_order_books_rejects_blank_order_id() -> None:
+    # Catches distinct public orders collapsing onto an unusable empty identity.
+    document = json.loads(fixture_bytes("order_book_orders.json"))
+    document["bids"][0]["order_id"] = ""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = fixture_bytes("order_books.json") if calls == 1 else json.dumps(document).encode()
+        return response(payload)
+
+    adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
+
+    with pytest.raises(ValueError, match="order_id"):
+        asyncio.run(adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID))
+
+
+def book_adapter_for(document: object, *, wall_times: list[datetime] | None = None) -> Any:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = fixture_bytes("order_books.json") if calls == 1 else json.dumps(document).encode()
+        return response(payload)
+
+    return make_adapter(handler, wall_times=wall_times or [RECEIVED_1, RECEIVED_2])
+
+
+def malformed_book(mutation: str) -> object:
+    document = json.loads(fixture_bytes("order_book_orders.json"))
+    if mutation == "missing_bids":
+        del document["bids"]
+    elif mutation == "non_list":
+        document["bids"] = {}
+    elif mutation == "negative_total":
+        document["total_bids"] = -1
+    elif mutation == "bool_total":
+        document["total_bids"] = True
+    elif mutation == "total_mismatch":
+        document["total_bids"] = 3
+    elif mutation == "non_mapping_order":
+        document["bids"][0] = "bad"
+    elif mutation == "missing_price":
+        del document["bids"][0]["price"]
+    elif mutation == "invalid_price":
+        document["bids"][0]["price"] = "bad"
+    elif mutation == "zero_quantity":
+        document["bids"][0]["remaining_base_amount"] = "0"
+    elif mutation == "duplicate_id_within":
+        document["bids"][1]["order_id"] = document["bids"][0]["order_id"]
+    elif mutation == "duplicate_id_across":
+        document["asks"][0]["order_id"] = document["bids"][0]["order_id"]
+    elif mutation == "empty_side":
+        document["asks"] = []
+        document["total_asks"] = 0
+    elif mutation == "locked":
+        document["asks"][0]["price"] = "99.00"
+        document["asks"][2]["price"] = "99.00"
+    else:
+        document["asks"][0]["price"] = "98.00"
+        document["asks"][2]["price"] = "98.00"
+    return document
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_bids", "bids"),
+        ("non_list", "list"),
+        ("negative_total", "nonnegative"),
+        ("bool_total", "integer"),
+        ("total_mismatch", "does not match"),
+        ("non_mapping_order", "mapping"),
+        ("missing_price", "price"),
+        ("invalid_price", "decimal"),
+        ("zero_quantity", "positive"),
+        ("duplicate_id_within", "duplicate order_id"),
+        ("duplicate_id_across", "duplicate order_id"),
+        ("empty_side", "empty"),
+        ("locked", "locked or crossed"),
+        ("crossed", "locked or crossed"),
+    ],
+)
+def test_fetch_order_books_fails_closed_on_malformed_or_impossible_response(
+    mutation: str, message: str
+) -> None:
+    # Catches structurally invalid individual orders becoming executable-depth evidence.
+    adapter = book_adapter_for(malformed_book(mutation))
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID))
+
+
+def complete_order(order_id: str, price: int, quantity: str = "1.0") -> dict[str, object]:
+    return {
+        "order_index": int(order_id.split("-")[-1]),
+        "order_id": order_id,
+        "owner_account_index": 1,
+        "initial_base_amount": quantity,
+        "remaining_base_amount": quantity,
+        "price": str(price),
+        "order_expiry": 1789059567000,
+        "transaction_time": 0,
+    }
+
+
+def test_fetch_order_books_retains_only_best_twenty_aggregated_prices() -> None:
+    # Catches truncation before sorting or an unbounded depth result.
+    bids = [complete_order(f"b-{index}", 99 - index) for index in range(22)]
+    asks = [complete_order(f"a-{index + 100}", 101 + index) for index in range(22)]
+    document = {
+        "code": 200,
+        "total_asks": 22,
+        "asks": list(reversed(asks)),
+        "total_bids": 22,
+        "bids": list(reversed(bids)),
+    }
+    adapter = book_adapter_for(document)
+
+    batch = asyncio.run(
+        adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID)
+    )
+
+    book = batch.normalized[0]
+    assert [level.price for level in book.bids] == [Decimal(value) for value in range(99, 79, -1)]
+    assert [level.price for level in book.asks] == [Decimal(value) for value in range(101, 121)]
+
+
+def test_fetch_order_books_rejects_more_than_requested_order_limit() -> None:
+    # Catches endpoint limit drift invalidating bounded aggregation work.
+    bids = [complete_order(f"b-{index}", 200 - index) for index in range(101)]
+    document = {
+        "code": 200,
+        "total_asks": 1,
+        "asks": [complete_order("a-200", 202)],
+        "total_bids": 101,
+        "bids": bids,
+    }
+    adapter = book_adapter_for(document)
+
+    with pytest.raises(ValueError, match="order limit"):
+        asyncio.run(adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID))
+
+
+def test_fetch_order_books_does_not_return_partial_batch_after_later_asset_failure() -> None:
+    # Catches a multi-asset call silently succeeding after one requested book is invalid.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return response(fixture_bytes("order_books.json"))
+        if calls == 2:
+            return response(fixture_bytes("order_book_orders.json"))
+        return response(json.dumps(malformed_book("empty_side")).encode())
+
+    adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2, RECEIVED_2])
+
+    with pytest.raises(ValueError, match="empty"):
+        asyncio.run(
+            adapter.fetch_order_books(frozenset({Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID)
+        )
+    assert calls == 3

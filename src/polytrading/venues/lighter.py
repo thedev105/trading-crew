@@ -6,14 +6,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 import httpx
 
 from polytrading.domain.models import (
     Asset,
+    BookLevel,
     FundingObservation,
     InstrumentKind,
     InstrumentSpec,
+    Level2BookSnapshot,
     RawEnvelope,
     Venue,
     normalize_utc_timestamp,
@@ -24,8 +27,10 @@ from polytrading.venues.recorder import make_raw_envelope
 _BASE_URL = "https://mainnet.zklighter.elliot.ai"
 _MARKETS_ENDPOINT = "/api/v1/orderBooks"
 _FUNDINGS_ENDPOINT = "/api/v1/fundings"
+_BOOK_ENDPOINT = "/api/v1/orderBookOrders"
 _SOURCE_VERSION = "mainnet-v1-public"
 _MAX_FUNDING_RANGE = timedelta(days=7)
+_BOOK_ORDER_LIMIT = 100
 _SYMBOL_BY_ASSET = {
     Asset.BTC: "BTC",
     Asset.ETH: "ETH",
@@ -180,6 +185,63 @@ class LighterPublicAdapter:
             normalized=normalized,
         )
 
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        _require_collection_context(observed_at)
+        markets_received, selected = await self._resolve_markets(assets)
+        raws = [markets_received.raw_envelope()]
+        books: list[Level2BookSnapshot] = []
+        warnings: list[AdapterWarning] = []
+        for asset, symbol, market_id, _row in selected:
+            received = await self._get(
+                _BOOK_ENDPOINT,
+                {"market_id": market_id, "limit": _BOOK_ORDER_LIMIT},
+            )
+            seen_order_ids: set[str] = set()
+            bids = _parse_book_side(
+                received.document, "bids", seen_order_ids=seen_order_ids, reverse=True
+            )
+            asks = _parse_book_side(
+                received.document, "asks", seen_order_ids=seen_order_ids, reverse=False
+            )
+            if bids[0].price >= asks[0].price:
+                raise ValueError("Lighter REST book is locked or crossed")
+            raw = received.raw_envelope()
+            raws.append(raw)
+            books.append(
+                Level2BookSnapshot(
+                    schema_version=1,
+                    cycle_id=cycle_id,
+                    venue=self.venue,
+                    symbol=symbol,
+                    asset=asset,
+                    bids=bids,
+                    asks=asks,
+                    depth_limit=20,
+                    sequence=None,
+                    effective_at=received.observed_at,
+                    observed_at=received.observed_at,
+                    source_hash=raw.source_hash,
+                )
+            )
+            warnings.append(
+                AdapterWarning(
+                    code="LIGHTER_REST_BOOK_LOCAL_TIMESTAMP",
+                    venue=self.venue,
+                    endpoint=_BOOK_ENDPOINT,
+                    symbol=symbol,
+                    message=(
+                        "Lighter REST book has no venue snapshot timestamp or sequence; "
+                        "local receipt time was used"
+                    ),
+                )
+            )
+        return AdapterBatch(raw=tuple(raws), normalized=tuple(books), warnings=tuple(warnings))
+
     async def _resolve_markets(
         self, assets: frozenset[Asset]
     ) -> tuple[
@@ -316,6 +378,46 @@ def _require_decimal_count(row: Mapping[str, object], key: str, symbol: str) -> 
     if not 0 <= value <= 18:
         raise ValueError(f"market {symbol} {key} must be between 0 and 18")
     return value
+
+
+def _parse_book_side(
+    document: Mapping[str, object],
+    key: str,
+    *,
+    seen_order_ids: set[str],
+    reverse: bool,
+) -> tuple[BookLevel, ...]:
+    total = _require_integer(document, f"total_{key}", "book response")
+    if total < 0:
+        raise ValueError(f"book total_{key} must be nonnegative")
+    rows = _require_list(_require_key(document, key, "book response"), key)
+    if len(rows) > _BOOK_ORDER_LIMIT:
+        raise ValueError(f"book {key} exceeds requested order limit")
+    if total != len(rows):
+        raise ValueError(f"book total_{key} does not match returned orders")
+    quantities: dict[Decimal, Decimal] = {}
+    counts: dict[Decimal, int] = {}
+    for value in rows:
+        row = _require_mapping(value, f"book {key} order")
+        order_id = _require_string(row, "order_id", f"book {key} order")
+        if not order_id:
+            raise ValueError("book order_id must not be blank")
+        if order_id in seen_order_ids:
+            raise ValueError("book response contains duplicate order_id")
+        seen_order_ids.add(order_id)
+        price = _require_decimal(row, "price", f"book {key} order")
+        quantity = _require_decimal(row, "remaining_base_amount", f"book {key} order")
+        if price <= 0 or quantity <= 0:
+            raise ValueError("book price and remaining quantity must be positive")
+        quantities[price] = quantities.get(price, Decimal(0)) + quantity
+        counts[price] = counts.get(price, 0) + 1
+    if not quantities:
+        raise ValueError(f"book {key} must not be empty")
+    prices = sorted(quantities, reverse=reverse)[:20]
+    return tuple(
+        BookLevel(price=price, quantity=quantities[price], order_count=counts[price])
+        for price in prices
+    )
 
 
 def _require_key(row: Mapping[str, object], key: str, context: str) -> object:
