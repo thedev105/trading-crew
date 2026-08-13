@@ -15,7 +15,13 @@ import httpx
 
 from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
-from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.discovery import evaluate_discovery
+from polytrading.carry.discovery_report import render_discovery_json, render_discovery_text
+from polytrading.carry.dossier import (
+    evaluate_dossier,
+    load_bundled_dossier,
+    load_bundled_dossiers,
+)
 from polytrading.carry.dossier_report import render_dossier_json, render_dossier_text
 from polytrading.carry.report import render_json, render_text
 from polytrading.carry.study import CarryPersistenceStudy, validate_study_window
@@ -145,7 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
     dossier = carry_commands.add_parser(
         "dossier", help="inspect the bundled contract-compatibility evidence"
     )
+    dossier.add_argument("--id", default="hyperliquid-dydx-core-v1")
     dossier.add_argument("--format", choices=("text", "json"), default="text")
+    discovery = carry_commands.add_parser(
+        "discovery", help="rank the bundled venue-compatibility evidence"
+    )
+    discovery.add_argument("--format", choices=("text", "json"), default="text")
 
     funding = commands.add_parser("funding", help="prospective funding evidence operations")
     funding_commands = funding.add_subparsers(dest="funding_command", required=True)
@@ -234,7 +245,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _carry_audit(arguments)
             if arguments.carry_command == "study":
                 return _carry_study(arguments)
-            return _carry_dossier(arguments)
+            if arguments.carry_command == "dossier":
+                return _carry_dossier(arguments)
+            return _carry_discovery(arguments)
         if arguments.command == "funding":
             return _funding_health(arguments)
         if arguments.command == "ai":
@@ -305,8 +318,16 @@ def _carry_study(arguments: argparse.Namespace) -> int:
 
 
 def _carry_dossier(arguments: argparse.Namespace) -> int:
-    report = evaluate_dossier(load_bundled_dossier())
+    report = evaluate_dossier(load_bundled_dossier(arguments.id))
     renderer = render_dossier_json if arguments.format == "json" else render_dossier_text
+    print(renderer(report))
+    return 0
+
+
+def _carry_discovery(arguments: argparse.Namespace) -> int:
+    reports = tuple(evaluate_dossier(dossier) for dossier in load_bundled_dossiers())
+    report = evaluate_discovery(reports)
+    renderer = render_discovery_json if arguments.format == "json" else render_discovery_text
     print(renderer(report))
     return 0
 

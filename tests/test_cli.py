@@ -82,6 +82,25 @@ def test_carry_dossier_parser_defaults_to_text_without_database_argument() -> No
 
     assert parsed.command == "carry"
     assert parsed.carry_command == "dossier"
+    assert parsed.id == "hyperliquid-dydx-core-v1"
+    assert parsed.format == "text"
+    assert "db" not in vars(parsed)
+
+
+def test_carry_dossier_accepts_explicit_catalog_id() -> None:
+    parsed = cli.build_parser().parse_args(
+        ["carry", "dossier", "--id", "lighter-dydx-core-v1", "--format", "json"]
+    )
+
+    assert parsed.id == "lighter-dydx-core-v1"
+    assert parsed.format == "json"
+
+
+def test_carry_discovery_parser_is_database_free() -> None:
+    parsed = cli.build_parser().parse_args(["carry", "discovery"])
+
+    assert parsed.command == "carry"
+    assert parsed.carry_command == "discovery"
     assert parsed.format == "text"
     assert "db" not in vars(parsed)
 
@@ -118,13 +137,84 @@ def test_carry_dossier_is_deterministic_offline_and_database_free(
 def test_carry_dossier_validation_failure_uses_sanitized_exit_two(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def reject_dossier() -> None:
+    def reject_dossier(_dossier_id: str = "hyperliquid-dydx-core-v1") -> None:
         raise ValueError("invalid bundled dossier")
 
     monkeypatch.setattr(cli, "load_bundled_dossier", reject_dossier)
 
     assert main(["carry", "dossier"]) == 2
     assert capsys.readouterr().err == "polytrading: error: invalid bundled dossier\n"
+
+
+def test_carry_dossier_explicit_candidate_reports_model_required(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["carry", "dossier", "--id", "lighter-dydx-core-v1", "--format", "json"]) == 0
+
+    document = json.loads(capsys.readouterr().out)
+    assert document["dossier_id"] == "lighter-dydx-core-v1"
+    assert document["status"] == "model_required"
+    assert document["counts"] == {
+        "blocking": 0,
+        "matched": 4,
+        "missing_evidence": 0,
+        "model_required": 10,
+    }
+    assert document["activation_status"] == "not_authorized"
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_carry_discovery_is_deterministic_offline_and_database_free(
+    output_format: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def reject_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("discovery command must not create a public network client")
+
+    monkeypatch.setattr(cli, "make_public_http_client", reject_network)
+    arguments = ["carry", "discovery", "--format", output_format]
+
+    assert main(arguments) == 0
+    first = capsys.readouterr().out
+    assert main(arguments) == 0
+    second = capsys.readouterr().out
+
+    assert first == second
+    assert not tuple(tmp_path.iterdir())
+    if output_format == "json":
+        document = json.loads(first)
+        assert document["selected_dossier_id"] == "lighter-dydx-core-v1"
+        assert document["counts"]["model_required"] == 1
+        assert document["activation_status"] == "not_authorized"
+    else:
+        assert "selected=lighter-dydx-core-v1" in first
+        assert "rank=2 | dossier=hyperliquid-dydx-core-v1" in first
+        assert "no trading authority exists" in first
+
+
+def test_carry_discovery_catalog_failure_uses_sanitized_exit_two(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_catalog() -> None:
+        raise ValueError("invalid bundled dossier catalog")
+
+    monkeypatch.setattr(cli, "load_bundled_dossiers", reject_catalog, raising=False)
+
+    assert main(["carry", "discovery"]) == 2
+    assert capsys.readouterr().err == "polytrading: error: invalid bundled dossier catalog\n"
+
+
+def test_carry_dossier_unknown_id_uses_sanitized_exit_two(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["carry", "dossier", "--id", "unknown-pair-v1"]) == 2
+    assert (
+        capsys.readouterr().err == "polytrading: error: unknown bundled dossier: unknown-pair-v1\n"
+    )
 
 
 @pytest.mark.parametrize("port", ["0", "65536", "1.5", "true", ""])
