@@ -32,6 +32,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "polytrading.storage.schema" = ["*.sql"]
 "polytrading.web.assets" = ["*.html", "*.css", "*.js"]
+"polytrading.carry.dossiers" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

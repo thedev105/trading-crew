@@ -176,8 +176,9 @@ Start the loopback-only operator console against an existing current-schema data
 
 Then open `http://127.0.0.1:8787` in a browser. The page presents one point-in-time snapshot of
 24-hour funding collection health, the latest public instrument/funding/book evidence, the existing
-Bybit/Hyperliquid carry research gate, evidence counts, and copyable CLI recipes. Every refresh opens
-the selected database read-only and uses one captured UTC `as_of` across the complete screen.
+Bybit/Hyperliquid carry research gate, the bundled Hyperliquid/dYdX compatibility dossier, evidence
+counts, and copyable CLI recipes. Every refresh opens the selected database read-only and uses one
+captured UTC `as_of` across the complete screen.
 
 The database must already exist and have the current schema. A temporary database lock or other
 availability conflict can make a refresh fail; the browser retains its last successful snapshot and
@@ -187,7 +188,40 @@ The recipes are text copied to the clipboard and are never executed by the page.
 only to `127.0.0.1` and has no remote mode, authentication surface, collection controls, credentials,
 accounts, positions, orders, or trading authority. Stop it with `Ctrl-C`.
 
-## 7. Synchronized 20-level book collection
+## 7. Hyperliquid/dYdX contract compatibility dossier
+
+Inspect the bundled official-source research dossier without a database or network request:
+
+```bash
+.venv/bin/polytrading carry dossier --format text
+.venv/bin/polytrading carry dossier --format json
+```
+
+The current result is `ineligible` with primary reason `quanto_structure_excluded`. Hyperliquid's
+official specification describes its ordinary BTC, ETH, and SOL perpetuals as USDC-margined while
+using a USDT-denominated oracle without a USDC/USDT conversion, and explicitly characterizes the
+contracts as technically quanto. Shared USDC margin or P&L accounting with dYdX therefore does not
+make this pair admissible: the approved initial Class C universe excludes quanto structures.
+
+`ineligible` is a successful research outcome, not a command failure. It prevents fee or return
+modeling from making a structurally rejected pair appear actionable. The report also preserves
+fourteen canonical checks across quantity, payoff, collateral/P&L, oracle/mark, liquidation/ADL,
+funding, constraints, fees, failure domains, and access. Blocking reasons take precedence without
+hiding model differences or missing evidence.
+
+The short excerpts, official URLs, observation timestamps, and hashes of the exact stored excerpt
+bytes are bundled with the package. The command never fetches remote documentation at runtime, and
+the excerpt hashes are not presented as hashes of the full remote pages. The dashboard shows the
+same typed report only when its observation timestamp is no later than the screen's `as_of` cutoff.
+
+Effective account-tier fees, point-in-time order constraints, failure-domain analysis, and legal or
+interface eligibility remain missing. Fee tables are tiered or governance/dynamic inputs and may not
+be treated as effective costs until the actual account state is captured. The next research gate is
+venue discovery: apply this dossier schema to another BTC/ETH/SOL pair and require no blocking or
+missing-evidence result before building executable fee, depth, forced-exit, or funding-reversal
+economics.
+
+## 8. Synchronized 20-level book collection
 
 Book cycles start the selected venue requests concurrently and request exactly 20 levels for each
 asset. Run one cycle with `--once`, or collect for a bounded duration:
@@ -223,7 +257,7 @@ The dYdX REST book response exposes neither a venue timestamp nor a sequence. It
 CLI prints `DYDX_REST_BOOK_LOCAL_TIMESTAMP`. These snapshots can support coarse receipt-skew and
 depth research, but not exchange-time simultaneity, continuous-sequence, or queue-position claims.
 
-## 8. Carry audit interpretation
+## 9. Carry audit interpretation
 
 Every audit requires an explicit point-in-time cutoff. Text and canonical JSON always order assets
 as BTC, ETH, and SOL and report research-only warnings. `DIAGNOSTIC_ONLY` means current compatible
@@ -236,7 +270,7 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 9. Cross-venue funding persistence study
+## 10. Cross-venue funding persistence study
 
 The read-only study tests one frozen direction: long the Bybit perpetual and short the
 Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
@@ -274,7 +308,7 @@ create a commercial data product. The current Bybit API agreement and any applic
 terms must be reviewed for the exact intended use before expanding collection or proprietary
 deployment.
 
-## 10. Database backup, replay, and schema versions
+## 11. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -286,7 +320,7 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
-## 11. Explicit read-only boundary
+## 12. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -294,7 +328,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 12. Evidence still required by the Class C activation gate
+## 13. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
@@ -310,7 +344,7 @@ requires all of the following evidence:
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
 
-## 12. Offline semantic scout experiment
+## 14. Offline semantic scout experiment
 
 The semantic scout is an offline research layer. AI-like components may retrieve similar rule
 text and propose structured interpretations; only deterministic schema, source-span, corpus,
