@@ -29,6 +29,9 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         "overview",
         "markets",
         "market-rows",
+        "compatibility",
+        "dossier-summary",
+        "dossier-rows",
         "research",
         "operations",
         "refresh",
@@ -62,6 +65,7 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
     assert "AbortController" in javascript
     assert "replaceChildren" in javascript
     assert "navigator.clipboard.writeText" in javascript
+    assert "snapshot.compatibility_dossier" in javascript
     for forbidden in (
         "innerhtml",
         "outerhtml",
@@ -84,3 +88,7 @@ def test_dashboard_styles_cover_focus_mobile_and_reduced_motion() -> None:
     assert ":focus-visible" in css
     assert "@media (max-width: 720px)" in css
     assert "prefers-reduced-motion" in css
+    assert '[data-tone="blocking"]' in css
+    assert '[data-tone="model_required"]' in css
+    assert '[data-tone="missing_evidence"]' in css
+    assert '[data-tone="matched"]' in css

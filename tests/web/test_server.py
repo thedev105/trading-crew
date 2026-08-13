@@ -27,7 +27,10 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
 
     assert response.status is HTTPStatus.OK
     assert response.content_type == "application/json; charset=utf-8"
-    assert json.loads(response.body)["as_of"] == "2026-08-13T12:06:00Z"
+    document = json.loads(response.body)
+    assert document["as_of"] == "2026-08-13T12:06:00Z"
+    assert document["compatibility_dossier"]["status"] == "ineligible"
+    assert document["compatibility_dossier"]["primary_reason_code"] == "quanto_structure_excluded"
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"

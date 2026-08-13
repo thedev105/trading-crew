@@ -239,15 +239,19 @@ footer {
 
 [data-tone="healthy"],
 [data-tone="complete"],
-[data-tone="diagnostic_only"] { --tone: var(--cyan); }
+[data-tone="diagnostic_only"],
+[data-tone="matched"] { --tone: var(--cyan); }
 [data-tone="degraded"],
 [data-tone="late"],
-[data-tone="stale"] { --tone: var(--amber); }
+[data-tone="stale"],
+[data-tone="model_required"] { --tone: var(--amber); }
 [data-tone="critical"],
 [data-tone="missing"],
 [data-tone="ineligible"],
 [data-tone="insufficient_data"],
-[data-tone="failed"] { --tone: var(--coral); }
+[data-tone="failed"],
+[data-tone="blocking"],
+[data-tone="missing_evidence"] { --tone: var(--coral); }
 
 .status-card { box-shadow: inset 0 3px 0 var(--tone, var(--quiet)); }
 .status-card .value, .status-pill { color: var(--tone, var(--muted)); }
@@ -285,6 +289,19 @@ tbody tr:hover { background: rgba(98, 230, 207, 0.035); }
 .positive { color: var(--cyan); }
 .negative { color: var(--coral); }
 
+.dossier-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.dossier-summary .status-card { min-height: 154px; }
+.dossier-summary .value { overflow-wrap: anywhere; font-size: clamp(1rem, 1.7vw, 1.55rem); }
+.dossier-table { min-width: 1320px; }
+.dossier-table .check-name { color: var(--cyan); }
+.dossier-table .summary-cell { min-width: 285px; white-space: normal; line-height: 1.55; }
+.judgment-cell { color: var(--tone, var(--muted)); text-transform: uppercase; }
+
 .carry-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .carry-card { padding: 22px; }
 .carry-card header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -313,6 +330,7 @@ noscript { display: block; padding: 20px; color: var(--coral); text-align: cente
 
 @media (max-width: 980px) {
   .overview-grid, .count-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dossier-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .carry-grid { grid-template-columns: 1fr; }
 }
 
@@ -322,6 +340,7 @@ noscript { display: block; padding: 20px; color: var(--coral); text-align: cente
   .section-heading { display: block; }
   .section-heading > p { margin-top: 16px; }
   .overview-grid, .count-grid, .recipe-list { grid-template-columns: 1fr; }
+  .dossier-summary { grid-template-columns: 1fr; }
   .boundary-strip { gap: 3px; }
   .boundary-cell { height: 24px; }
   .recipe-card { grid-template-columns: 1fr; }

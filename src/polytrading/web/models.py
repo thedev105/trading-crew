@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import Field, field_validator, model_validator
 
 from polytrading.carry.audit import AuditStatus
+from polytrading.carry.dossier_models import ContractDossierReport
 from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.funding_health_models import FundingCollectionHealthReport
@@ -176,6 +177,7 @@ class DashboardSnapshot(StrictRecord):
     funding_health: FundingCollectionHealthReport
     latest_funding_cycle: FundingCycleSummary | None
     latest_book_cycle: BookCycleSummary | None
+    compatibility_dossier: ContractDossierReport | None
     markets: tuple[MarketEvidenceRow, ...]
     carry_rows: tuple[CarryEvidenceRow, ...]
     evidence_counts: EvidenceCounts
@@ -225,6 +227,11 @@ class DashboardSnapshot(StrictRecord):
             and self.latest_book_cycle.request_completed_at > self.as_of
         ):
             raise ValueError("book cycle must not follow dashboard as-of")
+        if (
+            self.compatibility_dossier is not None
+            and self.compatibility_dossier.observed_at > self.as_of
+        ):
+            raise ValueError("dossier must not follow dashboard as-of")
         timestamps = (
             timestamp
             for row in self.markets

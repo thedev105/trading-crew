@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -12,6 +13,8 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from polytrading.carry.audit import CarryAuditor
+from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.dossier_models import ContractCompatibilityDossier
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
@@ -39,9 +42,15 @@ def _symbol(venue: Venue, asset: Asset) -> str:
 
 
 class DashboardBuilder:
-    def __init__(self, store: DuckDBStore, database_path: Path) -> None:
+    def __init__(
+        self,
+        store: DuckDBStore,
+        database_path: Path,
+        dossier_loader: Callable[[], ContractCompatibilityDossier] = load_bundled_dossier,
+    ) -> None:
         self._store = store
         self._database_path = database_path
+        self._dossier_loader = dossier_loader
 
     def build(self, as_of: datetime) -> DashboardSnapshot:
         normalized_as_of = normalize_utc_timestamp(as_of)
@@ -55,6 +64,7 @@ class DashboardBuilder:
             max_book_age=timedelta(seconds=30),
             max_book_cycle_skew=timedelta(seconds=1),
         ).audit(normalized_as_of)
+        dossier = self._dossier_loader()
 
         return DashboardSnapshot(
             schema_version=1,
@@ -83,6 +93,9 @@ class DashboardBuilder:
                     status=book_cycle.status,
                     max_effective_skew_ms=book_cycle.max_effective_skew_ms,
                 )
+            ),
+            compatibility_dossier=(
+                evaluate_dossier(dossier) if dossier.observed_at <= normalized_as_of else None
             ),
             markets=tuple(
                 self._market_row(venue, asset, normalized_as_of)

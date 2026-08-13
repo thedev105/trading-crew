@@ -12,6 +12,8 @@ const nodes = {
   overviewCards: document.querySelector("#overview-cards"),
   boundaryStrip: document.querySelector("#boundary-strip"),
   marketRows: document.querySelector("#market-rows"),
+  dossierSummary: document.querySelector("#dossier-summary"),
+  dossierRows: document.querySelector("#dossier-rows"),
   carryRows: document.querySelector("#carry-rows"),
   evidenceCounts: document.querySelector("#evidence-counts"),
   recipeList: document.querySelector("#recipe-list"),
@@ -121,6 +123,66 @@ function gateMetric(label, value) {
   return box;
 }
 
+function renderDossier(snapshot) {
+  const report = snapshot.compatibility_dossier;
+  if (!report) {
+    const unavailable = statusCard(
+      "Contract dossier",
+      "Unavailable",
+      "Unavailable at this snapshot cutoff",
+      "missing",
+    );
+    nodes.dossierSummary.replaceChildren(unavailable);
+    const row = document.createElement("tr");
+    const cell = tableCell("Unavailable at this snapshot cutoff", "unavailable summary-cell");
+    cell.colSpan = 5;
+    row.append(cell);
+    nodes.dossierRows.replaceChildren(row);
+    return;
+  }
+
+  const pair = `${report.left_venue} → ${report.right_venue}`;
+  nodes.dossierSummary.replaceChildren(
+    statusCard("Decision", report.status, `${pair} · ${report.assets.join(", ")}`, report.status),
+    statusCard(
+      "Primary blocker",
+      display(report.primary_reason_code),
+      `Observed ${compactTime(report.observed_at)}`,
+      report.status,
+    ),
+    statusCard("Matched", display(report.counts.matched), "Documented agreement", "matched"),
+    statusCard("Blocking", display(report.counts.blocking), "Admission failures", "blocking"),
+    statusCard(
+      "Model required",
+      display(report.counts.model_required),
+      "Differences needing validation",
+      "model_required",
+    ),
+    statusCard(
+      "Missing evidence",
+      display(report.counts.missing_evidence),
+      "Unresolved point-in-time facts",
+      "missing_evidence",
+    ),
+  );
+
+  const rows = report.checks.map((check) => {
+    const row = document.createElement("tr");
+    const judgment = tableCell(check.judgment);
+    judgment.classList.add("judgment-cell");
+    judgment.dataset.tone = statusTone(check.judgment);
+    row.append(
+      tableCell(check.kind, "check-name"),
+      judgment,
+      tableCell(check.reason_code),
+      tableCell(check.left_summary, "summary-cell"),
+      tableCell(check.right_summary, "summary-cell"),
+    );
+    return row;
+  });
+  nodes.dossierRows.replaceChildren(...rows);
+}
+
 function renderCarry(snapshot) {
   const cards = snapshot.carry_rows.map((item) => {
     const card = element("article", "carry-card");
@@ -198,6 +260,7 @@ function render(snapshot) {
   nodes.snapshotTime.textContent = compactTime(snapshot.as_of);
   renderOverview(snapshot);
   renderMarkets(snapshot);
+  renderDossier(snapshot);
   renderCarry(snapshot);
   renderCounts(snapshot);
   renderRecipes(snapshot);
@@ -208,6 +271,9 @@ function validateSnapshot(snapshot) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!snapshot.funding_health || !Array.isArray(snapshot.funding_health.boundaries)) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (!Object.prototype.hasOwnProperty.call(snapshot, "compatibility_dossier")) {
     throw new Error("INVALID_SNAPSHOT");
   }
   return snapshot;

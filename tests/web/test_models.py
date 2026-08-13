@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.carry.audit import AuditStatus
+from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
 from polytrading.domain.models import Asset, Venue
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
 from polytrading.web.models import (
@@ -81,6 +82,7 @@ def _snapshot_values() -> dict[str, object]:
         "funding_health": FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(AS_OF, 24),
         "latest_funding_cycle": None,
         "latest_book_cycle": None,
+        "compatibility_dossier": None,
         "markets": _market_rows(),
         "carry_rows": _carry_rows(),
         "evidence_counts": EvidenceCounts(
@@ -183,3 +185,16 @@ def test_snapshot_rejects_blank_or_path_database_names_and_unsorted_reasons() ->
     row["reason_codes"] = ("Z_REASON", "A_REASON")
     with pytest.raises(ValidationError, match="reason codes"):
         CarryEvidenceRow(**row)
+
+
+def test_snapshot_rejects_dossier_observed_after_snapshot_cutoff() -> None:
+    values = _snapshot_values()
+    report = evaluate_dossier(load_bundled_dossier())
+    values["as_of"] = report.observed_at - datetime.resolution
+    values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
+    values["compatibility_dossier"] = report
+
+    with pytest.raises(ValidationError, match="dossier must not follow dashboard as-of"):
+        DashboardSnapshot(**values)

@@ -5,6 +5,8 @@ from pathlib import Path
 from uuid import UUID
 
 from polytrading.carry.audit import AuditStatus
+from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.dossier_models import DossierStatus
 from polytrading.domain.models import Asset, BookLevel, Venue
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.dashboard import DashboardBuilder, render_dashboard_json
@@ -19,6 +21,7 @@ AS_OF = datetime(2026, 8, 13, 12, 6, tzinfo=UTC)
 SOURCE_HASH = "a" * 64
 FUTURE_HASH = "f" * 64
 BOOK_CYCLE_ID = UUID("00000000-0000-0000-0000-000000000a01")
+DOSSIER_AT = datetime(2026, 8, 13, 12, tzinfo=UTC)
 
 
 def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Path) -> None:
@@ -44,6 +47,26 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
         AuditStatus.INSUFFICIENT_DATA,
     )
     assert set(snapshot.evidence_counts.model_dump().values()) == {0}
+    assert snapshot.compatibility_dossier is not None
+    assert snapshot.compatibility_dossier.status is DossierStatus.INELIGIBLE
+    store.close()
+
+
+def test_builder_excludes_dossier_until_its_point_in_time_cutoff(tmp_path: Path) -> None:
+    path = tmp_path / "cutoff.duckdb"
+    store = DuckDBStore(path)
+
+    before = DashboardBuilder(store, path).build(DOSSIER_AT - timedelta(microseconds=1))
+    at_cutoff = DashboardBuilder(store, path).build(DOSSIER_AT)
+
+    assert before.compatibility_dossier is None
+    assert at_cutoff.compatibility_dossier == evaluate_dossier(load_bundled_dossier())
+    assert at_cutoff.compatibility_dossier.primary_reason_code == "quanto_structure_excluded"
+    assert len(at_cutoff.compatibility_dossier.checks) == 14
+    assert json.loads(render_dashboard_json(before))["compatibility_dossier"] is None
+    document = json.loads(render_dashboard_json(at_cutoff))["compatibility_dossier"]
+    assert document["status"] == "ineligible"
+    assert document["observed_at"] == "2026-08-13T12:00:00Z"
     store.close()
 
 
