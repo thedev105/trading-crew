@@ -1,6 +1,7 @@
 """Public-only venue data collection boundaries."""
 
 from polytrading.venues.dydx import DydxPublicAdapter
+from polytrading.venues.lighter import LighterPublicAdapter
 from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
     record_late_funding_cycle,
@@ -33,6 +34,7 @@ __all__ = [
     "FundingCollectionHealthAuditor",
     "FundingCollectionHealthReport",
     "FundingCycleItem",
+    "LighterPublicAdapter",
     "NormalizedRecord",
     "PointInTimeFundingCollector",
     "PublicRecorder",

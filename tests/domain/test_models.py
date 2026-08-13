@@ -118,6 +118,25 @@ def test_raw_evidence_serializes_dydx_venue_stably() -> None:
     assert item.model_dump(mode="json")["venue"] == "dydx"
 
 
+def test_raw_evidence_serializes_lighter_venue_stably() -> None:
+    # Catches an unstable persisted venue identity that DuckDB could not replay.
+    item = RawEnvelope(
+        schema_version=1,
+        event_id=uuid4(),
+        venue=Venue.LIGHTER,
+        endpoint="/api/v1/orderBooks",
+        venue_timestamp=None,
+        observed_at=NOW,
+        received_monotonic_ns=1,
+        request_latency_ms=Decimal("0"),
+        source_version="mainnet-v1-public",
+        payload_json="{}",
+        source_hash=SOURCE_HASH,
+    )
+
+    assert item.model_dump(mode="json")["venue"] == "lighter"
+
+
 def test_funding_rejects_rate_below_duckdb_decimal_scale() -> None:
     with pytest.raises(ValidationError) as exception:
         FundingObservation(

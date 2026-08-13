@@ -54,6 +54,7 @@ class Venue(StrEnum):
     HYPERLIQUID = "hyperliquid"
     BYBIT = "bybit"
     DYDX = "dydx"
+    LIGHTER = "lighter"
 
 
 class Asset(StrEnum):
