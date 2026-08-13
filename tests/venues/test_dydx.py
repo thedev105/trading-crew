@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
@@ -22,6 +23,7 @@ RECEIVED_1 = datetime(2026, 8, 13, 12, 0, 1, tzinfo=UTC)
 RECEIVED_2 = datetime(2026, 8, 13, 12, 0, 2, tzinfo=UTC)
 FUNDING_START = datetime(2026, 8, 13, 10, tzinfo=UTC)
 FUNDING_END = datetime(2026, 8, 13, 12, tzinfo=UTC)
+CYCLE_ID = UUID("00000000-0000-0000-0000-000000000713")
 
 
 def fixture_bytes(name: str) -> bytes:
@@ -498,3 +500,138 @@ def test_adapter_rejects_invalid_funding_page_budget(value: object) -> None:
             monotonic_ns=lambda: 1,
             max_funding_pages=value,
         )
+
+
+def test_fetch_order_books_sorts_truncates_and_uses_local_receipt_time() -> None:
+    # Catches unstable request order, wrong-side sorting, deep-level selection, or invented timing.
+    payload = fixture_bytes("orderbook.json")
+    requests: list[httpx.Request] = []
+    receipts = [
+        datetime(2026, 8, 13, 12, 1, 1, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 1, 2, tzinfo=UTC),
+        datetime(2026, 8, 13, 12, 1, 3, tzinfo=UTC),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(payload)
+
+    adapter = make_adapter(handler, wall_times=receipts)
+    batch = asyncio.run(
+        adapter.fetch_order_books(
+            frozenset({Asset.SOL, Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID
+        )
+    )
+
+    assert [request.url.path for request in requests] == [
+        "/v4/orderbooks/perpetualMarket/BTC-USD",
+        "/v4/orderbooks/perpetualMarket/ETH-USD",
+        "/v4/orderbooks/perpetualMarket/SOL-USD",
+    ]
+    assert len(batch.raw) == 3
+    assert all(raw.payload_json == payload.decode() for raw in batch.raw)
+    assert all(raw.venue_timestamp is None for raw in batch.raw)
+    assert [book.asset for book in batch.normalized] == [Asset.BTC, Asset.ETH, Asset.SOL]
+    assert [book.symbol for book in batch.normalized] == ["BTC-USD", "ETH-USD", "SOL-USD"]
+    for index, book in enumerate(batch.normalized):
+        assert book.cycle_id == CYCLE_ID
+        assert book.depth_limit == 20
+        assert book.sequence is None
+        assert book.effective_at == receipts[index]
+        assert book.observed_at == receipts[index]
+        assert book.source_hash == batch.raw[index].source_hash
+        assert [level.price for level in book.bids] == [
+            Decimal(value) for value in range(63999, 63979, -1)
+        ]
+        assert [level.price for level in book.asks] == [
+            Decimal(value) for value in range(64001, 64021)
+        ]
+        assert book.bids[0].quantity == Decimal("0.01")
+        assert book.asks[0].quantity == Decimal("0.01")
+        assert all(level.order_count is None for level in (*book.bids, *book.asks))
+    assert batch.warnings == tuple(
+        AdapterWarning(
+            code="DYDX_REST_BOOK_LOCAL_TIMESTAMP",
+            venue=Venue.DYDX,
+            endpoint=f"/v4/orderbooks/perpetualMarket/{symbol}",
+            symbol=symbol,
+            message=(
+                "dYdX REST book has no venue timestamp or sequence; local receipt time was used"
+            ),
+        )
+        for symbol in ("BTC-USD", "ETH-USD", "SOL-USD")
+    )
+
+
+def malformed_book(mutation: str) -> bytes:
+    document = json.loads(fixture_bytes("orderbook.json"))
+    if mutation == "missing_bids":
+        del document["bids"]
+    elif mutation == "non_list":
+        document["bids"] = {}
+    elif mutation == "non_mapping_level":
+        document["bids"][0] = "bad"
+    elif mutation == "missing_price":
+        del document["bids"][0]["price"]
+    elif mutation == "zero_price":
+        document["bids"][0]["price"] = "0"
+    elif mutation == "negative_size":
+        document["bids"][0]["size"] = "-1"
+    elif mutation == "invalid_decimal":
+        document["asks"][0]["price"] = "bad"
+    elif mutation == "duplicate_price":
+        document["bids"][1]["price"] = document["bids"][0]["price"]
+    elif mutation == "empty_side":
+        document["asks"] = []
+    elif mutation == "locked":
+        document["asks"][1]["price"] = "63999"
+    else:
+        document["asks"][1]["price"] = "63998"
+    return json.dumps(document).encode()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_bids", "bids"),
+        ("non_list", "list"),
+        ("non_mapping_level", "mapping"),
+        ("missing_price", "price"),
+        ("zero_price", "positive"),
+        ("negative_size", "positive"),
+        ("invalid_decimal", "decimal"),
+        ("duplicate_price", "duplicate"),
+        ("empty_side", "empty"),
+        ("locked", "locked or crossed"),
+        ("crossed", "locked or crossed"),
+    ],
+)
+def test_fetch_order_books_fails_closed_on_malformed_or_impossible_book(
+    mutation: str, message: str
+) -> None:
+    # Catches structurally invalid depth becoming executable-price evidence.
+    adapter = make_adapter(
+        lambda request: response(malformed_book(mutation)), wall_times=[RECEIVED_1]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(adapter.fetch_order_books(frozenset({Asset.BTC}), REQUEST_CONTEXT, CYCLE_ID))
+
+
+def test_fetch_order_books_does_not_return_partial_batch_after_later_asset_failure() -> None:
+    # Catches a multi-asset call silently succeeding after one requested response is malformed.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = fixture_bytes("orderbook.json") if calls == 1 else malformed_book("empty_side")
+        return response(payload)
+
+    adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
+
+    with pytest.raises(ValueError, match="empty"):
+        asyncio.run(
+            adapter.fetch_order_books(frozenset({Asset.BTC, Asset.ETH}), REQUEST_CONTEXT, CYCLE_ID)
+        )
+    assert calls == 2

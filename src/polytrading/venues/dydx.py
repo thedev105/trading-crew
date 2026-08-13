@@ -6,14 +6,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 import httpx
 
 from polytrading.domain.models import (
     Asset,
+    BookLevel,
     FundingObservation,
     InstrumentKind,
     InstrumentSpec,
+    Level2BookSnapshot,
     RawEnvelope,
     Venue,
     normalize_utc_timestamp,
@@ -24,6 +27,7 @@ from polytrading.venues.recorder import make_raw_envelope
 _BASE_URL = "https://indexer.dydx.trade"
 _MARKETS_ENDPOINT = "/v4/perpetualMarkets"
 _FUNDING_ENDPOINT_PREFIX = "/v4/historicalFunding"
+_ORDERBOOK_ENDPOINT_PREFIX = "/v4/orderbooks/perpetualMarket"
 _SOURCE_VERSION = "indexer-v4-public"
 _FUNDING_PAGE_LIMIT = 100
 _SYMBOL_BY_ASSET = {
@@ -205,6 +209,56 @@ class DydxPublicAdapter:
         normalized = tuple(observations[key] for key in sorted(observations))
         return AdapterBatch(raw=tuple(raws), normalized=normalized)
 
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        _require_collection_context(observed_at)
+        raws: list[RawEnvelope] = []
+        books: list[Level2BookSnapshot] = []
+        warnings: list[AdapterWarning] = []
+        for asset in sorted(assets, key=lambda item: item.value):
+            symbol = _SYMBOL_BY_ASSET[asset]
+            endpoint = f"{_ORDERBOOK_ENDPOINT_PREFIX}/{symbol}"
+            received = await self._get(endpoint)
+            bids = _parse_book_side(received.document, "bids", reverse=True)
+            asks = _parse_book_side(received.document, "asks", reverse=False)
+            if bids[0].price >= asks[0].price:
+                raise ValueError("dYdX REST order book is locked or crossed")
+            raw = received.raw_envelope()
+            raws.append(raw)
+            books.append(
+                Level2BookSnapshot(
+                    schema_version=1,
+                    cycle_id=cycle_id,
+                    venue=self.venue,
+                    symbol=symbol,
+                    asset=asset,
+                    bids=bids,
+                    asks=asks,
+                    depth_limit=20,
+                    sequence=None,
+                    effective_at=received.observed_at,
+                    observed_at=received.observed_at,
+                    source_hash=raw.source_hash,
+                )
+            )
+            warnings.append(
+                AdapterWarning(
+                    code="DYDX_REST_BOOK_LOCAL_TIMESTAMP",
+                    venue=self.venue,
+                    endpoint=endpoint,
+                    symbol=symbol,
+                    message=(
+                        "dYdX REST book has no venue timestamp or sequence; "
+                        "local receipt time was used"
+                    ),
+                )
+            )
+        return AdapterBatch(raw=tuple(raws), normalized=tuple(books), warnings=tuple(warnings))
+
     async def _get(
         self, endpoint: str, params: Mapping[str, str | int] | None = None
     ) -> _ReceivedResponse:
@@ -353,6 +407,26 @@ def _parse_iso_timestamp(value: object, context: str) -> datetime:
 
 def _format_query_timestamp(value: datetime) -> str:
     return normalize_utc_timestamp(value).isoformat().replace("+00:00", "Z")
+
+
+def _parse_book_side(
+    document: Mapping[str, object], side: str, *, reverse: bool
+) -> tuple[BookLevel, ...]:
+    rows = _require_list(_require_key(document, side, "order book response"), side)
+    if not rows:
+        raise ValueError(f"order book {side} must not be empty")
+    levels: list[BookLevel] = []
+    prices: set[Decimal] = set()
+    for value in rows:
+        row = _require_mapping(value, f"order book {side} level")
+        price = _require_positive_decimal(row, "price", f"order book {side} level")
+        quantity = _require_positive_decimal(row, "size", f"order book {side} level")
+        if price in prices:
+            raise ValueError(f"order book {side} contains a duplicate price")
+        prices.add(price)
+        levels.append(BookLevel(price=price, quantity=quantity, order_count=None))
+    levels.sort(key=lambda level: level.price, reverse=reverse)
+    return tuple(levels[:20])
 
 
 def _require_positive_decimal(mapping: Mapping[str, object], key: str, context: str) -> Decimal:
