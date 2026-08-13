@@ -24,10 +24,11 @@ from polytrading.corpus_intake.source_policy import (
 )
 
 NOW = datetime(2026, 8, 12, 16, tzinfo=UTC)
-DOCS_HTML = """<!doctype html><html><body>
-<h1>Market Data</h1>
-<p>All market data is publicly available through REST APIsâno authentication required.</p>
-</body></html>""".encode()
+DOCS_HTML = b"""<!doctype html><html><body>
+<h2>Gamma API</h2>
+<code>https://gamma-api.polymarket.com</code>
+<p>Discover events and markets, and retrieve the metadata needed to work with them.</p>
+</body></html>"""
 INSTITUTIONAL_HTML = b"""<!doctype html><html><body>
 <p>All Capital Markets Entities looking to consume Polymarket data must do so
 in consultation with Polymarket and ICE.</p>
@@ -123,6 +124,15 @@ def test_capture_hashes_page_without_retaining_body() -> None:
     assert record.full_body_retained is False
     assert "body_text" not in SourceEvidence.model_fields
     assert record.excerpt_sha256 == canonical_sha256(record.excerpt)
+
+
+def test_first_target_matches_current_canonical_gamma_api_overview() -> None:
+    record = capture(0, DOCS_HTML)
+
+    assert record.url == "https://docs.polymarket.com/api-reference/predictions/overview"
+    assert record.excerpt == (
+        "Discover events and markets, and retrieve the metadata needed to work with them."
+    )
 
 
 def test_capture_stops_streaming_as_soon_as_bound_is_crossed() -> None:

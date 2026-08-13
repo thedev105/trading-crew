@@ -16,8 +16,16 @@ from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.report import render_json, render_text
 from polytrading.corpus_intake.artifacts import CorpusRunWriter, verify_run
+from polytrading.corpus_intake.evidence import (
+    POLYMARKET_EVIDENCE_TARGETS,
+    SourceUseRunWriter,
+    capture_evidence,
+    verify_source_use_run,
+)
 from polytrading.corpus_intake.models import AcquisitionRequest, CorpusIntakeError
 from polytrading.corpus_intake.polymarket import acquire_polymarket
+from polytrading.corpus_intake.review_queue import prepare_review_queue
+from polytrading.corpus_intake.source_policy import IntendedUseScope, SourceUseApproval
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
@@ -121,6 +129,26 @@ def build_parser() -> argparse.ArgumentParser:
     corpus.add_argument("--max-pages", type=int, default=10)
     corpus.add_argument("--max-response-bytes", type=int, default=16 * 1024 * 1024)
     corpus.add_argument("--request-delay-seconds", type=float, default=0.05)
+
+    source_use = collect_commands.add_parser(
+        "source-use", help="capture hash-only official source-use evidence"
+    )
+    source_use.add_argument("--source", choices=("polymarket",), required=True)
+    source_use.add_argument("--output", required=True, type=Path)
+    source_use.add_argument("--retrieved-at", required=True)
+    source_use.add_argument("--max-response-bytes", type=int, default=2 * 1024 * 1024)
+
+    review_queue = collect_commands.add_parser(
+        "review-queue", help="prepare a source-use-gated offline review queue"
+    )
+    review_queue.add_argument("--intake", required=True, action="append", type=Path)
+    review_queue.add_argument("--source-use", required=True, type=Path)
+    review_queue.add_argument("--output", required=True, type=Path)
+    review_queue.add_argument("--as-of", required=True)
+    review_queue.add_argument("--ontology-version", required=True)
+    review_queue.add_argument("--approval", type=Path)
+    review_queue.add_argument("--reviewer-a")
+    review_queue.add_argument("--reviewer-b")
     add_ai_subcommands(commands)
     return parser
 
@@ -138,6 +166,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_collect_public(arguments))
         if arguments.collect_command == "corpus":
             return asyncio.run(_collect_corpus(arguments))
+        if arguments.collect_command == "source-use":
+            return asyncio.run(_collect_source_use(arguments))
+        if arguments.collect_command == "review-queue":
+            return _prepare_review_queue(arguments)
         return asyncio.run(_collect_books(arguments))
     except AIInputError as error:
         print(f"polytrading: AI input rejected: {error}", file=sys.stderr)
@@ -313,6 +345,76 @@ async def _collect_corpus(arguments: argparse.Namespace) -> int:
         f"captured {summary.candidate_count} review candidates across "
         f"{summary.event_family_count} event families and {summary.raw_page_count} raw pages; "
         "retention review is still required"
+    )
+    return 0
+
+
+async def _collect_source_use(arguments: argparse.Namespace) -> int:
+    retrieved_at = _parse_timestamp(arguments.retrieved_at)
+    writer = SourceUseRunWriter(
+        arguments.output,
+        project_root=Path.cwd(),
+        retrieved_at=retrieved_at,
+    )
+    scope = IntendedUseScope(
+        schema_version=1,
+        source="polymarket",
+        maximum_records=1_000,
+        local_retention=True,
+        derived_semantic_labels=True,
+        offline_model_evaluation=True,
+        proprietary_trading_research=True,
+        redistribution=False,
+        generative_model_training=False,
+    )
+    try:
+        async with make_public_http_client() as client:
+            evidence = tuple(
+                [
+                    await capture_evidence(
+                        client,
+                        target,
+                        retrieved_at=retrieved_at,
+                        max_response_bytes=arguments.max_response_bytes,
+                    )
+                    for target in POLYMARKET_EVIDENCE_TARGETS
+                ]
+            )
+        writer.complete(evidence=evidence, scope=scope)
+        verified = verify_source_use_run(writer.output)
+    except CorpusIntakeError as error:
+        raise CorpusCollectionError(str(error)) from error
+    print(
+        f"captured {verified.evidence_count} official source-use evidence records; "
+        "external confirmation is still required and the inquiry remains unsent"
+    )
+    return 0
+
+
+def _prepare_review_queue(arguments: argparse.Namespace) -> int:
+    if (arguments.reviewer_a is None) != (arguments.reviewer_b is None):
+        raise CliUsageError("reviewer-a and reviewer-b must be supplied together")
+    approval = (
+        SourceUseApproval.model_validate_json(arguments.approval.read_bytes())
+        if arguments.approval is not None
+        else None
+    )
+    reviewer_ids = (
+        None if arguments.reviewer_a is None else (arguments.reviewer_a, arguments.reviewer_b)
+    )
+    result = prepare_review_queue(
+        intake_directories=tuple(arguments.intake),
+        source_use_directory=arguments.source_use,
+        output=arguments.output,
+        project_root=Path.cwd(),
+        as_of=_parse_timestamp(arguments.as_of),
+        approval=approval,
+        reviewer_ids=reviewer_ids,
+        ontology_version=arguments.ontology_version,
+    )
+    print(
+        f"review queue {result.reason_code}: {result.blocked_item_count} blocked inventory "
+        f"items and {result.reviewer_packet_count} reviewer packets"
     )
     return 0
 

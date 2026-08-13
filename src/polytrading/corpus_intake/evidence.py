@@ -34,9 +34,11 @@ class EvidenceTarget:
 POLYMARKET_EVIDENCE_TARGETS = (
     EvidenceTarget(
         source="polymarket",
-        url="https://docs.polymarket.com/market-data/overview",
-        locator="no authentication required",
-        excerpt="no authentication required.",
+        url="https://docs.polymarket.com/api-reference/predictions/overview",
+        locator="Gamma API",
+        excerpt=(
+            "Discover events and markets, and retrieve the metadata needed to work with them."
+        ),
     ),
     EvidenceTarget(
         source="polymarket",

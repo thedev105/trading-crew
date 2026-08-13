@@ -17,12 +17,18 @@ import pytest
 
 import polytrading.cli as cli
 from polytrading.cli import RetryingTransport, collect_book_cycles, main
+from polytrading.corpus_intake.evidence import (
+    POLYMARKET_EVIDENCE_TARGETS,
+    verify_source_use_run,
+)
 from polytrading.corpus_intake.models import (
     AcquisitionDiagnostics,
     AcquisitionResult,
     CorpusIntakeError,
 )
 from polytrading.corpus_intake.polymarket import parse_page
+from polytrading.corpus_intake.review_queue import verify_review_queue_run
+from polytrading.corpus_intake.source_policy import SourceEvidence, canonical_sha256
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -274,6 +280,210 @@ def test_collect_corpus_source_failure_is_exit_one_and_has_no_manifest(
     assert status == 1
     assert "HTTP 503" in capsys.readouterr().err
     assert not (output / "manifest.json").exists()
+
+
+def test_collect_source_use_writes_unresolved_hash_only_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    async def capture(client, target, *, retrieved_at, max_response_bytes):
+        del client
+        assert max_response_bytes == 2_097_152
+        index = POLYMARKET_EVIDENCE_TARGETS.index(target) + 1
+        return SourceEvidence(
+            schema_version=1,
+            source="polymarket",
+            url=target.url,
+            retrieved_at=retrieved_at,
+            status_code=200,
+            content_type="text/html",
+            body_byte_count=index,
+            body_sha256=str(index) * 64,
+            etag=None,
+            last_modified=None,
+            locator=target.locator,
+            excerpt=target.excerpt,
+            excerpt_sha256=canonical_sha256(target.excerpt),
+            full_body_retained=False,
+        )
+
+    monkeypatch.setattr(cli, "capture_evidence", capture)
+    output = tmp_path / "var/source-use/run"
+
+    exit_code = main(
+        [
+            "collect",
+            "source-use",
+            "--source",
+            "polymarket",
+            "--output",
+            str(output),
+            "--retrieved-at",
+            "2026-08-12T16:00:00Z",
+            "--max-response-bytes",
+            "2097152",
+        ]
+    )
+    verified = verify_source_use_run(output)
+
+    assert exit_code == 0
+    assert verified.evidence_count == 2
+    assert verified.assessment.status == "requires_external_confirmation"
+    assert "external confirmation" in capsys.readouterr().out.lower()
+
+
+def test_collect_review_queue_reports_valid_blocked_outcome(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    fixture = Path(__file__).parent / "fixtures/polymarket/markets_keyset_page_1.json"
+
+    async def acquire(client, request, on_raw_page):
+        del client
+        page = parse_page(
+            body=fixture.read_bytes(),
+            request_url="https://gamma-api.polymarket.com/markets/keyset?limit=2",
+            requested_cursor=None,
+            page_ordinal=1,
+            retrieved_at=request.retrieved_at,
+            information_cutoff=request.information_cutoff,
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+        on_raw_page(page.raw)
+        return AcquisitionResult(
+            candidates=page.candidates,
+            diagnostics=AcquisitionDiagnostics(
+                page_count=1,
+                received_market_count=2,
+                exact_duplicate_count=0,
+                canonical_duplicate_count=0,
+                truncated_at_candidate_limit=True,
+                truncated_at_page_limit=False,
+            ),
+        )
+
+    async def capture(client, target, *, retrieved_at, max_response_bytes):
+        del client, max_response_bytes
+        index = POLYMARKET_EVIDENCE_TARGETS.index(target) + 1
+        return SourceEvidence(
+            schema_version=1,
+            source="polymarket",
+            url=target.url,
+            retrieved_at=retrieved_at,
+            status_code=200,
+            content_type="text/html",
+            body_byte_count=index,
+            body_sha256=str(index) * 64,
+            etag=None,
+            last_modified=None,
+            locator=target.locator,
+            excerpt=target.excerpt,
+            excerpt_sha256=canonical_sha256(target.excerpt),
+            full_body_retained=False,
+        )
+
+    monkeypatch.setattr(cli, "acquire_polymarket", acquire)
+    monkeypatch.setattr(cli, "capture_evidence", capture)
+    intake = tmp_path / "var/corpus-intake/run"
+    source_use = tmp_path / "var/source-use/run"
+    queue = tmp_path / "var/review-queue/run"
+    assert (
+        main(
+            [
+                "collect",
+                "corpus",
+                "--source",
+                "polymarket",
+                "--output",
+                str(intake),
+                "--retrieved-at",
+                "2026-08-12T16:00:00Z",
+                "--information-cutoff",
+                "2026-08-12T15:00:00Z",
+                "--max-candidates",
+                "2",
+                "--page-size",
+                "2",
+                "--max-pages",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "collect",
+                "source-use",
+                "--source",
+                "polymarket",
+                "--output",
+                str(source_use),
+                "--retrieved-at",
+                "2026-08-12T16:00:00Z",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "collect",
+            "review-queue",
+            "--intake",
+            str(intake),
+            "--source-use",
+            str(source_use),
+            "--output",
+            str(queue),
+            "--as-of",
+            "2026-08-12T16:00:00Z",
+            "--ontology-version",
+            "candidate-triage-v1",
+        ]
+    )
+    verified = verify_review_queue_run(queue)
+
+    assert exit_code == 0
+    assert verified.allowed is False
+    assert verified.blocked_item_count == 2
+    assert verified.reviewer_packet_count == 0
+    assert "external_confirmation_required" in capsys.readouterr().out
+    assert not list(queue.glob("reviewer-*"))
+
+
+def test_source_use_cli_requires_explicit_timestamp_and_quarantine_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing_time = main(
+        [
+            "collect",
+            "source-use",
+            "--source",
+            "polymarket",
+            "--output",
+            str(tmp_path / "var/source-use/run"),
+        ]
+    )
+    outside = main(
+        [
+            "collect",
+            "source-use",
+            "--source",
+            "polymarket",
+            "--output",
+            str(tmp_path / "outside"),
+            "--retrieved-at",
+            "2026-08-12T16:00:00Z",
+        ]
+    )
+
+    assert missing_time == 2
+    assert outside == 2
+    assert "var/source-use" in capsys.readouterr().err
 
 
 def test_public_collection_cli_validation_errors_exit_two(

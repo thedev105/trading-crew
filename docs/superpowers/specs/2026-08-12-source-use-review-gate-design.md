@@ -12,14 +12,13 @@ The immediate real-world outcome is intentionally a blocked release: the existin
 
 ## Official-source finding
 
-Polymarket's official market-data documentation describes its REST market data as public and available without authentication. That establishes technical access, not a reuse license.
+Polymarket's current official Predictions API overview identifies the Gamma API as the service for discovering events and markets and retrieving their metadata. The existing intake run also demonstrates technical access to the public market endpoint. Neither fact establishes a reuse license.
 
 Polymarket's official institutional-data page separately says that capital-markets entities seeking to consume Polymarket data must consult Polymarket and ICE. Its scope expressly includes API and on-chain data as well as derived, aggregated, or anonymized data. Because the contemplated system includes proprietary automated-trading research, the conservative machine decision is `requires_external_confirmation`.
 
 References:
 
-- <https://docs.polymarket.com/market-data/overview>
-- <https://docs.polymarket.com/api-reference/introduction>
+- <https://docs.polymarket.com/api-reference/predictions/overview>
 - <https://institutional.polymarket.com/>
 
 This finding is a source-policy control, not legal advice and not a conclusion about the legal enforceability or geographic reach of any term.
