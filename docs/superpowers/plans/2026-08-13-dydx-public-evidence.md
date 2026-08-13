@@ -237,10 +237,12 @@ Have the mock transport assert these requests in order:
 /v4/historicalFunding/BTC-USD?limit=100&effectiveBeforeOrAt=2026-08-13T10%3A59%3A59.999999Z
 ```
 
-The first fixture contains 12:00 and 11:00 observations; the second contains 11:00 identically,
-10:00, and 09:00. Request `[10:00, 12:00]`. Assert ordered normalized output 10:00, 11:00,
-12:00; the duplicate is included once; 10:00 points to page two's hash while 11:00 and 12:00
-point to page one's hash; 09:00 is filtered out; both raw responses remain.
+The first fixture contains 12:00, 11:00, and an identical duplicate 11:00 observation; the second
+contains 10:00 and 09:00. Request `[10:00, 12:00]`. Assert ordered normalized output 10:00, 11:00,
+12:00; the duplicate is included once; 10:00 points to page two's hash while 11:00 and 12:00 point
+to page one's hash; 09:00 is filtered out; both raw responses remain. Keeping the duplicate within
+one page is consistent with moving the next inclusive upper-bound cursor one microsecond before
+the first page's oldest timestamp.
 
 - [ ] **Step 2: Run the funding test and observe failure**
 
