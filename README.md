@@ -140,3 +140,96 @@ requires all of the following evidence:
 - a documented eligibility and legal/compliance review.
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
+
+## 10. Offline semantic scout experiment
+
+The semantic scout is an offline research layer. AI-like components may retrieve similar rule
+text and propose structured interpretations; only deterministic schema, source-span, corpus,
+registry, and evaluation code validates those proposals. Nothing in this package proves payoff
+equivalence, approves a proposal, changes a risk limit, accesses an account, or submits an order.
+
+This phase deliberately uses two local baselines: character 3–5 gram TF-IDF for candidate
+retrieval and conservative regular expressions for rule extraction. It also writes provider-neutral
+prompt packets for a separately authorized human-operated runner, but contains no hosted-model SDK,
+provider credentials, browsing tool, or inference call. In-repository baseline inference cost is
+exactly USD 0.
+
+The checked-in `tests/fixtures/ai/corpus` corpus is synthetic, frozen, and intentionally unresolved.
+It exists only for deterministic tests and demonstrations; its manifest records zero reviews and
+nine unresolved items. These commands therefore exercise mechanics, not model validation:
+
+```bash
+.venv/bin/polytrading ai retrieve \
+  --corpus tests/fixtures/ai/corpus \
+  --split validation \
+  --top-k 50 \
+  --output var/ai-retrieval.jsonl
+
+.venv/bin/polytrading ai extract-baseline \
+  --corpus tests/fixtures/ai/corpus \
+  --split validation \
+  --output var/ai-extractions.jsonl
+
+.venv/bin/polytrading ai prompt-packets \
+  --corpus tests/fixtures/ai/corpus \
+  --split validation \
+  --output var/ai-prompt-packets.jsonl
+
+.venv/bin/polytrading ai evaluate \
+  --corpus tests/fixtures/ai/corpus \
+  --experiment-id 019b3b42-0000-7000-8000-000000000001 \
+  --output var/ai-report
+```
+
+`import-artifacts` is a stricter boundary than baseline extraction. It requires an exact validated,
+unexpired model card already registered in the target DuckDB, a frozen matching corpus, exact
+source hashes and spans, an exact semantic version, and an explicit budget. A clean database has no
+such validated card, and the command correctly rejects the draft baseline. The synthetic CLI test
+registers a fixture-only card to exercise import mechanics; that is not production validation.
+
+### Corpus construction and preregistration
+
+Production evidence belongs only under `data/gold`. Preregister the sampling policy, import exact
+public rule text with source URL/retrieval/cutoff provenance, obtain two genuinely independent
+reviews for every contract and relationship, adjudicate disagreements with a distinct third person,
+then freeze the corpus. Never copy fixture reviews, invent reviewers, or label synthetic text as
+public evidence. The production gate can be checked without weakening it:
+
+```bash
+.venv/bin/polytrading ai corpus validate \
+  --dir data/gold \
+  --require-contracts 500 \
+  --require-templates 20 \
+  --require-relationships 250 \
+  --require-adversarial 200 \
+  --require-two-reviews
+```
+
+Until genuine Task 4 evidence exists, this command exits 1 and names every deficit. Evaluation also
+refuses an unfrozen or file-inconsistent manifest. Trial-family, code, model, feature, prompt, and
+split-family identities are fixed before the untouched test split; train diagnostics run first,
+validation second, and test at most once per registered experiment.
+
+### Reading the report
+
+- Critical-field exact match compares both known/unknown status and exact normalized values.
+- Candidate recall is retrieved known-positive relationships divided by all known positives.
+- Span validity is valid exact source-backed known fields divided by all known fields.
+- Malformed and hostile fail-closed rates must be 1; an accepted malformed item is a breach.
+- Mutation invalidation is reported independently for operator, timestamp, oracle, and fallback.
+- Review reduction is `1 - routed_manual_count / retrieval_candidate_count`; routing everything to
+  review honestly produces zero reduction.
+- A zero denominator is `NOT_MEASURABLE`, never NaN, and thresholds use unrounded Decimal values.
+
+JSON and Markdown reports retain raw numerators/denominators, failure IDs, abstentions, corpus and
+adversarial counts, hashes, and case results. Their top-level status remains
+`RESEARCH_ONLY_NOT_PROMOTABLE`. The fixture report explicitly labels its evaluation basis
+`synthetic_fixture_self_consistency`; it is not adjudicated-gold accuracy. Class G
+false-eligibility remains
+`BLOCKED_BY_DEPENDENCY` until a deterministic payoff compiler and graph exist and pass; semantic
+similarity or extraction accuracy cannot substitute for payoff proof.
+
+If a future provider runner is separately approved, its monthly inference budget is exactly the
+smaller of USD 25 and 0.3125% of supplied equity. Prompt packets themselves enable no tools or
+browsing. Imported artifacts can never contain eligibility, order, size, leverage, risk-limit,
+credential, wallet, tool-call, or trade-proposal authority fields.

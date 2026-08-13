@@ -35,6 +35,7 @@ def test_report_is_canonical_candid_and_byte_stable() -> None:
     assert first_json == second_json
     assert first_markdown == second_markdown
     assert parsed["overall_status"] == "RESEARCH_ONLY_NOT_PROMOTABLE"
+    assert parsed["evaluation_basis"] == "synthetic_fixture_self_consistency"
     assert parsed["semantic_gate_status"] == "BLOCKED_BY_DEPENDENCY"
     assert parsed["class_g_false_eligibility"] == {
         "dependency": "deterministic payoff compiler and graph",

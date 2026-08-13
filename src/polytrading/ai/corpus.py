@@ -14,7 +14,13 @@ from typing import Annotated, Any, Literal
 
 from pydantic import StringConstraints, field_validator, model_validator
 
-from polytrading.ai.models import AIRecord, GoldContract, GoldRelationship
+from polytrading.ai.models import (
+    AIRecord,
+    GoldContract,
+    GoldContractLabel,
+    GoldRelationship,
+    GoldRelationshipLabel,
+)
 from polytrading.ai.review import ReviewRecord, resolve_reviews
 from polytrading.domain.models import StrictRecord, normalize_utc_timestamp
 
@@ -434,6 +440,100 @@ class CorpusManifest(AIRecord):
     @classmethod
     def require_created_at_utc(cls, value: datetime) -> datetime:
         return normalize_utc_timestamp(value)
+
+
+class FrozenCorpus(StrictRecord):
+    manifest: CorpusManifest
+    contracts: tuple[CorpusContract, ...]
+    relationships: tuple[GoldRelationship, ...]
+
+
+def load_frozen_corpus(directory: Path) -> FrozenCorpus:
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError("frozen corpus manifest does not exist")
+    manifest = CorpusManifest.model_validate_json(manifest_path.read_bytes())
+    if not manifest.frozen:
+        raise ValueError("corpus manifest is not frozen")
+    paths = {
+        name: directory / f"{name}.jsonl"
+        for name in ("contracts", "relationships", "labels", "reviews")
+    }
+    for path in paths.values():
+        if not path.exists():
+            raise ValueError(f"required frozen corpus file does not exist: {path}")
+    contract_rows = _read_jsonl(paths["contracts"])
+    relationship_rows = _read_jsonl(paths["relationships"])
+    label_rows = _read_jsonl(paths["labels"])
+    review_rows = _read_jsonl(paths["reviews"])
+    contracts = tuple(_validate_json_record(CorpusContract, row) for row in contract_rows)
+    relationships = tuple(_validate_json_record(GoldRelationship, row) for row in relationship_rows)
+    labels = tuple(
+        _validate_json_record(
+            GoldContractLabel if "contract_id" in row else GoldRelationshipLabel,
+            row,
+        )
+        for row in label_rows
+    )
+    reviews = tuple(_validate_json_record(ReviewRecord, row) for row in review_rows)
+    validate_split_integrity(contracts, relationships)
+    completion = _review_completion(contracts, relationships, reviews)
+    file_hashes = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()
+    }
+    split_family_hashes = {
+        split: hashlib.sha256(
+            _canonical_json(
+                sorted({contract.event_family for contract in contracts if contract.split == split})
+            )
+        ).hexdigest()
+        for split in ("train", "validation", "test")
+    }
+    counts = {
+        "contracts": len(contracts),
+        "relationships": len(relationships),
+        "labels": len(labels),
+        "reviews": len(reviews),
+    }
+    rule_template_counts = dict(
+        sorted(Counter(contract.rule_template for contract in contracts).items())
+    )
+    adversarial_tag_counts = dict(
+        sorted(Counter(tag for label in labels for tag in label.adversarial_tags).items())
+    )
+    cutoff = max(
+        (contract.information_cutoff for contract in contracts),
+        default=_policy_cutoff(directory),
+    )
+    identity = {
+        "schema_version": 1,
+        "file_hashes": file_hashes,
+        "split_family_hashes": split_family_hashes,
+        "counts": counts,
+        "rule_template_counts": rule_template_counts,
+        "adversarial_tag_counts": adversarial_tag_counts,
+        "review_completion": completion,
+        "information_cutoff": cutoff.isoformat().replace("+00:00", "Z"),
+    }
+    expected_dataset_id = hashlib.sha256(_canonical_json(identity)).hexdigest()
+    expected = {
+        "dataset_id": expected_dataset_id,
+        "information_cutoff": cutoff,
+        "file_hashes": file_hashes,
+        "split_family_hashes": split_family_hashes,
+        "counts": counts,
+        "rule_template_counts": rule_template_counts,
+        "adversarial_tag_counts": adversarial_tag_counts,
+        "review_completion": completion,
+    }
+    for field, value in expected.items():
+        if getattr(manifest, field) != value:
+            raise ValueError(f"frozen corpus manifest {field} does not match corpus files")
+    return FrozenCorpus(
+        manifest=manifest,
+        contracts=contracts,
+        relationships=relationships,
+    )
 
 
 def freeze_manifest(

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 
-from polytrading.ai.cli import add_ai_subcommands, run_ai_command
+from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.report import render_json, render_text
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
@@ -116,6 +116,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.collect_command == "public":
             return asyncio.run(_collect_public(arguments))
         return asyncio.run(_collect_books(arguments))
+    except AIInputError as error:
+        print(f"polytrading: AI input rejected: {error}", file=sys.stderr)
+        return 1
     except (CliUsageError, ValueError, OSError) as error:
         print(f"polytrading: error: {error}", file=sys.stderr)
         return 2

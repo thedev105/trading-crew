@@ -43,6 +43,7 @@ class ClassGDependency(StrictRecord):
 class SemanticScoutReport(StrictRecord):
     schema_version: Literal[1]
     overall_status: Literal["RESEARCH_ONLY_NOT_PROMOTABLE"]
+    evaluation_basis: Literal["synthetic_fixture_self_consistency", "adjudicated_gold"]
     semantic_gate_status: GateStatus
     hashes: ReportHashes
     model_versions: tuple[str, ...]
@@ -89,6 +90,7 @@ def build_semantic_report(
     return SemanticScoutReport(
         schema_version=1,
         overall_status="RESEARCH_ONLY_NOT_PROMOTABLE",
+        evaluation_basis=request.evaluation_basis,
         semantic_gate_status=evaluation.gate_status,
         hashes=ReportHashes(
             manifest_hash=request.manifest.dataset_id,
@@ -135,6 +137,7 @@ def render_report_markdown(report: SemanticScoutReport) -> str:
         "# Offline semantic scout evaluation",
         "",
         f"Overall status: `{report.overall_status}`",
+        f"Evaluation basis: `{report.evaluation_basis}`",
         f"Semantic gate: `{report.semantic_gate_status}`",
         "",
         "## Identity",

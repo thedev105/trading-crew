@@ -165,7 +165,7 @@ def build_regex_model_card(validation_dataset_hash: str, code_revision: str) -> 
         authority="research_only",
         implementation_kind="deterministic_baseline",
         training_cutoff=None,
-        prompt_version=None,
+        prompt_version="regex-v1",
         feature_version=_feature_version(code_revision),
         validation_dataset_hash=validation_dataset_hash,
         status="draft",

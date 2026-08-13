@@ -70,6 +70,9 @@ class PayoffCompilerResults(StrictRecord):
 
 class EvaluationRequest(StrictRecord):
     schema_version: Literal[1]
+    evaluation_basis: Literal["synthetic_fixture_self_consistency", "adjudicated_gold"] = (
+        "synthetic_fixture_self_consistency"
+    )
     manifest: CorpusManifest
     experiment_id: UUID
     trial_family_id: NonEmptyString
