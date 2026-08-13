@@ -39,6 +39,7 @@ from polytrading.domain.models import (
 )
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.public import AdapterBatch
 from tests.carry.study_helpers import at, complete_block
 from tests.domain.factories import funding_observation, instrument_spec
@@ -53,6 +54,7 @@ from tests.venues.funding_cycle_helpers import (
 from tests.venues.funding_cycle_helpers import (
     instrument_spec as cycle_instrument_spec,
 )
+from tests.venues.funding_health_helpers import HEALTH_AS_OF, LATEST_BOUNDARY, funding_cycle
 
 FIXTURE = Path("tests/fixtures/replay/public_snapshot.jsonl")
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
@@ -725,13 +727,53 @@ def test_public_collection_cli_validation_errors_exit_two(
     assert "traceback" not in capsys.readouterr().err.lower()
 
 
-def test_funding_cycle_cli_requires_db_and_cycle_end_without_a_venue_option(
+def test_funding_cycle_cli_requires_db_and_exactly_one_boundary_mode_without_venue(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main(["collect", "funding-cycle", "--cycle-end", FUNDING_CYCLE_END.isoformat()]) == 2
     assert "--db" in capsys.readouterr().err
     assert main(["collect", "funding-cycle", "--db", str(tmp_path / "missing.duckdb")]) == 2
-    assert "--cycle-end" in capsys.readouterr().err
+    missing_mode = capsys.readouterr().err
+    assert "--cycle-end" in missing_mode
+    assert "--current" in missing_mode
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--db",
+                str(tmp_path / "both.duckdb"),
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--current",
+            ]
+        )
+        == 2
+    )
+    assert "not allowed with argument" in capsys.readouterr().err
+    explicit = cli.build_parser().parse_args(
+        [
+            "collect",
+            "funding-cycle",
+            "--db",
+            str(tmp_path / "explicit.duckdb"),
+            "--cycle-end",
+            FUNDING_CYCLE_END.isoformat(),
+        ]
+    )
+    current = cli.build_parser().parse_args(
+        [
+            "collect",
+            "funding-cycle",
+            "--db",
+            str(tmp_path / "current.duckdb"),
+            "--current",
+        ]
+    )
+    assert explicit.cycle_end == FUNDING_CYCLE_END.isoformat()
+    assert explicit.current is False
+    assert current.cycle_end is None
+    assert current.current is True
     assert (
         main(
             [
@@ -838,8 +880,7 @@ def test_funding_cycle_cli_records_late_attempt_without_network(
                 "funding-cycle",
                 "--db",
                 str(database),
-                "--cycle-end",
-                FUNDING_CYCLE_END.isoformat(),
+                "--current",
             ]
         )
         == 0
@@ -850,10 +891,15 @@ def test_funding_cycle_cli_records_late_attempt_without_network(
     assert entered is False
     store = DuckDBStore(database, read_only=True)
     cycles = store.funding_collection_cycles_between(FUNDING_CYCLE_END, FUNDING_CYCLE_END)
+    previous_cycles = store.funding_collection_cycles_between(
+        FUNDING_CYCLE_END - timedelta(hours=1),
+        FUNDING_CYCLE_END - timedelta(hours=1),
+    )
     store.close()
     assert len(cycles) == 1
     assert cycles[0].status == "late"
     assert len(cycles[0].items) == 6
+    assert previous_cycles == ()
 
 
 def test_funding_cycle_cli_collects_complete_exact_boundary_evidence(
@@ -928,7 +974,7 @@ def test_funding_cycle_cli_collects_complete_exact_boundary_evidence(
         [
             FUNDING_CYCLE_END + timedelta(seconds=30),
             FUNDING_CYCLE_END + timedelta(seconds=30),
-            FUNDING_CYCLE_END + timedelta(minutes=2),
+            FUNDING_CYCLE_END + timedelta(hours=1, seconds=1),
         ]
     )
     monkeypatch.setattr(cli, "public_adapter_session", session)
@@ -941,8 +987,7 @@ def test_funding_cycle_cli_collects_complete_exact_boundary_evidence(
                 "funding-cycle",
                 "--db",
                 str(database),
-                "--cycle-end",
-                FUNDING_CYCLE_END.isoformat(),
+                "--current",
                 "--format",
                 "json",
             ]
@@ -1007,6 +1052,200 @@ def test_funding_cycle_cli_classifies_persistence_conflict_as_collection_failure
     message = capsys.readouterr().err
     assert "collection failed" in message
     assert "conflicting funding cycle persistence" in message
+
+
+def _seed_health_database(
+    database: Path, status: FundingCycleStatus = FundingCycleStatus.COMPLETE
+) -> None:
+    store = DuckDBStore(database)
+    store.append_funding_collection_cycle(
+        funding_cycle(
+            LATEST_BOUNDARY, status, cycle_int=900 + list(FundingCycleStatus).index(status)
+        )
+    )
+    store.close()
+
+
+def _database_table_counts(database: Path) -> tuple[tuple[str, int], ...]:
+    with duckdb.connect(str(database), read_only=True) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                ORDER BY table_name
+                """
+            ).fetchall()
+        )
+        return tuple(
+            (table, connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+            for table in tables
+        )
+
+
+def test_funding_health_cli_is_deterministic_read_only_and_offline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "healthy.duckdb"
+    _seed_health_database(database)
+    before_bytes = database.read_bytes()
+    before_counts = _database_table_counts(database)
+
+    def reject_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("health audit touched the network")
+
+    monkeypatch.setattr(cli, "make_public_http_client", reject_network)
+    monkeypatch.setattr(cli, "public_adapter_session", reject_network)
+    arguments = [
+        "funding",
+        "health",
+        "--db",
+        str(database),
+        "--hours",
+        "1",
+        "--as-of",
+        HEALTH_AS_OF.isoformat(),
+        "--format",
+        "json",
+    ]
+
+    assert main(arguments) == 0
+    first = capsys.readouterr().out
+    assert main(arguments) == 0
+    second = capsys.readouterr().out
+
+    assert first == second
+    payload = json.loads(first)
+    assert payload["status"] == "healthy"
+    assert payload["boundaries"][0]["status"] == "complete"
+    assert database.read_bytes() == before_bytes
+    assert _database_table_counts(database) == before_counts
+
+
+@pytest.mark.parametrize(
+    ("cycle_status", "health_status"),
+    [
+        (FundingCycleStatus.DEGRADED, "degraded"),
+        (FundingCycleStatus.LATE, "critical"),
+    ],
+)
+def test_funding_health_cli_returns_one_for_actionable_health(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    cycle_status: FundingCycleStatus,
+    health_status: str,
+) -> None:
+    database = tmp_path / f"{cycle_status.value}.duckdb"
+    _seed_health_database(database, cycle_status)
+
+    assert (
+        main(
+            [
+                "funding",
+                "health",
+                "--db",
+                str(database),
+                "--hours",
+                "1",
+                "--as-of",
+                HEALTH_AS_OF.isoformat(),
+            ]
+        )
+        == 1
+    )
+    output = capsys.readouterr().out
+    assert output.splitlines()[0].endswith(f" | {health_status}")
+
+
+def test_funding_health_cli_captures_omitted_as_of_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "clock.duckdb"
+    _seed_health_database(database)
+    calls = 0
+
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        return HEALTH_AS_OF
+
+    monkeypatch.setattr(cli, "_utc_now", clock)
+
+    assert (
+        main(
+            [
+                "funding",
+                "health",
+                "--db",
+                str(database),
+                "--hours",
+                "1",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert calls == 1
+    assert json.loads(capsys.readouterr().out)["as_of"] == "2026-08-14T17:06:00Z"
+
+
+def test_funding_health_cli_rejects_invalid_hours_before_opening_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "must-not-open.duckdb"
+
+    assert (
+        main(
+            [
+                "funding",
+                "health",
+                "--db",
+                str(missing),
+                "--hours",
+                "0",
+                "--as-of",
+                HEALTH_AS_OF.isoformat(),
+            ]
+        )
+        == 2
+    )
+    message = capsys.readouterr().err
+    assert "between 1 and 2160" in message
+    assert "database" not in message
+    assert not missing.exists()
+
+
+def test_funding_health_cli_sanitizes_missing_and_old_schema_databases(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "missing.duckdb"
+    old = tmp_path / "old.duckdb"
+    duckdb.connect(str(old)).close()
+
+    for database in (missing, old):
+        assert (
+            main(
+                [
+                    "funding",
+                    "health",
+                    "--db",
+                    str(database),
+                    "--as-of",
+                    HEALTH_AS_OF.isoformat(),
+                ]
+            )
+            == 2
+        )
+        message = capsys.readouterr().err
+        assert message.startswith("polytrading: error:")
+        assert "traceback" not in message.casefold()
 
 
 class _ReplayOrderStore:

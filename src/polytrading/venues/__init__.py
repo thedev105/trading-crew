@@ -8,6 +8,11 @@ from polytrading.venues.funding_cycle_models import (
     FundingCollectionCycle,
     FundingCycleItem,
 )
+from polytrading.venues.funding_health import FundingCollectionHealthAuditor
+from polytrading.venues.funding_health_models import (
+    FundingBoundaryHealth,
+    FundingCollectionHealthReport,
+)
 from polytrading.venues.public import (
     AdapterBatch,
     AdapterWarning,
@@ -21,7 +26,10 @@ __all__ = [
     "AdapterBatch",
     "AdapterWarning",
     "BookCollectionCycle",
+    "FundingBoundaryHealth",
     "FundingCollectionCycle",
+    "FundingCollectionHealthAuditor",
+    "FundingCollectionHealthReport",
     "FundingCycleItem",
     "NormalizedRecord",
     "PointInTimeFundingCollector",

@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import httpx
 
 from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
@@ -37,10 +38,22 @@ from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
     record_late_funding_cycle,
 )
-from polytrading.venues.funding_cycle_models import validate_cycle_timing
+from polytrading.venues.funding_cycle_models import (
+    resolve_current_cycle_end,
+    validate_cycle_timing,
+)
 from polytrading.venues.funding_cycle_report import (
     render_funding_cycle_json,
     render_funding_cycle_text,
+)
+from polytrading.venues.funding_health import FundingCollectionHealthAuditor
+from polytrading.venues.funding_health_models import (
+    FundingCollectionHealthStatus,
+    resolve_health_window,
+)
+from polytrading.venues.funding_health_report import (
+    render_funding_health_json,
+    render_funding_health_text,
 )
 from polytrading.venues.hyperliquid import HyperliquidPublicAdapter
 from polytrading.venues.public import PublicVenueAdapter
@@ -122,6 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
     study.add_argument("--known-as-of", required=True)
     study.add_argument("--format", choices=("text", "json"), default="text")
 
+    funding = commands.add_parser("funding", help="prospective funding evidence operations")
+    funding_commands = funding.add_subparsers(dest="funding_command", required=True)
+    health = funding_commands.add_parser("health", help="audit hourly funding collection health")
+    health.add_argument("--db", required=True, type=Path)
+    health.add_argument("--hours", type=int, default=24)
+    health.add_argument("--as-of")
+    health.add_argument("--format", choices=("text", "json"), default="text")
+
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
     public = collect_commands.add_parser("public", help="collect public instruments and funding")
@@ -136,7 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     funding_cycle.add_argument("--db", required=True, type=Path)
     funding_cycle.add_argument("--assets", default="BTC,ETH,SOL")
-    funding_cycle.add_argument("--cycle-end", required=True)
+    funding_cycle_mode = funding_cycle.add_mutually_exclusive_group(required=True)
+    funding_cycle_mode.add_argument("--cycle-end")
+    funding_cycle_mode.add_argument("--current", action="store_true")
     funding_cycle.add_argument("--format", choices=("text", "json"), default="text")
 
     books = collect_commands.add_parser("books", help="collect synchronized public books")
@@ -196,6 +219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.carry_command == "audit"
                 else _carry_study(arguments)
             )
+        if arguments.command == "funding":
+            return _funding_health(arguments)
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
@@ -377,8 +402,12 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
 
 async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     assets = _parse_assets(arguments.assets)
-    cycle_end = _parse_timestamp(arguments.cycle_end)
     now = _utc_now()
+    cycle_end = (
+        resolve_current_cycle_end(now)
+        if arguments.current
+        else _parse_timestamp(arguments.cycle_end)
+    )
     _, _, is_late = validate_cycle_timing(cycle_end, now)
 
     store = DuckDBStore(arguments.db)
@@ -403,6 +432,29 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     )
     print(renderer(cycle))
     return 0
+
+
+def _funding_health(arguments: argparse.Namespace) -> int:
+    as_of = _parse_timestamp(arguments.as_of) if arguments.as_of else _utc_now()
+    resolve_health_window(as_of, arguments.hours)
+    if not arguments.db.is_file():
+        raise CliUsageError("funding health database is unavailable or not current")
+
+    store: DuckDBStore | None = None
+    try:
+        store = DuckDBStore(arguments.db, read_only=True)
+        report = FundingCollectionHealthAuditor(store).audit(as_of, arguments.hours)
+    except (duckdb.Error, RuntimeError) as error:
+        raise CliUsageError("funding health database is unavailable or not current") from error
+    finally:
+        if store is not None:
+            store.close()
+
+    renderer = (
+        render_funding_health_json if arguments.format == "json" else render_funding_health_text
+    )
+    print(renderer(report))
+    return 0 if report.status is FundingCollectionHealthStatus.HEALTHY else 1
 
 
 async def _collect_corpus(arguments: argparse.Namespace) -> int:
