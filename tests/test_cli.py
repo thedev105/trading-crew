@@ -60,6 +60,59 @@ FIXTURE = Path("tests/fixtures/replay/public_snapshot.jsonl")
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
 
+def test_dashboard_parser_has_local_read_only_arguments_only() -> None:
+    parsed = cli.build_parser().parse_args(["dashboard", "--db", "var/forward.duckdb"])
+
+    assert parsed.command == "dashboard"
+    assert parsed.db == Path("var/forward.duckdb")
+    assert parsed.port == 8787
+    assert {
+        "host",
+        "token",
+        "user",
+        "password",
+        "account",
+        "order",
+        "execution",
+    }.isdisjoint(vars(parsed))
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "1.5", "true", ""])
+def test_dashboard_rejects_invalid_ports(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], port: str
+) -> None:
+    assert main(["dashboard", "--db", str(tmp_path / "db.duckdb"), "--port", port]) == 2
+    assert "port must be an integer between 1 and 65535" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("port", [1, 65_535])
+def test_dashboard_accepts_port_boundaries(port: int) -> None:
+    parsed = cli.build_parser().parse_args(
+        ["dashboard", "--db", "var/forward.duckdb", "--port", str(port)]
+    )
+    assert parsed.port == port
+
+
+def test_dashboard_validates_then_serves_selected_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "research data.duckdb"
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        cli,
+        "validate_dashboard_database",
+        lambda value: calls.append(("validate", value)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "serve_dashboard",
+        lambda value, port: calls.append(("serve", value, port)),
+    )
+
+    assert main(["dashboard", "--db", str(path), "--port", "9000"]) == 0
+    assert calls == [("validate", path), ("serve", path, 9000)]
+
+
 def test_replay_and_audit_are_deterministic_and_preserve_lineage(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

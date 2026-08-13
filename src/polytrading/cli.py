@@ -60,6 +60,7 @@ from polytrading.venues.hyperliquid import HyperliquidPublicAdapter
 from polytrading.venues.public import AdapterBatch, AdapterWarning, PublicVenueAdapter
 from polytrading.venues.recorder import PublicRecorder
 from polytrading.venues.synchronized import SynchronizedBookCollector
+from polytrading.web.server import serve_dashboard, validate_dashboard_database
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
@@ -119,6 +120,10 @@ def build_parser() -> argparse.ArgumentParser:
     replay = commands.add_parser("replay", help="replay public adapter batches")
     replay.add_argument("--input", required=True, type=Path)
     replay.add_argument("--db", required=True, type=Path)
+
+    dashboard = commands.add_parser("dashboard", help="serve the local read-only evidence console")
+    dashboard.add_argument("--db", required=True, type=Path)
+    dashboard.add_argument("--port", type=_dashboard_port, default=8787)
 
     carry = commands.add_parser("carry", help="carry research diagnostics")
     carry_commands = carry.add_subparsers(dest="carry_command", required=True)
@@ -212,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = build_parser().parse_args(argv)
+        if arguments.command == "dashboard":
+            validate_dashboard_database(arguments.db)
+            serve_dashboard(arguments.db, arguments.port)
+            return 0
         if arguments.command == "replay":
             return _replay(arguments)
         if arguments.command == "carry":
@@ -295,6 +304,17 @@ def _parse_timestamp(value: str) -> datetime:
         return normalize_utc_timestamp(parsed)
     except ValueError as error:
         raise CliUsageError(f"invalid timestamp {value!r}") from error
+
+
+def _dashboard_port(value: str) -> int:
+    message = "port must be an integer between 1 and 65535"
+    try:
+        port = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(message) from error
+    if not 1 <= port <= 65_535:
+        raise argparse.ArgumentTypeError(message)
+    return port
 
 
 def _utc_now() -> datetime:

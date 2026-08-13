@@ -164,7 +164,30 @@ aware UTC clock internally. Collection status and health coverage measure prospe
 continuity only. They do not measure strategy quality, expected returns, or profitability, and a
 health alert is not a reason to backfill an old boundary as though it were collected on time.
 
-## 6. Synchronized 20-level book collection
+## 6. Local evidence dashboard
+
+Start the loopback-only operator console against an existing current-schema database:
+
+```bash
+.venv/bin/polytrading dashboard \
+  --db var/forward.duckdb \
+  --port 8787
+```
+
+Then open `http://127.0.0.1:8787` in a browser. The page presents one point-in-time snapshot of
+24-hour funding collection health, the latest public instrument/funding/book evidence, the existing
+Bybit/Hyperliquid carry research gate, evidence counts, and copyable CLI recipes. Every refresh opens
+the selected database read-only and uses one captured UTC `as_of` across the complete screen.
+
+The database must already exist and have the current schema. A temporary database lock or other
+availability conflict can make a refresh fail; the browser retains its last successful snapshot and
+marks it stale. Missing evidence remains visibly unavailable rather than appearing as zero.
+
+The recipes are text copied to the clipboard and are never executed by the page. The server binds
+only to `127.0.0.1` and has no remote mode, authentication surface, collection controls, credentials,
+accounts, positions, orders, or trading authority. Stop it with `Ctrl-C`.
+
+## 7. Synchronized 20-level book collection
 
 Book cycles start the selected venue requests concurrently and request exactly 20 levels for each
 asset. Run one cycle with `--once`, or collect for a bounded duration:
@@ -200,7 +223,7 @@ The dYdX REST book response exposes neither a venue timestamp nor a sequence. It
 CLI prints `DYDX_REST_BOOK_LOCAL_TIMESTAMP`. These snapshots can support coarse receipt-skew and
 depth research, but not exchange-time simultaneity, continuous-sequence, or queue-position claims.
 
-## 7. Carry audit interpretation
+## 8. Carry audit interpretation
 
 Every audit requires an explicit point-in-time cutoff. Text and canonical JSON always order assets
 as BTC, ETH, and SOL and report research-only warnings. `DIAGNOSTIC_ONLY` means current compatible
@@ -213,7 +236,7 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 8. Cross-venue funding persistence study
+## 9. Cross-venue funding persistence study
 
 The read-only study tests one frozen direction: long the Bybit perpetual and short the
 Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
@@ -251,7 +274,7 @@ create a commercial data product. The current Bybit API agreement and any applic
 terms must be reviewed for the exact intended use before expanding collection or proprietary
 deployment.
 
-## 9. Database backup, replay, and schema versions
+## 10. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -263,7 +286,7 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
-## 10. Explicit read-only boundary
+## 11. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -271,7 +294,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 11. Evidence still required by the Class C activation gate
+## 12. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
