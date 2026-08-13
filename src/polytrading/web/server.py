@@ -156,6 +156,9 @@ def _handler_for(application: DashboardApplication) -> type[BaseHTTPRequestHandl
         def do_TRACE(self) -> None:
             self._write_response("TRACE")
 
+        def do_CONNECT(self) -> None:
+            self._write_response("CONNECT")
+
         def _write_response(self, method: str) -> None:
             response = application.respond(method, self.path, self.headers.get("Host", ""))
             self.send_response(response.status.value)

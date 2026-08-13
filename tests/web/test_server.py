@@ -1,10 +1,12 @@
 import json
+import socket
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
 
 import pytest
 
+import polytrading.web.server as web_server
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.server import DashboardApplication, validate_dashboard_database
 
@@ -42,6 +44,25 @@ def test_dashboard_rejects_every_mutating_http_method(database_path: Path, metho
     assert response.status is HTTPStatus.METHOD_NOT_ALLOWED
     assert response.headers["Allow"] == "GET"
     assert json.loads(response.body) == {"error": {"code": "METHOD_NOT_ALLOWED"}}
+
+
+def test_http_handler_routes_connect_through_the_get_only_policy(database_path: Path) -> None:
+    application = DashboardApplication(database_path, clock=lambda: AS_OF)
+    handler = web_server._handler_for(application)
+    client, accepted = socket.socketpair()
+    client.settimeout(1)
+    try:
+        client.sendall(b"CONNECT tunnel HTTP/1.1\r\nHost: localhost:8787\r\n\r\n")
+        handler(accepted, ("127.0.0.1", 1), object())
+        response = client.recv(4096)
+    finally:
+        client.close()
+        accepted.close()
+
+    header, body = response.split(b"\r\n\r\n", 1)
+    assert header.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert b"Allow: GET" in header
+    assert json.loads(body) == {"error": {"code": "METHOD_NOT_ALLOWED"}}
 
 
 @pytest.mark.parametrize("host", ["", "evil.example", "127.0.0.2", "localhost:0", "localhost:x"])
