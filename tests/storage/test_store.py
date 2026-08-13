@@ -21,6 +21,8 @@ from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from tests.domain.factories import NOW, SOURCE_HASH, instrument_spec
 
 OTHER_SOURCE_HASH = "b" * 64
+THIRD_SOURCE_HASH = "c" * 64
+FOURTH_SOURCE_HASH = "d" * 64
 
 
 def raw_envelope(**overrides: object) -> RawEnvelope:
@@ -212,6 +214,61 @@ def test_all_record_types_round_trip_without_float_conversion(tmp_path: Path) ->
         ("ask", 0, book.asks[0].price, book.asks[0].quantity),
         ("ask", 1, book.asks[1].price, book.asks[1].quantity),
     ]
+
+
+def test_funding_revisions_respect_open_start_closed_end_and_knowledge_cutoff(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    start = NOW - timedelta(hours=16)
+    middle = NOW - timedelta(hours=8)
+    known_as_of = NOW + timedelta(minutes=1)
+    for record in (
+        funding_observation(effective_at=start, observed_at=start + timedelta(minutes=1)),
+        funding_observation(
+            effective_at=middle,
+            observed_at=middle + timedelta(minutes=1),
+            source_hash=OTHER_SOURCE_HASH,
+        ),
+        funding_observation(
+            effective_at=middle,
+            observed_at=known_as_of + timedelta(minutes=1),
+            source_hash=THIRD_SOURCE_HASH,
+        ),
+        funding_observation(
+            effective_at=NOW,
+            observed_at=known_as_of,
+            source_hash=FOURTH_SOURCE_HASH,
+        ),
+    ):
+        store.append_funding(record)
+
+    rows = store.funding_revisions_between(
+        Venue.BYBIT,
+        "BTCUSDT",
+        start,
+        NOW,
+        known_as_of,
+    )
+
+    assert [(row.effective_at, row.observed_at, row.source_hash) for row in rows] == [
+        (middle, middle + timedelta(minutes=1), OTHER_SOURCE_HASH),
+        (NOW, known_as_of, FOURTH_SOURCE_HASH),
+    ]
+    store.close()
+
+
+def test_funding_revisions_require_ordered_window_and_knowledge_cutoff(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+
+    with pytest.raises(ValueError, match="start must be less than or equal to end"):
+        store.funding_revisions_between(Venue.BYBIT, "BTCUSDT", NOW, NOW - timedelta(hours=1), NOW)
+    with pytest.raises(ValueError, match="known_as_of must be greater than or equal to end"):
+        store.funding_revisions_between(
+            Venue.BYBIT, "BTCUSDT", NOW - timedelta(hours=1), NOW, NOW - timedelta(microseconds=1)
+        )
+
+    store.close()
 
 
 @pytest.mark.parametrize(

@@ -653,6 +653,48 @@ class DuckDBStore:
             for row in rows
         )
 
+    def funding_revisions_between(
+        self,
+        venue: Venue,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        known_as_of: datetime,
+    ) -> tuple[FundingObservation, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
+        if normalized_known_as_of < normalized_end:
+            raise ValueError("known_as_of must be greater than or equal to end")
+        rows = self._connection.execute(
+            """
+            SELECT venue, symbol, asset, rate, interval_hours, epoch_us(effective_at),
+                   epoch_us(observed_at), source_hash, schema_version
+            FROM funding_observations
+            WHERE venue = ? AND symbol = ?
+              AND effective_at > ? AND effective_at <= ?
+              AND observed_at <= ?
+            ORDER BY effective_at, observed_at, source_hash
+            """,
+            [venue.value, symbol, normalized_start, normalized_end, normalized_known_as_of],
+        ).fetchall()
+        return tuple(
+            FundingObservation(
+                venue=Venue(row[0]),
+                symbol=row[1],
+                asset=Asset(row[2]),
+                rate=row[3],
+                interval_hours=row[4],
+                effective_at=_utc_from_epoch_us(row[5]),
+                observed_at=_utc_from_epoch_us(row[6]),
+                source_hash=row[7],
+                schema_version=row[8],
+            )
+            for row in rows
+        )
+
     def _append_book_snapshot(self, record: Level2BookSnapshot) -> bool:
         if self._normalized_retry(
             "book snapshot",
