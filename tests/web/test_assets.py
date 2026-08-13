@@ -93,6 +93,13 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
         assert forbidden not in combined
 
 
+def test_dashboard_client_accepts_the_canonical_twelve_market_rows() -> None:
+    javascript = _asset("app.js")
+
+    assert "snapshot.markets.length !== 12" in javascript
+    assert "snapshot.markets.length !== 9" not in javascript
+
+
 def test_discovery_copy_is_neutral_and_keeps_activation_closed() -> None:
     html = _asset("index.html")
     javascript = _asset("app.js")

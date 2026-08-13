@@ -136,9 +136,16 @@ def test_lighter_source_accepts_only_documented_official_domains(url: str) -> No
     assert source.venue is ResearchVenue.LIGHTER
 
 
-def test_research_venues_do_not_expand_market_data_adapter_support() -> None:
-    assert tuple(Venue) == (Venue.HYPERLIQUID, Venue.BYBIT, Venue.DYDX)
-    assert ResearchVenue.LIGHTER.value == "lighter"
+def test_promoted_lighter_retains_distinct_research_and_adapter_identities() -> None:
+    # Catches the compatibility dossier enum being replaced by the operational adapter enum.
+    assert tuple(Venue) == (
+        Venue.HYPERLIQUID,
+        Venue.BYBIT,
+        Venue.DYDX,
+        Venue.LIGHTER,
+    )
+    assert ResearchVenue.LIGHTER.value == Venue.LIGHTER.value == "lighter"
+    assert ResearchVenue.LIGHTER is not Venue.LIGHTER
 
 
 def test_dossier_rejects_source_observed_after_its_cutoff() -> None:

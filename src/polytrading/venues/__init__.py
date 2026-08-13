@@ -1,7 +1,6 @@
 """Public-only venue data collection boundaries."""
 
 from polytrading.venues.dydx import DydxPublicAdapter
-from polytrading.venues.lighter import LighterPublicAdapter
 from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
     record_late_funding_cycle,
@@ -15,6 +14,7 @@ from polytrading.venues.funding_health_models import (
     FundingBoundaryHealth,
     FundingCollectionHealthReport,
 )
+from polytrading.venues.lighter import LighterPublicAdapter
 from polytrading.venues.public import (
     AdapterBatch,
     AdapterWarning,

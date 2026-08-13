@@ -320,7 +320,7 @@ function render(snapshot) {
 }
 
 function validateSnapshot(snapshot) {
-  if (!snapshot || snapshot.schema_version !== 1 || !Array.isArray(snapshot.markets) || snapshot.markets.length !== 9) {
+  if (!snapshot || snapshot.schema_version !== 1 || !Array.isArray(snapshot.markets) || snapshot.markets.length !== 12) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!snapshot.funding_health || !Array.isArray(snapshot.funding_health.boundaries)) {
