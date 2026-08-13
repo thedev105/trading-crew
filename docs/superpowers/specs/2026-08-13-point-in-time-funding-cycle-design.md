@@ -115,9 +115,11 @@ Every requested venue/asset pair produces one `FundingCycleItem` with:
 - expected symbol;
 - an instrument outcome;
 - a funding outcome;
+- zero or one instrument observation timestamp;
 - zero or one funding effective timestamp;
 - zero or one funding observation timestamp;
-- sorted unique source hashes; and
+- sorted unique instrument source hashes;
+- sorted unique funding source hashes; and
 - sorted unique reason codes for every non-successful component.
 
 Instrument outcomes are `captured`, `failed`, or `late_not_collected`. Funding outcomes are:
@@ -138,9 +140,10 @@ The carry study remains responsible for block completeness.
 An instrument response can fail while funding succeeds from a previously known specification, or
 the reverse. Keeping the two outcomes separate prevents a single label from hiding either fact.
 When a venue-level instrument batch fails, the same sanitized instrument failure code is attached
-to every requested asset for that venue. Item source hashes include every valid instrument and
-funding raw response that supports that venue/asset item; a shared instrument raw hash may
-therefore appear in several items.
+to every requested asset for that venue. Separate item hash fields include every valid instrument
+and funding raw response that supports that venue/asset item; a shared instrument raw hash may
+therefore appear in several items. Keeping the fields separate makes component lineage verifiable
+without interpreting endpoint names.
 
 ### 5.2 Funding collection cycle
 
@@ -160,14 +163,14 @@ Allowed statuses are:
 
 - `complete`: every instrument item was captured, every Hyperliquid funding item was captured,
   every Bybit funding item was either captured or a successful no-settlement response, and every
-  captured funding item was observed within five minutes;
+  captured instrument and funding item was observed within five minutes;
 - `degraded`: at least one item failed, was missing, or required bootstrap; or
-- `late`: no request was made because the command started late, or at least one captured item was
-  observed after the five-minute cutoff.
+- `late`: no request was made because the command started late, or at least one captured
+  instrument or funding component was observed after the five-minute cutoff.
 
 Model validators enforce canonical item order, exact pair coverage, timestamp order, outcome
 field consistency, status derivation, and equality between cycle source hashes and the union of
-item source hashes.
+all item instrument and funding source hashes.
 
 ## 6. Collection data flow
 
