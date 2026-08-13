@@ -39,6 +39,8 @@ class FundingCollectionHealthAuditor:
         )
         attempts_by_boundary: dict[datetime, list[FundingCollectionCycle]] = defaultdict(list)
         for cycle in self._store.funding_collection_cycles_between(first_boundary, last_boundary):
+            if cycle.request_completed_at > normalized_as_of:
+                continue
             attempts_by_boundary[cycle.cycle_end].append(cycle)
 
         boundaries = tuple(

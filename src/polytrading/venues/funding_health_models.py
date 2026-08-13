@@ -186,6 +186,12 @@ class FundingCollectionHealthReport(StrictRecord):
         )
         if tuple(item.cycle_end for item in self.boundaries) != expected_boundaries:
             raise ValueError("boundaries must cover the exact health window")
+        if any(
+            item.selected_request_completed_at is not None
+            and item.selected_request_completed_at > self.as_of
+            for item in self.boundaries
+        ):
+            raise ValueError("selected completion must not follow as-of")
 
         counts = {
             status: sum(item.status is status for item in self.boundaries)

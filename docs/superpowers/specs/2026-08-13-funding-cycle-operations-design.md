@@ -105,10 +105,12 @@ Every expected boundary produces one `FundingBoundaryHealth` record with:
   exists; and
 - sorted reason codes.
 
-Attempts are ranked `complete`, then `degraded`, then `late`. The selected attempt is the earliest
-completion within the best available rank, with cycle UUID as a stable tie-breaker. A later
-successful retry can therefore establish complete evidence without erasing the earlier failed or
-late attempt; all counts remain visible.
+Only attempts whose `request_completed_at` is at or before `as_of` participate in a report, so a
+reproducible historical audit cannot see a later retry. Eligible attempts are ranked `complete`,
+then `degraded`, then `late`. The selected attempt is the earliest completion within the best
+available rank, with cycle UUID as a stable tie-breaker. A later successful retry can therefore
+establish complete evidence in subsequent reports without erasing the earlier failed or late
+attempt; all eligible counts remain visible.
 
 Reason codes are deterministic:
 

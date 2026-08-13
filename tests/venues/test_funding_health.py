@@ -159,6 +159,26 @@ def test_completion_time_then_uuid_break_complete_attempt_ties() -> None:
     )
 
 
+def test_audit_excludes_attempts_completed_after_the_as_of_cutoff() -> None:
+    future_known = funding_cycle(
+        LATEST_BOUNDARY,
+        FundingCycleStatus.COMPLETE,
+        cycle_int=30,
+        completed_offset=timedelta(minutes=7),
+    )
+    store = FakeFundingCycleHistory((future_known,))
+
+    before_completion = FundingCollectionHealthAuditor(store).audit(HEALTH_AS_OF, 1)
+    after_completion = FundingCollectionHealthAuditor(store).audit(
+        HEALTH_AS_OF + timedelta(minutes=2), 1
+    )
+
+    assert before_completion.boundaries[0].status is FundingBoundaryStatus.MISSING
+    assert before_completion.boundaries[0].attempt_count == 0
+    assert after_completion.boundaries[0].status is FundingBoundaryStatus.COMPLETE
+    assert after_completion.boundaries[0].selected_cycle_id == future_known.cycle_id
+
+
 @settings(max_examples=50, deadline=None)
 @given(
     data=st.data(),

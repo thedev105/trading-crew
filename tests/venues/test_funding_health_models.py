@@ -105,6 +105,17 @@ def test_health_window_rejects_naive_and_pre_epoch_windows() -> None:
         resolve_health_window(datetime(1970, 1, 1, 0, 4, tzinfo=UTC), 1)
 
 
+def test_health_window_accepts_ninety_days_and_crosses_leap_day_hourly() -> None:
+    leap_as_of = datetime(2024, 3, 1, 0, 5, tzinfo=UTC)
+
+    _, leap_first, leap_last = resolve_health_window(leap_as_of, 49)
+    _, maximum_first, maximum_last = resolve_health_window(leap_as_of, 2_160)
+
+    assert leap_first == datetime(2024, 2, 28, 0, tzinfo=UTC)
+    assert leap_last == datetime(2024, 3, 1, 0, tzinfo=UTC)
+    assert maximum_last - maximum_first == timedelta(hours=2_159)
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -195,6 +206,13 @@ def test_report_accepts_exact_counts_coverage_streak_and_hash_union() -> None:
 
     assert result.current_complete_streak == 2
     assert result.complete_coverage == Decimal("0.6666666666666666666666666667")
+
+
+def test_report_rejects_selected_attempt_completed_after_as_of() -> None:
+    future_known = boundary(selected_request_completed_at=AS_OF + timedelta(minutes=1))
+
+    with pytest.raises(ValidationError, match="selected completion must not follow as-of"):
+        report(boundaries=(future_known,))
 
 
 @pytest.mark.parametrize(

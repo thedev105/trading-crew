@@ -73,15 +73,26 @@ once a specification exists at the requested start, later Bybit collections norm
 
 ## 5. Prospective hourly funding-cycle collection
 
-The prospective collector records one named UTC-hour boundary across both venues. An external
-scheduler must pass the hour that just ended and invoke the command no later than five minutes
-after that boundary:
+The prospective collector records one UTC-hour boundary across both venues. For a reproducible
+manual invocation, name that boundary explicitly:
 
 ```bash
 .venv/bin/polytrading collect funding-cycle \
   --db var/forward.duckdb \
   --assets BTC,ETH,SOL \
   --cycle-end 2026-08-13T17:00:00Z \
+  --format json
+```
+
+For hourly operation, an external scheduler can invoke current mode shortly after the hour. The
+command captures one aware UTC clock value, floors it to the current whole hour, and cannot shift
+to a newer boundary if collection crosses an hour:
+
+```bash
+.venv/bin/polytrading collect funding-cycle \
+  --db var/forward.duckdb \
+  --current \
+  --assets BTC,ETH,SOL \
   --format json
 ```
 
@@ -102,6 +113,39 @@ responses retain their raw source hashes and response-observation time so a miss
 response cannot appear on time. Keep raw data local and review venue terms for the intended use.
 This command neither authorizes live collection nor enables trading, account access, credentials,
 or redistribution.
+
+Audit recent collection health separately after the five-minute collection window has closed:
+
+```bash
+.venv/bin/polytrading funding health \
+  --db var/forward.duckdb \
+  --hours 24 \
+  --format text
+```
+
+The health command opens an existing current-schema database read-only, makes no network requests,
+and evaluates exactly the requested hourly boundaries. At `17:05:00Z`, the `17:00:00Z` boundary
+is auditable; before that instant it is not. Exit `0` means every audited boundary has at least one
+complete attempt. Exit `1` means health is `degraded` or `critical`; exit `2` means invalid input or
+an unavailable/non-current database. When `--as-of` is supplied, attempts completed after that
+cutoff are excluded so later retries cannot leak into a historical report. A first Bybit boundary
+can be degraded while its observed instrument specification establishes the non-backdated basis
+for later hours. Retries append new cycle UUIDs and health selects the best attempt without hiding
+the earlier attempts.
+
+For example, these portable cron entries collect at minute 1 and audit at minute 6. They are
+documentation only; this project does not install or modify a scheduler. Another installation must
+replace `/Volumes/WORK/poly-trading` with its own absolute checkout path:
+
+```cron
+1 * * * * cd /Volumes/WORK/poly-trading && .venv/bin/polytrading collect funding-cycle --db var/forward.duckdb --current --format json >> var/funding-cycle.log 2>&1
+6 * * * * cd /Volumes/WORK/poly-trading && .venv/bin/polytrading funding health --db var/forward.duckdb --hours 24 --format json >> var/funding-health.log 2>&1
+```
+
+Cron's configured timezone is not used to calculate the boundary: `--current` derives it from an
+aware UTC clock internally. Collection status and health coverage measure prospective evidence
+continuity only. They do not measure strategy quality, expected returns, or profitability, and a
+health alert is not a reason to backfill an old boundary as though it were collected on time.
 
 ## 6. Synchronized 20-level book collection
 
