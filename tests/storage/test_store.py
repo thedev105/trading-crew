@@ -310,6 +310,62 @@ def test_funding_collection_cycle_query_rejects_reversed_or_naive_windows(
     store.close()
 
 
+def test_latest_funding_cycle_and_evidence_counts_are_point_in_time(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "dashboard.duckdb")
+    as_of = NOW + timedelta(minutes=30)
+    old_cycle = funding_collection_cycle()
+    future_cycle = funding_collection_cycle(
+        cycle_id=UUID("00000000-0000-0000-0000-000000000903"),
+        cycle_end=NOW + timedelta(hours=1),
+    )
+    store.append_funding_collection_cycle(old_cycle)
+    store.append_funding_collection_cycle(future_cycle)
+    store.append_instrument(instrument_spec(observed_at=as_of - timedelta(minutes=1)))
+    store.append_instrument(
+        instrument_spec(
+            instrument_id="bybit:ETHUSDT",
+            symbol="ETHUSDT",
+            asset=Asset.ETH,
+            observed_at=as_of + timedelta(minutes=1),
+            source_hash=OTHER_SOURCE_HASH,
+        )
+    )
+
+    assert store.latest_funding_collection_cycle_as_of(as_of) == old_cycle
+    assert store.evidence_counts_as_of(as_of) == {
+        "raw_envelopes": 0,
+        "instrument_specs": 1,
+        "funding_observations": 0,
+        "market_snapshots": 0,
+        "book_snapshots": 0,
+        "book_collection_cycles": 0,
+        "funding_collection_cycles": 1,
+    }
+    store.close()
+
+
+def test_dashboard_reads_are_empty_and_require_aware_cutoff(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "dashboard.duckdb")
+
+    assert store.latest_funding_collection_cycle_as_of(NOW) is None
+    assert store.evidence_counts_as_of(NOW) == {
+        "raw_envelopes": 0,
+        "instrument_specs": 0,
+        "funding_observations": 0,
+        "market_snapshots": 0,
+        "book_snapshots": 0,
+        "book_collection_cycles": 0,
+        "funding_collection_cycles": 0,
+    }
+    for reader in (
+        store.latest_funding_collection_cycle_as_of,
+        store.evidence_counts_as_of,
+    ):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            reader(NOW.replace(tzinfo=None))
+    store.close()
+
+
 def test_all_record_types_round_trip_without_float_conversion(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     raw = raw_envelope()

@@ -582,6 +582,47 @@ class DuckDBStore:
         ).fetchall()
         return tuple(FundingCollectionCycle.model_validate_json(row[0]) for row in rows)
 
+    def latest_funding_collection_cycle_as_of(
+        self, as_of: datetime
+    ) -> FundingCollectionCycle | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM funding_collection_cycles
+            WHERE request_completed_at <= ?
+            ORDER BY request_completed_at DESC, cycle_end DESC, cycle_id
+            LIMIT 1
+            """,
+            [normalized_as_of],
+        ).fetchone()
+        return None if row is None else FundingCollectionCycle.model_validate_json(row[0])
+
+    def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        queries = (
+            ("raw_envelopes", "SELECT count(*) FROM raw_envelopes WHERE observed_at <= ?"),
+            ("instrument_specs", "SELECT count(*) FROM instrument_specs WHERE observed_at <= ?"),
+            (
+                "funding_observations",
+                "SELECT count(*) FROM funding_observations WHERE observed_at <= ?",
+            ),
+            ("market_snapshots", "SELECT count(*) FROM market_snapshots WHERE observed_at <= ?"),
+            ("book_snapshots", "SELECT count(*) FROM book_snapshots WHERE observed_at <= ?"),
+            (
+                "book_collection_cycles",
+                "SELECT count(*) FROM book_collection_cycles WHERE request_completed_at <= ?",
+            ),
+            (
+                "funding_collection_cycles",
+                "SELECT count(*) FROM funding_collection_cycles WHERE request_completed_at <= ?",
+            ),
+        )
+        return {
+            name: int(self._connection.execute(sql, [normalized_as_of]).fetchone()[0])
+            for name, sql in queries
+        }
+
     def latest_funding_as_of(
         self, venue: Venue, symbol: str, as_of: datetime
     ) -> FundingObservation | None:
