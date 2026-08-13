@@ -15,6 +15,8 @@ import httpx
 
 from polytrading.ai.cli import AIInputError, add_ai_subcommands, run_ai_command
 from polytrading.carry.audit import CarryAuditor
+from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossier
+from polytrading.carry.dossier_report import render_dossier_json, render_dossier_text
 from polytrading.carry.report import render_json, render_text
 from polytrading.carry.study import CarryPersistenceStudy, validate_study_window
 from polytrading.carry.study_report import render_study_json, render_study_text
@@ -140,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     study.add_argument("--end", required=True)
     study.add_argument("--known-as-of", required=True)
     study.add_argument("--format", choices=("text", "json"), default="text")
+    dossier = carry_commands.add_parser(
+        "dossier", help="inspect the bundled contract-compatibility evidence"
+    )
+    dossier.add_argument("--format", choices=("text", "json"), default="text")
 
     funding = commands.add_parser("funding", help="prospective funding evidence operations")
     funding_commands = funding.add_subparsers(dest="funding_command", required=True)
@@ -224,11 +230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "replay":
             return _replay(arguments)
         if arguments.command == "carry":
-            return (
-                _carry_audit(arguments)
-                if arguments.carry_command == "audit"
-                else _carry_study(arguments)
-            )
+            if arguments.carry_command == "audit":
+                return _carry_audit(arguments)
+            if arguments.carry_command == "study":
+                return _carry_study(arguments)
+            return _carry_dossier(arguments)
         if arguments.command == "funding":
             return _funding_health(arguments)
         if arguments.command == "ai":
@@ -294,6 +300,13 @@ def _carry_study(arguments: argparse.Namespace) -> int:
     finally:
         store.close()
     renderer = render_study_json if arguments.format == "json" else render_study_text
+    print(renderer(report))
+    return 0
+
+
+def _carry_dossier(arguments: argparse.Namespace) -> int:
+    report = evaluate_dossier(load_bundled_dossier())
+    renderer = render_dossier_json if arguments.format == "json" else render_dossier_text
     print(renderer(report))
     return 0
 

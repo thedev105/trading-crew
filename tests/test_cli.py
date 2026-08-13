@@ -77,6 +77,56 @@ def test_dashboard_parser_has_local_read_only_arguments_only() -> None:
     }.isdisjoint(vars(parsed))
 
 
+def test_carry_dossier_parser_defaults_to_text_without_database_argument() -> None:
+    parsed = cli.build_parser().parse_args(["carry", "dossier"])
+
+    assert parsed.command == "carry"
+    assert parsed.carry_command == "dossier"
+    assert parsed.format == "text"
+    assert "db" not in vars(parsed)
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_carry_dossier_is_deterministic_offline_and_database_free(
+    output_format: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def reject_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("dossier command must not create a public network client")
+
+    monkeypatch.setattr(cli, "make_public_http_client", reject_network)
+
+    arguments = ["carry", "dossier", "--format", output_format]
+    assert main(arguments) == 0
+    first = capsys.readouterr().out
+    assert main(arguments) == 0
+    second = capsys.readouterr().out
+
+    assert first == second
+    assert not tuple(tmp_path.iterdir())
+    if output_format == "json":
+        assert json.loads(first)["primary_reason_code"] == "quanto_structure_excluded"
+    else:
+        assert "status=ineligible" in first
+        assert "primary_blocker=quanto_structure_excluded" in first
+
+
+def test_carry_dossier_validation_failure_uses_sanitized_exit_two(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_dossier() -> None:
+        raise ValueError("invalid bundled dossier")
+
+    monkeypatch.setattr(cli, "load_bundled_dossier", reject_dossier)
+
+    assert main(["carry", "dossier"]) == 2
+    assert capsys.readouterr().err == "polytrading: error: invalid bundled dossier\n"
+
+
 @pytest.mark.parametrize("port", ["0", "65536", "1.5", "true", ""])
 def test_dashboard_rejects_invalid_ports(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], port: str
