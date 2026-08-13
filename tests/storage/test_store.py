@@ -18,6 +18,15 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.venues.funding_cycle_models import (
+    FUNDING_CYCLE_PROTOCOL_VERSION,
+    FUNDING_CYCLE_WARNINGS,
+    FundingCaptureOutcome,
+    FundingCollectionCycle,
+    FundingCycleItem,
+    FundingCycleStatus,
+    InstrumentCaptureOutcome,
+)
 from tests.domain.factories import NOW, SOURCE_HASH, instrument_spec
 
 OTHER_SOURCE_HASH = "b" * 64
@@ -135,6 +144,56 @@ def fee_schedule(**overrides: object) -> FeeSchedule:
     return FeeSchedule(**values)
 
 
+def funding_collection_cycle(**overrides: object) -> FundingCollectionCycle:
+    cycle_end = overrides.pop("cycle_end", NOW)
+    items = (
+        FundingCycleItem(
+            schema_version=1,
+            venue=Venue.BYBIT,
+            asset=Asset.BTC,
+            symbol="BTCUSDT",
+            instrument_outcome=InstrumentCaptureOutcome.CAPTURED,
+            funding_outcome=FundingCaptureOutcome.NO_SETTLEMENT,
+            instrument_observed_at=cycle_end + timedelta(minutes=1),
+            funding_effective_at=None,
+            funding_observed_at=None,
+            instrument_source_hashes=(SOURCE_HASH,),
+            funding_source_hashes=(OTHER_SOURCE_HASH,),
+            reason_codes=(),
+        ),
+        FundingCycleItem(
+            schema_version=1,
+            venue=Venue.HYPERLIQUID,
+            asset=Asset.BTC,
+            symbol="BTC",
+            instrument_outcome=InstrumentCaptureOutcome.CAPTURED,
+            funding_outcome=FundingCaptureOutcome.CAPTURED,
+            instrument_observed_at=cycle_end + timedelta(minutes=1),
+            funding_effective_at=cycle_end,
+            funding_observed_at=cycle_end + timedelta(minutes=2),
+            instrument_source_hashes=(THIRD_SOURCE_HASH,),
+            funding_source_hashes=(FOURTH_SOURCE_HASH,),
+            reason_codes=(),
+        ),
+    )
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "protocol_version": FUNDING_CYCLE_PROTOCOL_VERSION,
+        "cycle_id": UUID("00000000-0000-0000-0000-000000000902"),
+        "cycle_end": cycle_end,
+        "assets": (Asset.BTC,),
+        "venues": (Venue.BYBIT, Venue.HYPERLIQUID),
+        "request_started_at": cycle_end + timedelta(seconds=30),
+        "request_completed_at": cycle_end + timedelta(minutes=2),
+        "items": items,
+        "status": FundingCycleStatus.COMPLETE,
+        "source_hashes": (SOURCE_HASH, OTHER_SOURCE_HASH, THIRD_SOURCE_HASH, FOURTH_SOURCE_HASH),
+        "warnings": FUNDING_CYCLE_WARNINGS,
+    }
+    values.update(overrides)
+    return FundingCollectionCycle(**values)
+
+
 def open_store(path: Path) -> DuckDBStore:
     return DuckDBStore(path)
 
@@ -148,14 +207,14 @@ def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Pat
     with duckdb.connect(str(path), read_only=True) as connection:
         assert connection.execute(
             "SELECT version, count(*) FROM schema_migrations GROUP BY version"
-        ).fetchall() == [(1, 1), (2, 1)]
+        ).fetchall() == [(1, 1), (2, 1), (3, 1)]
 
 
 def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [3, NOW])
+        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [4, NOW])
 
     with pytest.raises(RuntimeError, match="not a known prefix"):
         open_store(path)
@@ -165,7 +224,7 @@ def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> No
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
 
     with pytest.raises(RuntimeError, match="read-only store requires current schema"):
         DuckDBStore(path, read_only=True)
@@ -176,6 +235,81 @@ def test_migration_sql_is_available_as_packaged_data() -> None:
 
     assert migration.is_file()
     assert "CREATE TABLE schema_migrations" in migration.read_text(encoding="utf-8")
+
+    forward_migration = importlib.resources.files("polytrading.storage.schema").joinpath(
+        "003_forward_funding_cycles.sql"
+    )
+    assert forward_migration.is_file()
+    assert "CREATE TABLE funding_collection_cycles" in forward_migration.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_funding_collection_cycle_round_trips_and_exact_retry_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    record = funding_collection_cycle()
+
+    assert store.append_funding_collection_cycle(record) is True
+    assert store.append_funding_collection_cycle(record) is False
+    assert store.funding_collection_cycles_between(NOW, NOW) == (record,)
+    store.close()
+
+
+def test_funding_collection_cycle_conflict_fails_closed(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    original = funding_collection_cycle()
+    conflict = funding_collection_cycle(request_completed_at=NOW + timedelta(minutes=3))
+    store.append_funding_collection_cycle(original)
+
+    with pytest.raises(
+        ConflictingRecordError,
+        match="conflicting funding collection cycle for immutable identity",
+    ):
+        store.append_funding_collection_cycle(conflict)
+    store.close()
+
+
+def test_funding_collection_cycles_use_closed_boundaries_and_stable_attempt_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "research.duckdb"
+    store = open_store(path)
+    first = funding_collection_cycle()
+    second = funding_collection_cycle(
+        cycle_id=UUID("00000000-0000-0000-0000-000000000903"),
+        request_completed_at=NOW + timedelta(minutes=3),
+    )
+    later = funding_collection_cycle(
+        cycle_id=UUID("00000000-0000-0000-0000-000000000904"),
+        cycle_end=NOW + timedelta(hours=1),
+    )
+    for record in (later, second, first):
+        store.append_funding_collection_cycle(record)
+
+    assert store.funding_collection_cycles_between(NOW, NOW + timedelta(hours=1)) == (
+        first,
+        second,
+        later,
+    )
+    store.close()
+
+    read_only = DuckDBStore(path, read_only=True)
+    assert read_only.funding_collection_cycles_between(NOW, NOW) == (first, second)
+    read_only.close()
+
+
+def test_funding_collection_cycle_query_rejects_reversed_or_naive_windows(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+
+    with pytest.raises(ValueError, match="start must be less than or equal to end"):
+        store.funding_collection_cycles_between(NOW, NOW - timedelta(hours=1))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.funding_collection_cycles_between(NOW.replace(tzinfo=None), NOW)
+    store.close()
 
 
 def test_all_record_types_round_trip_without_float_conversion(tmp_path: Path) -> None:

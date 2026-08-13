@@ -30,6 +30,7 @@ from polytrading.domain.models import (
 )
 from polytrading.ledger.models import JournalTransaction, TrialBalanceRow
 from polytrading.research.models import ExperimentRecord
+from polytrading.venues.funding_cycle_models import FundingCollectionCycle
 from polytrading.venues.synchronized import BookCollectionCycle
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
@@ -259,6 +260,12 @@ class DuckDBStore:
             return self._append_book_collection_cycle(record)
         with self.transaction():
             return self._append_book_collection_cycle(record)
+
+    def append_funding_collection_cycle(self, record: FundingCollectionCycle) -> bool:
+        if self._in_transaction:
+            return self._append_funding_collection_cycle(record)
+        with self.transaction():
+            return self._append_funding_collection_cycle(record)
 
     def append_fee_schedule(self, record: FeeSchedule) -> bool:
         if self._normalized_retry(
@@ -557,6 +564,24 @@ class DuckDBStore:
             return None
         return BookCollectionCycle.model_validate_json(row[0])
 
+    def funding_collection_cycles_between(
+        self, start: datetime, end: datetime
+    ) -> tuple[FundingCollectionCycle, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
+        rows = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM funding_collection_cycles
+            WHERE cycle_end >= ? AND cycle_end <= ?
+            ORDER BY cycle_end, request_completed_at, cycle_id
+            """,
+            [normalized_start, normalized_end],
+        ).fetchall()
+        return tuple(FundingCollectionCycle.model_validate_json(row[0]) for row in rows)
+
     def latest_funding_as_of(
         self, venue: Venue, symbol: str, as_of: datetime
     ) -> FundingObservation | None:
@@ -758,6 +783,28 @@ class DuckDBStore:
                 record.cycle_id,
                 record.request_completed_at,
                 record.status,
+                _canonical_json(record),
+                _record_hash(record),
+            ],
+        )
+        return True
+
+    def _append_funding_collection_cycle(self, record: FundingCollectionCycle) -> bool:
+        if self._normalized_retry(
+            "funding collection cycle",
+            record,
+            "funding_collection_cycles",
+            "cycle_id = ?",
+            [record.cycle_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO funding_collection_cycles VALUES (?, ?, ?, ?, ?::JSON, ?)",
+            [
+                record.cycle_id,
+                record.cycle_end,
+                record.request_completed_at,
+                record.status.value,
                 _canonical_json(record),
                 _record_hash(record),
             ],
