@@ -166,6 +166,14 @@ def test_gate_accepts_only_exact_effective_human_approval() -> None:
             NOW,
             "approval_not_effective",
         ),
+        (
+            {
+                "approved_at": NOW + timedelta(hours=1),
+                "effective_at": NOW - timedelta(hours=1),
+            },
+            NOW,
+            "approval_not_issued",
+        ),
         ({"expires_at": NOW}, NOW, "approval_expired"),
     ],
 )

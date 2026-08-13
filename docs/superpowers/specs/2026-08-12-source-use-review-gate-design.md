@@ -1,7 +1,7 @@
 # Source-Use and Independent-Review Gate Design
 
-**Date:** 2026-08-12  
-**Status:** Approved for implementation under the user's standing instruction to proceed and self-review  
+**Date:** 2026-08-12
+**Status:** Approved for implementation under the user's standing instruction to proceed and self-review
 **Scope:** Evidence capture, source-use gating, and offline independent-review preparation
 
 ## Objective

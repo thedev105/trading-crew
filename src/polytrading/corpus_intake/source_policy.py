@@ -21,6 +21,7 @@ GateReason = Literal[
     "approval_scope_mismatch",
     "approval_evidence_mismatch",
     "approval_manifest_mismatch",
+    "approval_not_issued",
     "approval_not_effective",
     "approval_expired",
     "exact_human_approval",
@@ -201,6 +202,8 @@ def evaluate_source_gate(
         return decision(False, "approval_evidence_mismatch")
     if approval.intake_manifest_sha256s != manifest_hashes:
         return decision(False, "approval_manifest_mismatch")
+    if as_of < approval.approved_at:
+        return decision(False, "approval_not_issued")
     if as_of < approval.effective_at:
         return decision(False, "approval_not_effective")
     if approval.expires_at is not None and as_of >= approval.expires_at:

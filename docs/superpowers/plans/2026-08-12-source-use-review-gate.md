@@ -365,7 +365,7 @@ git commit -m "feat(corpus): expose source-use review gate"
 **Interfaces:**
 - Produces a verified, review-ready branch.
 
-- [ ] **Step 1: Run complete quality gate**
+- [x] **Step 1: Run complete quality gate**
 
 ```bash
 pytest --cov=polytrading --cov-report=term-missing --cov-fail-under=90
@@ -376,14 +376,14 @@ git status --short
 git log --oneline main..HEAD
 ```
 
-- [ ] **Step 2: Audit safety properties**
+- [x] **Step 2: Audit safety properties**
 
 Confirm code cannot generate approval; no full page body is retained; the real run has no packet directories; blocked schemas contain no source text or URL fields; approval checks scope, evidence, manifests, dates, and role; review CLI has no hardcoded gold path; AI remains offline; inquiry says unsent; and production gold hashes match.
 
-- [ ] **Step 3: Review the complete branch diff against the design**
+- [x] **Step 3: Review the complete branch diff against the design**
 
 Run `git diff --stat main...HEAD` and `git diff main...HEAD`. Correct any discovered gap by adding a failing regression test first.
 
-- [ ] **Step 4: Repeat Step 1 after every correction**
+- [x] **Step 4: Repeat Step 1 after every correction**
 
 Do not claim success from a stale verification run. Commit only substantive corrections with `fix(corpus): close source-use review gaps`.
