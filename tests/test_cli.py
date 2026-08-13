@@ -470,6 +470,7 @@ def test_public_http_client_has_explicit_identity_and_timeouts() -> None:
     client = cli.make_public_http_client(transport=_SequenceTransport([200]))
 
     assert client.headers["user-agent"] == "polytrading/0.1 public-market-research"
+    assert client.headers["accept-encoding"] == "identity"
     assert client.timeout.connect == 10
     assert client.timeout.read == 30
     asyncio.run(client.aclose())

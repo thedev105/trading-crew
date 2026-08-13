@@ -122,6 +122,29 @@ class _SequenceTransport(httpx.AsyncBaseTransport):
         )
 
 
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.consumed = 0
+
+    async def __aiter__(self):
+        for chunk in (b"x" * 60, b"y" * 60, b"z" * 60):
+            self.consumed += 1
+            yield chunk
+
+
+class _StreamingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, stream: _ChunkStream) -> None:
+        self.stream = stream
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=self.stream,
+            request=request,
+        )
+
+
 async def _no_sleep(delay: float) -> None:
     assert delay == pytest.approx(0.05)
 
@@ -211,6 +234,20 @@ def test_acquire_rejects_status_content_type_and_oversized_body(
 
     with pytest.raises(CorpusIntakeError, match=match):
         asyncio.run(exercise())
+
+
+def test_acquire_stops_streaming_as_soon_as_response_limit_is_crossed() -> None:
+    stream = _ChunkStream()
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=_StreamingTransport(stream)) as client:
+            return await acquire_polymarket(
+                client, _request(max_response_bytes=100), lambda page: None
+            )
+
+    with pytest.raises(CorpusIntakeError, match="response size"):
+        asyncio.run(exercise())
+    assert stream.consumed == 2
 
 
 def test_acquire_rejects_cursor_loop() -> None:

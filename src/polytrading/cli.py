@@ -214,7 +214,10 @@ def make_public_http_client(
 ) -> httpx.AsyncClient:
     base_transport = transport or httpx.AsyncHTTPTransport()
     return httpx.AsyncClient(
-        headers={"User-Agent": "polytrading/0.1 public-market-research"},
+        headers={
+            "Accept-Encoding": "identity",
+            "User-Agent": "polytrading/0.1 public-market-research",
+        },
         timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0),
         transport=RetryingTransport(base_transport),
     )

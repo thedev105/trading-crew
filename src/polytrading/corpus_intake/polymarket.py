@@ -343,24 +343,37 @@ async def acquire_polymarket(
         }
         if requested_cursor is not None:
             params["after_cursor"] = requested_cursor
-        response = await client.get(ENDPOINT, params=params, follow_redirects=False)
-        if response.status_code != 200:
-            raise CorpusIntakeError(f"public source returned HTTP {response.status_code}")
-        content_type = response.headers.get("content-type", "").partition(";")[0].strip().casefold()
-        if content_type != "application/json":
-            raise CorpusIntakeError("public source returned an unexpected content type")
-        body = response.content
-        if len(body) > request.max_response_bytes:
-            raise CorpusIntakeError("public source response size exceeds the configured limit")
+        async with client.stream(
+            "GET", ENDPOINT, params=params, follow_redirects=False
+        ) as response:
+            if response.status_code != 200:
+                raise CorpusIntakeError(f"public source returned HTTP {response.status_code}")
+            content_type = (
+                response.headers.get("content-type", "").partition(";")[0].strip().casefold()
+            )
+            if content_type != "application/json":
+                raise CorpusIntakeError("public source returned an unexpected content type")
+            body_parts: list[bytes] = []
+            received_bytes = 0
+            async for chunk in response.aiter_bytes():
+                received_bytes += len(chunk)
+                if received_bytes > request.max_response_bytes:
+                    raise CorpusIntakeError(
+                        "public source response size exceeds the configured limit"
+                    )
+                body_parts.append(chunk)
+            body = b"".join(body_parts)
+            request_url = str(response.request.url)
+            response_headers = dict(response.headers)
         parsed = parse_page(
             body=body,
-            request_url=str(response.request.url),
+            request_url=request_url,
             requested_cursor=requested_cursor,
             page_ordinal=page_ordinal,
             retrieved_at=request.retrieved_at,
             information_cutoff=request.information_cutoff,
             status_code=response.status_code,
-            headers=response.headers,
+            headers=response_headers,
         )
         page_count += 1
         received_market_count += len(parsed.candidates)
