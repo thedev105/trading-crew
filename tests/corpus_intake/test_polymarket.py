@@ -51,6 +51,7 @@ def test_parse_page_extracts_event_family_and_only_review_routing_tags() -> None
     assert first.event_family_id == "polymarket:event:event-10"
     assert first.public_event_url == "https://polymarket.com/event/bitcoin-price-2026"
     assert first.category == "Crypto"
+    assert first.source_tags == ("Bitcoin",)
     assert first.routing_tags == (
         "crypto",
         "deadline_or_date",
@@ -160,6 +161,20 @@ def test_acquire_follows_keyset_cursor_and_sorts_candidates() -> None:
     assert transport.requests[0].url.params["include_tag"] == "true"
     assert "after_cursor" not in transport.requests[0].url.params
     assert transport.requests[1].url.params["after_cursor"] == "cursor-2"
+
+
+def test_acquire_can_collect_a_separate_closed_market_cohort() -> None:
+    body = json.dumps({"markets": []}).encode()
+    transport = _SequenceTransport([(200, body, "application/json")])
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await acquire_polymarket(
+                client, _request(market_state="closed"), lambda page: None
+            )
+
+    asyncio.run(exercise())
+    assert transport.requests[0].url.params["closed"] == "true"
 
 
 def test_acquire_stops_exactly_at_candidate_limit() -> None:

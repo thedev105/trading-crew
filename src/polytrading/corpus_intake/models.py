@@ -17,6 +17,7 @@ class AcquisitionRequest:
     retrieved_at: datetime
     information_cutoff: datetime
     max_candidates: int
+    market_state: Literal["open", "closed"] = "open"
     page_size: int = 100
     max_pages: int = 10
     max_response_bytes: int = 16 * 1024 * 1024
@@ -29,6 +30,8 @@ class AcquisitionRequest:
         object.__setattr__(self, "information_cutoff", information_cutoff)
         if information_cutoff > retrieved_at:
             raise CorpusIntakeError("information cutoff must not follow retrieval time")
+        if self.market_state not in ("open", "closed"):
+            raise CorpusIntakeError("market state must be open or closed")
         _require_bounded_integer("max candidates", self.max_candidates, 1, 5_000)
         _require_bounded_integer("page size", self.page_size, 1, 100)
         _require_bounded_integer("max pages", self.max_pages, 1, 100)
@@ -77,6 +80,7 @@ class CorpusCandidate:
     description: str | None
     resolution_source: str | None
     category: str | None
+    source_tags: tuple[str, ...]
     start_date: str | None
     end_date: str | None
     active: bool | None

@@ -122,6 +122,7 @@ def _normalize_market(
     description = _optional_string(market, "description", warnings)
     resolution_source = _optional_string(market, "resolutionSource", warnings)
     category = _optional_string(market, "category", warnings)
+    source_tags = _source_tags(market, warnings)
     start_date = _optional_string(market, "startDate", warnings)
     end_date = _optional_string(market, "endDate", warnings)
     active = _optional_bool(market, "active", warnings)
@@ -147,6 +148,7 @@ def _normalize_market(
         description=description,
         resolution_source=resolution_source,
         category=category,
+        source_tags=source_tags,
         start_date=start_date,
         end_date=end_date,
     )
@@ -163,6 +165,7 @@ def _normalize_market(
         description=description,
         resolution_source=resolution_source,
         category=category,
+        source_tags=source_tags,
         start_date=start_date,
         end_date=end_date,
         active=active,
@@ -218,6 +221,26 @@ def _optional_bool(market: dict[str, Any], name: str, warnings: list[str]) -> bo
     return value
 
 
+def _source_tags(market: dict[str, Any], warnings: list[str]) -> tuple[str, ...]:
+    value = market.get("tags")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        warnings.append("invalid_tags")
+        return ()
+    labels: set[str] = set()
+    for tag in value:
+        if not isinstance(tag, dict):
+            warnings.append("invalid_tag")
+            continue
+        label = tag.get("label")
+        if _is_nonempty_string(label):
+            labels.add(label.strip())
+        elif label is not None:
+            warnings.append("invalid_tag_label")
+    return tuple(sorted(labels))
+
+
 def _snake_case(name: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).casefold()
 
@@ -255,12 +278,13 @@ def _routing_tags(
     description: str | None,
     resolution_source: str | None,
     category: str | None,
+    source_tags: tuple[str, ...],
     start_date: str | None,
     end_date: str | None,
 ) -> tuple[str, ...]:
     tags: set[str] = set()
     semantic_text = " ".join(part for part in (question, description) if part)
-    category_text = (category or "").casefold()
+    category_text = " ".join((category or "", *source_tags)).casefold()
     all_text = f"{category_text} {semantic_text.casefold()}"
     if "crypto" in all_text or any(
         token in all_text for token in ("bitcoin", "ethereum", "solana")
@@ -314,7 +338,7 @@ async def acquire_polymarket(
     for page_ordinal in range(1, request.max_pages + 1):
         params = {
             "limit": str(request.page_size),
-            "closed": "false",
+            "closed": "true" if request.market_state == "closed" else "false",
             "include_tag": "true",
         }
         if requested_cursor is not None:
@@ -402,6 +426,7 @@ def _candidate_fingerprint(candidate: CorpusCandidate, *, include_identity: bool
         "description": candidate.description,
         "resolution_source": candidate.resolution_source,
         "category": candidate.category,
+        "source_tags": candidate.source_tags,
         "start_date": candidate.start_date,
         "end_date": candidate.end_date,
         "active": candidate.active,

@@ -116,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     corpus.add_argument("--retrieved-at", required=True)
     corpus.add_argument("--information-cutoff", required=True)
     corpus.add_argument("--max-candidates", required=True, type=int)
+    corpus.add_argument("--market-state", choices=("open", "closed"), default="open")
     corpus.add_argument("--page-size", type=int, default=100)
     corpus.add_argument("--max-pages", type=int, default=10)
     corpus.add_argument("--max-response-bytes", type=int, default=16 * 1024 * 1024)
@@ -291,6 +292,7 @@ async def _collect_corpus(arguments: argparse.Namespace) -> int:
         retrieved_at=_parse_timestamp(arguments.retrieved_at),
         information_cutoff=_parse_timestamp(arguments.information_cutoff),
         max_candidates=arguments.max_candidates,
+        market_state=arguments.market_state,
         page_size=arguments.page_size,
         max_pages=arguments.max_pages,
         max_response_bytes=arguments.max_response_bytes,

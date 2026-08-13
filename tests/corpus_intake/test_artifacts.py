@@ -84,6 +84,7 @@ def test_writer_streams_raw_then_writes_canonical_manifest_last(tmp_path: Path) 
     assert coverage["candidate_count"] == 2
     assert coverage["event_family_count"] == 2
     assert coverage["categories"] == {"Crypto": 1, "Sports": 1}
+    assert coverage["source_tags"] == {"Bitcoin": 1}
     assert coverage["routing_tags"]["deadline_or_date"] == 2
 
     manifest = json.loads((output / "manifest.json").read_text())

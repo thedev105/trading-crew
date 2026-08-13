@@ -65,7 +65,8 @@ polytrading collect corpus \
   --output <directory> \
   --retrieved-at <UTC timestamp> \
   --information-cutoff <UTC timestamp> \
-  --max-candidates <positive integer>
+  --max-candidates <positive integer> \
+  --market-state <open|closed>
 ```
 
 Both times are required. Runtime wall-clock time is not silently substituted into persisted evidence. `information_cutoff` must not follow `retrieved_at`. A caller may optionally set a page cap; the default is bounded.
@@ -95,7 +96,7 @@ Each accepted source market becomes one candidate with these fields:
 - stable candidate ID derived from source name and source market ID;
 - source platform, market ID, condition ID, event-family ID, slug, API URL, and public event URL;
 - exact question, description, and resolution-source text as provided by the API;
-- category, active/closed/archived state, and relevant market dates;
+- category, source-provided tag labels, active/closed/archived state, and relevant market dates;
 - retrieval time and information cutoff;
 - raw-capture SHA-256 and raw page ordinal;
 - `retention_status: review_required`;
@@ -138,7 +139,7 @@ A completed run contains:
 - `raw_pages.jsonl`: exact page captures and hashes;
 - `candidates.jsonl`: normalized, de-duplicated review candidates;
 - `manifest.json`: schema version, run inputs, source-policy state, counts, hashes of output files, and completion status;
-- `coverage.json`: counts by source category, event-family key, and reviewer-routing tag, plus rejection/warning diagnostics.
+- `coverage.json`: counts by source category, source-provided tag, event-family key, and reviewer-routing tag, plus rejection/warning diagnostics.
 
 JSON is canonicalized with sorted keys and compact separators. JSONL ends with exactly one newline when non-empty. Candidate order is deterministic: source, event-family key, source market ID.
 

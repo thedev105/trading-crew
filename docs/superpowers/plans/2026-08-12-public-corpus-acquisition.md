@@ -305,6 +305,7 @@ polytrading collect corpus \
   --retrieved-at 2026-08-12T16:00:00Z \
   --information-cutoff 2026-08-12T16:00:00Z \
   --max-candidates 500 \
+  --market-state open \
   --page-size 100 \
   --max-pages 10
 ```

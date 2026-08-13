@@ -193,6 +193,7 @@ def _coverage(candidates: tuple[CorpusCandidate, ...], result: AcquisitionResult
     categories = Counter(item.category or "<missing>" for item in candidates)
     families = Counter(item.event_family_id for item in candidates)
     routing_tags = Counter(tag for item in candidates for tag in item.routing_tags)
+    source_tags = Counter(tag for item in candidates for tag in item.source_tags)
     warnings = Counter(warning for item in candidates for warning in item.warnings)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -201,6 +202,7 @@ def _coverage(candidates: tuple[CorpusCandidate, ...], result: AcquisitionResult
         "categories": dict(sorted(categories.items())),
         "event_families": dict(sorted(families.items())),
         "routing_tags": dict(sorted(routing_tags.items())),
+        "source_tags": dict(sorted(source_tags.items())),
         "warnings": dict(sorted(warnings.items())),
         "diagnostics": _json_value(result.diagnostics),
         "routing_tags_are_gold_labels": False,

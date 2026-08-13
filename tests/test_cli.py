@@ -229,12 +229,15 @@ def test_collect_corpus_writes_verified_public_only_run(
                 "2026-08-12T15:00:00Z",
                 "--max-candidates",
                 "500",
+                "--market-state",
+                "closed",
             ]
         )
         == 0
     )
 
     assert observed["request"].retrieved_at == NOW.replace(hour=16)
+    assert observed["request"].market_state == "closed"
     assert (output / "manifest.json").exists()
     output_text = capsys.readouterr().out
     assert "2 review candidates" in output_text
