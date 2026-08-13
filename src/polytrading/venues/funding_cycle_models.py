@@ -65,6 +65,11 @@ def validate_cycle_timing(cycle_end: datetime, now: datetime) -> tuple[datetime,
     )
 
 
+def resolve_current_cycle_end(now: datetime) -> datetime:
+    normalized_now = normalize_utc_timestamp(now)
+    return normalized_now.replace(minute=0, second=0, microsecond=0)
+
+
 class FundingCycleItem(StrictRecord):
     schema_version: Literal[1]
     venue: Venue

@@ -16,6 +16,7 @@ from polytrading.venues.funding_cycle_models import (
     FundingCycleItem,
     FundingCycleStatus,
     InstrumentCaptureOutcome,
+    resolve_current_cycle_end,
     validate_cycle_timing,
 )
 
@@ -100,6 +101,18 @@ def test_cycle_timing_normalizes_aware_values_and_marks_first_late_microsecond()
     assert cycle_end == CYCLE_END
     assert now == CYCLE_END + timedelta(minutes=5, microseconds=1)
     assert is_late is True
+
+
+def test_current_cycle_end_is_the_floor_of_one_aware_clock_value() -> None:
+    eastern = timezone(-timedelta(hours=4))
+    now = datetime(2026, 8, 13, 13, 59, 59, 999999, tzinfo=eastern)
+
+    assert resolve_current_cycle_end(now) == CYCLE_END
+
+
+def test_current_cycle_end_rejects_naive_time() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        resolve_current_cycle_end(datetime(2026, 8, 13, 17))
 
 
 @pytest.mark.parametrize(
