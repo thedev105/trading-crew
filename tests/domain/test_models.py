@@ -100,6 +100,24 @@ def test_funding_normalizes_to_hourly_rate() -> None:
     assert item.hourly_rate == Decimal("0.0000125")
 
 
+def test_raw_evidence_serializes_dydx_venue_stably() -> None:
+    item = RawEnvelope(
+        schema_version=1,
+        event_id=uuid4(),
+        venue=Venue.DYDX,
+        endpoint="/v4/perpetualMarkets",
+        venue_timestamp=None,
+        observed_at=NOW,
+        received_monotonic_ns=1,
+        request_latency_ms=Decimal("0"),
+        source_version="indexer-v4-public",
+        payload_json="{}",
+        source_hash=SOURCE_HASH,
+    )
+
+    assert item.model_dump(mode="json")["venue"] == "dydx"
+
+
 def test_funding_rejects_rate_below_duckdb_decimal_scale() -> None:
     with pytest.raises(ValidationError) as exception:
         FundingObservation(

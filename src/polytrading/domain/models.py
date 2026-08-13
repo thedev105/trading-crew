@@ -53,6 +53,7 @@ class StrictRecord(BaseModel):
 class Venue(StrEnum):
     HYPERLIQUID = "hyperliquid"
     BYBIT = "bybit"
+    DYDX = "dydx"
 
 
 class Asset(StrEnum):
