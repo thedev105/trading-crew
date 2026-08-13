@@ -105,7 +105,45 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 7. Database backup, replay, and schema versions
+## 7. Cross-venue funding persistence study
+
+The read-only study tests one frozen direction: long the Bybit perpetual and short the
+Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
+blocks and never fills a missing funding interval. The database must already exist; the command
+opens it in read-only mode, performs no network requests, and does not collect or modify data.
+
+```bash
+.venv/bin/polytrading carry study \
+  --db var/public.duckdb \
+  --asset BTC \
+  --start 2025-08-13T00:00:00Z \
+  --end 2026-08-13T00:00:00Z \
+  --known-as-of 2026-08-13T00:05:00Z \
+  --format json
+```
+
+`known-as-of` is the local knowledge cutoff: revisions observed later are excluded. A historical
+API download is labeled `historical_reconstruction` when it was learned more than five minutes
+after settlement. It can support a 365-day gross replication but cannot count as the required
+forward record. A genuinely point-in-time study needs at least 90 days. Both require at least 99%
+paired block coverage and complete 7-, 14-, and 28-day windows.
+
+`FORWARD_TEST_REQUIRED` means only that a gross historical replication passed its fixed median,
+lower-tail, and best-month-concentration checks. `NET_FORWARD_GATE_REQUIRED` means point-in-time
+gross funding passed; it still does not recommend or approve a trade. Neither state models fees,
+slippage, basis P&L, collateral effects, financing, taxes, or venue and forced-exit losses.
+
+A displayed 10% annualized funding spread is a rate on one matched leg's notional, not a 10%
+account return. A fully collateralized two-venue position ties up capital on both legs, and four
+executions plus reserves can consume the gross spread. Live use remains disabled and requires
+separate data-use, eligibility, net-cost, stress, execution, and reconciliation approval.
+
+Technical access is not a data license. Do not redistribute venue records or use this tool to
+create a commercial data product. The current Bybit API agreement and any applicable Hyperliquid
+terms must be reviewed for the exact intended use before expanding collection or proprietary
+deployment.
+
+## 8. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -117,7 +155,7 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
-## 8. Explicit read-only boundary
+## 9. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -125,7 +163,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 9. Evidence still required by the Class C activation gate
+## 10. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
@@ -141,7 +179,7 @@ requires all of the following evidence:
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
 
-## 10. Offline semantic scout experiment
+## 11. Offline semantic scout experiment
 
 The semantic scout is an offline research layer. AI-like components may retrieve similar rule
 text and propose structured interpretations; only deterministic schema, source-span, corpus,

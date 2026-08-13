@@ -2,6 +2,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 from polytrading.carry.study import _prepare_blocks
@@ -12,7 +14,7 @@ from polytrading.carry.study_models import (
     PairedFundingBlock,
 )
 from polytrading.domain.models import Asset, Venue
-from tests.carry.study_helpers import at, complete_block, funding_row
+from tests.carry.study_helpers import at, complete_block, funding_row, history_from_spreads
 
 START = at("2026-01-01T00:00:00Z")
 END = at("2026-01-01T08:00:00Z")
@@ -215,3 +217,44 @@ def test_report_models_reject_invalid_arithmetic_and_counts() -> None:
             last_paired_at=END,
             incomplete_blocks=(),
         )
+
+
+@given(
+    st.lists(
+        st.decimals(
+            min_value=Decimal("-0.01"),
+            max_value=Decimal("0.01"),
+            places=6,
+            allow_nan=False,
+            allow_infinity=False,
+        ),
+        min_size=1,
+        max_size=12,
+    )
+)
+@settings(max_examples=50)
+def test_block_assembly_is_input_order_invariant_and_conserves_native_rates(
+    spread_values: list[Decimal],
+) -> None:
+    spreads = tuple(spread_values)
+    rows = history_from_spreads(START, spreads, observation_lag=timedelta(minutes=1))
+    bybit = tuple(row for row in rows if row.venue is Venue.BYBIT)
+    hyperliquid = tuple(row for row in rows if row.venue is Venue.HYPERLIQUID)
+    end = START + timedelta(hours=8 * len(spreads))
+
+    ordered = prepare(
+        rows,
+        end=end,
+        known_as_of=end + timedelta(minutes=5),
+    )
+    reversed_input = prepare(
+        end=end,
+        known_as_of=end + timedelta(minutes=5),
+        bybit_rows=tuple(reversed(bybit)),
+        hyperliquid_rows=tuple(reversed(hyperliquid)),
+    )
+
+    assert reversed_input == ordered
+    assert sum((block.spread for block in ordered.paired_blocks), Decimal(0)) == sum(
+        (row.rate for row in hyperliquid), Decimal(0)
+    ) - sum((row.rate for row in bybit), Decimal(0))

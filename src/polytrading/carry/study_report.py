@@ -73,7 +73,10 @@ def _timestamp(value: datetime) -> str:
 def _decimal(value: Decimal) -> str:
     if value == 0:
         return "0"
-    return format(value.normalize(), "f")
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
 
 
 def _json_value(value: Any) -> Any:

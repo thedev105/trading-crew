@@ -246,6 +246,9 @@ def _distribution(values: tuple[Decimal, ...]) -> DistributionSummary:
     if not values:
         raise ValueError("distribution requires at least one value")
     count = len(values)
+    positive_count = sum(value > 0 for value in values)
+    zero_count = sum(value == 0 for value in values)
+    negative_count = sum(value < 0 for value in values)
     return DistributionSummary(
         schema_version=1,
         count=count,
@@ -255,9 +258,12 @@ def _distribution(values: tuple[Decimal, ...]) -> DistributionSummary:
         percentile_95=_nearest_rank(values, Decimal("0.95")),
         minimum=min(values),
         maximum=max(values),
-        positive_fraction=Decimal(sum(value > 0 for value in values)) / Decimal(count),
-        zero_fraction=Decimal(sum(value == 0 for value in values)) / Decimal(count),
-        negative_fraction=Decimal(sum(value < 0 for value in values)) / Decimal(count),
+        positive_count=positive_count,
+        zero_count=zero_count,
+        negative_count=negative_count,
+        positive_fraction=Decimal(positive_count) / Decimal(count),
+        zero_fraction=Decimal(zero_count) / Decimal(count),
+        negative_fraction=Decimal(negative_count) / Decimal(count),
     )
 
 

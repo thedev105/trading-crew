@@ -2,13 +2,18 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from polytrading.carry.study import (
     _build_report,
+    _distribution,
+    _holding_window_sums,
     _longest_adverse_run,
     _maximum_drawdown,
     _nearest_rank,
     _sign_behavior,
+    _statistics,
     _summarize_holding_windows,
 )
 from polytrading.carry.study_models import (
@@ -54,6 +59,19 @@ def test_nearest_rank_uses_exact_decimal_ceiling_without_interpolation() -> None
     assert _nearest_rank(values, Decimal("0.05")) == Decimal("1")
     assert _nearest_rank(values, Decimal("0.50")) == Decimal("2")
     assert _nearest_rank(values, Decimal("0.95")) == Decimal("100")
+
+
+def test_distribution_preserves_counts_for_nonterminating_sign_fractions() -> None:
+    distribution = _distribution((Decimal(1), Decimal(0), Decimal(-1)))
+
+    assert (
+        distribution.positive_count,
+        distribution.zero_count,
+        distribution.negative_count,
+    ) == (1, 1, 1)
+    assert distribution.positive_fraction == Decimal(1) / Decimal(3)
+    assert distribution.zero_fraction == Decimal(1) / Decimal(3)
+    assert distribution.negative_fraction == Decimal(1) / Decimal(3)
 
 
 def test_path_statistics_include_initial_zero_and_zeros_break_sign_runs() -> None:
@@ -203,3 +221,82 @@ def test_gross_report_discloses_every_unmodeled_cost_in_stable_order() -> None:
         "slippage",
         "taxes",
     )
+
+
+@given(
+    st.lists(
+        st.decimals(
+            min_value=Decimal("-10"),
+            max_value=Decimal("10"),
+            places=4,
+            allow_nan=False,
+            allow_infinity=False,
+        ),
+        min_size=1,
+        max_size=100,
+    )
+)
+@settings(max_examples=50)
+def test_maximum_drawdown_is_bounded_by_the_cumulative_path_range(
+    raw_values: list[Decimal],
+) -> None:
+    cumulative = Decimal(0)
+    path = [cumulative]
+    for value in raw_values:
+        cumulative += value
+        path.append(cumulative)
+
+    drawdown = _maximum_drawdown(tuple(raw_values))
+
+    assert Decimal(0) <= drawdown <= max(path) - min(path)
+
+
+@given(
+    st.lists(
+        st.decimals(
+            min_value=Decimal("-1"),
+            max_value=Decimal("1"),
+            places=4,
+            allow_nan=False,
+            allow_infinity=False,
+        ),
+        min_size=84,
+        max_size=84,
+    ),
+    st.decimals(
+        min_value=Decimal("0.0001"),
+        max_value=Decimal("1"),
+        places=4,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+)
+@settings(max_examples=50)
+def test_positive_shift_cannot_reduce_reported_cumulative_gross_funding(
+    raw_values: list[Decimal], shift: Decimal
+) -> None:
+    def blocks(values: list[Decimal]) -> tuple[PairedFundingBlock, ...]:
+        return tuple(
+            PairedFundingBlock(
+                schema_version=1,
+                block_start=START + timedelta(hours=8 * index),
+                block_end=START + timedelta(hours=8 * (index + 1)),
+                bybit_rate=Decimal(0),
+                hyperliquid_rate=value,
+                spread=value,
+            )
+            for index, value in enumerate(values)
+        )
+
+    original_blocks = blocks(raw_values)
+    shifted_blocks = blocks([value + shift for value in raw_values])
+    original = _statistics(
+        original_blocks,
+        {days: _holding_window_sums(original_blocks, days) for days in (7, 14, 28)},
+    )
+    shifted = _statistics(
+        shifted_blocks,
+        {days: _holding_window_sums(shifted_blocks, days) for days in (7, 14, 28)},
+    )
+
+    assert shifted.cumulative_gross_funding >= original.cumulative_gross_funding

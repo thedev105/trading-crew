@@ -133,6 +133,9 @@ class DistributionSummary(StrictRecord):
     percentile_95: Decimal
     minimum: Decimal
     maximum: Decimal
+    positive_count: Annotated[int, Field(ge=0)]
+    zero_count: Annotated[int, Field(ge=0)]
+    negative_count: Annotated[int, Field(ge=0)]
     positive_fraction: Annotated[Decimal, Field(ge=Decimal(0), le=Decimal(1))]
     zero_fraction: Annotated[Decimal, Field(ge=Decimal(0), le=Decimal(1))]
     negative_fraction: Annotated[Decimal, Field(ge=Decimal(0), le=Decimal(1))]
@@ -143,8 +146,19 @@ class DistributionSummary(StrictRecord):
             self.minimum <= self.percentile_05 <= self.median <= self.percentile_95 <= self.maximum
         ):
             raise ValueError("distribution order statistics are inconsistent")
-        if self.positive_fraction + self.zero_fraction + self.negative_fraction != Decimal(1):
-            raise ValueError("distribution sign fractions must sum to one")
+        if self.positive_count + self.zero_count + self.negative_count != self.count:
+            raise ValueError("distribution sign counts must sum to count")
+        expected_fractions = (
+            Decimal(self.positive_count) / Decimal(self.count),
+            Decimal(self.zero_count) / Decimal(self.count),
+            Decimal(self.negative_count) / Decimal(self.count),
+        )
+        if (
+            self.positive_fraction,
+            self.zero_fraction,
+            self.negative_fraction,
+        ) != expected_fractions:
+            raise ValueError("distribution sign fractions must match exact counts")
         return self
 
 

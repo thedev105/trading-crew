@@ -2,7 +2,7 @@ import json
 from datetime import timedelta
 from decimal import Decimal
 
-from polytrading.carry.study_report import render_study_json, render_study_text
+from polytrading.carry.study_report import _decimal, render_study_json, render_study_text
 from tests.carry.test_study_statistics import report_for
 
 
@@ -37,6 +37,14 @@ def test_json_is_stable_typed_and_discloses_gross_economics() -> None:
         observation_lag=timedelta(days=1),
     )
     assert render_study_json(equivalent) == rendered
+
+
+def test_canonical_decimal_trims_scale_without_rounding_significant_digits() -> None:
+    assert _decimal(Decimal("12345678901234567890.123456789012345678")) == (
+        "12345678901234567890.123456789012345678"
+    )
+    assert _decimal(Decimal("1000.000000000000000000")) == "1000"
+    assert _decimal(Decimal("-0.000000000000000000")) == "0"
 
 
 def test_text_report_has_stable_header_metrics_and_research_footer() -> None:
