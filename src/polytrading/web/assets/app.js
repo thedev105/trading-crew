@@ -12,8 +12,11 @@ const nodes = {
   overviewCards: document.querySelector("#overview-cards"),
   boundaryStrip: document.querySelector("#boundary-strip"),
   marketRows: document.querySelector("#market-rows"),
-  dossierSummary: document.querySelector("#dossier-summary"),
+  discoverySummary: document.querySelector("#discovery-summary"),
+  candidateRows: document.querySelector("#candidate-rows"),
   dossierRows: document.querySelector("#dossier-rows"),
+  dossierLeftHeading: document.querySelector("#dossier-left-heading"),
+  dossierRightHeading: document.querySelector("#dossier-right-heading"),
   carryRows: document.querySelector("#carry-rows"),
   evidenceCounts: document.querySelector("#evidence-counts"),
   recipeList: document.querySelector("#recipe-list"),
@@ -123,50 +126,100 @@ function gateMetric(label, value) {
   return box;
 }
 
-function renderDossier(snapshot) {
-  const report = snapshot.compatibility_dossier;
-  if (!report) {
+function unavailableTableRow(message, columnCount) {
+  const row = document.createElement("tr");
+  const cell = tableCell(message, "unavailable summary-cell");
+  cell.colSpan = columnCount;
+  row.append(cell);
+  return row;
+}
+
+function renderDiscovery(snapshot) {
+  const discovery = snapshot.venue_discovery;
+  if (!discovery) {
     const unavailable = statusCard(
-      "Contract dossier",
+      "Venue discovery",
       "Unavailable",
       "Unavailable at this snapshot cutoff",
       "missing",
     );
-    nodes.dossierSummary.replaceChildren(unavailable);
-    const row = document.createElement("tr");
-    const cell = tableCell("Unavailable at this snapshot cutoff", "unavailable summary-cell");
-    cell.colSpan = 5;
-    row.append(cell);
-    nodes.dossierRows.replaceChildren(row);
+    nodes.discoverySummary.replaceChildren(unavailable);
+    nodes.candidateRows.replaceChildren(unavailableTableRow("Unavailable at this snapshot cutoff", 9));
+    nodes.dossierLeftHeading.textContent = "Left evidence";
+    nodes.dossierRightHeading.textContent = "Right evidence";
+    nodes.dossierRows.replaceChildren(unavailableTableRow("No selected candidate", 5));
     return;
   }
 
-  const pair = `${report.left_venue} → ${report.right_venue}`;
-  nodes.dossierSummary.replaceChildren(
-    statusCard("Decision", report.status, `${pair} · ${report.assets.join(", ")}`, report.status),
+  const selectedReport = discovery.selected_dossier_id
+    ? discovery.candidates.find((candidate) => candidate.dossier_id === discovery.selected_dossier_id)
+    : null;
+  const candidateRows = discovery.candidates.map((candidate, index) => {
+    const selected = candidate.dossier_id === discovery.selected_dossier_id;
+    const reason = selected ? discovery.selection_reason_code : candidate.primary_reason_code;
+    const row = document.createElement("tr");
+    if (selected) row.classList.add("candidate-selected");
+    const status = tableCell(candidate.status);
+    status.classList.add("judgment-cell");
+    status.dataset.tone = statusTone(candidate.status);
+    row.append(
+      tableCell(selected ? `#${index + 1} · Selected` : `#${index + 1}`),
+      tableCell(`${candidate.left_venue} → ${candidate.right_venue}`, "venue-name"),
+      tableCell(candidate.assets.join(", ")),
+      status,
+      tableCell(candidate.counts.matched),
+      tableCell(candidate.counts.model_required),
+      tableCell(candidate.counts.blocking),
+      tableCell(candidate.counts.missing_evidence),
+      tableCell(reason, "summary-cell"),
+    );
+    return row;
+  });
+  nodes.candidateRows.replaceChildren(...candidateRows);
+
+  if (!selectedReport) {
+    nodes.discoverySummary.replaceChildren(
+      statusCard(
+        "Selection",
+        "No advanceable candidate",
+        discovery.selection_reason_code,
+        "missing",
+      ),
+      statusCard("Activation", "Not authorized", "Research display only", "blocking"),
+    );
+    nodes.dossierLeftHeading.textContent = "Left evidence";
+    nodes.dossierRightHeading.textContent = "Right evidence";
+    nodes.dossierRows.replaceChildren(unavailableTableRow("No selected candidate", 5));
+    return;
+  }
+
+  const pair = `${selectedReport.left_venue} → ${selectedReport.right_venue}`;
+  nodes.discoverySummary.replaceChildren(
     statusCard(
-      "Primary blocker",
-      display(report.primary_reason_code),
-      `Observed ${compactTime(report.observed_at)}`,
-      report.status,
+      "Selected candidate",
+      pair,
+      `${selectedReport.assets.join(", ")} · ${selectedReport.dossier_id}`,
+      selectedReport.status,
     ),
-    statusCard("Matched", display(report.counts.matched), "Documented agreement", "matched"),
-    statusCard("Blocking", display(report.counts.blocking), "Admission failures", "blocking"),
     statusCard(
-      "Model required",
-      display(report.counts.model_required),
-      "Differences needing validation",
+      "Research status",
+      selectedReport.status,
+      `Observed ${compactTime(selectedReport.observed_at)}`,
+      selectedReport.status,
+    ),
+    statusCard("Activation", "Not authorized", "Research result only", "blocking"),
+    statusCard(
+      "Next gate",
+      "Public evidence + economic modeling",
+      "No paper or live execution authority",
       "model_required",
-    ),
-    statusCard(
-      "Missing evidence",
-      display(report.counts.missing_evidence),
-      "Unresolved point-in-time facts",
-      "missing_evidence",
     ),
   );
 
-  const rows = report.checks.map((check) => {
+  nodes.dossierLeftHeading.textContent = `${selectedReport.left_venue} evidence`;
+  nodes.dossierRightHeading.textContent = `${selectedReport.right_venue} evidence`;
+
+  const rows = selectedReport.checks.map((check) => {
     const row = document.createElement("tr");
     const judgment = tableCell(check.judgment);
     judgment.classList.add("judgment-cell");
@@ -260,7 +313,7 @@ function render(snapshot) {
   nodes.snapshotTime.textContent = compactTime(snapshot.as_of);
   renderOverview(snapshot);
   renderMarkets(snapshot);
-  renderDossier(snapshot);
+  renderDiscovery(snapshot);
   renderCarry(snapshot);
   renderCounts(snapshot);
   renderRecipes(snapshot);
@@ -274,6 +327,15 @@ function validateSnapshot(snapshot) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!Object.prototype.hasOwnProperty.call(snapshot, "compatibility_dossier")) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (!Object.prototype.hasOwnProperty.call(snapshot, "venue_discovery")) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (snapshot.compatibility_dossier !== null && typeof snapshot.compatibility_dossier !== "object") {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (snapshot.venue_discovery !== null && !Array.isArray(snapshot.venue_discovery.candidates)) {
     throw new Error("INVALID_SNAPSHOT");
   }
   return snapshot;

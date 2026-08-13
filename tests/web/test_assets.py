@@ -30,8 +30,11 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         "markets",
         "market-rows",
         "compatibility",
-        "dossier-summary",
+        "discovery-summary",
+        "candidate-rows",
         "dossier-rows",
+        "dossier-left-heading",
+        "dossier-right-heading",
         "research",
         "operations",
         "refresh",
@@ -66,6 +69,12 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
     assert "replaceChildren" in javascript
     assert "navigator.clipboard.writeText" in javascript
     assert "snapshot.compatibility_dossier" in javascript
+    assert "snapshot.venue_discovery" in javascript
+    assert "renderDiscovery(snapshot)" in javascript
+    assert "nodes.candidateRows.replaceChildren" in javascript
+    assert "nodes.dossierLeftHeading.textContent" in javascript
+    assert "nodes.dossierRightHeading.textContent" in javascript
+    assert 'hasOwnProperty.call(snapshot, "venue_discovery")' in javascript
     for forbidden in (
         "innerhtml",
         "outerhtml",
@@ -78,8 +87,23 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
         "api-key",
         "place-order",
         "execute-trade",
+        "websocket",
+        "eventsource",
     ):
         assert forbidden not in combined
+
+
+def test_discovery_copy_is_neutral_and_keeps_activation_closed() -> None:
+    html = _asset("index.html")
+    javascript = _asset("app.js")
+
+    assert "Venue discovery" in html
+    assert "Ranked candidates" in html
+    assert "Selected candidate checks" in html
+    assert "Public evidence + economic modeling" in javascript
+    assert "Not authorized" in javascript
+    assert "No advanceable candidate" in javascript
+    assert "candidate-selected" in javascript
 
 
 def test_dashboard_styles_cover_focus_mobile_and_reduced_motion() -> None:

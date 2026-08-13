@@ -31,7 +31,7 @@
   <nav class="section-nav" aria-label="Dashboard sections">
     <a href="#overview">Overview</a>
     <a href="#markets">Markets</a>
-    <a href="#compatibility">Compatibility</a>
+    <a href="#compatibility">Discovery</a>
     <a href="#research">Research gate</a>
     <a href="#evidence">Evidence</a>
     <a href="#operations">Operations</a>
@@ -69,13 +69,21 @@
 
     <section id="compatibility" class="dashboard-section" aria-labelledby="compatibility-title">
       <div class="section-heading">
-        <div><p class="section-index">03 / CONTRACT DOSSIER</p><h2 id="compatibility-title">Compatibility before economics</h2></div>
-        <p>Official-source facts evaluated against the initial Class C admission rules. A rejection prevents invalid profit modeling.</p>
+        <div><p class="section-index">03 / VENUE DISCOVERY</p><h2 id="compatibility-title">Venue discovery</h2></div>
+        <p>Official-source facts ranked by structural admission status. Selection opens another research gate; it never authorizes trading.</p>
       </div>
-      <div id="dossier-summary" class="dossier-summary" aria-live="polite"></div>
+      <div id="discovery-summary" class="dossier-summary" aria-live="polite"></div>
+      <div class="boundary-heading"><h3>Ranked candidates</h3><p>Best research status first</p></div>
+      <div class="table-shell candidate-table-shell">
+        <table class="candidate-table">
+          <thead><tr><th scope="col">Rank</th><th scope="col">Pair</th><th scope="col">Assets</th><th scope="col">Status</th><th scope="col">Matched</th><th scope="col">Model</th><th scope="col">Blocking</th><th scope="col">Missing</th><th scope="col">Reason</th></tr></thead>
+          <tbody id="candidate-rows"></tbody>
+        </table>
+      </div>
+      <div class="boundary-heading selected-check-heading"><h3>Selected candidate checks</h3><p>Complete admission matrix</p></div>
       <div class="table-shell dossier-table-shell">
         <table class="dossier-table">
-          <thead><tr><th scope="col">Check</th><th scope="col">Judgment</th><th scope="col">Reason</th><th scope="col">Hyperliquid evidence</th><th scope="col">dYdX evidence</th></tr></thead>
+          <thead><tr><th scope="col">Check</th><th scope="col">Judgment</th><th scope="col">Reason</th><th id="dossier-left-heading" scope="col">Left evidence</th><th id="dossier-right-heading" scope="col">Right evidence</th></tr></thead>
           <tbody id="dossier-rows"></tbody>
         </table>
       </div>

@@ -291,12 +291,19 @@ tbody tr:hover { background: rgba(98, 230, 207, 0.035); }
 
 .dossier-summary {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 24px;
 }
 .dossier-summary .status-card { min-height: 154px; }
 .dossier-summary .value { overflow-wrap: anywhere; font-size: clamp(1rem, 1.7vw, 1.55rem); }
+.candidate-table-shell { margin-bottom: 34px; }
+.candidate-table { min-width: 1080px; }
+.candidate-table td:first-child { color: var(--muted); font-weight: 700; }
+.candidate-table .summary-cell { min-width: 260px; white-space: normal; line-height: 1.45; }
+.candidate-selected { background: rgba(98, 230, 207, 0.08); box-shadow: inset 4px 0 0 var(--cyan); }
+.candidate-selected td:first-child { color: var(--cyan); text-transform: uppercase; }
+.selected-check-heading { margin-top: 0; }
 .dossier-table { min-width: 1320px; }
 .dossier-table .check-name { color: var(--cyan); }
 .dossier-table .summary-cell { min-width: 285px; white-space: normal; line-height: 1.55; }
