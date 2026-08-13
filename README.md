@@ -176,9 +176,11 @@ Start the loopback-only operator console against an existing current-schema data
 
 Then open `http://127.0.0.1:8787` in a browser. The page presents one point-in-time snapshot of
 24-hour funding collection health, the latest public instrument/funding/book evidence, the existing
-Bybit/Hyperliquid carry research gate, the bundled Hyperliquid/dYdX compatibility dossier, evidence
-counts, and copyable CLI recipes. Every refresh opens the selected database read-only and uses one
-captured UTC `as_of` across the complete screen.
+Bybit/Hyperliquid carry research gate, the ranked contract-dossier catalog, the selected candidate's
+complete check matrix, evidence counts, and copyable CLI recipes. Every refresh opens the selected
+database read-only and uses one captured UTC `as_of` across the complete screen. A dossier appears
+only when its observation time is no later than that cutoff, so later venue research cannot leak
+into a historical dashboard view.
 
 The database must already exist and have the current schema. A temporary database lock or other
 availability conflict can make a refresh fail; the browser retains its last successful snapshot and
@@ -188,20 +190,39 @@ The recipes are text copied to the clipboard and are never executed by the page.
 only to `127.0.0.1` and has no remote mode, authentication surface, collection controls, credentials,
 accounts, positions, orders, or trading authority. Stop it with `Ctrl-C`.
 
-## 7. Hyperliquid/dYdX contract compatibility dossier
+## 7. Venue discovery and contract compatibility dossiers
 
-Inspect the bundled official-source research dossier without a database or network request:
+Rank the bundled official-source research catalog without a database or network request, or inspect
+either immutable dossier directly:
 
 ```bash
+.venv/bin/polytrading carry discovery --format text
+.venv/bin/polytrading carry discovery --format json
 .venv/bin/polytrading carry dossier --format text
-.venv/bin/polytrading carry dossier --format json
+.venv/bin/polytrading carry dossier --id lighter-dydx-core-v1 --format text
 ```
 
-The current result is `ineligible` with primary reason `quanto_structure_excluded`. Hyperliquid's
-official specification describes its ordinary BTC, ETH, and SOL perpetuals as USDC-margined while
-using a USDT-denominated oracle without a USDC/USDT conversion, and explicitly characterizes the
-contracts as technically quanto. Shared USDC margin or P&L accounting with dYdX therefore does not
-make this pair admissible: the approved initial Class C universe excludes quanto structures.
+At the 2026-08-13 research cutoff, discovery selects `lighter-dydx-core-v1` for the next modeling
+stage. It has exactly four matched checks, ten `model_required` checks, zero blocking checks, and
+zero missing-evidence checks. The documented matches are base-quantity semantics, linear USD
+payoff, USDC accounting, and hourly funding. The remaining checks still require explicit models or
+reviews for oracle and mark construction, liquidation and deleveraging, funding formulas and caps,
+order constraints, effective costs, failure domains, and access eligibility.
+
+`model_required` means only that the pair passed the initial structural screen with enough official
+evidence to define those next investigations. It is not a conclusion that the venues are equivalent,
+the trade is profitable, drawdown is bounded, an account is eligible, or paper or live execution is
+authorized. In particular, Lighter's documented Standard Account may advertise zero maker and taker
+fees while imposing maker, taker, and cancellation latency; Premium Account fees and latency vary by
+tier. The economic model must use observed executable conditions and the intended account type, not
+the headline fee.
+
+Hyperliquid/dYdX remains visible at rank two as `ineligible` with primary reason
+`quanto_structure_excluded`. Hyperliquid's official specification describes its ordinary BTC, ETH,
+and SOL perpetuals as USDC-margined while using a USDT-denominated oracle without a USDC/USDT
+conversion, and characterizes the contracts as technically quanto. Shared USDC margin or P&L
+accounting with dYdX therefore does not make this pair admissible: the approved initial Class C
+universe excludes quanto structures.
 
 `ineligible` is a successful research outcome, not a command failure. It prevents fee or return
 modeling from making a structurally rejected pair appear actionable. The report also preserves
@@ -214,12 +235,11 @@ bytes are bundled with the package. The command never fetches remote documentati
 the excerpt hashes are not presented as hashes of the full remote pages. The dashboard shows the
 same typed report only when its observation timestamp is no later than the screen's `as_of` cutoff.
 
-Effective account-tier fees, point-in-time order constraints, failure-domain analysis, and legal or
-interface eligibility remain missing. Fee tables are tiered or governance/dynamic inputs and may not
-be treated as effective costs until the actual account state is captured. The next research gate is
-venue discovery: apply this dossier schema to another BTC/ETH/SOL pair and require no blocking or
-missing-evidence result before building executable fee, depth, forced-exit, or funding-reversal
-economics.
+Germany or Estonia not appearing in a displayed restriction excerpt is not legal approval. User,
+entity, sanctions, interface, API, KYC, tax, and jurisdiction eligibility remain a separate documented
+review before any activation decision. The next engineering gate is a read-only Lighter public-data
+adapter followed by point-in-time fee, latency, depth, forced-exit, basis, and funding-reversal
+economics. No account or execution surface belongs in that gate.
 
 ## 8. Synchronized 20-level book collection
 
