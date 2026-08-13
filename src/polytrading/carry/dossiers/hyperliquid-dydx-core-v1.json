@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "dossier_id": "hyperliquid-dydx-core-v1",
+  "left_venue": "hyperliquid",
+  "right_venue": "dydx",
+  "assets": ["BTC", "ETH", "SOL"],
+  "observed_at": "2026-08-13T12:00:00Z",
+  "decision_scope": "research_only",
+  "warning": "Research only — no trading authority.",
+  "sources": [
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_contract_specifications",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications",
+      "title": "Contract specifications",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "these contracts are technically quanto contracts where USDT pnl is denominated in USDC.",
+      "excerpt_sha256": "f9696c5f4657560c55eebf23cf4bc138082cb1ca476aeb6c956f7cc27bb8252d"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_robust_price_indices",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices",
+      "title": "Robust price indices",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Mark price is an unbiased and robust estimate of the fair perp price",
+      "excerpt_sha256": "5dd9cd21880f5086405598ed3a5774e2d7e83ca9bfae3f2e22751c4d88815f95"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_funding",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding",
+      "title": "Funding",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "The funding rate on Hyperliquid is paid every hour.",
+      "excerpt_sha256": "dd4ce6cb36ed91ad5014720ddc93f0bda038d597520eea0dd044faeab5144a47"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_liquidations",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations",
+      "title": "Liquidations",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Liquidations use the mark price, which combines external CEX prices with Hyperliquid's book state.",
+      "excerpt_sha256": "e6da07376f12fe8c2b125a2b7436011b24b4e7e834568c62d46fae6d1d6d4024"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_auto_deleveraging",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/auto-deleveraging",
+      "title": "Auto-deleveraging",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Auto-deleveraging strictly ensures that the platform stays solvent.",
+      "excerpt_sha256": "f4d877fa32425936180bb4d3aa0e1909694393bd93482bee8723d206ef59ab60"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "hyperliquid_fees",
+      "venue": "hyperliquid",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees",
+      "title": "Fees",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Fees are based on your rolling 14 day volume",
+      "excerpt_sha256": "654459123cb1a0a05e6164334861c7a90f5b52734e58f218921746c6d65cdd09"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_perpetual_protocol",
+      "venue": "dydx",
+      "url": "https://github.com/dydxprotocol/v4-chain/blob/main/proto/dydxprotocol/perpetuals/perpetual.proto",
+      "title": "Perpetual protocol definition",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "It acts as the oracle price for the purposes of calculating collateral, margin requirements, and funding rates.",
+      "excerpt_sha256": "dcf8942be134c299ed935f66e451153e923f7f1e1dc39d17ebdbe83fd3a61709"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_oracle_prices",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166990-oracle-prices-on-dydx-chain",
+      "title": "Oracle prices on dYdX Chain",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "The oracle price for each trading pair is used for the following:",
+      "excerpt_sha256": "65f0d6038df1c0d1640597c8199a7d23cc4546ef4ad9715926449110a166bed2"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_funding",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166992-default-funding-rates-on-dydx",
+      "title": "Default funding rates on dYdX",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "We charge funding rates every hour on our platform.",
+      "excerpt_sha256": "690ea65254607e28d31e239134362e8157f48b2f9c27e65ca6df2d37bd7d03d0"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_liquidity_tiers",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166993-default-liquidity-tiers-on-dydx-chain",
+      "title": "Default Liquidity Tiers on dYdX Chain",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Each market has a Lower Cap and Upper Cap denominated in USDC.",
+      "excerpt_sha256": "ec3eb038f43366a0f503d58db21af3db6750647abf9310e92c3921d117255f38"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_liquidations",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166991-liquidations-on-dydx-chain",
+      "title": "Liquidations on dYdX Chain",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "Positions are closed via protocol-generated liquidation matches",
+      "excerpt_sha256": "7aaf1b48d8fffb6fa130af5fdf53deb04c15a9039e365aab4fa172e0a6e3d36e"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_contract_loss",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166973-contract-loss-mechanisms-on-dydx-chain",
+      "title": "Contract loss mechanisms on dYdX Chain",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "If an account’s value turns negative, deleveraging occurs immediately against randomly chosen offsetting positions",
+      "excerpt_sha256": "4c31e68838e71bdeeda581f9d2a6ad33c11d82acce5569a77914a4a3dfe8290d"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "dydx_fees",
+      "venue": "dydx",
+      "url": "https://help.dydx.trade/en/articles/166995-trading-fees-on-dydx",
+      "title": "Trading fees on dYdX",
+      "observed_at": "2026-08-13T12:00:00Z",
+      "evidence_excerpt": "dYdX uses a maker-taker fee model for determining trade fees.",
+      "excerpt_sha256": "413fa32d07d07760e056ef2501da83744737e472cbaf6953ef04c6048cc145b6"
+    }
+  ],
+  "checks": [
+    {
+      "schema_version": 1,
+      "kind": "asset_and_quantity",
+      "judgment": "matched",
+      "reason_code": "base_quantity_semantics_match",
+      "left_summary": "Core contracts represent one unit of the underlying asset.",
+      "right_summary": "Protocol positions use base quantums convertible to full underlying units.",
+      "source_ids": ["hyperliquid_contract_specifications", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "payoff_and_quote",
+      "judgment": "blocking",
+      "reason_code": "quanto_structure_excluded",
+      "left_summary": "BTC, ETH, and SOL use USDT-denominated oracle exposure but USDC P&L without a USDC/USDT conversion; Hyperliquid calls this technically quanto.",
+      "right_summary": "The protocol definition models base positions against quote quantums and does not establish the same documented quanto treatment.",
+      "source_ids": ["hyperliquid_contract_specifications", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "collateral_and_pnl",
+      "judgment": "matched",
+      "reason_code": "usdc_accounting_matches",
+      "left_summary": "Core perpetual margin and realized P&L accounting are in USDC.",
+      "right_summary": "Margin caps and quote accounting are denominated in USDC.",
+      "source_ids": ["hyperliquid_contract_specifications", "dydx_liquidity_tiers", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "oracle_construction",
+      "judgment": "model_required",
+      "reason_code": "oracle_construction_differs",
+      "left_summary": "Validator-published external-market oracle prices feed funding and the composite mark.",
+      "right_summary": "Validator-consensus oracle prices feed collateral, margin, liquidations, and funding.",
+      "source_ids": ["hyperliquid_robust_price_indices", "dydx_oracle_prices", "dydx_perpetual_protocol"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "mark_and_margin",
+      "judgment": "model_required",
+      "reason_code": "margin_reference_differs",
+      "left_summary": "A composite mark distinct from the oracle drives margin, liquidation, and unrealized P&L.",
+      "right_summary": "The documented oracle drives collateral and liquidation while liquidity-tier parameters scale margin.",
+      "source_ids": ["hyperliquid_robust_price_indices", "dydx_oracle_prices", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "liquidation",
+      "judgment": "model_required",
+      "reason_code": "liquidation_mechanism_differs",
+      "left_summary": "Mark-triggered positions first attempt market-order liquidation before backstop handling.",
+      "right_summary": "Oracle-triggered protocol liquidation orders match resting order-book liquidity with penalty rules.",
+      "source_ids": ["hyperliquid_liquidations", "dydx_liquidations"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "auto_deleveraging",
+      "judgment": "model_required",
+      "reason_code": "deleveraging_mechanism_differs",
+      "left_summary": "Profitable opposing accounts are ranked when an account or isolated position becomes negative.",
+      "right_summary": "Randomly chosen offsetting positions can be deleveraged when an account becomes negative.",
+      "source_ids": ["hyperliquid_auto_deleveraging", "dydx_contract_loss"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_interval",
+      "judgment": "matched",
+      "reason_code": "hourly_funding_matches",
+      "left_summary": "Funding is paid every hour.",
+      "right_summary": "Funding is charged every hour.",
+      "source_ids": ["hyperliquid_funding", "dydx_funding"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_formula",
+      "judgment": "model_required",
+      "reason_code": "funding_formula_differs",
+      "left_summary": "The formula uses a five-second sampled premium, fixed interest component, and hourly averaging.",
+      "right_summary": "The formula uses proposer-voted premiums and governance-adjustable sampling and clamp parameters.",
+      "source_ids": ["hyperliquid_funding", "dydx_funding"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "funding_cap",
+      "judgment": "model_required",
+      "reason_code": "funding_caps_differ",
+      "left_summary": "The documented core-perpetual cap is four percent per hour.",
+      "right_summary": "The cap depends on governance-controlled initial and maintenance margin parameters.",
+      "source_ids": ["hyperliquid_funding", "dydx_funding", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "order_constraints",
+      "judgment": "missing_evidence",
+      "reason_code": "point_in_time_constraints_missing",
+      "left_summary": "Documentation describes size constraints, but no account-specific point-in-time limit capture exists.",
+      "right_summary": "Governance and liquidity-tier parameters are dynamic, and no point-in-time constraint capture exists.",
+      "source_ids": ["hyperliquid_contract_specifications", "dydx_liquidity_tiers"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "fee_schedule",
+      "judgment": "missing_evidence",
+      "reason_code": "effective_account_fees_missing",
+      "left_summary": "Fees vary with rolling volume and account conditions; the effective account tier is not captured.",
+      "right_summary": "Maker-taker fees are governance-adjustable; the effective account tier is not captured.",
+      "source_ids": ["hyperliquid_fees", "dydx_fees"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "venue_failure_domain",
+      "judgment": "missing_evidence",
+      "reason_code": "failure_domain_assessment_missing",
+      "left_summary": "Liquidation and deleveraging mechanisms are documented, but operational independence has not been assessed.",
+      "right_summary": "Liquidation and deleveraging mechanisms are documented, but correlated oracle, bridge, and outage exposure has not been assessed.",
+      "source_ids": ["hyperliquid_liquidations", "hyperliquid_auto_deleveraging", "dydx_liquidations", "dydx_contract_loss"]
+    },
+    {
+      "schema_version": 1,
+      "kind": "access_eligibility",
+      "judgment": "missing_evidence",
+      "reason_code": "eligibility_review_deferred",
+      "left_summary": "Technical contract documentation does not establish the operator's legal or interface eligibility.",
+      "right_summary": "Protocol source and technical documentation do not establish the operator's legal or interface eligibility.",
+      "source_ids": ["hyperliquid_contract_specifications", "dydx_perpetual_protocol"]
+    }
+  ]
+}

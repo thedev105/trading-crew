@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from importlib.resources import files
+
+from pydantic import ValidationError
+
 from polytrading.carry.dossier_models import (
     ContractCompatibilityDossier,
     ContractDossierReport,
@@ -13,6 +17,21 @@ _STATUS_PRECEDENCE = (
     (DossierJudgment.MISSING_EVIDENCE, DossierStatus.EVIDENCE_INCOMPLETE),
     (DossierJudgment.MODEL_REQUIRED, DossierStatus.MODEL_REQUIRED),
 )
+
+_BUNDLED_DOSSIER = "hyperliquid-dydx-core-v1.json"
+
+
+def load_bundled_dossier() -> ContractCompatibilityDossier:
+    """Load and validate the immutable contract dossier packaged with the application."""
+    try:
+        payload = (
+            files("polytrading.carry.dossiers")
+            .joinpath(_BUNDLED_DOSSIER)
+            .read_text(encoding="utf-8")
+        )
+        return ContractCompatibilityDossier.model_validate_json(payload)
+    except (OSError, ValidationError) as error:
+        raise ValueError("invalid bundled dossier: hyperliquid-dydx-core-v1") from error
 
 
 def evaluate_dossier(dossier: ContractCompatibilityDossier) -> ContractDossierReport:
