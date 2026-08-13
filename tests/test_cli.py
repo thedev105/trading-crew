@@ -40,7 +40,7 @@ from polytrading.domain.models import (
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
-from polytrading.venues.public import AdapterBatch
+from polytrading.venues.public import AdapterBatch, AdapterWarning
 from tests.carry.study_helpers import at, complete_block
 from tests.domain.factories import funding_observation, instrument_spec
 from tests.venues.funding_cycle_helpers import (
@@ -1358,6 +1358,38 @@ def test_public_http_client_has_explicit_identity_and_timeouts() -> None:
     asyncio.run(client.aclose())
 
 
+def test_public_adapter_session_routes_every_venue_to_its_concrete_adapter(
+    tmp_path: Path,
+) -> None:
+    # Catches the old non-Bybit fallback silently routing dYdX requests to Hyperliquid.
+    store = DuckDBStore(tmp_path / "routing.duckdb")
+
+    async def exercise() -> tuple[tuple[str, Venue], ...]:
+        async with cli.public_adapter_session(
+            store, (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+        ) as adapters:
+            return tuple((type(adapter).__name__, adapter.venue) for adapter in adapters)
+
+    assert asyncio.run(exercise()) == (
+        ("BybitPublicAdapter", Venue.BYBIT),
+        ("HyperliquidPublicAdapter", Venue.HYPERLIQUID),
+        ("DydxPublicAdapter", Venue.DYDX),
+    )
+    store.close()
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+def test_generic_collection_parsers_accept_dydx(command: str, tmp_path: Path) -> None:
+    # Catches a venue implemented in code but unreachable through the public CLI contract.
+    arguments = ["collect", command, "--venue", "dydx", "--db", str(tmp_path / "x.duckdb")]
+    if command == "books":
+        arguments.append("--once")
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.venue == "dydx"
+
+
 async def _record_delay(delays: list[float], delay: float) -> None:
     delays.append(delay)
 
@@ -1394,7 +1426,14 @@ class _BookAdapter:
         source_hash = sha256(payload_json.encode()).hexdigest()
         raw = RawEnvelope(
             schema_version=1,
-            event_id=UUID(int=self.calls * 10 + (1 if self.venue is Venue.BYBIT else 2)),
+            event_id=UUID(
+                int=self.calls * 10
+                + {
+                    Venue.BYBIT: 1,
+                    Venue.HYPERLIQUID: 2,
+                    Venue.DYDX: 3,
+                }[self.venue]
+            ),
             venue=self.venue,
             endpoint="/public/book",
             venue_timestamp=observed_at,
@@ -1411,6 +1450,29 @@ class _BookAdapter:
         return AdapterBatch(raw=(raw,), normalized=books)
 
 
+class _WarningBookAdapter(_BookAdapter):
+    async def fetch_order_books(
+        self, assets: frozenset[Asset], observed_at: datetime, cycle_id: UUID
+    ) -> AdapterBatch:
+        batch = await super().fetch_order_books(assets, observed_at, cycle_id)
+        return AdapterBatch(
+            raw=batch.raw,
+            normalized=batch.normalized,
+            warnings=(
+                AdapterWarning(
+                    code="DYDX_REST_BOOK_LOCAL_TIMESTAMP",
+                    venue=Venue.DYDX,
+                    endpoint="/v4/orderbooks/perpetualMarket/BTC-USD",
+                    symbol="BTC-USD",
+                    message=(
+                        "dYdX REST book has no venue timestamp or sequence; "
+                        "local receipt time was used"
+                    ),
+                ),
+            ),
+        )
+
+
 def _book(
     venue: Venue, asset: Asset, cycle_id: UUID, observed_at: datetime, source_hash: str
 ) -> Level2BookSnapshot:
@@ -1423,7 +1485,13 @@ def _book(
         schema_version=1,
         cycle_id=cycle_id,
         venue=venue,
-        symbol=f"{asset.value}{'USDT' if venue is Venue.BYBIT else ''}",
+        symbol=(
+            f"{asset.value}USDT"
+            if venue is Venue.BYBIT
+            else f"{asset.value}-USD"
+            if venue is Venue.DYDX
+            else asset.value
+        ),
         asset=asset,
         bids=(BookLevel(price=base - 1, quantity=Decimal("1"), order_count=1),),
         asks=(BookLevel(price=base + 1, quantity=Decimal("1"), order_count=1),),
@@ -1542,12 +1610,39 @@ class _PublicAdapter:
         return AdapterBatch(raw=(), normalized=())
 
 
+class _WarningPublicAdapter(_PublicAdapter):
+    async def fetch_market_snapshots(
+        self, assets: frozenset[Asset], observed_at: datetime
+    ) -> AdapterBatch:
+        self.calls.append((self.venue, "markets", assets, observed_at))
+        return AdapterBatch(
+            raw=(),
+            normalized=(),
+            warnings=(
+                AdapterWarning(
+                    code="DYDX_MARK_PRICE_UNAVAILABLE",
+                    venue=Venue.DYDX,
+                    endpoint="/v4/perpetualMarkets",
+                    symbol="BTC-USD",
+                    message="dYdX public market evidence has no documented mark-price field",
+                ),
+            ),
+        )
+
+
 class _PersistingPublicAdapter(_PublicAdapter):
     def _raw(self, suffix: int) -> RawEnvelope:
         payload = f'{{"venue":"{self.venue.value}","suffix":{suffix}}}'
         return RawEnvelope(
             schema_version=1,
-            event_id=UUID(int=(1000 if self.venue is Venue.BYBIT else 2000) + suffix),
+            event_id=UUID(
+                int={
+                    Venue.BYBIT: 1000,
+                    Venue.HYPERLIQUID: 2000,
+                    Venue.DYDX: 3000,
+                }[self.venue]
+                + suffix
+            ),
             venue=self.venue,
             endpoint="/public/test",
             venue_timestamp=NOW,
@@ -1624,18 +1719,19 @@ class _PersistingPublicAdapter(_PublicAdapter):
         )
 
 
-def test_collect_public_cli_uses_both_public_adapters_and_seven_day_default(
+def test_collect_public_cli_uses_all_public_adapters_and_seven_day_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[object, ...]] = []
     adapters = (
         _PublicAdapter(Venue.BYBIT, calls),
         _PublicAdapter(Venue.HYPERLIQUID, calls),
+        _PublicAdapter(Venue.DYDX, calls),
     )
 
     @asynccontextmanager
     async def session(store: object, venues: object):
-        assert set(venues) == {Venue.BYBIT, Venue.HYPERLIQUID}
+        assert tuple(venues) == (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
         yield adapters
 
     monkeypatch.setattr(cli, "public_adapter_session", session)
@@ -1657,13 +1753,53 @@ def test_collect_public_cli_uses_both_public_adapters_and_seven_day_default(
         )
         == 0
     )
-    assert [(call[0], call[1]) for call in calls[:2]] == [
+    assert [(call[0], call[1]) for call in calls[:3]] == [
         (Venue.BYBIT, "instruments"),
         (Venue.HYPERLIQUID, "instruments"),
+        (Venue.DYDX, "instruments"),
     ]
     funding_calls = [call for call in calls if call[1] == "funding"]
-    assert len(funding_calls) == 6
+    assert len(funding_calls) == 9
     assert all(call[3] == NOW - timedelta(days=7) and call[4] == NOW for call in funding_calls)
+
+
+def test_collect_public_cli_prints_structured_adapter_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Catches valid adapter limitations being persisted but hidden from the operator.
+    calls: list[tuple[object, ...]] = []
+    adapter = _WarningPublicAdapter(Venue.DYDX, calls)
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        assert tuple(venues) == (Venue.DYDX,)
+        yield (adapter,)
+
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert (
+        main(
+            [
+                "collect",
+                "public",
+                "--venue",
+                "dydx",
+                "--assets",
+                "BTC",
+                "--db",
+                str(tmp_path / "warning.duckdb"),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().err == (
+        "polytrading: warning: dydx DYDX_MARK_PRICE_UNAVAILABLE BTC-USD "
+        "/v4/perpetualMarkets: dYdX public market evidence has no documented "
+        "mark-price field\n"
+    )
 
 
 def test_collect_public_skips_bybit_history_without_point_in_time_instrument_basis(
@@ -1786,18 +1922,19 @@ def test_bybit_history_basis_requires_an_instrument_known_at_range_start(
     store.close()
 
 
-def test_collect_books_once_cli_launches_both_venues_in_one_cycle(
+def test_collect_books_once_cli_launches_all_venues_in_one_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     starts: list[Venue] = []
     adapters = (
         _BookAdapter(Venue.BYBIT, starts),
         _BookAdapter(Venue.HYPERLIQUID, starts),
+        _BookAdapter(Venue.DYDX, starts),
     )
 
     @asynccontextmanager
     async def session(store: object, venues: object):
-        assert set(venues) == {Venue.BYBIT, Venue.HYPERLIQUID}
+        assert tuple(venues) == (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
         yield adapters
 
     monkeypatch.setattr(cli, "public_adapter_session", session)
@@ -1820,10 +1957,50 @@ def test_collect_books_once_cli_launches_both_venues_in_one_cycle(
         )
         == 0
     )
-    assert starts == [Venue.BYBIT, Venue.HYPERLIQUID]
+    assert starts == [Venue.BYBIT, Venue.DYDX, Venue.HYPERLIQUID]
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
-        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (6,)
+        assert connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (9,)
+
+
+def test_collect_books_cli_prints_validated_adapter_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Catches synchronized-book warnings being dropped between validation and the CLI.
+    starts: list[Venue] = []
+    adapter = _WarningBookAdapter(Venue.DYDX, starts)
+
+    @asynccontextmanager
+    async def session(store: object, venues: object):
+        assert tuple(venues) == (Venue.DYDX,)
+        yield (adapter,)
+
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert (
+        main(
+            [
+                "collect",
+                "books",
+                "--venue",
+                "dydx",
+                "--assets",
+                "BTC",
+                "--once",
+                "--db",
+                str(tmp_path / "book-warning.duckdb"),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().err == (
+        "polytrading: warning: dydx DYDX_REST_BOOK_LOCAL_TIMESTAMP BTC-USD "
+        "/v4/orderbooks/perpetualMarket/BTC-USD: dYdX REST book has no venue timestamp "
+        "or sequence; local receipt time was used\n"
+    )
 
 
 def test_venue_modules_define_no_private_or_trading_method_names() -> None:

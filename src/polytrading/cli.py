@@ -34,6 +34,7 @@ from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.bybit import BybitPublicAdapter
+from polytrading.venues.dydx import DydxPublicAdapter
 from polytrading.venues.funding_cycle import (
     PointInTimeFundingCollector,
     record_late_funding_cycle,
@@ -56,7 +57,7 @@ from polytrading.venues.funding_health_report import (
     render_funding_health_text,
 )
 from polytrading.venues.hyperliquid import HyperliquidPublicAdapter
-from polytrading.venues.public import PublicVenueAdapter
+from polytrading.venues.public import AdapterBatch, AdapterWarning, PublicVenueAdapter
 from polytrading.venues.recorder import PublicRecorder
 from polytrading.venues.synchronized import SynchronizedBookCollector
 
@@ -146,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
     public = collect_commands.add_parser("public", help="collect public instruments and funding")
-    public.add_argument("--venue", choices=("hyperliquid", "bybit", "all"), required=True)
+    public.add_argument("--venue", choices=("hyperliquid", "bybit", "dydx", "all"), required=True)
     public.add_argument("--assets", default="BTC,ETH,SOL")
     public.add_argument("--start")
     public.add_argument("--end")
@@ -163,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     funding_cycle.add_argument("--format", choices=("text", "json"), default="text")
 
     books = collect_commands.add_parser("books", help="collect synchronized public books")
-    books.add_argument("--venue", choices=("hyperliquid", "bybit", "all"), required=True)
+    books.add_argument("--venue", choices=("hyperliquid", "bybit", "dydx", "all"), required=True)
     books.add_argument("--assets", default="BTC,ETH,SOL")
     mode = books.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
@@ -315,7 +316,7 @@ def _parse_assets(value: str) -> frozenset[Asset]:
 
 def _parse_venues(value: str) -> tuple[Venue, ...]:
     if value == "all":
-        return (Venue.BYBIT, Venue.HYPERLIQUID)
+        return (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
     return (Venue(value),)
 
 
@@ -352,11 +353,41 @@ async def public_adapter_session(
                         instrument_registry=InstrumentRegistry(store),
                     )
                 )
-            else:
+            elif venue is Venue.HYPERLIQUID:
                 adapters.append(HyperliquidPublicAdapter(client, _utc_now, time.monotonic_ns))
+            elif venue is Venue.DYDX:
+                adapters.append(DydxPublicAdapter(client, _utc_now, time.monotonic_ns))
+            else:
+                raise ValueError(f"unsupported public venue: {venue.value}")
         yield tuple(adapters)
     finally:
         await asyncio.gather(*(client.aclose() for client in clients))
+
+
+def _render_adapter_warning(warning: AdapterWarning) -> str:
+    return (
+        f"polytrading: warning: {warning.venue.value} {warning.code} "
+        f"{warning.symbol} {warning.endpoint}: {warning.message}"
+    )
+
+
+def _print_adapter_warning(warning: AdapterWarning) -> None:
+    print(_render_adapter_warning(warning), file=sys.stderr)
+
+
+def _record_public_batch(recorder: PublicRecorder, batch: AdapterBatch) -> None:
+    recorder.record(batch)
+    for warning in sorted(
+        batch.warnings,
+        key=lambda item: (
+            item.venue.value,
+            item.code,
+            item.symbol,
+            item.endpoint,
+            item.message,
+        ),
+    ):
+        _print_adapter_warning(warning)
 
 
 async def _collect_public(arguments: argparse.Namespace) -> int:
@@ -374,9 +405,11 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
         recorder = PublicRecorder(store)
         async with public_adapter_session(store, venues) as adapters:
             for adapter in adapters:
-                recorder.record(await adapter.fetch_instruments(assets, observed_at))
+                _record_public_batch(recorder, await adapter.fetch_instruments(assets, observed_at))
             for adapter in adapters:
-                recorder.record(await adapter.fetch_market_snapshots(assets, observed_at))
+                _record_public_batch(
+                    recorder, await adapter.fetch_market_snapshots(assets, observed_at)
+                )
                 for asset in sorted(assets, key=lambda item: item.value):
                     if adapter.venue is Venue.BYBIT and not _has_bybit_history_basis(
                         store, asset, start
@@ -388,8 +421,9 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
                             file=sys.stderr,
                         )
                         continue
-                    recorder.record(
-                        await adapter.fetch_funding_history(asset, start, end, observed_at)
+                    _record_public_batch(
+                        recorder,
+                        await adapter.fetch_funding_history(asset, start, end, observed_at),
                     )
     finally:
         store.close()
@@ -604,7 +638,9 @@ async def collect_book_cycles(
     if not math.isfinite(max_failure_backoff_seconds) or max_failure_backoff_seconds <= 0:
         raise ValueError("maximum failure backoff must be positive")
     ordered_adapters = tuple(adapters)
-    collector = SynchronizedBookCollector(store, clock=wall_clock)
+    collector = SynchronizedBookCollector(
+        store, clock=wall_clock, warning_sink=_print_adapter_warning
+    )
     started = monotonic()
     deadline = started + duration_seconds if duration_seconds is not None else math.inf
     consecutive_failures = 0

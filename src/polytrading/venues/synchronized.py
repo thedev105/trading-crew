@@ -19,6 +19,7 @@ from polytrading.domain.models import (
 from polytrading.venues.public import (
     AdapterBatch,
     AdapterBatchIntegrityError,
+    AdapterWarning,
     PublicVenueAdapter,
     validate_adapter_batch,
 )
@@ -84,11 +85,13 @@ class SynchronizedBookCollector:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         cycle_id_factory: Callable[[], UUID] = uuid4,
         research_skew_target_ms: Decimal = Decimal(1_000),
+        warning_sink: Callable[[AdapterWarning], None] | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._cycle_id_factory = cycle_id_factory
         self._research_skew_target_ms = research_skew_target_ms
+        self._warning_sink = warning_sink
 
     async def collect_once(
         self,
@@ -189,6 +192,19 @@ class SynchronizedBookCollector:
                 for book in books:
                     append_normalized(transaction, book)
             transaction.append_book_collection_cycle(cycle)
+        if self._warning_sink is not None:
+            warnings = sorted(
+                (warning for _venue, batch in successful_batches for warning in batch.warnings),
+                key=lambda warning: (
+                    warning.venue.value,
+                    warning.code,
+                    warning.symbol,
+                    warning.endpoint,
+                    warning.message,
+                ),
+            )
+            for warning in warnings:
+                self._warning_sink(warning)
         return cycle
 
     @staticmethod

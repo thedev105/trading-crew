@@ -19,7 +19,7 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.storage.store import DuckDBStore
-from polytrading.venues.public import AdapterBatch
+from polytrading.venues.public import AdapterBatch, AdapterWarning
 from polytrading.venues.synchronized import SynchronizedBookCollector
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
@@ -251,11 +251,13 @@ def collector(
     store: DuckDBStore,
     *,
     clock: Callable[[], datetime] | None = None,
+    warning_sink: Callable[[AdapterWarning], None] | None = None,
 ) -> SynchronizedBookCollector:
     return SynchronizedBookCollector(
         store,
         clock=clock or SequenceClock(NOW, NOW + timedelta(milliseconds=50)),
         cycle_id_factory=lambda: CYCLE_ID,
+        warning_sink=warning_sink,
     )
 
 
@@ -507,3 +509,74 @@ def test_cycle_insert_failure_rolls_back_raw_and_books(tmp_path: Path) -> None:
             )
         )
     assert counts == (0, 0, 0, 0)
+
+
+class WarningBookAdapter(ImmediateBookAdapter):
+    def __init__(self, venue: Venue, *, corrupt_hash: bool = False) -> None:
+        super().__init__(venue)
+        self.corrupt_hash = corrupt_hash
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        batch = await super().fetch_order_books(assets, observed_at, cycle_id)
+        raw = batch.raw[0]
+        if self.corrupt_hash:
+            raw = raw.model_copy(update={"source_hash": "f" * 64})
+        return AdapterBatch(
+            raw=(raw,),
+            normalized=batch.normalized,
+            warnings=(
+                AdapterWarning(
+                    code="LOCAL_TIME",
+                    venue=self.venue,
+                    endpoint="/public/book",
+                    symbol="BTC",
+                    message="local receipt time was used",
+                ),
+            ),
+        )
+
+
+def test_validated_book_batch_sends_structured_warning_after_persistence(tmp_path: Path) -> None:
+    # Catches book limitations disappearing before the operator-facing boundary.
+    store = DuckDBStore(tmp_path / "warning.duckdb")
+    warnings: list[AdapterWarning] = []
+
+    cycle = asyncio.run(
+        collector(store, warning_sink=warnings.append).collect_once(
+            (WarningBookAdapter(Venue.HYPERLIQUID),), ASSETS, NOW
+        )
+    )
+
+    assert cycle.status == "complete"
+    assert warnings == [
+        AdapterWarning(
+            code="LOCAL_TIME",
+            venue=Venue.HYPERLIQUID,
+            endpoint="/public/book",
+            symbol="BTC",
+            message="local receipt time was used",
+        )
+    ]
+    assert store.latest_book_cycle_as_of(NOW + timedelta(seconds=1)) == cycle
+    store.close()
+
+
+def test_invalid_book_batch_does_not_send_untrusted_warning(tmp_path: Path) -> None:
+    # Catches warning text from a rejected/corrupt batch reaching an operator.
+    store = DuckDBStore(tmp_path / "invalid-warning.duckdb")
+    warnings: list[AdapterWarning] = []
+
+    cycle = asyncio.run(
+        collector(store, warning_sink=warnings.append).collect_once(
+            (WarningBookAdapter(Venue.HYPERLIQUID, corrupt_hash=True),), ASSETS, NOW
+        )
+    )
+
+    assert cycle.status == "failed"
+    assert warnings == []
+    store.close()
