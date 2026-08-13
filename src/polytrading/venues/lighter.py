@@ -1,27 +1,31 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from polytrading.domain.models import (
     Asset,
+    FundingObservation,
     InstrumentKind,
     InstrumentSpec,
     RawEnvelope,
     Venue,
     normalize_utc_timestamp,
 )
-from polytrading.venues.public import AdapterBatch
+from polytrading.venues.public import AdapterBatch, AdapterWarning
 from polytrading.venues.recorder import make_raw_envelope
 
 _BASE_URL = "https://mainnet.zklighter.elliot.ai"
 _MARKETS_ENDPOINT = "/api/v1/orderBooks"
+_FUNDINGS_ENDPOINT = "/api/v1/fundings"
 _SOURCE_VERSION = "mainnet-v1-public"
+_MAX_FUNDING_RANGE = timedelta(days=7)
 _SYMBOL_BY_ASSET = {
     Asset.BTC: "BTC",
     Asset.ETH: "ETH",
@@ -75,6 +79,106 @@ class LighterPublicAdapter:
             for asset, symbol, _market_id, row in selected
         )
         return AdapterBatch(raw=(raw,), normalized=instruments)
+
+    async def fetch_market_snapshots(
+        self, assets: frozenset[Asset], observed_at: datetime
+    ) -> AdapterBatch:
+        _require_collection_context(observed_at)
+        received, selected = await self._resolve_markets(assets)
+        warnings = tuple(
+            AdapterWarning(
+                code="LIGHTER_MARK_INDEX_UNAVAILABLE",
+                venue=self.venue,
+                endpoint=_MARKETS_ENDPOINT,
+                symbol=symbol,
+                message=(
+                    "Lighter REST evidence has no response-timestamped mark and index price pair"
+                ),
+            )
+            for _asset, symbol, _market_id, _row in selected
+        )
+        return AdapterBatch(raw=(received.raw_envelope(),), normalized=(), warnings=warnings)
+
+    async def fetch_funding_history(
+        self,
+        asset: Asset,
+        start: datetime,
+        end: datetime,
+        observed_at: datetime,
+    ) -> AdapterBatch:
+        _require_collection_context(observed_at)
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        if normalized_end < normalized_start:
+            raise ValueError("funding range end must not precede start")
+        if normalized_end - normalized_start > _MAX_FUNDING_RANGE:
+            raise ValueError("Lighter funding range must not exceed seven days")
+
+        markets_received, selected = await self._resolve_markets(frozenset({asset}))
+        _selected_asset, symbol, market_id, _row = selected[0]
+        count_back = math.ceil((normalized_end - normalized_start) / timedelta(hours=1)) + 1
+        funding_received = await self._get(
+            _FUNDINGS_ENDPOINT,
+            {
+                "market_id": market_id,
+                "resolution": "1h",
+                "start_timestamp": math.floor(normalized_start.timestamp()),
+                "end_timestamp": math.ceil(normalized_end.timestamp()),
+                "count_back": min(count_back, 169),
+            },
+        )
+        resolution = _require_string(funding_received.document, "resolution", "funding response")
+        if resolution != "1h":
+            raise ValueError("Lighter funding response resolution must be 1h")
+        rows = _require_list(
+            _require_key(funding_received.document, "fundings", "funding response"),
+            "fundings",
+        )
+        if len(rows) > count_back:
+            raise ValueError("funding response exceeds requested count_back")
+        raw_market = markets_received.raw_envelope()
+        raw_funding = funding_received.raw_envelope()
+        observations: dict[datetime, FundingObservation] = {}
+        signed_rates: dict[datetime, Decimal] = {}
+        for value in rows:
+            row = _require_mapping(value, "funding row")
+            timestamp = _require_integer(row, "timestamp", "funding row")
+            try:
+                effective_at = datetime.fromtimestamp(timestamp, UTC)
+            except (OverflowError, OSError, ValueError) as error:
+                raise ValueError("funding timestamp is outside the supported range") from error
+            if effective_at > funding_received.observed_at:
+                raise ValueError("funding timestamp is after response receipt")
+            rate = _require_decimal(row, "rate", "funding row")
+            if rate < 0:
+                raise ValueError("funding rate must be nonnegative before direction is applied")
+            direction = _require_string(row, "direction", "funding row")
+            if direction not in {"long", "short"}:
+                raise ValueError("funding direction must be long or short")
+            signed_rate = Decimal(0) if rate == 0 else rate if direction == "long" else -rate
+            previous = signed_rates.get(effective_at)
+            if previous is not None:
+                if previous != signed_rate:
+                    raise ValueError("conflicting duplicate funding observation")
+                continue
+            signed_rates[effective_at] = signed_rate
+            if normalized_start <= effective_at <= normalized_end:
+                observations[effective_at] = FundingObservation(
+                    schema_version=1,
+                    venue=self.venue,
+                    symbol=symbol,
+                    asset=asset,
+                    rate=signed_rate,
+                    interval_hours=Decimal(1),
+                    effective_at=effective_at,
+                    observed_at=funding_received.observed_at,
+                    source_hash=raw_funding.source_hash,
+                )
+        normalized = tuple(observations[key] for key in sorted(observations))
+        return AdapterBatch(
+            raw=(raw_market, raw_funding),
+            normalized=normalized,
+        )
 
     async def _resolve_markets(
         self, assets: frozenset[Asset]

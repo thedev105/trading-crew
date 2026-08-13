@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -13,10 +13,14 @@ import httpx
 import pytest
 
 from polytrading.domain.models import Asset, InstrumentKind, Venue
+from polytrading.venues.public import AdapterWarning
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "lighter"
 REQUEST_CONTEXT = datetime(2026, 8, 13, 11, 59, tzinfo=UTC)
 RECEIVED_1 = datetime(2026, 8, 13, 12, 0, 1, tzinfo=UTC)
+RECEIVED_2 = datetime(2026, 8, 13, 12, 0, 2, tzinfo=UTC)
+FUNDING_START = datetime(2026, 8, 13, 10, tzinfo=UTC)
+FUNDING_END = datetime(2026, 8, 13, 12, tzinfo=UTC)
 
 
 def fixture_bytes(name: str) -> bytes:
@@ -243,3 +247,336 @@ def test_collection_context_must_be_aware_before_any_request() -> None:
             adapter.fetch_instruments(frozenset({Asset.BTC}), datetime(2026, 8, 13, 12, 0, 0))
         )
     assert called is False
+
+
+def test_fetch_market_snapshots_preserves_raw_and_warns_without_inventing_prices() -> None:
+    # Catches last-trade or midpoint substitution into required mark and index fields.
+    payload = fixture_bytes("order_books.json")
+    adapter = make_adapter(lambda request: response(payload), wall_times=[RECEIVED_1])
+
+    batch = asyncio.run(
+        adapter.fetch_market_snapshots(frozenset({Asset.SOL, Asset.BTC}), REQUEST_CONTEXT)
+    )
+
+    assert len(batch.raw) == 1
+    assert batch.raw[0].payload_json == payload.decode()
+    assert batch.normalized == ()
+    assert batch.warnings == (
+        AdapterWarning(
+            code="LIGHTER_MARK_INDEX_UNAVAILABLE",
+            venue=Venue.LIGHTER,
+            endpoint="/api/v1/orderBooks",
+            symbol="BTC",
+            message=("Lighter REST evidence has no response-timestamped mark and index price pair"),
+        ),
+        AdapterWarning(
+            code="LIGHTER_MARK_INDEX_UNAVAILABLE",
+            venue=Venue.LIGHTER,
+            endpoint="/api/v1/orderBooks",
+            symbol="SOL",
+            message=("Lighter REST evidence has no response-timestamped mark and index price pair"),
+        ),
+    )
+
+
+def test_fetch_funding_history_resolves_market_and_normalizes_settled_direction() -> None:
+    # Catches use of projected rates, hard-coded IDs, unsigned history, or range leakage.
+    market_payload = fixture_bytes("order_books.json")
+    funding_payload = fixture_bytes("fundings.json")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(
+            market_payload if request.url.path.endswith("orderBooks") else funding_payload
+        )
+
+    adapter = make_adapter(
+        handler,
+        wall_times=[RECEIVED_1, RECEIVED_2],
+        monotonic_times=[100, 200, 300, 450],
+    )
+    batch = asyncio.run(
+        adapter.fetch_funding_history(Asset.BTC, FUNDING_START, FUNDING_END, REQUEST_CONTEXT)
+    )
+
+    assert [request.url.path for request in requests] == [
+        "/api/v1/orderBooks",
+        "/api/v1/fundings",
+    ]
+    assert [dict(request.url.params) for request in requests] == [
+        {"filter": "perp"},
+        {
+            "market_id": "1",
+            "resolution": "1h",
+            "start_timestamp": "1786615200",
+            "end_timestamp": "1786622400",
+            "count_back": "3",
+        },
+    ]
+    assert "/api/v1/funding-rates" not in [request.url.path for request in requests]
+    assert [raw.payload_json for raw in batch.raw] == [
+        market_payload.decode(),
+        funding_payload.decode(),
+    ]
+    assert [item.effective_at for item in batch.normalized] == [
+        FUNDING_START,
+        FUNDING_START + timedelta(hours=1),
+        FUNDING_END,
+    ]
+    assert [item.rate for item in batch.normalized] == [
+        Decimal("0.0002"),
+        Decimal("-0.0003"),
+        Decimal("0"),
+    ]
+    assert all(item.venue is Venue.LIGHTER for item in batch.normalized)
+    assert all(item.symbol == "BTC" for item in batch.normalized)
+    assert all(item.asset is Asset.BTC for item in batch.normalized)
+    assert all(item.interval_hours == Decimal(1) for item in batch.normalized)
+    assert all(item.observed_at == RECEIVED_2 for item in batch.normalized)
+    assert all(item.source_hash == batch.raw[1].source_hash for item in batch.normalized)
+
+
+def test_fetch_funding_history_rejects_more_rows_than_requested_count_back() -> None:
+    # Catches a changed endpoint contract invalidating the bounded one-request assumption.
+    document = {
+        "code": 200,
+        "resolution": "1h",
+        "fundings": [
+            {
+                "timestamp": 1786615200,
+                "value": "0.1",
+                "rate": "0.0001",
+                "direction": "long",
+            },
+            {
+                "timestamp": 1786611600,
+                "value": "0.1",
+                "rate": "0.0001",
+                "direction": "long",
+            },
+        ],
+    }
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = fixture_bytes("order_books.json") if calls == 1 else json.dumps(document).encode()
+        return response(payload)
+
+    adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
+
+    with pytest.raises(ValueError, match="count_back"):
+        asyncio.run(
+            adapter.fetch_funding_history(Asset.BTC, FUNDING_START, FUNDING_START, REQUEST_CONTEXT)
+        )
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        (datetime(2026, 8, 13, 10), FUNDING_END, "timezone-aware"),
+        (FUNDING_START, datetime(2026, 8, 13, 12), "timezone-aware"),
+        (FUNDING_END, FUNDING_START, "must not precede"),
+        (FUNDING_START, FUNDING_START + timedelta(days=7, seconds=1), "seven days"),
+    ],
+)
+def test_fetch_funding_history_rejects_invalid_range_before_request(
+    start: datetime, end: datetime, message: str
+) -> None:
+    # Catches ambiguous, reversed, or unbounded evidence windows reaching the network.
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return response(fixture_bytes("order_books.json"))
+
+    adapter = make_adapter(handler, wall_times=[])
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(adapter.fetch_funding_history(Asset.BTC, start, end, REQUEST_CONTEXT))
+    assert called is False
+
+
+def test_fetch_funding_history_accepts_exact_seven_days_and_normalizes_query_seconds() -> None:
+    # Catches off-by-one rejection at the cap or local-offset/subsecond query corruption.
+    eastern = timezone(-timedelta(hours=4))
+    start = datetime(2026, 8, 6, 10, 0, 0, 250_000, tzinfo=UTC)
+    end = start + timedelta(days=7)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("orderBooks"):
+            return response(fixture_bytes("order_books.json"))
+        return response(b'{"code":200,"resolution":"1h","fundings":[]}')
+
+    adapter = make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
+    batch = asyncio.run(
+        adapter.fetch_funding_history(
+            Asset.BTC, start.astimezone(eastern), end.astimezone(eastern), REQUEST_CONTEXT
+        )
+    )
+
+    assert dict(requests[1].url.params) == {
+        "market_id": "1",
+        "resolution": "1h",
+        "start_timestamp": "1786010400",
+        "end_timestamp": "1786615201",
+        "count_back": "169",
+    }
+    assert len(batch.raw) == 2
+    assert batch.normalized == ()
+
+
+def funding_adapter_for(document: object) -> Any:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = fixture_bytes("order_books.json") if calls == 1 else json.dumps(document).encode()
+        return response(payload)
+
+    return make_adapter(handler, wall_times=[RECEIVED_1, RECEIVED_2])
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"code": 200, "resolution": "8h", "fundings": []}, "resolution"),
+        ({"code": 200, "resolution": "1h"}, "fundings"),
+        ({"code": 200, "resolution": "1h", "fundings": {}}, "list"),
+        ({"code": 200, "resolution": "1h", "fundings": ["bad"]}, "mapping"),
+        (
+            {
+                "code": 200,
+                "resolution": "1h",
+                "fundings": [{"timestamp": True, "rate": "0.1", "direction": "long"}],
+            },
+            "integer",
+        ),
+        (
+            {
+                "code": 200,
+                "resolution": "1h",
+                "fundings": [{"timestamp": 1786615200, "rate": 0.1, "direction": "long"}],
+            },
+            "decimal string",
+        ),
+        (
+            {
+                "code": 200,
+                "resolution": "1h",
+                "fundings": [{"timestamp": 1786615200, "rate": "-0.1", "direction": "long"}],
+            },
+            "nonnegative",
+        ),
+        (
+            {
+                "code": 200,
+                "resolution": "1h",
+                "fundings": [{"timestamp": 1786615200, "rate": "0.1", "direction": "both"}],
+            },
+            "long or short",
+        ),
+        (
+            {
+                "code": 200,
+                "resolution": "1h",
+                "fundings": [{"timestamp": 1786622403, "rate": "0.1", "direction": "long"}],
+            },
+            "response receipt",
+        ),
+    ],
+)
+def test_fetch_funding_history_fails_closed_on_malformed_settled_rows(
+    document: object, message: str
+) -> None:
+    # Catches malformed, projected, or future values becoming settled funding evidence.
+    adapter = funding_adapter_for(document)
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            adapter.fetch_funding_history(Asset.BTC, FUNDING_START, FUNDING_END, REQUEST_CONTEXT)
+        )
+
+
+def test_fetch_funding_history_accepts_identical_duplicate_once() -> None:
+    # Catches an identical immutable timestamp appearing twice in normalized output.
+    document = {
+        "code": 200,
+        "resolution": "1h",
+        "fundings": [
+            {
+                "timestamp": 1786615200,
+                "rate": "0.0002",
+                "direction": "long",
+            },
+            {
+                "timestamp": 1786615200,
+                "rate": "0.0002",
+                "direction": "long",
+            },
+        ],
+    }
+    adapter = funding_adapter_for(document)
+
+    batch = asyncio.run(
+        adapter.fetch_funding_history(
+            Asset.BTC,
+            FUNDING_START,
+            FUNDING_START + timedelta(hours=1),
+            REQUEST_CONTEXT,
+        )
+    )
+
+    assert len(batch.normalized) == 1
+    assert batch.normalized[0].effective_at == FUNDING_START
+    assert batch.normalized[0].rate == Decimal("0.0002")
+
+
+def test_fetch_funding_history_filters_to_closed_requested_range() -> None:
+    # Catches API boundary overfetch leaking into normalized settled history.
+    document = {
+        "code": 200,
+        "resolution": "1h",
+        "fundings": [
+            {"timestamp": 1786615200, "rate": "0.0002", "direction": "long"},
+            {"timestamp": 1786618800, "rate": "0.0003", "direction": "long"},
+        ],
+    }
+    adapter = funding_adapter_for(document)
+
+    batch = asyncio.run(
+        adapter.fetch_funding_history(
+            Asset.BTC,
+            FUNDING_START + timedelta(minutes=30),
+            FUNDING_START + timedelta(hours=1),
+            REQUEST_CONTEXT,
+        )
+    )
+
+    assert [item.effective_at for item in batch.normalized] == [FUNDING_START + timedelta(hours=1)]
+
+
+def test_fetch_funding_history_rejects_conflicting_duplicate() -> None:
+    # Catches nondeterministic overwrite of an immutable settled timestamp.
+    document = {
+        "code": 200,
+        "resolution": "1h",
+        "fundings": [
+            {"timestamp": 1786615200, "rate": "0.0002", "direction": "long"},
+            {"timestamp": 1786615200, "rate": "0.0002", "direction": "short"},
+        ],
+    }
+    adapter = funding_adapter_for(document)
+
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        asyncio.run(
+            adapter.fetch_funding_history(
+                Asset.BTC, FUNDING_START, FUNDING_START + timedelta(hours=1), REQUEST_CONTEXT
+            )
+        )
