@@ -17,11 +17,11 @@ from tests.domain.factories import (
     instrument_spec,
 )
 
-AS_OF = datetime(2026, 8, 13, 12, 6, tzinfo=UTC)
+AS_OF = datetime(2026, 8, 13, 16, 6, tzinfo=UTC)
 SOURCE_HASH = "a" * 64
 FUTURE_HASH = "f" * 64
 BOOK_CYCLE_ID = UUID("00000000-0000-0000-0000-000000000a01")
-DOSSIER_AT = datetime(2026, 8, 13, 12, tzinfo=UTC)
+DOSSIER_AT = datetime(2026, 8, 13, 15, 58, 12, tzinfo=UTC)
 
 
 def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Path) -> None:
@@ -66,7 +66,7 @@ def test_builder_excludes_dossier_until_its_point_in_time_cutoff(tmp_path: Path)
     assert json.loads(render_dashboard_json(before))["compatibility_dossier"] is None
     document = json.loads(render_dashboard_json(at_cutoff))["compatibility_dossier"]
     assert document["status"] == "ineligible"
-    assert document["observed_at"] == "2026-08-13T12:00:00Z"
+    assert document["observed_at"] == "2026-08-13T15:58:12Z"
     store.close()
 
 
@@ -158,7 +158,7 @@ def test_recipes_shell_quote_database_path_and_json_uses_public_scalars(tmp_path
     assert quoted in snapshot.operation_recipes.collect_public
     assert quoted in snapshot.operation_recipes.collect_books_once
     document = json.loads(render_dashboard_json(snapshot))
-    assert document["as_of"] == "2026-08-13T12:06:00Z"
+    assert document["as_of"] == "2026-08-13T16:06:00Z"
     assert document["funding_health"]["complete_coverage"] == "0"
     assert document["markets"][0]["venue"] == "bybit"
     assert document["markets"][0]["asset"] == "BTC"

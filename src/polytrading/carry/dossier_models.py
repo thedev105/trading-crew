@@ -185,6 +185,8 @@ class ContractCompatibilityDossier(StrictRecord):
     def require_coherent_dossier(self) -> ContractCompatibilityDossier:
         if self.left_venue is self.right_venue:
             raise ValueError("dossier venues must be distinct")
+        if {source.venue for source in self.sources} != {self.left_venue, self.right_venue}:
+            raise ValueError("source venues must exactly cover the compared venues")
         source_ids = tuple(source.source_id for source in self.sources)
         if not source_ids or len(set(source_ids)) != len(source_ids):
             raise ValueError("dossier source IDs must be nonempty and unique")

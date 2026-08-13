@@ -30,7 +30,7 @@ def load_bundled_dossier() -> ContractCompatibilityDossier:
             .read_text(encoding="utf-8")
         )
         return ContractCompatibilityDossier.model_validate_json(payload)
-    except (OSError, ValidationError) as error:
+    except (OSError, UnicodeError, ValidationError) as error:
         raise ValueError("invalid bundled dossier: hyperliquid-dydx-core-v1") from error
 
 

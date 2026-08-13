@@ -18,6 +18,7 @@ from polytrading.domain.models import Asset, Venue
 
 DOSSIER_AT = datetime(2026, 8, 13, 12, tzinfo=UTC)
 SOURCE_ID = "hyperliquid_contract_specifications"
+RIGHT_SOURCE_ID = "dydx_perpetual_protocol"
 EXCERPT = "these contracts are technically quanto contracts"
 SOURCE_URL = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications"
 
@@ -37,12 +38,26 @@ def dossier_source(**overrides: object) -> DossierSource:
     return DossierSource(**values)
 
 
+def right_dossier_source(**overrides: object) -> DossierSource:
+    values: dict[str, object] = {
+        "source_id": RIGHT_SOURCE_ID,
+        "venue": Venue.DYDX,
+        "url": (
+            "https://github.com/dydxprotocol/v4-chain/blob/main/"
+            "proto/dydxprotocol/perpetuals/perpetual.proto"
+        ),
+        "title": "Perpetual protocol definition",
+    }
+    values.update(overrides)
+    return dossier_source(**values)
+
+
 def dossier_check(
     kind: DossierCheckKind,
     *,
     judgment: DossierJudgment = DossierJudgment.MATCHED,
     reason_code: str | None = None,
-    source_ids: tuple[str, ...] = (SOURCE_ID,),
+    source_ids: tuple[str, ...] = (SOURCE_ID, RIGHT_SOURCE_ID),
     **overrides: object,
 ) -> DossierCheck:
     values: dict[str, object] = {
@@ -73,7 +88,7 @@ def contract_dossier(
         "observed_at": DOSSIER_AT,
         "decision_scope": "research_only",
         "warning": "Research only — no trading authority.",
-        "sources": sources or (dossier_source(),),
+        "sources": sources or (dossier_source(), right_dossier_source()),
         "checks": checks or tuple(dossier_check(kind) for kind in CANONICAL_DOSSIER_CHECKS),
     }
     values.update(overrides)
@@ -109,7 +124,15 @@ def test_dossier_rejects_source_observed_after_its_cutoff() -> None:
     future = dossier_source(observed_at=DOSSIER_AT + timedelta(microseconds=1))
 
     with pytest.raises(ValidationError, match="dossier observation"):
-        contract_dossier(sources=(future,))
+        contract_dossier(sources=(future, right_dossier_source()))
+
+
+def test_dossier_sources_must_cover_exactly_the_compared_venues() -> None:
+    left_only_checks = tuple(
+        dossier_check(kind, source_ids=(SOURCE_ID,)) for kind in CANONICAL_DOSSIER_CHECKS
+    )
+    with pytest.raises(ValidationError, match="source venues"):
+        contract_dossier(sources=(dossier_source(),), checks=left_only_checks)
 
 
 def test_dossier_requires_every_canonical_check_once_in_exact_order() -> None:
@@ -134,7 +157,7 @@ def test_dossier_rejects_unknown_and_uncited_sources() -> None:
         url="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding",
     )
     with pytest.raises(ValidationError, match="uncited source"):
-        contract_dossier(sources=(dossier_source(), extra))
+        contract_dossier(sources=(dossier_source(), right_dossier_source(), extra))
 
 
 @pytest.mark.parametrize(

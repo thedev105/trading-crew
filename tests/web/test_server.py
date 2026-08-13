@@ -10,7 +10,7 @@ import polytrading.web.server as web_server
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.server import DashboardApplication, validate_dashboard_database
 
-AS_OF = datetime(2026, 8, 13, 12, 6, tzinfo=UTC)
+AS_OF = datetime(2026, 8, 13, 16, 6, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
     assert response.status is HTTPStatus.OK
     assert response.content_type == "application/json; charset=utf-8"
     document = json.loads(response.body)
-    assert document["as_of"] == "2026-08-13T12:06:00Z"
+    assert document["as_of"] == "2026-08-13T16:06:00Z"
     assert document["compatibility_dossier"]["status"] == "ineligible"
     assert document["compatibility_dossier"]["primary_reason_code"] == "quanto_structure_excluded"
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")

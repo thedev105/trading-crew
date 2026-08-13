@@ -4,7 +4,7 @@
   "left_venue": "hyperliquid",
   "right_venue": "dydx",
   "assets": ["BTC", "ETH", "SOL"],
-  "observed_at": "2026-08-13T12:00:00Z",
+  "observed_at": "2026-08-13T15:58:12Z",
   "decision_scope": "research_only",
   "warning": "Research only — no trading authority.",
   "sources": [
@@ -14,7 +14,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications",
       "title": "Contract specifications",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "these contracts are technically quanto contracts where USDT pnl is denominated in USDC.",
       "excerpt_sha256": "f9696c5f4657560c55eebf23cf4bc138082cb1ca476aeb6c956f7cc27bb8252d"
     },
@@ -24,7 +24,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices",
       "title": "Robust price indices",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Mark price is an unbiased and robust estimate of the fair perp price",
       "excerpt_sha256": "5dd9cd21880f5086405598ed3a5774e2d7e83ca9bfae3f2e22751c4d88815f95"
     },
@@ -34,7 +34,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding",
       "title": "Funding",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "The funding rate on Hyperliquid is paid every hour.",
       "excerpt_sha256": "dd4ce6cb36ed91ad5014720ddc93f0bda038d597520eea0dd044faeab5144a47"
     },
@@ -44,7 +44,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations",
       "title": "Liquidations",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Liquidations use the mark price, which combines external CEX prices with Hyperliquid's book state.",
       "excerpt_sha256": "e6da07376f12fe8c2b125a2b7436011b24b4e7e834568c62d46fae6d1d6d4024"
     },
@@ -54,7 +54,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/auto-deleveraging",
       "title": "Auto-deleveraging",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Auto-deleveraging strictly ensures that the platform stays solvent.",
       "excerpt_sha256": "f4d877fa32425936180bb4d3aa0e1909694393bd93482bee8723d206ef59ab60"
     },
@@ -64,7 +64,7 @@
       "venue": "hyperliquid",
       "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees",
       "title": "Fees",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Fees are based on your rolling 14 day volume",
       "excerpt_sha256": "654459123cb1a0a05e6164334861c7a90f5b52734e58f218921746c6d65cdd09"
     },
@@ -74,7 +74,7 @@
       "venue": "dydx",
       "url": "https://github.com/dydxprotocol/v4-chain/blob/main/proto/dydxprotocol/perpetuals/perpetual.proto",
       "title": "Perpetual protocol definition",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "It acts as the oracle price for the purposes of calculating collateral, margin requirements, and funding rates.",
       "excerpt_sha256": "dcf8942be134c299ed935f66e451153e923f7f1e1dc39d17ebdbe83fd3a61709"
     },
@@ -84,7 +84,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166990-oracle-prices-on-dydx-chain",
       "title": "Oracle prices on dYdX Chain",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "The oracle price for each trading pair is used for the following:",
       "excerpt_sha256": "65f0d6038df1c0d1640597c8199a7d23cc4546ef4ad9715926449110a166bed2"
     },
@@ -94,7 +94,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166992-default-funding-rates-on-dydx",
       "title": "Default funding rates on dYdX",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "We charge funding rates every hour on our platform.",
       "excerpt_sha256": "690ea65254607e28d31e239134362e8157f48b2f9c27e65ca6df2d37bd7d03d0"
     },
@@ -104,7 +104,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166993-default-liquidity-tiers-on-dydx-chain",
       "title": "Default Liquidity Tiers on dYdX Chain",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Each market has a Lower Cap and Upper Cap denominated in USDC.",
       "excerpt_sha256": "ec3eb038f43366a0f503d58db21af3db6750647abf9310e92c3921d117255f38"
     },
@@ -114,7 +114,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166991-liquidations-on-dydx-chain",
       "title": "Liquidations on dYdX Chain",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "Positions are closed via protocol-generated liquidation matches",
       "excerpt_sha256": "7aaf1b48d8fffb6fa130af5fdf53deb04c15a9039e365aab4fa172e0a6e3d36e"
     },
@@ -124,7 +124,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166973-contract-loss-mechanisms-on-dydx-chain",
       "title": "Contract loss mechanisms on dYdX Chain",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "If an account’s value turns negative, deleveraging occurs immediately against randomly chosen offsetting positions",
       "excerpt_sha256": "4c31e68838e71bdeeda581f9d2a6ad33c11d82acce5569a77914a4a3dfe8290d"
     },
@@ -134,7 +134,7 @@
       "venue": "dydx",
       "url": "https://help.dydx.trade/en/articles/166995-trading-fees-on-dydx",
       "title": "Trading fees on dYdX",
-      "observed_at": "2026-08-13T12:00:00Z",
+      "observed_at": "2026-08-13T15:58:12Z",
       "evidence_excerpt": "dYdX uses a maker-taker fee model for determining trade fees.",
       "excerpt_sha256": "413fa32d07d07760e056ef2501da83744737e472cbaf6953ef04c6048cc145b6"
     }

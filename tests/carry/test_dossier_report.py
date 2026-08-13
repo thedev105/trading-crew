@@ -13,7 +13,7 @@ def test_dossier_json_is_deterministic_and_preserves_complete_evidence() -> None
 
     assert first == second
     assert first == json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
-    assert document["observed_at"] == "2026-08-13T12:00:00Z"
+    assert document["observed_at"] == "2026-08-13T15:58:12Z"
     assert document["status"] == "ineligible"
     assert document["primary_reason_code"] == "quanto_structure_excluded"
     assert len(document["sources"]) == 13

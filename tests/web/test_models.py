@@ -17,7 +17,7 @@ from polytrading.web.models import (
     OperationRecipes,
 )
 
-AS_OF = datetime(2026, 8, 13, 12, 6, tzinfo=UTC)
+AS_OF = datetime(2026, 8, 13, 16, 6, tzinfo=UTC)
 VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
 ASSETS = (Asset.BTC, Asset.ETH, Asset.SOL)
 EXPECTED_PAIRS = tuple((venue, asset) for venue in VENUES for asset in ASSETS)
