@@ -64,7 +64,9 @@ class DuckDBStore:
         self._connection = duckdb.connect(str(path), read_only=read_only)
         self._in_transaction = False
         try:
-            if not read_only:
+            if read_only:
+                self._verify_current_schema()
+            else:
                 self._apply_migrations()
         except BaseException:
             self._connection.close()
@@ -826,6 +828,32 @@ class DuckDBStore:
             raise ConflictingRecordError(f"conflicting {label} for immutable identity")
 
     def _apply_migrations(self) -> None:
+        migrations = self._migration_entries()
+        versions = [version for version, _ in migrations]
+
+        self._connection.execute("BEGIN TRANSACTION")
+        try:
+            applied = self._applied_migration_versions(versions)
+            for version, migration in migrations[len(applied) :]:
+                self._connection.execute(migration.read_text(encoding="utf-8"))
+                self._connection.execute(
+                    "INSERT INTO schema_migrations VALUES (?, ?)", [version, datetime.now(UTC)]
+                )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def _verify_current_schema(self) -> None:
+        versions = [version for version, _ in self._migration_entries()]
+        applied = self._applied_migration_versions(versions)
+        if applied != versions:
+            raise RuntimeError(
+                f"read-only store requires current schema {versions}; found {applied}"
+            )
+
+    @staticmethod
+    def _migration_entries() -> list[tuple[int, Any]]:
         migration_root = resources.files("polytrading.storage.schema")
         migrations: list[tuple[int, Any]] = []
         for entry in migration_root.iterdir():
@@ -836,40 +864,32 @@ class DuckDBStore:
         versions = [version for version, _ in migrations]
         if versions != list(range(1, len(versions) + 1)):
             raise RuntimeError(f"migration versions must be contiguous from 1; found {versions}")
+        return migrations
 
-        self._connection.execute("BEGIN TRANSACTION")
-        try:
-            has_migration_table = bool(
-                self._connection.execute(
-                    """
-                    SELECT count(*)
-                    FROM information_schema.tables
-                    WHERE table_schema = 'main' AND table_name = 'schema_migrations'
-                    """
-                ).fetchone()[0]
-            )
-            applied = (
-                [
-                    row[0]
-                    for row in self._connection.execute(
-                        "SELECT version FROM schema_migrations ORDER BY version"
-                    ).fetchall()
-                ]
-                if has_migration_table
-                else []
-            )
-            if has_migration_table and not applied:
-                raise RuntimeError("schema_migrations exists without an applied version")
-            if applied != list(range(1, len(applied) + 1)) or any(
-                version not in versions for version in applied
-            ):
-                raise RuntimeError(f"applied migration versions are not a known prefix: {applied}")
-            for version, migration in migrations[len(applied) :]:
-                self._connection.execute(migration.read_text(encoding="utf-8"))
-                self._connection.execute(
-                    "INSERT INTO schema_migrations VALUES (?, ?)", [version, datetime.now(UTC)]
-                )
-            self._connection.execute("COMMIT")
-        except BaseException:
-            self._connection.execute("ROLLBACK")
-            raise
+    def _applied_migration_versions(self, known_versions: list[int]) -> list[int]:
+        has_migration_table = bool(
+            self._connection.execute(
+                """
+                SELECT count(*)
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_name = 'schema_migrations'
+                """
+            ).fetchone()[0]
+        )
+        applied = (
+            [
+                row[0]
+                for row in self._connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ).fetchall()
+            ]
+            if has_migration_table
+            else []
+        )
+        if has_migration_table and not applied:
+            raise RuntimeError("schema_migrations exists without an applied version")
+        if applied != list(range(1, len(applied) + 1)) or any(
+            version not in known_versions for version in applied
+        ):
+            raise RuntimeError(f"applied migration versions are not a known prefix: {applied}")
+        return applied

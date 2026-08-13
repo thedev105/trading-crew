@@ -161,6 +161,16 @@ def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
         open_store(path)
 
 
+def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> None:
+    path = tmp_path / "research.duckdb"
+    open_store(path).close()
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+
+    with pytest.raises(RuntimeError, match="read-only store requires current schema"):
+        DuckDBStore(path, read_only=True)
+
+
 def test_migration_sql_is_available_as_packaged_data() -> None:
     migration = importlib.resources.files("polytrading.storage.schema").joinpath("001_initial.sql")
 
