@@ -40,7 +40,7 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
     assert snapshot.funding_health.missing_boundary_count == 24
     assert snapshot.latest_funding_cycle is None
     assert snapshot.latest_book_cycle is None
-    assert len(snapshot.markets) == 9
+    assert len(snapshot.markets) == 12
     assert all(
         row.instrument_observed_at is None and row.funding_rate is None and row.best_bid is None
         for row in snapshot.markets
@@ -169,6 +169,94 @@ def test_builder_selects_latest_pre_cutoff_dydx_evidence_and_preserves_native_ra
     assert snapshot.latest_book_cycle.cycle_id == BOOK_CYCLE_ID
     assert snapshot.evidence_counts.instrument_specs == 1
     assert snapshot.evidence_counts.funding_observations == 1
+    store.close()
+
+
+def test_builder_selects_latest_pre_cutoff_lighter_evidence_and_preserves_signed_rate(
+    tmp_path: Path,
+) -> None:
+    # Catches symbol mismapping, future leakage, or loss of Lighter's signed hourly rate.
+    path = tmp_path / "lighter-market.duckdb"
+    store = DuckDBStore(path)
+    instrument = instrument_spec(
+        instrument_id="lighter:BTC",
+        venue=Venue.LIGHTER,
+        symbol="BTC",
+        asset=Asset.BTC,
+        collateral_asset="USDC",
+        pnl_asset="USDC",
+        funding_interval_hours=Decimal("1"),
+        observed_at=AS_OF - timedelta(minutes=10),
+    )
+    future_instrument = instrument.model_copy(
+        update={"observed_at": AS_OF + timedelta(minutes=1), "source_hash": FUTURE_HASH}
+    )
+    funding = funding_observation(
+        venue=Venue.LIGHTER,
+        symbol="BTC",
+        asset=Asset.BTC,
+        rate=Decimal("-0.0003"),
+        interval_hours=Decimal("1"),
+        effective_at=AS_OF - timedelta(hours=1),
+        observed_at=AS_OF - timedelta(minutes=5),
+    )
+    future_funding = funding.model_copy(
+        update={
+            "rate": Decimal("0.9"),
+            "effective_at": AS_OF - timedelta(minutes=30),
+            "observed_at": AS_OF + timedelta(minutes=1),
+            "source_hash": FUTURE_HASH,
+        }
+    )
+    cycle_id = UUID("00000000-0000-0000-0000-000000000a02")
+    book = book_snapshot(
+        cycle_id=cycle_id,
+        venue=Venue.LIGHTER,
+        symbol="BTC",
+        asset=Asset.BTC,
+        bids=(BookLevel(price=Decimal("100"), quantity=Decimal("2"), order_count=2),),
+        asks=(BookLevel(price=Decimal("101"), quantity=Decimal("3"), order_count=3),),
+        effective_at=AS_OF - timedelta(seconds=2),
+        observed_at=AS_OF - timedelta(seconds=1),
+    )
+    cycle = book_collection_cycle(
+        cycle_id=cycle_id,
+        assets=(Asset.BTC,),
+        venues=(Venue.LIGHTER,),
+        request_started_at=AS_OF - timedelta(seconds=3),
+        request_completed_at=AS_OF - timedelta(seconds=1),
+        effective_timestamps=(book.effective_at,),
+    )
+    for record in (instrument, future_instrument):
+        store.append_instrument(record)
+    for record in (funding, future_funding):
+        store.append_funding(record)
+    store.append_book_snapshot(book)
+    store.append_book_collection_cycle(cycle)
+
+    snapshot = DashboardBuilder(store, path).build(AS_OF)
+    row = next(
+        item for item in snapshot.markets if item.venue is Venue.LIGHTER and item.asset is Asset.BTC
+    )
+    document = json.loads(render_dashboard_json(snapshot))
+    rendered = next(
+        item
+        for item in document["markets"]
+        if item["venue"] == "lighter" and item["asset"] == "BTC"
+    )
+
+    assert row.symbol == "BTC"
+    assert row.instrument_observed_at == instrument.observed_at
+    assert row.funding_rate == Decimal("-0.0003")
+    assert row.funding_interval_hours == Decimal("1")
+    assert row.best_bid == Decimal("100")
+    assert row.best_ask == Decimal("101")
+    assert row.spread_bps == Decimal("99.50248756218905472636815920")
+    assert rendered["funding_rate"] == "-0.000300000000000000"
+    assert len(snapshot.markets) == 12
+    assert len(snapshot.carry_rows) == 3
+    assert snapshot.funding_health.requested_hours == 24
+    assert len(snapshot.funding_health.boundaries) == 24
     store.close()
 
 

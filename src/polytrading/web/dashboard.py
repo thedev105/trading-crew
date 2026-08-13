@@ -30,7 +30,7 @@ from polytrading.web.models import (
     OperationRecipes,
 )
 
-_VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+_VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
 _ASSETS = (Asset.BTC, Asset.ETH, Asset.SOL)
 
 

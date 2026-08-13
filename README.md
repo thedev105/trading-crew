@@ -4,7 +4,7 @@
 
 `polytrading` is point-in-time, market-neutral market research software. This first increment
 collects authenticated-free public evidence for BTC, ETH, and SOL linear perpetuals on Bybit,
-Hyperliquid, and dYdX, then produces deterministic carry diagnostics for the separately defined
+Hyperliquid, dYdX, and Lighter, then produces deterministic carry diagnostics for the separately defined
 legacy venue pair. It does not promise profit, prevent loss, forecast returns, or recommend a
 trade. A large displayed spread is an instantaneous observation, not an investable return.
 
@@ -87,6 +87,23 @@ response exposes an oracle price but no documented mark-price field, while this 
 oracle, midpoint, or last trade as a mark. dYdX and Hyperliquid both documenting USDC margin makes
 them a compatibility-research candidate, not proof that their contracts, failure domains, costs,
 or access rules are compatible—and not evidence of profit or live eligibility.
+
+Lighter settled public evidence can be collected separately without credentials:
+
+```bash
+.venv/bin/polytrading collect public \
+  --venue lighter \
+  --assets BTC,ETH,SOL \
+  --db var/lighter-public.duckdb
+```
+
+The adapter resolves current integer market IDs from public metadata instead of hard-coding them.
+It records exact active instrument metadata and the `/api/v1/fundings` settled hourly history. A
+settled row whose direction is `long` is normalized as a positive rate because longs paid shorts;
+`short` is negative because shorts paid longs. The multi-exchange `/api/v1/funding-rates` current
+estimate is not used as realized evidence. Lighter's selected REST evidence does not expose a
+response-timestamped mark/index pair, so collection emits `LIGHTER_MARK_INDEX_UNAVAILABLE` and does
+not create a `MarketSnapshot` from a midpoint, last trade, or other substitute.
 
 ## 5. Prospective hourly funding-cycle collection
 
@@ -182,6 +199,10 @@ database read-only and uses one captured UTC `as_of` across the complete screen.
 only when its observation time is no later than that cutoff, so later venue research cannot leak
 into a historical dashboard view.
 
+The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
+dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
+records exist. They do not display a strategy signal, expected return, or execution action.
+
 The database must already exist and have the current schema. A temporary database lock or other
 availability conflict can make a refresh fail; the browser retains its last successful snapshot and
 marks it stale. Missing evidence remains visibly unavailable rather than appearing as zero.
@@ -237,9 +258,10 @@ same typed report only when its observation timestamp is no later than the scree
 
 Germany or Estonia not appearing in a displayed restriction excerpt is not legal approval. User,
 entity, sanctions, interface, API, KYC, tax, and jurisdiction eligibility remain a separate documented
-review before any activation decision. The next engineering gate is a read-only Lighter public-data
-adapter followed by point-in-time fee, latency, depth, forced-exit, basis, and funding-reversal
-economics. No account or execution surface belongs in that gate.
+review before any activation decision. The implemented read-only Lighter adapter supplies the next
+evidence stream; the following engineering gate is a separate point-in-time model of fees, latency,
+marketable depth, forced exits, basis, and funding reversals after enough observations accumulate.
+No account or execution surface belongs in that gate.
 
 ## 8. Synchronized 20-level book collection
 
@@ -276,6 +298,23 @@ The dYdX REST book response exposes neither a venue timestamp nor a sequence. It
 `effective_at` is therefore the local post-response receipt time, its sequence is absent, and the
 CLI prints `DYDX_REST_BOOK_LOCAL_TIMESTAMP`. These snapshots can support coarse receipt-skew and
 depth research, but not exchange-time simultaneity, continuous-sequence, or queue-position claims.
+
+For Lighter-only REST depth:
+
+```bash
+.venv/bin/polytrading collect books \
+  --venue lighter \
+  --assets BTC,ETH,SOL \
+  --once \
+  --db var/lighter-books.duckdb
+```
+
+Lighter's REST response contains individual public orders. The adapter sums remaining quantity at
+each price, records the number of contributing orders, and retains the best 20 aggregated price
+levels per side. The response provides no venue snapshot timestamp or sequence, so the normalized
+book uses local post-response receipt time and the CLI prints
+`LIGHTER_REST_BOOK_LOCAL_TIMESTAMP`. This is executable-depth research evidence, not queue-position
+or continuous-book proof.
 
 ## 9. Carry audit interpretation
 

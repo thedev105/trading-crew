@@ -18,7 +18,7 @@ from polytrading.venues.funding_health_models import FundingCollectionHealthRepo
 RESEARCH_WARNING = "Research only — no trading authority."
 NonnegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 
-_VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX)
+_VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
 _ASSETS = (Asset.BTC, Asset.ETH, Asset.SOL)
 _EXPECTED_MARKETS = tuple((venue, asset) for venue in _VENUES for asset in _ASSETS)
 
