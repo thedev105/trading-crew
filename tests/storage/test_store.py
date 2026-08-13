@@ -240,9 +240,7 @@ def test_migration_sql_is_available_as_packaged_data() -> None:
         "003_forward_funding_cycles.sql"
     )
     assert forward_migration.is_file()
-    assert "CREATE TABLE funding_collection_cycles" in forward_migration.read_text(
-        encoding="utf-8"
-    )
+    assert "CREATE TABLE funding_collection_cycles" in forward_migration.read_text(encoding="utf-8")
 
 
 def test_funding_collection_cycle_round_trips_and_exact_retry_is_idempotent(

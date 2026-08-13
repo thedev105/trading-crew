@@ -21,8 +21,7 @@ def render_funding_cycle_json(cycle: FundingCollectionCycle) -> str:
 
 def render_funding_cycle_text(cycle: FundingCollectionCycle) -> str:
     lines = [
-        f"Point-in-time funding cycle v1 | {_timestamp(cycle.cycle_end)} | "
-        f"{cycle.status.value}",
+        f"Point-in-time funding cycle v1 | {_timestamp(cycle.cycle_end)} | {cycle.status.value}",
         f"Window cutoff: {_timestamp(cycle.cycle_end + FUNDING_POINT_IN_TIME_LAG)}",
     ]
     for item in cycle.items:

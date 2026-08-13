@@ -123,8 +123,7 @@ def test_json_is_byte_stable_canonical_and_preserves_exact_types() -> None:
     assert payload["status"] == "complete"
     assert payload["warnings"] == list(FUNDING_CYCLE_WARNINGS)
     assert [
-        (item["venue"], item["asset"], item["funding_outcome"])
-        for item in payload["items"]
+        (item["venue"], item["asset"], item["funding_outcome"]) for item in payload["items"]
     ] == [
         ("bybit", "BTC", "no_settlement"),
         ("bybit", "ETH", "no_settlement"),
