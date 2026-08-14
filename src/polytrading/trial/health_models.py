@@ -11,7 +11,7 @@ from uuid import UUID
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from polytrading.carry.economics_models import EconomicsDecision
+from polytrading.carry.economics_models import EconomicsDecision, require_machine_reason_codes
 from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
 
 NonnegativeInt = Annotated[int, Field(ge=0)]
@@ -341,7 +341,7 @@ class TrialEconomicsEvaluationSummary(_ValidatedCopyRecord):
     def require_canonical_economics_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if tuple(sorted(set(value))) != value:
             raise ValueError("economics reason codes must be sorted and unique")
-        return value
+        return require_machine_reason_codes(value)
 
     @model_validator(mode="after")
     def require_coherent_economics_summary(self) -> TrialEconomicsEvaluationSummary:

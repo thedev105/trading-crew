@@ -767,15 +767,29 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     _, _, is_late = validate_cycle_timing(cycle_end, now)
 
     store: DuckDBStore | None = None
+    active_error: BaseException | None = None
     try:
-        store = DuckDBStore(arguments.db)
-        if is_late:
-            cycle = record_late_funding_cycle(store, assets, cycle_end, now)
-        else:
-            async with public_adapter_session(store, (Venue.BYBIT, Venue.HYPERLIQUID)) as adapters:
-                cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
-                    adapters, assets, cycle_end
-                )
+        try:
+            store = DuckDBStore(arguments.db)
+            if is_late:
+                cycle = record_late_funding_cycle(store, assets, cycle_end, now)
+            else:
+                async with public_adapter_session(
+                    store, (Venue.BYBIT, Venue.HYPERLIQUID)
+                ) as adapters:
+                    cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
+                        adapters, assets, cycle_end
+                    )
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    if active_error is None:
+                        raise
     except (
         ConflictingRecordError,
         duckdb.Error,
@@ -785,9 +799,6 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
         ValueError,
     ) as error:
         raise _classified_funding_cycle_error(error) from error
-    finally:
-        if store is not None:
-            store.close()
 
     renderer = (
         render_funding_cycle_json if arguments.format == "json" else render_funding_cycle_text

@@ -1969,6 +1969,110 @@ def test_existing_funding_cycle_filesystem_failure_uses_stable_sanitized_classif
     assert secret not in stderr
 
 
+@pytest.mark.parametrize(
+    ("error_type", "expected_code"),
+    [
+        (OSError, "FUNDING_CYCLE_FILESYSTEM_ERROR"),
+        (duckdb.Error, "FUNDING_CYCLE_DATABASE_ERROR"),
+    ],
+)
+def test_funding_cycle_close_failure_uses_stable_sanitized_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+    expected_code: str,
+) -> None:
+    secret = (
+        "/private/evidence/funding.duckdb "
+        "https://private.example.test/funding?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+    store_type = cli.DuckDBStore
+
+    class CloseFailingStore(store_type):
+        def close(self) -> None:
+            super().close()
+            raise error_type(secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: FUNDING_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "close-failure.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"polytrading: collection failed: {expected_code}\n"
+    assert secret not in captured.err
+
+
+def test_funding_cycle_body_failure_wins_over_sanitized_close_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_secret = "https://private.example.test/body?token=secret response-body=confidential"
+    close_secret = "/private/evidence/funding.duckdb lock-owner=private"
+    store_type = cli.DuckDBStore
+
+    class CloseFailingStore(store_type):
+        def close(self) -> None:
+            super().close()
+            raise OSError(close_secret)
+
+    class FailingCollector:
+        def __init__(self, store: object, *, clock: object) -> None:
+            del store, clock
+
+        async def collect_once(self, adapters: object, assets: object, cycle_end: object) -> object:
+            del adapters, assets, cycle_end
+            raise httpx.ConnectError(body_secret)
+
+    @asynccontextmanager
+    async def session(store: object, venues: object) -> Iterator[tuple[object, ...]]:
+        del store, venues
+        yield ()
+
+    monkeypatch.setattr(cli, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(cli, "PointInTimeFundingCollector", FailingCollector)
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: FUNDING_CYCLE_END + timedelta(seconds=30))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "body-and-close-failure.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: FUNDING_CYCLE_HTTP_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+
+
 def test_trial_funding_malformed_timestamp_returns_two(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

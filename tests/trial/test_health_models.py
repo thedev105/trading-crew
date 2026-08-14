@@ -526,6 +526,60 @@ def test_economics_summary_rejects_partial_legacy_and_future_evidence() -> None:
         LighterDydxTrialHealthReport(**values)
 
 
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "/private/evidence/economics.json",
+        "https://private.example.test/economics?token=secret",
+        "API_TOKEN=secret response-body=confidential",
+        "compatibility_blocking",
+        "1_LEADING_DIGIT",
+        "HAS-DASH",
+    ],
+)
+def test_economics_summary_rejects_non_machine_reason_codes(reason_code: str) -> None:
+    with pytest.raises(ValidationError, match="uppercase machine identifier"):
+        economics(
+            Asset.BTC,
+            available=True,
+            evaluation_schema_version=2,
+            evaluation_id=UUID(int=90),
+            policy_hash="c" * 64,
+            known_as_of=at(16),
+            evaluated_at=at(16, second=1),
+            decision=EconomicsDecision.REJECTED,
+            reason_codes=(reason_code,),
+        )
+
+
+def test_economics_summary_accepts_current_and_legacy_machine_reason_codes() -> None:
+    current = economics(
+        Asset.BTC,
+        available=True,
+        evaluation_schema_version=2,
+        evaluation_id=UUID(int=91),
+        policy_hash="c" * 64,
+        known_as_of=at(16),
+        evaluated_at=at(16, second=1),
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("BOOK_COVERAGE_INSUFFICIENT",),
+    )
+    legacy = economics(
+        Asset.ETH,
+        available=True,
+        evaluation_schema_version=1,
+        evaluation_id=UUID(int=92),
+        policy_hash=None,
+        known_as_of=at(16),
+        evaluated_at=at(16, second=1),
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED",),
+    )
+
+    assert current.reason_codes == ("BOOK_COVERAGE_INSUFFICIENT",)
+    assert legacy.reason_codes == ("LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED",)
+
+
 def test_recent_boundaries_cover_only_started_intersection() -> None:
     at_16 = boundary(cycle_end=at(16))
     at_17 = boundary()

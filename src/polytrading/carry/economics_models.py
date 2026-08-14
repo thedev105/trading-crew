@@ -60,6 +60,12 @@ def _require_nonblank(value: str, label: str) -> str:
     return value
 
 
+def require_machine_reason_codes(value: tuple[str, ...]) -> tuple[str, ...]:
+    if any(_REASON_CODE.fullmatch(code) is None for code in value):
+        raise ValueError("reason code must be an uppercase machine identifier")
+    return value
+
+
 def _require_source_url(value: str, venue: Venue | None = None) -> str:
     try:
         parsed = urlsplit(value)
@@ -546,9 +552,7 @@ class LegacyEconomicEvaluationSummary(StrictRecord):
     def require_legacy_reason_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if tuple(sorted(set(value))) != value:
             raise ValueError("reason codes must be sorted and unique")
-        if any(_REASON_CODE.fullmatch(code) is None for code in value):
-            raise ValueError("reason code must be an uppercase machine identifier")
-        return value
+        return require_machine_reason_codes(value)
 
 
 class CandidateEconomicsReport(StrictRecord):
@@ -597,9 +601,7 @@ class CandidateEconomicsReport(StrictRecord):
     def require_canonical_reason_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if tuple(sorted(set(value))) != value:
             raise ValueError("reason codes must be sorted and unique")
-        if any(_REASON_CODE.fullmatch(code) is None for code in value):
-            raise ValueError("reason code must be an uppercase machine identifier")
-        return value
+        return require_machine_reason_codes(value)
 
     @model_validator(mode="after")
     def require_coherent_report(self) -> CandidateEconomicsReport:
