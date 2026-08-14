@@ -213,6 +213,21 @@ def test_reviewed_fee_evidence_rejects_unsupported_venue_and_blank_tier() -> Non
         fee(Venue.DYDX, tier_name="   ")
 
 
+def test_report_accepts_canonical_empty_or_multiple_reviewed_fee_tiers() -> None:
+    assert report(reviewed_fees=()).reviewed_fees == ()
+    fees = (
+        fee(Venue.DYDX, tier_name="alpha"),
+        fee(Venue.DYDX, tier_name="zeta", source_hash="c" * 64),
+        fee(Venue.LIGHTER, tier_name="beta"),
+    )
+    assert report(reviewed_fees=fees).reviewed_fees == fees
+
+    with pytest.raises(ValidationError, match="canonical"):
+        report(reviewed_fees=tuple(reversed(fees)))
+    with pytest.raises(ValidationError, match="unique"):
+        report(reviewed_fees=(fees[0], fees[0]))
+
+
 def report(**overrides: object) -> LighterDydxTrialHealthReport:
     current = boundary()
     values: dict[str, object] = {

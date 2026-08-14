@@ -64,6 +64,9 @@ from polytrading.trial.funding_report import (
     render_trial_funding_json,
     render_trial_funding_text,
 )
+from polytrading.trial.health import LighterDydxTrialHealthAuditor
+from polytrading.trial.health_models import TrialCollectionStatus
+from polytrading.trial.health_report import render_trial_health_json, render_trial_health_text
 from polytrading.trial.writer_lease import WriterLeaseUnavailable, database_writer_lease
 from polytrading.venues.bybit import BybitPublicAdapter
 from polytrading.venues.dydx import DydxPublicAdapter
@@ -223,6 +226,13 @@ def build_parser() -> argparse.ArgumentParser:
     trial_books_mode.add_argument("--once", action="store_true")
     trial_books_mode.add_argument("--duration-seconds", type=float)
     trial_books.add_argument("--interval-seconds", type=float, default=5.0)
+    trial_health = trial_commands.add_parser(
+        "health", help="audit prospective Lighter-dYdX trial evidence"
+    )
+    trial_health.add_argument("--db", required=True, type=Path)
+    trial_health.add_argument("--recent-hours", type=_trial_recent_hours, default=24)
+    trial_health.add_argument("--as-of")
+    trial_health.add_argument("--format", choices=("text", "json"), default="text")
 
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
@@ -323,7 +333,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "trial":
             if arguments.trial_command == "funding":
                 return asyncio.run(_trial_funding(arguments))
-            return asyncio.run(_trial_books(arguments))
+            if arguments.trial_command == "books":
+                return asyncio.run(_trial_books(arguments))
+            return _trial_health(arguments)
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
@@ -558,6 +570,17 @@ def _dashboard_port(value: str) -> int:
     if not 1 <= port <= 65_535:
         raise argparse.ArgumentTypeError(message)
     return port
+
+
+def _trial_recent_hours(value: str) -> int:
+    message = "recent hours must be an integer between 1 and 2160"
+    try:
+        hours = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(message) from error
+    if str(hours) != value or not 1 <= hours <= 2_160:
+        raise argparse.ArgumentTypeError(message)
+    return hours
 
 
 def _utc_now() -> datetime:
@@ -842,6 +865,37 @@ def _persist_trial_funding(database: Path, prepared: PreparedLighterDydxFundingC
     finally:
         if store is not None:
             store.close()
+
+
+def _trial_health(arguments: argparse.Namespace) -> int:
+    as_of = _parse_timestamp(arguments.as_of) if arguments.as_of else _utc_now()
+    if not arguments.db.is_file():
+        raise CliUsageError("trial health database is unavailable or not current")
+
+    store: DuckDBStore | None = None
+    try:
+        store = DuckDBStore(arguments.db, read_only=True)
+        report = LighterDydxTrialHealthAuditor(store).audit(as_of, arguments.recent_hours)
+        renderer = (
+            render_trial_health_json if arguments.format == "json" else render_trial_health_text
+        )
+        rendered = renderer(report)
+    except (duckdb.Error, ValueError, RuntimeError, OSError) as error:
+        raise CliUsageError("trial health database is unavailable or not current") from error
+    finally:
+        if store is not None:
+            store.close()
+
+    print(rendered, end="" if arguments.format == "text" else "\n")
+    return (
+        0
+        if report.status
+        in (
+            TrialCollectionStatus.COLLECTING,
+            TrialCollectionStatus.READY_FOR_ECONOMICS_EVALUATION,
+        )
+        else 1
+    )
 
 
 def _funding_health(arguments: argparse.Namespace) -> int:

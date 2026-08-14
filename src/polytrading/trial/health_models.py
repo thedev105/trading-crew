@@ -494,7 +494,19 @@ class LighterDydxTrialHealthReport(_ValidatedCopyRecord):
     def require_canonical_fee_order(
         cls, value: tuple[ReviewedFeeEvidenceSummary, ...]
     ) -> tuple[ReviewedFeeEvidenceSummary, ...]:
-        if tuple(item.venue for item in value) != _FEE_VENUES:
+        keys = tuple(
+            (
+                _FEE_VENUES.index(item.venue),
+                item.tier_name,
+                item.effective_from,
+                item.observed_at,
+                item.source_hash,
+            )
+            for item in value
+        )
+        if len(set(keys)) != len(keys):
+            raise ValueError("reviewed fees must be unique")
+        if tuple(sorted(keys)) != keys:
             raise ValueError("reviewed fees must use canonical dYdX/Lighter order")
         return value
 

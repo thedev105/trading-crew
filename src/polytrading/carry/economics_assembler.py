@@ -18,8 +18,12 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.book_evidence import (
+    EligibleTrialBookPair,
+    eligible_lighter_dydx_book_pair,
+    select_hourly_trial_books,
+)
 from polytrading.trial.funding_lineage import select_prospective_funding
-from polytrading.venues.synchronized import BookCollectionCycle
 
 _VENUES = (Venue.DYDX, Venue.LIGHTER)
 _SYMBOLS = {
@@ -60,12 +64,6 @@ class EconomicsAssemblyResult:
     source_hashes: tuple[str, ...]
     reason_codes: tuple[str, ...]
     bundle: EconomicsEvidenceBundle | None
-
-
-@dataclass(frozen=True)
-class _CyclePair:
-    cycle: BookCollectionCycle
-    pair: PairedBookObservation
 
 
 def _duration_microseconds(value: timedelta) -> int:
@@ -313,7 +311,7 @@ class EconomicsEvidenceAssembler:
     ) -> tuple[
         tuple[PairedBookObservation, ...],
         tuple[PairedBookObservation, ...],
-        _CyclePair | None,
+        EligibleTrialBookPair | None,
         int,
     ]:
         cycles = self._store.book_collection_cycles_between(
@@ -321,38 +319,30 @@ class EconomicsEvidenceAssembler:
             policy.known_as_of,
             policy.known_as_of,
         )
-        eligible: list[_CyclePair] = []
+        eligible: list[EligibleTrialBookPair] = []
         for cycle in cycles:
-            pair = self._eligible_cycle_pair(cycle, policy)
-            if pair is None:
-                continue
-            eligible.append(_CyclePair(cycle=cycle, pair=pair))
-            source_hashes.update(cycle.source_hashes)
-            source_hashes.update((pair.dydx.source_hash, pair.lighter.source_hash))
-        eligible.sort(key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
-        hourly: list[PairedBookObservation] = []
-        for hour in range(1, policy.evaluation_days * 24 + 1):
-            boundary = evaluation_start + timedelta(hours=hour)
-            selected = next(
-                (
-                    item
-                    for item in reversed(eligible)
-                    if item.cycle.request_completed_at <= boundary
-                    and boundary - item.cycle.request_completed_at
-                    <= timedelta(seconds=int(policy.maximum_hourly_book_age_seconds))
-                    and item.pair.dydx.observed_at <= boundary
-                    and item.pair.lighter.observed_at <= boundary
-                ),
-                None,
+            item = eligible_lighter_dydx_book_pair(
+                self._store,
+                cycle,
+                policy.asset,
+                policy.known_as_of,
+                policy.maximum_cycle_skew_ms,
             )
-            if selected is not None:
-                hourly.append(
-                    PairedBookObservation(
-                        effective_at=boundary,
-                        lighter=selected.pair.lighter,
-                        dydx=selected.pair.dydx,
-                    )
-                )
+            if item is None:
+                continue
+            eligible.append(item)
+            source_hashes.update(cycle.source_hashes)
+            source_hashes.update((item.pair.dydx.source_hash, item.pair.lighter.source_hash))
+        eligible.sort(key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
+        hourly = select_hourly_trial_books(
+            self._store,
+            policy.asset,
+            evaluation_start,
+            policy.study_end,
+            policy.known_as_of,
+            policy.maximum_hourly_book_age_seconds,
+            policy.maximum_cycle_skew_ms,
+        )
         dense = tuple(
             item.pair
             for item in eligible
@@ -365,51 +355,7 @@ class EconomicsEvidenceAssembler:
             seconds=int(policy.maximum_book_age_seconds)
         ):
             reasons.add("BOOK_LATEST_STALE")
-        return tuple(hourly), dense, latest, len(hourly)
-
-    def _eligible_cycle_pair(
-        self, cycle: BookCollectionCycle, policy: EconomicsPolicy
-    ) -> PairedBookObservation | None:
-        if (
-            cycle.status != "complete"
-            or policy.asset not in cycle.assets
-            or not set(_VENUES).issubset(cycle.venues)
-            or not cycle.source_hashes
-            or cycle.max_effective_skew_ms > policy.maximum_cycle_skew_ms
-            or cycle.request_completed_at > policy.known_as_of
-        ):
-            return None
-        books = self._store.books_for_cycle(cycle.cycle_id)
-        selected = {
-            venue: tuple(
-                item for item in books if item.venue is venue and item.asset is policy.asset
-            )
-            for venue in _VENUES
-        }
-        if any(len(rows) != 1 for rows in selected.values()):
-            return None
-        dydx = selected[Venue.DYDX][0]
-        lighter = selected[Venue.LIGHTER][0]
-        if (
-            dydx.symbol != _SYMBOLS[policy.asset][Venue.DYDX]
-            or lighter.symbol != _SYMBOLS[policy.asset][Venue.LIGHTER]
-            or not dydx.source_hash
-            or not lighter.source_hash
-            or dydx.source_hash not in cycle.source_hashes
-            or lighter.source_hash not in cycle.source_hashes
-            or dydx.observed_at > cycle.request_completed_at
-            or lighter.observed_at > cycle.request_completed_at
-            or dydx.effective_at > cycle.request_completed_at
-            or lighter.effective_at > cycle.request_completed_at
-            or _duration_milliseconds(abs(dydx.effective_at - lighter.effective_at))
-            > policy.maximum_cycle_skew_ms
-        ):
-            return None
-        return PairedBookObservation(
-            effective_at=max(dydx.effective_at, lighter.effective_at),
-            lighter=lighter,
-            dydx=dydx,
-        )
+        return tuple(item.pair for item in hourly), dense, latest, len(hourly)
 
     @staticmethod
     def _coverage_reasons(

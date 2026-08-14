@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import duckdb
@@ -42,6 +43,7 @@ from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.trial.books import TrialBookRunSummary
 from polytrading.trial.funding_models import TrialFundingCycleStatus
+from polytrading.trial.health_models import TrialCollectionStatus
 from polytrading.trial.writer_lease import WriterLeaseUnavailable
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.public import AdapterBatch, AdapterWarning
@@ -1142,6 +1144,181 @@ def test_trial_funding_parser_requires_exactly_one_boundary_mode_without_scope_o
         == 2
     )
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("recent_hours", ("1", "2160"))
+def test_trial_health_parser_accepts_exact_recent_hour_edges(recent_hours: str) -> None:
+    parsed = cli.build_parser().parse_args(
+        [
+            "trial",
+            "health",
+            "--db",
+            "var/trial.duckdb",
+            "--recent-hours",
+            recent_hours,
+            "--as-of",
+            "2026-08-14T07:06:00Z",
+            "--format",
+            "json",
+        ]
+    )
+    assert parsed.trial_command == "health"
+    assert parsed.recent_hours == int(recent_hours)
+    assert parsed.format == "json"
+
+
+@pytest.mark.parametrize("recent_hours", ("true", "false", "0", "2161", "1.5"))
+def test_trial_health_rejects_invalid_hours_before_opening_database(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    recent_hours: str,
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    database.write_bytes(b"not opened")
+    monkeypatch.setattr(
+        cli,
+        "DuckDBStore",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid CLI input opened DuckDB")
+        ),
+    )
+    assert (
+        main(
+            [
+                "trial",
+                "health",
+                "--db",
+                str(database),
+                "--recent-hours",
+                recent_hours,
+            ]
+        )
+        == 2
+    )
+    assert "recent hours" in capsys.readouterr().err.lower()
+
+
+def test_trial_health_rejects_timestamp_and_missing_database_before_duckdb(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "DuckDBStore",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid CLI input opened DuckDB")
+        ),
+    )
+    assert (
+        main(
+            [
+                "trial",
+                "health",
+                "--db",
+                str(tmp_path / "missing.duckdb"),
+                "--as-of",
+                "invalid",
+            ]
+        )
+        == 2
+    )
+    assert "invalid timestamp" in capsys.readouterr().err
+    assert main(["trial", "health", "--db", str(tmp_path / "missing.duckdb")]) == 2
+    assert "trial health database is unavailable or not current" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("status", "output_format", "expected_exit"),
+    (
+        (TrialCollectionStatus.COLLECTING, "text", 0),
+        (TrialCollectionStatus.READY_FOR_ECONOMICS_EVALUATION, "json", 0),
+        (TrialCollectionStatus.NOT_STARTED, "text", 1),
+        (TrialCollectionStatus.DEGRADED, "json", 1),
+    ),
+)
+def test_trial_health_is_read_only_offline_synchronous_and_routes_status(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    status: TrialCollectionStatus,
+    output_format: str,
+    expected_exit: int,
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    database.write_bytes(b"fixture")
+    calls: list[object] = []
+
+    class FakeStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            calls.append((path, read_only))
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class FakeAuditor:
+        def __init__(self, store: FakeStore) -> None:
+            calls.append(("auditor", store))
+
+        def audit(self, as_of: datetime, recent_hours: int) -> SimpleNamespace:
+            calls.append(("audit", as_of, recent_hours))
+            return SimpleNamespace(status=status)
+
+    monkeypatch.setattr(cli, "DuckDBStore", FakeStore)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", FakeAuditor)
+    monkeypatch.setattr(cli, "render_trial_health_text", lambda _report: "TEXT")
+    monkeypatch.setattr(cli, "render_trial_health_json", lambda _report: "JSON")
+    monkeypatch.setattr(
+        cli,
+        "make_public_http_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("network opened")),
+    )
+    monkeypatch.setattr(
+        cli.asyncio,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("asyncio used")),
+    )
+
+    assert (
+        main(
+            [
+                "trial",
+                "health",
+                "--db",
+                str(database),
+                "--recent-hours",
+                "24",
+                "--as-of",
+                "2026-08-14T07:06:00Z",
+                "--format",
+                output_format,
+            ]
+        )
+        == expected_exit
+    )
+    assert calls[0] == (database, True)
+    assert calls[-1] == "close"
+    assert capsys.readouterr().out == ("JSON\n" if output_format == "json" else "TEXT")
+
+
+def test_trial_health_uses_one_clock_read_and_sanitizes_stale_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    database.write_bytes(b"outdated")
+    clock_reads = 0
+
+    def clock() -> datetime:
+        nonlocal clock_reads
+        clock_reads += 1
+        return datetime(2026, 8, 14, 7, 6, tzinfo=UTC)
+
+    monkeypatch.setattr(cli, "_utc_now", clock)
+    assert main(["trial", "health", "--db", str(database)]) == 2
+    assert clock_reads == 1
+    assert (
+        capsys.readouterr().err
+        == "polytrading: error: trial health database is unavailable or not current\n"
+    )
 
 
 def test_trial_books_parser_requires_exactly_one_mode_without_scope_options(
