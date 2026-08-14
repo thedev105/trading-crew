@@ -40,6 +40,8 @@ from polytrading.domain.models import (
 )
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.funding_models import TrialFundingCycleStatus
+from polytrading.trial.writer_lease import WriterLeaseUnavailable
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.public import AdapterBatch, AdapterWarning
 from tests.carry.study_helpers import at, complete_block
@@ -47,6 +49,7 @@ from tests.carry.test_economics import EVALUATION_ID, evaluate_bundle, passing_b
 from tests.carry.test_economics_models import KNOWN_AS_OF, policy
 from tests.carry.test_fee_import import payload as fee_payload
 from tests.domain.factories import funding_observation, instrument_spec
+from tests.trial.funding_helpers import CYCLE_END as TRIAL_CYCLE_END
 from tests.venues.funding_cycle_helpers import (
     CYCLE_END as FUNDING_CYCLE_END,
 )
@@ -1099,6 +1102,416 @@ def test_public_collection_cli_validation_errors_exit_two(
         == 2
     )
     assert "traceback" not in capsys.readouterr().err.lower()
+
+
+def test_trial_funding_parser_requires_exactly_one_boundary_mode_without_scope_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parsed = cli.build_parser().parse_args(
+        [
+            "trial",
+            "funding",
+            "--current",
+            "--db",
+            "var/trial.duckdb",
+            "--format",
+            "json",
+        ]
+    )
+    assert parsed.command == "trial"
+    assert parsed.trial_command == "funding"
+    assert parsed.current is True
+    assert not hasattr(parsed, "venue")
+    assert not hasattr(parsed, "assets")
+
+    assert main(["trial", "funding", "--db", str(tmp_path / "neither.duckdb")]) == 2
+    assert "--cycle-end" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--db",
+                str(tmp_path / "both.duckdb"),
+                "--current",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+            ]
+        )
+        == 2
+    )
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_trial_funding_current_uses_one_clock_read_for_boundary_and_late_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def now() -> datetime:
+        nonlocal calls
+        calls += 1
+        return TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1)
+
+    monkeypatch.setattr(cli, "_utc_now", now)
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--current",
+                "--db",
+                str(tmp_path / "current.duckdb"),
+            ]
+        )
+        == 0
+    )
+    assert calls == 1
+
+
+def test_trial_funding_early_input_returns_two_before_lease_store_or_client(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "early-trial.duckdb"
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("early input touched an external resource")
+
+    monkeypatch.setattr(cli, "database_writer_lease", reject, raising=False)
+    monkeypatch.setattr(cli, "DuckDBStore", reject)
+    monkeypatch.setattr(cli, "make_public_http_client", reject)
+    monkeypatch.setattr(cli, "_utc_now", lambda: TRIAL_CYCLE_END - timedelta(microseconds=1))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(database),
+            ]
+        )
+        == 2
+    )
+    assert "precedes cycle end" in capsys.readouterr().err
+    assert not database.exists()
+
+
+def test_trial_funding_late_mode_uses_no_client_and_persists_diagnostic(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "late-trial.duckdb"
+
+    def reject_client(**_kwargs: object) -> None:
+        raise AssertionError("late mode created a public client")
+
+    monkeypatch.setattr(cli, "make_public_http_client", reject_client)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--current",
+                "--db",
+                str(database),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "late"
+    store = DuckDBStore(database, read_only=True)
+    cycles = store.lighter_dydx_funding_cycles_between(
+        TRIAL_CYCLE_END,
+        TRIAL_CYCLE_END,
+        TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+    store.close()
+    assert len(cycles) == 1
+    assert cycles[0].status is TrialFundingCycleStatus.LATE
+
+
+def test_trial_funding_collects_before_lease_and_store_and_bounds_lease_wait(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.trial.test_funding import complete_prepared_cycle
+
+    database = tmp_path / "complete-trial.duckdb"
+    prepared = complete_prepared_cycle()
+    events: list[str] = []
+    lease_timeouts: list[float] = []
+
+    @contextmanager
+    def lease(path: Path, *, timeout_seconds: float) -> Iterator[None]:
+        assert path == database
+        lease_timeouts.append(timeout_seconds)
+        events.append("lease")
+        yield
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, ...]]:
+        events.append("clients")
+        assert not database.exists()
+        yield (object(), object())
+
+    class Collector:
+        def __init__(self, *, clock: object) -> None:
+            del clock
+
+        async def prepare_once(self, adapters: object, assets: object, cycle_end: object) -> object:
+            del adapters, assets, cycle_end
+            events.append("prepared")
+            assert not database.exists()
+            return prepared
+
+    real_store = cli.DuckDBStore
+
+    def open_store(path: Path) -> DuckDBStore:
+        events.append("store")
+        return real_store(path)
+
+    times = iter(
+        [
+            TRIAL_CYCLE_END + timedelta(seconds=10),
+            TRIAL_CYCLE_END + timedelta(seconds=12),
+            TRIAL_CYCLE_END + timedelta(seconds=13),
+        ]
+    )
+    monkeypatch.setattr(cli, "database_writer_lease", lease, raising=False)
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session, raising=False)
+    monkeypatch.setattr(cli, "LighterDydxFundingCollector", Collector, raising=False)
+    monkeypatch.setattr(cli, "DuckDBStore", open_store)
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(times))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(database),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+    assert lease_timeouts == [288.0]
+    assert events == ["clients", "prepared", "lease", "store"]
+
+
+def test_trial_funding_adapter_session_uses_independent_clients_and_closes_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[object] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class Adapter:
+        def __init__(self, client: object, *args: object) -> None:
+            del args
+            self.client = client
+
+    def client_factory() -> object:
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(cli, "make_public_http_client", client_factory)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", Adapter)
+    monkeypatch.setattr(cli, "LighterPublicAdapter", Adapter)
+
+    async def exercise() -> tuple[object, object]:
+        async with cli._lighter_dydx_adapter_session() as adapters:
+            return adapters[0].client, adapters[1].client  # type: ignore[attr-defined]
+
+    adapter_clients = asyncio.run(exercise())
+
+    assert adapter_clients == tuple(clients)
+    assert adapter_clients[0] is not adapter_clients[1]
+    assert all(client.closed for client in clients)  # type: ignore[attr-defined]
+
+
+def test_trial_funding_degraded_persisted_cycle_returns_zero(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.trial.test_funding import FakeAdapter, _collect, _funding_batch
+
+    database = tmp_path / "degraded-trial.duckdb"
+    lighter = FakeAdapter(Venue.LIGHTER)
+    lighter.funding_results[Asset.BTC] = _funding_batch(
+        Venue.LIGHTER,
+        Asset.BTC,
+        TRIAL_CYCLE_END + timedelta(seconds=12),
+        777,
+        include_record=False,
+    )
+    prepared = _collect((FakeAdapter(Venue.DYDX), lighter))
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, ...]]:
+        yield (object(), object())
+
+    class Collector:
+        def __init__(self, *, clock: object) -> None:
+            del clock
+
+        async def prepare_once(self, adapters: object, assets: object, cycle_end: object) -> object:
+            del adapters, assets, cycle_end
+            return prepared
+
+    times = iter(
+        [
+            TRIAL_CYCLE_END + timedelta(seconds=10),
+            TRIAL_CYCLE_END + timedelta(seconds=20),
+            TRIAL_CYCLE_END + timedelta(seconds=21),
+        ]
+    )
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session)
+    monkeypatch.setattr(cli, "LighterDydxFundingCollector", Collector)
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(times))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(database),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "degraded"
+
+
+def test_trial_funding_revalidation_after_requests_preserves_prepared_response(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.trial.test_funding import complete_prepared_cycle
+
+    database = tmp_path / "lease-late.duckdb"
+    prepared = complete_prepared_cycle()
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, ...]]:
+        yield (object(), object())
+
+    class Collector:
+        def __init__(self, *, clock: object) -> None:
+            del clock
+
+        async def prepare_once(self, adapters: object, assets: object, cycle_end: object) -> object:
+            del adapters, assets, cycle_end
+            return prepared
+
+    times = iter(
+        [
+            TRIAL_CYCLE_END + timedelta(seconds=10),
+            TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+            TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+        ]
+    )
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session, raising=False)
+    monkeypatch.setattr(cli, "LighterDydxFundingCollector", Collector, raising=False)
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(times))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(database),
+            ]
+        )
+        == 0
+    )
+    assert "complete" in capsys.readouterr().out
+    store = DuckDBStore(database, read_only=True)
+    cycle = store.latest_lighter_dydx_funding_cycle_as_of(
+        TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1)
+    )
+    store.close()
+    assert cycle is not None
+    assert cycle == prepared.cycle
+
+
+def test_trial_funding_lease_failure_preventing_persistence_returns_one(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise WriterLeaseUnavailable("busy")
+
+    monkeypatch.setattr(cli, "database_writer_lease", unavailable, raising=False)
+    monkeypatch.setattr(cli, "_utc_now", lambda: TRIAL_CYCLE_END + timedelta(seconds=10))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "busy.duckdb"),
+            ]
+        )
+        == 1
+    )
+    assert "collection failed" in capsys.readouterr().err
+
+
+def test_trial_funding_malformed_timestamp_returns_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                "not-a-time",
+                "--db",
+                str(tmp_path / "malformed.duckdb"),
+            ]
+        )
+        == 2
+    )
+    assert "invalid timestamp" in capsys.readouterr().err
 
 
 def test_funding_cycle_cli_requires_db_and_exactly_one_boundary_mode_without_venue(

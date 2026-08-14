@@ -48,6 +48,22 @@ from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.funding import (
+    LighterDydxFundingCollector,
+    PreparedLighterDydxFundingCycle,
+    persist_lighter_dydx_funding_cycle,
+    record_late_lighter_dydx_cycle,
+)
+from polytrading.trial.funding_models import (
+    TRIAL_FUNDING_POINT_IN_TIME_LAG,
+    resolve_current_trial_cycle_end,
+    validate_trial_cycle_timing,
+)
+from polytrading.trial.funding_report import (
+    render_trial_funding_json,
+    render_trial_funding_text,
+)
+from polytrading.trial.writer_lease import WriterLeaseUnavailable, database_writer_lease
 from polytrading.venues.bybit import BybitPublicAdapter
 from polytrading.venues.dydx import DydxPublicAdapter
 from polytrading.venues.funding_cycle import (
@@ -188,6 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
     health.add_argument("--as-of")
     health.add_argument("--format", choices=("text", "json"), default="text")
 
+    trial = commands.add_parser("trial", help="candidate evidence operations")
+    trial_commands = trial.add_subparsers(dest="trial_command", required=True)
+    trial_funding = trial_commands.add_parser(
+        "funding", help="collect one prospective Lighter-dYdX funding boundary"
+    )
+    trial_funding.add_argument("--db", required=True, type=Path)
+    trial_funding_mode = trial_funding.add_mutually_exclusive_group(required=True)
+    trial_funding_mode.add_argument("--cycle-end")
+    trial_funding_mode.add_argument("--current", action="store_true")
+    trial_funding.add_argument("--format", choices=("text", "json"), default="text")
+
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
     public = collect_commands.add_parser("public", help="collect public instruments and funding")
@@ -284,6 +311,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _fees_import(arguments)
         if arguments.command == "funding":
             return _funding_health(arguments)
+        if arguments.command == "trial":
+            return asyncio.run(_trial_funding(arguments))
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
@@ -589,6 +618,22 @@ async def public_adapter_session(
         await asyncio.gather(*(client.aclose() for client in clients))
 
 
+@asynccontextmanager
+async def _lighter_dydx_adapter_session() -> AsyncIterator[tuple[PublicVenueAdapter, ...]]:
+    clients: list[httpx.AsyncClient] = []
+    try:
+        dydx_client = make_public_http_client()
+        clients.append(dydx_client)
+        lighter_client = make_public_http_client()
+        clients.append(lighter_client)
+        yield (
+            DydxPublicAdapter(dydx_client, _utc_now, time.monotonic_ns),
+            LighterPublicAdapter(lighter_client, _utc_now, time.monotonic_ns),
+        )
+    finally:
+        await asyncio.gather(*(client.aclose() for client in clients))
+
+
 def _render_adapter_warning(warning: AdapterWarning) -> str:
     return (
         f"polytrading: warning: {warning.venue.value} {warning.code} "
@@ -691,6 +736,70 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     )
     print(renderer(cycle))
     return 0
+
+
+async def _trial_funding(arguments: argparse.Namespace) -> int:
+    invocation_now = _utc_now()
+    cycle_end = (
+        resolve_current_trial_cycle_end(invocation_now)
+        if arguments.current
+        else _parse_timestamp(arguments.cycle_end)
+    )
+    normalized_cycle_end, normalized_now, is_late = validate_trial_cycle_timing(
+        cycle_end, invocation_now
+    )
+    assets = frozenset(Asset)
+
+    try:
+        if is_late:
+            cycle = record_late_lighter_dydx_cycle(assets, normalized_cycle_end, normalized_now)
+            prepared = PreparedLighterDydxFundingCycle((), (), (), cycle)
+            with database_writer_lease(arguments.db, timeout_seconds=0.0):
+                _persist_trial_funding(arguments.db, prepared)
+        else:
+            async with _lighter_dydx_adapter_session() as adapters:
+                prepared = await LighterDydxFundingCollector(clock=_utc_now).prepare_once(
+                    adapters, assets, normalized_cycle_end
+                )
+            cycle = prepared.cycle
+            lease_requested_at = _utc_now()
+            validate_trial_cycle_timing(normalized_cycle_end, lease_requested_at)
+            lease_timeout = max(
+                0.0,
+                (
+                    normalized_cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG - lease_requested_at
+                ).total_seconds(),
+            )
+            with database_writer_lease(arguments.db, timeout_seconds=lease_timeout):
+                acquired_at = _utc_now()
+                validate_trial_cycle_timing(normalized_cycle_end, acquired_at)
+                _persist_trial_funding(arguments.db, prepared)
+    except (
+        ConflictingRecordError,
+        WriterLeaseUnavailable,
+        duckdb.Error,
+        httpx.HTTPError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        raise FundingCycleCollectionError(str(error)) from error
+
+    renderer = (
+        render_trial_funding_json if arguments.format == "json" else render_trial_funding_text
+    )
+    print(renderer(cycle))
+    return 0
+
+
+def _persist_trial_funding(database: Path, prepared: PreparedLighterDydxFundingCycle) -> None:
+    store: DuckDBStore | None = None
+    try:
+        store = DuckDBStore(database)
+        persist_lighter_dydx_funding_cycle(store, prepared)
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _funding_health(arguments: argparse.Namespace) -> int:
