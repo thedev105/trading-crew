@@ -21,8 +21,10 @@ from polytrading.carry.economics_execution import (
     walk_book,
 )
 from polytrading.carry.economics_funding import (
+    FundingCashflowHorizonStatistics,
+    FundingCashflowObservation,
     exact_median,
-    funding_horizon_statistics,
+    funding_cashflow_horizon_statistics,
     orient_funding,
     select_direction,
 )
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
     from polytrading.carry.economics_assembler import (
         EconomicsAssemblyResult,
         EconomicsEvidenceBundle,
+        PairedFundingObservation,
     )
 
 _HORIZONS = (7, 14, 28)
@@ -183,6 +186,29 @@ def _direction_venues(direction: FundingDirection) -> tuple[Venue, Venue]:
     return Venue.DYDX, Venue.LIGHTER
 
 
+def _funding_cashflows(
+    pairs: tuple[PairedFundingObservation, ...],
+    direction: FundingDirection,
+    position: ShadowPosition,
+) -> tuple[FundingCashflowObservation, ...]:
+    lighter_sign = (
+        Decimal(1) if direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX else Decimal(-1)
+    )
+    dydx_sign = -lighter_sign
+    return tuple(
+        FundingCashflowObservation(
+            effective_at=pair.effective_at,
+            lighter_rate=pair.lighter.rate * lighter_sign,
+            dydx_rate=pair.dydx.rate * dydx_sign,
+            lighter_funding_usd=(
+                position.lighter_entry_notional_usd * pair.lighter.rate * lighter_sign
+            ),
+            dydx_funding_usd=(position.dydx_entry_notional_usd * pair.dydx.rate * dydx_sign),
+        )
+        for pair in pairs
+    )
+
+
 def _instrument(bundle: EconomicsEvidenceBundle, venue: Venue) -> InstrumentSpec:
     return next(item for item in bundle.instruments if item.venue is venue)
 
@@ -282,7 +308,7 @@ def _latency_cost(
 def _quote_counts(
     bundle: EconomicsEvidenceBundle,
     direction: FundingDirection,
-    seven_day_rate: Decimal,
+    seven_day: FundingCashflowHorizonStatistics,
     seven_day_funding_reversal_rate: Decimal,
     seven_day_basis_rate: Decimal,
     latency_cost_usd: Decimal,
@@ -314,9 +340,13 @@ def _quote_counts(
         except InsufficientDepthError:
             continue
         fee = _taker_fee_cost(bundle, position, lighter_exit, dydx_exit)
-        gross = position.assigned_capital_usd * seven_day_rate
-        reversal = position.assigned_capital_usd * seven_day_funding_reversal_rate
-        basis = position.assigned_capital_usd * seven_day_basis_rate
+        gross = (
+            position.lighter_entry_notional_usd * seven_day.lighter_rate_sum
+            + position.dydx_entry_notional_usd * seven_day.dydx_rate_sum
+        )
+        reference_notional = position.assigned_capital_usd / Decimal(2)
+        reversal = reference_notional * seven_day_funding_reversal_rate
+        basis = reference_notional * seven_day_basis_rate
         shared = {
             "gross_funding_usd": gross,
             "entry_cost_usd": entry,
@@ -340,10 +370,13 @@ def _complete_economics(
     position: ShadowPosition,
 ) -> tuple[CompleteEconomics, set[str]]:
     policy = bundle.policy
-    evaluation_rows = tuple(
-        (pair.effective_at, pair.lighter.rate - pair.dydx.rate)
+    evaluation_pairs = tuple(
+        pair
         for pair in bundle.funding_pairs
         if bundle.training_end < pair.effective_at <= bundle.evaluation_end
+    )
+    evaluation_rows = tuple(
+        (pair.effective_at, pair.lighter.rate - pair.dydx.rate) for pair in evaluation_pairs
     )
     oriented_rows = tuple(
         zip(
@@ -354,9 +387,22 @@ def _complete_economics(
     )
     if len(oriented_rows) < 28 * 24:
         raise _IncompleteCalculation("FUNDING_CONTIGUOUS_WINDOW_INSUFFICIENT")
+    current_start = bundle.evaluation_end - timedelta(hours=7 * 24 - 1)
+    expected_current_timestamps = tuple(
+        current_start + timedelta(hours=offset) for offset in range(7 * 24)
+    )
+    current_rows = tuple(
+        row for row in oriented_rows if current_start <= row[0] <= bundle.evaluation_end
+    )
+    if tuple(timestamp for timestamp, _ in current_rows) != expected_current_timestamps:
+        raise _IncompleteCalculation("CURRENT_FUNDING_WINDOW_INSUFFICIENT")
+    cashflow_rows = _funding_cashflows(evaluation_pairs, direction, position)
     try:
         statistics = tuple(
-            funding_horizon_statistics(oriented_rows, holding_days)  # type: ignore[arg-type]
+            funding_cashflow_horizon_statistics(
+                cashflow_rows,
+                holding_days,  # type: ignore[arg-type]
+            )
             for holding_days in _HORIZONS
         )
         basis_rates = tuple(
@@ -366,7 +412,7 @@ def _complete_economics(
     except ValueError as error:
         raise _IncompleteCalculation("EVALUATION_WINDOW_INSUFFICIENT") from error
 
-    current_values = tuple(value for _, value in oriented_rows[-7 * 24 :])
+    current_values = tuple(value for _, value in current_rows)
     reasons: set[str] = set()
     if exact_median(current_values) <= 0:
         reasons.add("CURRENT_FUNDING_REGIME_REVERSED")
@@ -411,20 +457,26 @@ def _complete_economics(
         policy.minimum_annualized_return,
         policy.cash_benchmark_annual_rate + policy.cash_benchmark_spread,
     )
+    reference_notional = position.assigned_capital_usd / Decimal(2)
     horizons: list[HorizonEconomics] = []
     for stats, basis_rate in zip(statistics, basis_rates, strict=True):
-        gross = position.assigned_capital_usd * stats.percentile_05_sum
-        reversal = position.assigned_capital_usd * stats.maximum_drawdown
-        basis = position.assigned_capital_usd * basis_rate
+        gross = stats.gross_funding_usd
+        reversal = stats.maximum_drawdown_usd
+        basis = reference_notional * basis_rate
         net = gross - costs.normal_cost_usd - reversal - basis
         assigned_return = net / position.assigned_capital_usd
         annualized = assigned_return * Decimal(365) / Decimal(stats.holding_days)
         horizon = HorizonEconomics(
             schema_version=1,
             holding_days=stats.holding_days,
-            conservative_funding_rate=stats.percentile_05_sum,
+            conservative_funding_rate=gross / position.assigned_capital_usd,
+            lighter_funding_rate_sum=stats.lighter_rate_sum,
+            dydx_funding_rate_sum=stats.dydx_rate_sum,
+            lighter_funding_usd=stats.lighter_funding_usd,
+            dydx_funding_usd=stats.dydx_funding_usd,
             gross_funding_usd=gross,
             funding_reversal_reserve_usd=reversal,
+            basis_divergence_rate=basis_rate,
             basis_divergence_reserve_usd=basis,
             conservative_net_usd=net,
             assigned_capital_return=assigned_return,
@@ -491,8 +543,8 @@ def _complete_economics(
     normal_count, stress_count = _quote_counts(
         bundle,
         direction,
-        horizons[0].conservative_funding_rate,
-        statistics[0].maximum_drawdown,
+        statistics[0],
+        statistics[0].maximum_drawdown_usd / reference_notional,
         basis_rates[0],
         latency,
     )

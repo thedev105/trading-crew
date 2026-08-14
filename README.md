@@ -303,6 +303,11 @@ rates are JSON strings and whose URLs and hashes identify the exact point-in-tim
 }
 ```
 
+The dates, tier names, account types, URLs, hashes, rates, margin fractions, and operational-cost
+URL in these JSON blocks are illustrative placeholders, not reviewed evidence. Replace every one
+with values and SHA-256 hashes from an actual human review at the intended point in time; copying
+the examples does not establish a valid fee, margin, latency, or operational assumption.
+
 Save that document as `reviewed-fees.json`, then import it atomically:
 
 ```bash
@@ -419,19 +424,24 @@ report passed the frozen numeric gates; it is still research only. Invalid input
 database, or an immutable-record conflict exits with code 2.
 
 The database needs 90 prospective days: the first 30 select one direction from only the training
-funding median, and the next 60 evaluate that fixed direction without hindsight switching. It also
-needs at least 99% paired hourly funding and book coverage, recent synchronized depth, consecutive
-dense book samples for latency, the actual reviewed fee tiers, documented latency and margin facts,
-and a reviewed operational-cost amount. An empty or young database should normally produce
-`INSUFFICIENT_EVIDENCE`, not zero-valued economics.
+funding median, and the next 60 evaluate that fixed direction without hindsight switching. The
+current-regime check requires exactly the final 168 consecutive hourly boundaries ending at the
+evaluation end; it never bridges a missing hour by taking the last 168 available rows. The database
+also needs at least 99% paired hourly funding and book coverage, recent synchronized depth,
+consecutive dense book samples for latency, the actual reviewed fee tiers, documented latency and
+margin facts, and a reviewed operational-cost amount. An empty or young database should normally
+produce `INSUFFICIENT_EVIDENCE`, not zero-valued economics.
 
 Sizing uses equal base quantity on both legs, rounds down to a compatible step, assumes both legs
 are fully collateralized, and caps assigned capital at the smallest of 10% of account equity,
-USD 500, available depth, and the incomplete-leg loss limit. Funding uses fifth-percentile rolling
-7-, 14-, and 28-day sums. Funding reversal, adverse basis divergence, forced exit, latency, fees,
-and operations are additive reserves; favorable basis convergence receives no credit. Reports show
-return on assigned capital and on total account equity so unused cash is never removed from the
-account denominator.
+USD 500, available entry and doubled forced-exit depth, and the incomplete-leg loss limit. If exit
+depth is tighter, sizing rounds down before rejecting. Funding is calculated once per exact venue
+leg with the correct long/short sign; the fifth-percentile rolling 7-, 14-, and 28-day aggregate USD
+cashflow is divided by total assigned capital for portfolio return. Funding reversal, adverse basis
+divergence, forced exit, latency, fees, and operations are additive reserves. Basis divergence is
+charged against the average one-leg entry notional, and favorable convergence receives no credit.
+Reports show both venue funding components and return on assigned capital and total account equity,
+so unused cash is never removed from the account denominator.
 
 `SHADOW_CANDIDATE` is not a recommendation, simulated fill, paper order, promise of profit, or live
 authorization. The system has no wallet, signer, balance, position, transfer, order, cancellation,

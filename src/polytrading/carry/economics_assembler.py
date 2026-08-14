@@ -356,7 +356,13 @@ class EconomicsEvidenceAssembler:
                 None,
             )
             if selected is not None:
-                hourly.append(selected.pair)
+                hourly.append(
+                    PairedBookObservation(
+                        effective_at=boundary,
+                        lighter=selected.pair.lighter,
+                        dydx=selected.pair.dydx,
+                    )
+                )
         dense = tuple(
             item.pair
             for item in eligible

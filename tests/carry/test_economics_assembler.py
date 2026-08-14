@@ -209,6 +209,11 @@ def test_complete_assembly_uses_exact_windows_tiers_books_and_lineage(
     assert len(result.bundle.funding_pairs) == 2160
     assert len(result.bundle.hourly_books) == 1440
     assert len(result.bundle.dense_books) == 1442
+    evaluation_start = STUDY_END - timedelta(days=60)
+    assert result.bundle.hourly_books[0].effective_at == evaluation_start + timedelta(hours=1)
+    assert result.bundle.hourly_books[0].lighter.effective_at == (
+        evaluation_start + timedelta(hours=1, minutes=-1, milliseconds=-100)
+    )
     assert result.bundle.latest_books.effective_at == KNOWN_AS_OF - timedelta(
         seconds=5, milliseconds=100
     )

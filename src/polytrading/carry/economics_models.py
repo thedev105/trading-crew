@@ -314,8 +314,13 @@ class HorizonEconomics(StrictRecord):
     schema_version: Literal[1]
     holding_days: Literal[7, 14, 28]
     conservative_funding_rate: Decimal
+    lighter_funding_rate_sum: Decimal
+    dydx_funding_rate_sum: Decimal
+    lighter_funding_usd: Decimal
+    dydx_funding_usd: Decimal
     gross_funding_usd: Decimal
     funding_reversal_reserve_usd: NonnegativeDecimal
+    basis_divergence_rate: NonnegativeDecimal
     basis_divergence_reserve_usd: NonnegativeDecimal
     conservative_net_usd: Decimal
     assigned_capital_return: Decimal
@@ -327,6 +332,8 @@ class HorizonEconomics(StrictRecord):
 
     @model_validator(mode="after")
     def require_intrinsic_horizon_identities(self) -> HorizonEconomics:
+        if self.gross_funding_usd != self.lighter_funding_usd + self.dydx_funding_usd:
+            raise ValueError("gross funding identity must equal both venue funding components")
         expected_annualized = (
             self.assigned_capital_return * Decimal(365) / Decimal(self.holding_days)
         )
@@ -412,10 +419,23 @@ class CompleteEconomics(StrictRecord):
         if tuple(item.holding_days for item in self.horizons) != (7, 14, 28):
             raise ValueError("holding horizons must be ordered as 7, 14, and 28 days")
         for item in self.horizons:
-            if item.gross_funding_usd != (
-                self.assigned_capital_usd * item.conservative_funding_rate
+            if item.lighter_funding_usd != (
+                self.lighter_entry_notional_usd * item.lighter_funding_rate_sum
             ):
-                raise ValueError("gross funding identity is inconsistent")
+                raise ValueError("Lighter funding component identity is inconsistent")
+            if item.dydx_funding_usd != (self.dydx_entry_notional_usd * item.dydx_funding_rate_sum):
+                raise ValueError("dYdX funding component identity is inconsistent")
+            if item.conservative_funding_rate != (
+                item.gross_funding_usd / self.assigned_capital_usd
+            ):
+                raise ValueError("conservative funding rate identity is inconsistent")
+            reference_notional = (
+                self.lighter_entry_notional_usd + self.dydx_entry_notional_usd
+            ) / Decimal(2)
+            if item.basis_divergence_reserve_usd != (
+                reference_notional * item.basis_divergence_rate
+            ):
+                raise ValueError("basis divergence reserve identity is inconsistent")
             expected_net = (
                 item.gross_funding_usd
                 - self.costs.normal_cost_usd

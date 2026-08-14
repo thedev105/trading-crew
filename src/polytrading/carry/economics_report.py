@@ -76,8 +76,13 @@ def render_economics_text(report: CandidateEconomicsReport) -> str:
         for horizon in economics.horizons:
             lines.append(
                 f"{horizon.holding_days} days: "
+                f"lighter_rate_sum={_decimal(horizon.lighter_funding_rate_sum)}, "
+                f"dydx_rate_sum={_decimal(horizon.dydx_funding_rate_sum)}, "
+                f"lighter_funding={_decimal(horizon.lighter_funding_usd)} USD, "
+                f"dydx_funding={_decimal(horizon.dydx_funding_usd)} USD, "
                 f"gross={_decimal(horizon.gross_funding_usd)} USD, "
                 f"funding_reversal={_decimal(horizon.funding_reversal_reserve_usd)} USD, "
+                f"basis_rate={_decimal(horizon.basis_divergence_rate)}, "
                 f"basis={_decimal(horizon.basis_divergence_reserve_usd)} USD, "
                 f"net={_decimal(horizon.conservative_net_usd)} USD, "
                 f"assigned_return={_decimal(horizon.assigned_capital_return)}, "

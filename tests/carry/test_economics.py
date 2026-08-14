@@ -16,7 +16,7 @@ from polytrading.carry.economics_assembler import (
     PairedFundingObservation,
 )
 from polytrading.carry.economics_execution import PairedBookObservation
-from polytrading.carry.economics_models import EconomicsDecision
+from polytrading.carry.economics_models import EconomicsDecision, FundingDirection
 from polytrading.domain.models import Asset, FundingObservation, Venue
 from tests.carry.test_economics_models import (
     KNOWN_AS_OF,
@@ -139,7 +139,7 @@ def passing_bundle() -> EconomicsEvidenceBundle:
         PairedFundingObservation(
             effective_at=effective_at,
             dydx=funding(Venue.DYDX, Decimal("0"), effective_at),
-            lighter=funding(Venue.LIGHTER, Decimal("0.0002"), effective_at),
+            lighter=funding(Venue.LIGHTER, Decimal("0.0004"), effective_at),
         )
         for hour in range(1, 90 * 24 + 1)
         if (effective_at := training_start + timedelta(hours=hour))
@@ -343,6 +343,67 @@ def test_complete_economics_passes_only_when_every_gate_passes() -> None:
     assert report.economics.all_numeric_gates_pass
     assert report.economics.normal_quote_observations == 1440
     assert report.economics.stress_quote_observations == 1440
+    seven_day = report.economics.horizons[0]
+    assert seven_day.lighter_funding_rate_sum == Decimal("0.0672")
+    assert seven_day.dydx_funding_rate_sum == 0
+    assert seven_day.lighter_funding_usd == Decimal("13.3056000")
+    assert seven_day.dydx_funding_usd == 0
+    assert seven_day.gross_funding_usd == Decimal("13.3056000")
+    assert seven_day.conservative_funding_rate == (
+        seven_day.gross_funding_usd / report.economics.assigned_capital_usd
+    )
+
+
+def test_funding_cashflow_is_calculated_once_per_venue_leg() -> None:
+    bundle = passing_bundle()
+    changed = replace(
+        bundle,
+        funding_pairs=tuple(
+            pair
+            if pair.effective_at <= bundle.training_end
+            else replace(
+                pair,
+                dydx=funding(Venue.DYDX, Decimal("0.0001"), pair.effective_at),
+            )
+            for pair in bundle.funding_pairs
+        ),
+    )
+
+    report = evaluate_bundle(changed)
+
+    assert report.economics is not None
+    seven_day = report.economics.horizons[0]
+    assert seven_day.lighter_funding_rate_sum == Decimal("0.0672")
+    assert seven_day.dydx_funding_rate_sum == Decimal("-0.0168")
+    assert seven_day.lighter_funding_usd == Decimal("13.3056000")
+    assert seven_day.dydx_funding_usd == Decimal("-3.3596640")
+    assert seven_day.gross_funding_usd == Decimal("9.9459360")
+
+
+def test_reverse_direction_funding_components_keep_venue_signs() -> None:
+    bundle = passing_bundle()
+    changed = replace(
+        bundle,
+        funding_pairs=tuple(
+            replace(
+                pair,
+                lighter=funding(Venue.LIGHTER, Decimal("-0.0004"), pair.effective_at),
+            )
+            for pair in bundle.funding_pairs
+        ),
+    )
+
+    report = evaluate_bundle(changed)
+
+    assert report.direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER
+    assert report.economics is not None
+    seven_day = report.economics.horizons[0]
+    assert seven_day.lighter_funding_rate_sum == Decimal("0.0672")
+    assert seven_day.dydx_funding_rate_sum == 0
+    assert seven_day.lighter_funding_usd == (
+        report.economics.lighter_entry_notional_usd * Decimal("0.0672")
+    )
+    assert seven_day.gross_funding_usd == seven_day.lighter_funding_usd
 
 
 def test_complete_depth_failure_is_direction_bearing_rejection_without_results() -> None:
@@ -384,7 +445,7 @@ def test_complete_depth_failure_is_direction_bearing_rejection_without_results()
     assert report.economics is None
 
 
-def test_forced_exit_depth_failure_is_a_sizing_rejection() -> None:
+def test_forced_exit_depth_sizes_down_before_economics() -> None:
     bundle = passing_bundle()
     latest = replace(
         bundle.latest_books,
@@ -408,10 +469,10 @@ def test_forced_exit_depth_failure_is_a_sizing_rejection() -> None:
 
     report = evaluate_bundle(replace(bundle, latest_books=latest))
 
-    assert report.decision is EconomicsDecision.REJECTED
-    assert report.reason_codes == ("DEPTH_FORCED_EXIT_UNAVAILABLE",)
+    assert report.economics is not None
+    assert report.economics.base_quantity == Decimal("1.000")
+    assert "DEPTH_FORCED_EXIT_UNAVAILABLE" not in report.reason_codes
     assert report.direction is not None
-    assert report.economics is None
 
 
 def test_current_regime_reversal_is_rejected_without_changing_training_direction() -> None:
@@ -436,6 +497,24 @@ def test_current_regime_reversal_is_rejected_without_changing_training_direction
     assert "CURRENT_FUNDING_REGIME_REVERSED" in report.reason_codes
     assert report.direction is not None
     assert report.economics is not None
+
+
+def test_current_regime_requires_the_final_168_consecutive_hours() -> None:
+    bundle = passing_bundle()
+    missing_at = bundle.evaluation_end - timedelta(hours=3)
+    changed = replace(
+        bundle,
+        funding_pairs=tuple(
+            pair for pair in bundle.funding_pairs if pair.effective_at != missing_at
+        ),
+    )
+
+    report = evaluate_bundle(changed)
+
+    assert report.decision is EconomicsDecision.INSUFFICIENT_EVIDENCE
+    assert report.reason_codes == ("CURRENT_FUNDING_WINDOW_INSUFFICIENT",)
+    assert report.direction is None
+    assert report.economics is None
 
 
 @pytest.mark.parametrize(

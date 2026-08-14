@@ -6,7 +6,9 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from polytrading.carry.economics_funding import (
+    FundingCashflowObservation,
     exact_median,
+    funding_cashflow_horizon_statistics,
     funding_horizon_statistics,
     maximum_funding_drawdown,
     nearest_rank,
@@ -101,6 +103,29 @@ def test_horizon_statistics_return_exact_lower_tail_and_drawdown() -> None:
 def test_horizon_statistics_require_at_least_one_complete_window() -> None:
     with pytest.raises(ValueError, match="complete 7-day funding window"):
         funding_horizon_statistics(hourly_rows((Decimal("1"),) * 167), 7)
+
+
+def test_cashflow_lower_tail_preserves_exact_venue_components() -> None:
+    rows = tuple(
+        FundingCashflowObservation(
+            effective_at=START + timedelta(hours=index),
+            lighter_rate=Decimal("0.001"),
+            dydx_rate=Decimal("-0.0005"),
+            lighter_funding_usd=Decimal("2"),
+            dydx_funding_usd=Decimal("-1"),
+        )
+        for index in range(7 * 24)
+    )
+
+    result = funding_cashflow_horizon_statistics(rows, 7)
+
+    assert result.complete_window_count == 1
+    assert result.lighter_rate_sum == Decimal("0.168")
+    assert result.dydx_rate_sum == Decimal("-0.0840")
+    assert result.lighter_funding_usd == Decimal("336")
+    assert result.dydx_funding_usd == Decimal("-168")
+    assert result.gross_funding_usd == Decimal("168")
+    assert result.maximum_drawdown_usd == 0
 
 
 @pytest.mark.parametrize("bad_hour", [0, 1, 167, 168, 335])

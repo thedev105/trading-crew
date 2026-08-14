@@ -188,6 +188,18 @@ def _entry_levels(
     raise ValueError("unsupported funding direction")
 
 
+def _exit_levels(
+    direction: FundingDirection,
+    lighter_book: Level2BookSnapshot,
+    dydx_book: Level2BookSnapshot,
+) -> tuple[tuple[BookLevel, ...], tuple[BookLevel, ...]]:
+    if direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX:
+        return lighter_book.asks[:20], dydx_book.bids[:20]
+    if direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER:
+        return lighter_book.bids[:20], dydx_book.asks[:20]
+    raise ValueError("unsupported funding direction")
+
+
 def _validate_position_inputs(
     lighter_book: Level2BookSnapshot,
     dydx_book: Level2BookSnapshot,
@@ -247,6 +259,10 @@ def size_shadow_position(
         try:
             lighter_quote = _base_walk(lighter_levels, base_quantity, lighter_instrument)
             dydx_quote = _base_walk(dydx_levels, base_quantity, dydx_instrument)
+            lighter_exit_levels, dydx_exit_levels = _exit_levels(direction, lighter_book, dydx_book)
+            stressed_quantity = base_quantity * policy.forced_exit_depth_multiplier
+            _base_walk(lighter_exit_levels, stressed_quantity, lighter_instrument)
+            _base_walk(dydx_exit_levels, stressed_quantity, dydx_instrument)
         except InsufficientDepthError:
             return None
         assigned = lighter_quote.notional + dydx_quote.notional

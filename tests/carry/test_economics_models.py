@@ -175,8 +175,13 @@ def horizon(days: int, **overrides: object) -> HorizonEconomics:
         "schema_version": 1,
         "holding_days": days,
         "conservative_funding_rate": funding_rate,
+        "lighter_funding_rate_sum": funding_rate * Decimal(2),
+        "dydx_funding_rate_sum": Decimal(0),
+        "lighter_funding_usd": gross,
+        "dydx_funding_usd": Decimal(0),
         "gross_funding_usd": gross,
         "funding_reversal_reserve_usd": reversal,
+        "basis_divergence_rate": Decimal("0.0004"),
         "basis_divergence_reserve_usd": basis,
         "conservative_net_usd": net,
         "assigned_capital_return": assigned_return,
@@ -444,6 +449,14 @@ def test_complete_economics_enforces_capital_cost_and_horizon_identities() -> No
     with pytest.raises(ValidationError, match="gross funding identity"):
         rows = list(complete_economics().horizons)
         rows[0] = horizon(7, gross_funding_usd=Decimal("99"))
+        complete_economics(horizons=tuple(rows))
+    with pytest.raises(ValidationError, match="Lighter funding component"):
+        rows = list(complete_economics().horizons)
+        rows[0] = horizon(7, lighter_funding_rate_sum=Decimal("0.05"))
+        complete_economics(horizons=tuple(rows))
+    with pytest.raises(ValidationError, match="basis divergence reserve"):
+        rows = list(complete_economics().horizons)
+        rows[0] = horizon(7, basis_divergence_rate=Decimal("0.0005"))
         complete_economics(horizons=tuple(rows))
     with pytest.raises(ValidationError, match="holding horizons"):
         rows = complete_economics().horizons

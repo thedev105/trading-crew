@@ -194,9 +194,12 @@ short Lighter / long dYdX:  lighter_rate - dydx_rate
 short dYdX / long Lighter:  dydx_rate - lighter_rate
 ```
 
-The selected direction is not recomputed inside the evaluation window. The median of the final
-seven complete evaluation days must remain positive in the frozen direction. Otherwise the report
-is `REJECTED` with `CURRENT_FUNDING_REGIME_REVERSED`.
+The selected direction is not recomputed inside the evaluation window. The current-regime input is
+exactly the final 168 consecutive hourly boundaries ending at `evaluation_end`; it cannot select the
+last 168 available rows across a gap. A missing or displaced boundary makes the report
+`INSUFFICIENT_EVIDENCE` with `CURRENT_FUNDING_WINDOW_INSUFFICIENT`. When complete, its median must
+remain positive in the frozen direction. Otherwise the report is `REJECTED` with
+`CURRENT_FUNDING_REGIME_REVERSED`.
 
 ## 7. Book Selection and Base-Quantity Matching
 
@@ -212,7 +215,10 @@ must:
 
 For each historical UTC hour, the assembler selects the latest eligible cycle completed at or
 before the boundary and no more than five minutes old. It never selects a future cycle. At least
-99% of evaluation hours must have an eligible representative pair.
+99% of evaluation hours must have an eligible representative pair. The representative pair's
+window timestamp is the exact UTC boundary so consecutive windows cannot be split by harmless
+source-time jitter. The nested venue snapshots retain their original effective timestamps for
+age, skew, and lineage checks.
 
 The two legs use equal base quantity `q`. This provides exact base-asset delta matching before
 rounding. The quantity must satisfy both venue quantity steps and minimum notionals. A common
@@ -233,7 +239,9 @@ The evaluator walks levels in deterministic price order:
 - a short exit consumes asks.
 
 It calculates exact quantity-weighted average prices. It never calls this result a fill and never
-models queue position.
+models queue position. Position sizing must also prove that both opposite-side forced-exit walks
+can consume `forced_exit_depth_multiplier * q`. When exit depth is the tighter constraint, the
+evaluator rounds the quantity down to supported capacity before rejecting it.
 
 ## 8. Capital and Capacity
 
@@ -268,16 +276,33 @@ All calculations use exact Decimal values. No binary float enters a financial ca
 
 ### 9.1 Funding lower tail
 
-For the fixed direction, construct every complete rolling 7-, 14-, and 28-day funding sum in the
-60-day evaluation window. A rolling window may not bridge a missing hour. The conservative gross
-funding rate for a horizon is the nearest-rank fifth percentile of its sums.
+For each evaluation hour, calculate each venue leg once from its exact entry notional. A positive
+venue rate means longs pay shorts, so the signed USD components are:
+
+```text
+short Lighter / long dYdX:
+    lighter_funding_usd =  lighter_entry_notional_usd * lighter_rate
+    dydx_funding_usd    = -dydx_entry_notional_usd * dydx_rate
+
+short dYdX / long Lighter:
+    lighter_funding_usd = -lighter_entry_notional_usd * lighter_rate
+    dydx_funding_usd    =  dydx_entry_notional_usd * dydx_rate
+```
+
+Construct every complete rolling 7-, 14-, and 28-day window of the aggregate signed USD cashflow
+in the 60-day evaluation period. A rolling window may not bridge a missing hour. Select the
+nearest-rank fifth-percentile window by aggregate USD cashflow and retain that actual window's
+Lighter and dYdX rate sums and USD components. The portfolio-level conservative funding rate is
+`gross_funding_usd / assigned_capital_usd`; the venue-rate differential is not applied to both legs
+a second time.
 
 ### 9.2 Funding-reversal reserve
 
-For each horizon, calculate the maximum cumulative drawdown of the oriented hourly funding path
-inside any complete evaluation subwindow no longer than that horizon. The nonnegative result is the
-funding-reversal reserve. It is charged in addition to the lower-tail estimate intentionally; this
-is a conservative shadow gate, not an unbiased expected-value estimator.
+For each horizon, calculate the maximum cumulative drawdown of the aggregate signed hourly USD
+cashflow path inside any complete evaluation subwindow no longer than that horizon. The
+nonnegative USD result is the funding-reversal reserve. It is charged in addition to the lower-tail
+estimate intentionally; this is a conservative shadow gate, not an unbiased expected-value
+estimator.
 
 ### 9.3 Basis-divergence reserve
 
@@ -291,7 +316,9 @@ pair_mid:      (lighter_mid + dydx_mid) / 2
 
 For every complete 7-, 14-, and 28-day book window, adverse basis change is
 `max(0, ending_basis - starting_basis)`. The reserve is the nearest-rank 99th percentile adverse
-change. Favorable convergence is set to zero and never credited.
+change multiplied by the average exact entry notional,
+`(lighter_entry_notional_usd + dydx_entry_notional_usd) / 2`. Favorable convergence is set to zero
+and never credited. The two-leg assigned-capital total is not used as a one-leg basis notional.
 
 ### 9.4 Entry and exit costs
 
@@ -353,11 +380,20 @@ probabilistic loss forecast.
 
 ### 9.8 Horizon identity
 
-For horizon `H` and assigned capital `C`:
+For horizon `H`, let `L` and `D` be the exact Lighter and dYdX entry notionals. The selected signed
+rate sums already include direction:
 
 ```text
+lighter_funding_usd(H) = L * lighter_funding_rate_sum(H)
+dydx_funding_usd(H)    = D * dydx_funding_rate_sum(H)
 gross_funding_usd(H)
-    = C / 2 * conservative_funding_rate(H) * 2
+    = lighter_funding_usd(H) + dydx_funding_usd(H)
+
+conservative_funding_rate(H)
+    = gross_funding_usd(H) / assigned_capital_usd
+
+basis_divergence_reserve_usd(H)
+    = ((L + D) / 2) * basis_divergence_rate(H)
 
 conservative_net_usd(H)
     = gross_funding_usd(H)
@@ -373,10 +409,9 @@ assigned_capital_return(H) = conservative_net_usd(H) / C
 account_return(H) = conservative_net_usd(H) / account_equity_usd
 ```
 
-The gross identity uses equal reference notional on two funding legs. Per-hour venue funding is
-calculated separately before aggregation so notional normalization and direction remain auditable.
-The implementation must expose the exact component values rather than rely on the abbreviated
-display identity alone.
+Per-hour venue funding is calculated separately before aggregation so notional normalization and
+direction remain auditable. The implementation exposes both signed venue rate sums, both signed USD
+components, their aggregate, and the portfolio-normalized rate.
 
 Annualization is simple, not compounded:
 
@@ -523,10 +558,12 @@ hashes.
 
 - funding signs for both fixed directions;
 - training selection never reads evaluation observations;
-- rolling windows never bridge missing hours;
+- rolling windows never bridge missing hours, and the current-regime window is the exact final 168
+  consecutive boundaries;
 - exact nearest-rank fifth and 99th percentiles;
-- deterministic level walking and compatible quantity rounding;
-- entry, exit, fee, reserve, return, and annualization identities;
+- deterministic level walking, compatible quantity rounding, and forced-exit-aware downsizing;
+- per-venue funding cashflow, aggregate funding, entry, exit, fee, reserve, return, and annualization
+  identities;
 - favorable basis movement receives zero credit;
 - doubled transaction costs change only cost components; and
 - insufficient inputs withhold dependent headline values.

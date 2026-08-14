@@ -37,6 +37,20 @@ Hypothesis 6.160.0, Ruff 0.15.22, local HTML/CSS/JavaScript.
 - Keep Bybit–Hyperliquid carry study, carry audit, funding cycle, and health semantics unchanged.
 - Keep repository coverage at or above 90%.
 
+## Post-review calculation corrections
+
+The completed implementation and its regression tests incorporate these mandatory corrections:
+
+- calculate signed funding once for each exact venue-leg notional, select lower-tail windows by
+  aggregate USD cashflow, retain both venue components, and normalize the aggregate by total
+  assigned capital;
+- require the current-regime sample to be the exact final 168 consecutive hourly boundaries ending
+  at `evaluation_end`;
+- label hourly representative pairs with the exact UTC boundary while preserving each nested
+  source book's timestamp for freshness, skew, and lineage; and
+- include doubled opposite-side forced-exit depth in quantity sizing, downsizing before rejecting,
+  and apply basis divergence to the average one-leg entry notional.
+
 ## File Structure
 
 - Create `src/polytrading/carry/economics_models.py`: public enums, policy, assumptions, coverage,
@@ -242,11 +256,13 @@ execution, margin, and fee assumptions used rather than only their calculated to
 
 - [ ] **Step 7: Add exact identity and decision-coherence tests**
 
-Assert capital conservation, unused cash, cost sum, per-horizon net identity, assigned/account
-returns, simple annualization, doubled-cost identity, incompatible decision/economics combinations,
-wrong horizon order, duplicate hashes/reasons, and the exact research warning. Assert canonical
-policy JSON uses sorted compact keys, Decimal strings, and UTC `Z`; its SHA-256 must change when any
-operator-selectable input changes and remain stable across repeated serialization.
+Assert capital conservation, unused cash, cost sum, signed Lighter and dYdX funding-rate/entry-
+notional identities, their exact USD aggregate, portfolio-normalized funding rate, one-leg basis
+identity, per-horizon net identity, assigned/account returns, simple annualization, doubled-cost
+identity, incompatible decision/economics combinations, wrong horizon order, duplicate
+hashes/reasons, and the exact research warning. Assert canonical policy JSON uses sorted compact
+keys, Decimal strings, and UTC `Z`; its SHA-256 must change when any operator-selectable input
+changes and remain stable across repeated serialization.
 
 - [ ] **Step 8: Verify and commit Task 1**
 
@@ -275,7 +291,8 @@ Expected: all focused tests and static checks pass.
 
 - Consumes: `FundingDirection` from Task 1 and paired `(datetime, Decimal, Decimal)` hourly rates.
 - Produces: `select_direction`, `orient_funding`, `rolling_funding_sums`, `nearest_rank`,
-  `maximum_funding_drawdown`, and `funding_horizon_statistics`.
+  `maximum_funding_drawdown`, `funding_horizon_statistics`, `FundingCashflowObservation`,
+  `FundingCashflowHorizonStatistics`, and `funding_cashflow_horizon_statistics`.
 
 - [ ] **Step 1: Write failing direction tests**
 
@@ -339,6 +356,12 @@ Return a frozen dataclass with holding days, complete-window count, fifth-percen
 nonnegative maximum drawdown. Require at least one complete rolling window. Add exact tests for
 7/14/28-day counts, current-seven-day median, negative paths, zero values, and a gap at each possible
 boundary.
+
+Also construct exact per-venue signed USD cashflow observations from the two entry notionals.
+`funding_cashflow_horizon_statistics` selects the nearest-rank fifth-percentile window by aggregate
+USD cashflow, returns both signed rate sums and both signed USD components from that same observed
+window, and computes drawdown on the aggregate USD path. Assert the gross identity and both fixed
+direction signs; never multiply an already-differential rate by two-leg capital.
 
 - [ ] **Step 7: Add monotonic Hypothesis tests**
 
@@ -426,12 +449,16 @@ def size_shadow_position(
 
 Round down to a common valid multiple, require both minimum notionals, keep aggregate absolute
 entry notional no greater than assigned capital, and expose unused cash and incomplete-leg loss.
+The same sizing predicate must walk `forced_exit_depth_multiplier * base_quantity` on both
+opposite-side exit books. If exit depth is tighter than entry depth, binary sizing returns the
+largest supported compatible quantity rather than accepting a position that only fails later.
 
 - [ ] **Step 5: Write and implement basis-reserve tests**
 
 Build hourly paired midpoint fixtures for both directions. Assert favorable convergence contributes
 zero, adverse widening uses `max(0, ending - starting)`, gaps are never bridged, and the reserve is
-the exact nearest-rank 99th percentile for 7/14/28-day windows.
+the exact nearest-rank 99th percentile for 7/14/28-day windows. Convert the rate to USD with the
+average of the two exact entry notionals, never the total two-leg assigned capital.
 
 - [ ] **Step 6: Write and implement latency-reserve tests**
 
@@ -672,7 +699,9 @@ one-hour intervals, and pair by effective timestamp. Query book cycles starting 
 the first historical boundary so that boundary can select eligible prior evidence; select the
 latest eligible cycle completed at or before each hourly boundary with a five-minute age limit.
 Select the latest current cycle separately within 30 seconds of `known_as_of`. Require cycles to be
-complete and pair skew no greater than 1,000 milliseconds.
+complete and pair skew no greater than 1,000 milliseconds. Set each representative pair's timeline
+timestamp to the exact UTC boundary, while retaining original nested source-book timestamps for
+age, skew, and lineage.
 
 - [ ] **Step 4: Implement dossier, fee, instrument, and lineage gates**
 
@@ -749,9 +778,9 @@ validate evaluated_at and UUID
 return typed insufficient report when assembly is incomplete
 select direction from only the 30-day training differential
 orient only the 60-day evaluation differential
-calculate current seven-day regime
+require and calculate the exact final 168 consecutive hourly current-regime boundaries
 size equal-base legs from latest depth
-calculate 7/14/28 funding, basis, fee, exit, latency, and operational components
+calculate per-venue and aggregate 7/14/28 funding, one-leg basis, fee, exit, latency, and operational components
 calculate margin, incomplete-leg, stress-loss, drawdown, and quote-count gates
 collect every applicable rejection reason
 emit SHADOW_CANDIDATE only when the reason set is empty
@@ -780,9 +809,10 @@ insufficient rather than rejected or positive.
 - [ ] **Step 6: Write failing report-renderer tests and implement renderers**
 
 Text must include warning, decision, direction or unavailable, coverage, capital, every cost,
-7/14/28 results, stress gates, and sorted reasons. Canonical JSON must sort keys, serialize Decimal
-as strings, UUID as string, UTC with `Z`, and match `CandidateEconomicsReport` on parse. Prohibit
-`buy`, `sell`, `enter`, `execute`, `guaranteed`, and `expected profit` action copy.
+signed per-venue rate sums and USD cashflows, aggregate 7/14/28 results, basis rates, stress gates,
+and sorted reasons. Canonical JSON must sort keys, serialize Decimal as strings, UUID as string, UTC
+with `Z`, and match `CandidateEconomicsReport` on parse. Prohibit `buy`, `sell`, `enter`, `execute`,
+`guaranteed`, and `expected profit` action copy.
 
 - [ ] **Step 7: Write failing parser and CLI workflow tests**
 

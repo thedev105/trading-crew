@@ -203,6 +203,28 @@ def test_sizing_uses_only_the_first_twenty_levels() -> None:
     assert result is None
 
 
+def test_sizing_down_includes_doubled_forced_exit_depth() -> None:
+    lighter = book(Venue.LIGHTER).model_copy(
+        update={"asks": (BookLevel(price=Decimal("101"), quantity=Decimal("2"), order_count=1),)}
+    )
+    dydx = book(Venue.DYDX).model_copy(
+        update={"bids": (BookLevel(price=Decimal("100"), quantity=Decimal("2"), order_count=1),)}
+    )
+
+    result = size_shadow_position(
+        policy=policy(account_equity_usd=Decimal("10000")),
+        direction=FundingDirection.SHORT_LIGHTER_LONG_DYDX,
+        lighter_book=lighter,
+        dydx_book=dydx,
+        lighter_instrument=instrument(Venue.LIGHTER),
+        dydx_instrument=instrument(Venue.DYDX),
+    )
+
+    assert result is not None
+    assert result.base_quantity == Decimal("1.0")
+    assert forced_exit_cost(result, lighter, dydx, Decimal("2")) >= 0
+
+
 def test_entry_and_forced_exit_costs_walk_the_correct_opposite_sides() -> None:
     lighter = book(Venue.LIGHTER, bid="100", ask="102")
     dydx = book(Venue.DYDX, bid="99", ask="101")
