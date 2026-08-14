@@ -94,6 +94,12 @@ def test_item_rejects_symbol_mismatched_to_venue_and_asset(
         LighterDydxFundingItem(**item_data(venue=venue, asset=asset, symbol=symbol))
 
 
+@pytest.mark.parametrize("venue", [Venue.BYBIT, Venue.HYPERLIQUID])
+def test_item_rejects_unsupported_venues_with_a_validation_error(venue: Venue) -> None:
+    with pytest.raises(ValidationError, match="venue must be dYdX or Lighter"):
+        LighterDydxFundingItem(**item_data(venue=venue, symbol="BTC"))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

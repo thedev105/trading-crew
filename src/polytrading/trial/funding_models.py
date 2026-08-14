@@ -83,6 +83,13 @@ class LighterDydxFundingItem(StrictRecord):
     funding_source_hashes: tuple[Sha256, ...]
     reason_codes: tuple[str, ...]
 
+    @field_validator("venue")
+    @classmethod
+    def require_expected_venue(cls, value: Venue) -> Venue:
+        if value not in _EXPECTED_VENUES:
+            raise ValueError("venue must be dYdX or Lighter")
+        return value
+
     @field_validator("instrument_observed_at", "funding_effective_at", "funding_observed_at")
     @classmethod
     def require_utc_optional_timestamp(cls, value: datetime | None) -> datetime | None:
