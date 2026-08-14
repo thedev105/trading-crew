@@ -105,7 +105,9 @@ def test_posix_contention_errnos_follow_bounded_lease_handling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_errno: int
 ) -> None:
     def raise_lock_error(file_descriptor: int, operation: int) -> None:
-        del file_descriptor, operation
+        del file_descriptor
+        if operation == writer_lease.fcntl.LOCK_UN:
+            return
         raise OSError(lock_errno, "simulated flock contention")
 
     monkeypatch.setattr(writer_lease.fcntl, "flock", raise_lock_error)
