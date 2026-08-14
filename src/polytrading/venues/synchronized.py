@@ -146,12 +146,16 @@ class SynchronizedBookCollector:
         request_completed_at = normalize_utc_timestamp(self._clock())
 
         successful_batches: list[tuple[Venue, AdapterBatch]] = []
+        accepted_raw_event_ids: set[UUID] = set()
         failure_codes: list[str] = []
         for adapter, result in zip(ordered_adapters, results, strict=True):
             if isinstance(result, asyncio.CancelledError):
                 raise result
             if isinstance(result, BaseException):
                 failure_codes.append(f"{adapter.venue.value}:{type(result).__name__}")
+                continue
+            if type(result) is not AdapterBatch:
+                failure_codes.append(f"{adapter.venue.value}:invalid_adapter_batch")
                 continue
             batch_failure = self._validate_book_batch(
                 result, adapter.venue, requested_assets, cycle_id
@@ -164,6 +168,11 @@ class SynchronizedBookCollector:
             except AdapterBatchIntegrityError as error:
                 failure_codes.append(f"{adapter.venue.value}:{error.code}")
                 continue
+            batch_event_ids = {raw.event_id for raw in result.raw}
+            if not accepted_raw_event_ids.isdisjoint(batch_event_ids):
+                failure_codes.append(f"{adapter.venue.value}:duplicate_raw_identity")
+                continue
+            accepted_raw_event_ids.update(batch_event_ids)
             successful_batches.append((adapter.venue, result))
 
         raw_records = tuple(

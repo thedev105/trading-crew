@@ -10,7 +10,11 @@ import duckdb
 
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
-from polytrading.trial.writer_lease import WriterLeaseUnavailable, database_writer_lease
+from polytrading.trial.writer_lease import (
+    WriterLeaseCleanupError,
+    WriterLeaseUnavailable,
+    database_writer_lease,
+)
 from polytrading.venues.public import PublicVenueAdapter
 from polytrading.venues.synchronized import (
     SynchronizedBookCollector,
@@ -93,7 +97,7 @@ async def run_trial_book_session(
                     if store is not None:
                         try:
                             store.close()
-                        except Exception as error:
+                        except BaseException as error:
                             if active_error is None:
                                 raise TrialBookStoreCloseError() from error
             persisted_cycles += 1
@@ -101,7 +105,7 @@ async def run_trial_book_session(
                 failed_cycles += 1
             elif prepared.cycle.status == "skew_exceeds_research_target":
                 skewed_cycles += 1
-        except TrialBookStoreCloseError:
+        except (TrialBookStoreCloseError, WriterLeaseCleanupError):
             raise
         except WriterLeaseUnavailable:
             lease_skipped_cycles += 1

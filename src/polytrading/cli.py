@@ -67,7 +67,11 @@ from polytrading.trial.funding_report import (
 from polytrading.trial.health import LighterDydxTrialHealthAuditor
 from polytrading.trial.health_models import TrialCollectionStatus
 from polytrading.trial.health_report import render_trial_health_json, render_trial_health_text
-from polytrading.trial.writer_lease import WriterLeaseUnavailable, database_writer_lease
+from polytrading.trial.writer_lease import (
+    WriterLeaseCleanupError,
+    WriterLeaseUnavailable,
+    database_writer_lease,
+)
 from polytrading.venues.bybit import BybitPublicAdapter
 from polytrading.venues.dydx import DydxPublicAdapter
 from polytrading.venues.funding_cycle import (
@@ -144,22 +148,30 @@ class FundingCycleCollectionError(RuntimeError):
     """A point-in-time funding cycle could not be durably recorded."""
 
 
+class TrialFundingStoreCloseError(RuntimeError):
+    """A trial-funding store failed during cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__("TRIAL_FUNDING_STORE_CLOSE_ERROR")
+
+
 class TrialCommandError(RuntimeError):
     """A trial command failed without exposing machine-local details."""
 
 
 def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollectionError:
-    if isinstance(error, ConflictingRecordError):
+    classified_error = _cleanup_error_cause(error)
+    if isinstance(classified_error, ConflictingRecordError):
         code = "FUNDING_CYCLE_PERSISTENCE_CONFLICT"
-    elif isinstance(error, WriterLeaseUnavailable):
+    elif isinstance(classified_error, WriterLeaseUnavailable):
         code = "FUNDING_CYCLE_WRITER_LEASE_UNAVAILABLE"
-    elif isinstance(error, duckdb.Error):
+    elif isinstance(classified_error, duckdb.Error):
         code = "FUNDING_CYCLE_DATABASE_ERROR"
-    elif isinstance(error, httpx.HTTPError):
+    elif isinstance(classified_error, httpx.HTTPError):
         code = "FUNDING_CYCLE_HTTP_ERROR"
-    elif isinstance(error, OSError):
+    elif isinstance(classified_error, OSError):
         code = "FUNDING_CYCLE_FILESYSTEM_ERROR"
-    elif isinstance(error, ValueError):
+    elif isinstance(classified_error, ValueError):
         code = "FUNDING_CYCLE_VALIDATION_ERROR"
     else:
         code = "FUNDING_CYCLE_COLLECTION_ERROR"
@@ -168,11 +180,7 @@ def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollect
 
 def _classified_trial_error(command: str, error: BaseException) -> TrialCommandError:
     prefix = {"books": "TRIAL_BOOKS", "health": "TRIAL_HEALTH"}[command]
-    classified_error = (
-        error.__cause__
-        if isinstance(error, TrialBookStoreCloseError) and error.__cause__ is not None
-        else error
-    )
+    classified_error = _cleanup_error_cause(error)
     if isinstance(classified_error, duckdb.Error):
         suffix = "DATABASE_ERROR"
     elif isinstance(classified_error, httpx.HTTPError):
@@ -184,6 +192,18 @@ def _classified_trial_error(command: str, error: BaseException) -> TrialCommandE
     else:
         suffix = "OPERATION_ERROR"
     return TrialCommandError(f"{prefix}_{suffix}")
+
+
+def _cleanup_error_cause(error: BaseException) -> BaseException:
+    if (
+        isinstance(
+            error,
+            (TrialBookStoreCloseError, TrialFundingStoreCloseError, WriterLeaseCleanupError),
+        )
+        and error.__cause__ is not None
+    ):
+        return error.__cause__
+    return error
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -878,15 +898,7 @@ async def _trial_funding(arguments: argparse.Namespace) -> int:
                         )
                     cycle = prepared.cycle
                 _persist_trial_funding(arguments.db, prepared)
-    except (
-        ConflictingRecordError,
-        WriterLeaseUnavailable,
-        duckdb.Error,
-        httpx.HTTPError,
-        OSError,
-        RuntimeError,
-        ValueError,
-    ) as error:
+    except Exception as error:
         raise _classified_funding_cycle_error(error) from error
 
     renderer = (
@@ -929,12 +941,21 @@ async def _trial_books(arguments: argparse.Namespace) -> int:
 
 def _persist_trial_funding(database: Path, prepared: PreparedLighterDydxFundingCycle) -> None:
     store: DuckDBStore | None = None
+    active_error: BaseException | None = None
     try:
-        store = DuckDBStore(database)
-        persist_lighter_dydx_funding_cycle(store, prepared)
+        try:
+            store = DuckDBStore(database)
+            persist_lighter_dydx_funding_cycle(store, prepared)
+        except BaseException as error:
+            active_error = error
+            raise
     finally:
         if store is not None:
-            store.close()
+            try:
+                store.close()
+            except BaseException as error:
+                if active_error is None:
+                    raise TrialFundingStoreCloseError() from error
 
 
 def _trial_health(arguments: argparse.Namespace) -> int:

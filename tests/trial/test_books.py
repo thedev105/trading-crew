@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 import polytrading.trial.books as trial_books
+import polytrading.trial.writer_lease as trial_writer_lease
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -313,6 +314,39 @@ def test_trial_book_lease_contention_skips_store_open(
     assert stores.events == []
 
 
+def test_trial_book_writer_lease_cleanup_only_failure_escapes_per_cycle_handling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_cause = OSError("hostile /private/trial.duckdb.writer.lock?token=secret")
+
+    @contextmanager
+    def cleanup_failing_lease(_path: Path, *, timeout_seconds: float) -> Iterator[None]:
+        assert timeout_seconds == 0
+        yield
+        raise trial_writer_lease.WriterLeaseCleanupError() from cleanup_cause
+
+    stores = RecordingStoreFactory()
+    monkeypatch.setattr(trial_books, "database_writer_lease", cleanup_failing_lease)
+
+    with pytest.raises(BaseException) as captured:
+        asyncio.run(
+            run_trial_book_session(
+                complete_trial_adapters(),
+                tmp_path / "trial.duckdb",
+                duration_seconds=None,
+                interval_seconds=5,
+                monotonic=lambda: 0,
+                wall_clock=lambda: NOW,
+                sleep=asyncio.sleep,
+                store_factory=stores,
+            )
+        )
+
+    assert type(captured.value).__name__ == "WriterLeaseCleanupError"
+    assert captured.value.__cause__ is cleanup_cause
+    assert stores.events == ["open", "close"]
+
+
 @pytest.mark.parametrize(
     ("adapters", "expected"),
     [
@@ -451,15 +485,22 @@ def test_trial_book_store_close_failure_does_not_replace_primary_cancellation(
         pass
 
 
+@pytest.mark.parametrize(
+    "close_secret",
+    [
+        OSError(
+            "/private/evidence/books.duckdb "
+            "https://private.example.test/books?token=secret "
+            "response-body=confidential lock-owner=private"
+        ),
+        asyncio.CancelledError("hostile cleanup cancellation token=secret"),
+    ],
+    ids=("exception", "base-exception"),
+)
 def test_trial_book_store_close_only_failure_escapes_as_sanitizable_error(
-    tmp_path: Path,
+    tmp_path: Path, close_secret: BaseException
 ) -> None:
     database = tmp_path / "trial.duckdb"
-    close_secret = OSError(
-        "/private/evidence/books.duckdb "
-        "https://private.example.test/books?token=secret "
-        "response-body=confidential lock-owner=private"
-    )
     stores = RecordingStoreFactory(close_error=close_secret)
 
     with pytest.raises(RuntimeError, match=r"^TRIAL_BOOK_STORE_CLOSE_ERROR$") as captured:

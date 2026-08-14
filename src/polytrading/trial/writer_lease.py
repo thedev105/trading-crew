@@ -12,7 +12,19 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-__all__ = ["WriterLeaseUnavailable", "database_writer_lease", "writer_lease_path"]
+__all__ = [
+    "WriterLeaseCleanupError",
+    "WriterLeaseUnavailable",
+    "database_writer_lease",
+    "writer_lease_path",
+]
+
+
+class WriterLeaseCleanupError(RuntimeError):
+    """An owned database writer lease resource failed during cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__("DATABASE_WRITER_LEASE_CLEANUP_ERROR")
 
 
 class WriterLeaseUnavailable(RuntimeError):
@@ -37,20 +49,33 @@ def database_writer_lease(
     deadline = monotonic() + timeout
     handle = writer_lease_path(database_path).open("a+b")
     locked = False
+    active_error: BaseException | None = None
     try:
-        while not _try_lock(handle):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise WriterLeaseUnavailable("database writer lease is busy")
-            sleep(min(poll, remaining))
-        locked = True
-        yield
+        try:
+            while not _try_lock(handle):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise WriterLeaseUnavailable("database writer lease is busy")
+                sleep(min(poll, remaining))
+            locked = True
+            yield
+        except BaseException as error:
+            active_error = error
+            raise
     finally:
+        cleanup_error: BaseException | None = None
         try:
             if locked:
                 _unlock_if_held(handle)
-        finally:
+        except BaseException as error:
+            cleanup_error = error
+        try:
             handle.close()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if active_error is None and cleanup_error is not None:
+            raise WriterLeaseCleanupError() from cleanup_error
 
 
 def _finite_nonnegative(value: float, label: str) -> float:

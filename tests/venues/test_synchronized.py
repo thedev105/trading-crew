@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import duckdb
@@ -151,6 +152,91 @@ class ImmediateBookAdapter:
                 for asset in sorted(assets, key=lambda item: item.value)
             ),
         )
+
+
+class MalformedBookBatchAdapter(ImmediateBookAdapter):
+    def __init__(self, venue: Venue, malformed_kind: str) -> None:
+        super().__init__(venue)
+        self.malformed_kind = malformed_kind
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        if self.malformed_kind == "object":
+            return object()  # type: ignore[return-value]
+        batch = await super().fetch_order_books(assets, observed_at, cycle_id)
+        warning = AdapterWarning(
+            code="HOSTILE_RAW_MODEL",
+            venue=self.venue,
+            endpoint="https://private.example.test/book?token=secret",
+            symbol="response-body=confidential",
+            message="lock-owner=/private/malformed.lock",
+        )
+        return SimpleNamespace(  # type: ignore[return-value]
+            raw=batch.raw,
+            normalized=batch.normalized,
+            warnings=(warning,),
+        )
+
+
+class ConfiguredBookAdapter:
+    def __init__(
+        self,
+        venue: Venue,
+        event_id: UUID,
+        payload_json: str,
+        *,
+        warning_code: str | None = None,
+    ) -> None:
+        self.venue = venue
+        self.event_id = event_id
+        self.payload_json = payload_json
+        self.warning_code = warning_code
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        source_hash = hashlib.sha256(self.payload_json.encode()).hexdigest()
+        raw = raw_envelope(Venue.HYPERLIQUID).model_copy(
+            update={
+                "event_id": self.event_id,
+                "venue": self.venue,
+                "endpoint": f"/{self.venue.value}/public/book",
+                "payload_json": self.payload_json,
+                "source_hash": source_hash,
+            }
+        )
+        books = tuple(
+            book_snapshot(Venue.HYPERLIQUID, asset, cycle_id, NOW).model_copy(
+                update={
+                    "venue": self.venue,
+                    "symbol": f"{asset.value}-{self.venue.value}",
+                    "sequence": f"{self.venue.value}-{asset.value}",
+                    "source_hash": source_hash,
+                }
+            )
+            for asset in sorted(assets, key=lambda item: item.value)
+        )
+        warnings = (
+            (
+                AdapterWarning(
+                    code=self.warning_code,
+                    venue=self.venue,
+                    endpoint=f"/{self.venue.value}/public/book",
+                    symbol="BTC",
+                    message=f"{self.venue.value} local timestamp",
+                ),
+            )
+            if self.warning_code is not None
+            else ()
+        )
+        return AdapterBatch(raw=(raw,), normalized=books, warnings=warnings)
 
 
 class WrongVenueBatchAdapter:
@@ -483,6 +569,174 @@ def test_adapter_failure_persists_only_successful_raw_and_failed_cycle_atomicall
             )
         )
     assert counts == (1, 0, 0, 1)
+
+
+@pytest.mark.parametrize("malformed_kind", ["object", "wrong_model"])
+def test_non_adapter_batch_return_is_scoped_failure_with_valid_peer_persistence(
+    tmp_path: Path, malformed_kind: str
+) -> None:
+    path = tmp_path / f"malformed-{malformed_kind}.duckdb"
+    store = DuckDBStore(path)
+
+    prepared = asyncio.run(
+        SynchronizedBookCollector(
+            store=None,
+            clock=SequenceClock(NOW, LATER),
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once(
+            (
+                MalformedBookBatchAdapter(Venue.HYPERLIQUID, malformed_kind),
+                ImmediateBookAdapter(Venue.BYBIT),
+            ),
+            ASSETS,
+            NOW,
+        )
+    )
+
+    assert prepared.cycle.status == "failed"
+    assert prepared.cycle.venues == (Venue.BYBIT, Venue.HYPERLIQUID)
+    assert prepared.cycle.failure_codes == ("hyperliquid:invalid_adapter_batch",)
+    assert tuple(raw.venue for raw in prepared.raw_records) == (Venue.BYBIT,)
+    assert {(book.venue, book.asset) for book in prepared.books} == {
+        (Venue.BYBIT, Asset.BTC),
+        (Venue.BYBIT, Asset.ETH),
+        (Venue.BYBIT, Asset.SOL),
+    }
+    assert prepared.warnings == ()
+    assert prepared.cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+
+    assert persist_prepared_book_cycle(store, prepared) is True
+    assert store.latest_book_cycle_as_of(LATER) == prepared.cycle
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        counts = tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "book_snapshots",
+                "book_levels",
+                "book_collection_cycles",
+            )
+        )
+    assert counts == (1, 0, 0, 1)
+
+
+def test_cross_venue_duplicate_raw_identity_is_canonical_queryable_failure(
+    tmp_path: Path,
+) -> None:
+    shared_id = UUID("00000000-0000-0000-0000-0000000000aa")
+    later_id = UUID("00000000-0000-0000-0000-0000000000bb")
+    adapters = (
+        ConfiguredBookAdapter(
+            Venue.BYBIT,
+            shared_id,
+            '{"venue":"bybit","owner":"first"}',
+            warning_code="BYBIT_ACCEPTED",
+        ),
+        ConfiguredBookAdapter(
+            Venue.DYDX,
+            shared_id,
+            '{"venue":"dydx","owner":"collision","token":"secret"}',
+            warning_code="DYDX_REJECTED_SECRET",
+        ),
+        ConfiguredBookAdapter(
+            Venue.HYPERLIQUID,
+            later_id,
+            '{"venue":"hyperliquid","owner":"continued"}',
+            warning_code="HYPERLIQUID_ACCEPTED",
+        ),
+    )
+
+    def prepare(candidate_adapters: tuple[ConfiguredBookAdapter, ...]):
+        return asyncio.run(
+            SynchronizedBookCollector(
+                store=None,
+                clock=SequenceClock(NOW, LATER),
+                cycle_id_factory=lambda: CYCLE_ID,
+            ).prepare_once(candidate_adapters, ASSETS, NOW)
+        )
+
+    prepared = prepare(adapters)
+    reversed_prepared = prepare(tuple(reversed(adapters)))
+
+    assert prepared == reversed_prepared
+    assert prepared.cycle.status == "failed"
+    assert prepared.cycle.venues == (Venue.BYBIT, Venue.DYDX, Venue.HYPERLIQUID)
+    assert prepared.cycle.failure_codes == ("dydx:duplicate_raw_identity",)
+    assert tuple((raw.venue, raw.event_id) for raw in prepared.raw_records) == (
+        (Venue.BYBIT, shared_id),
+        (Venue.HYPERLIQUID, later_id),
+    )
+    assert {book.venue for book in prepared.books} == {Venue.BYBIT, Venue.HYPERLIQUID}
+    assert tuple(warning.code for warning in prepared.warnings) == (
+        "BYBIT_ACCEPTED",
+        "HYPERLIQUID_ACCEPTED",
+    )
+    accepted_hashes = tuple(sorted(raw.source_hash for raw in prepared.raw_records))
+    assert prepared.cycle.source_hashes == accepted_hashes
+
+    path = tmp_path / "cross-venue-duplicate.duckdb"
+    store = DuckDBStore(path)
+    assert persist_prepared_book_cycle(store, prepared) is True
+    assert store.latest_book_cycle_as_of(LATER) == prepared.cycle
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        counts = tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "book_snapshots",
+                "book_levels",
+                "book_collection_cycles",
+            )
+        )
+        persisted_ids = connection.execute(
+            "SELECT event_id FROM raw_envelopes ORDER BY venue"
+        ).fetchall()
+    assert counts == (2, 0, 0, 1)
+    assert persisted_ids == [(shared_id,), (later_id,)]
+
+
+def test_same_source_hash_with_distinct_cross_venue_event_ids_is_preserved(
+    tmp_path: Path,
+) -> None:
+    payload = '{"public":"identical-exact-payload"}'
+    shared_hash = hashlib.sha256(payload.encode()).hexdigest()
+    adapters = (
+        ConfiguredBookAdapter(Venue.HYPERLIQUID, UUID(int=202), payload),
+        ConfiguredBookAdapter(Venue.BYBIT, UUID(int=101), payload),
+    )
+    prepared = asyncio.run(
+        SynchronizedBookCollector(
+            store=None,
+            clock=SequenceClock(NOW, LATER),
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once(adapters, ASSETS, NOW)
+    )
+
+    assert prepared.cycle.status == "complete"
+    assert prepared.cycle.failure_codes == ()
+    assert tuple(raw.event_id for raw in prepared.raw_records) == (UUID(int=101), UUID(int=202))
+    assert len(prepared.books) == 6
+    assert prepared.cycle.source_hashes == (shared_hash,)
+
+    path = tmp_path / "same-hash-distinct-id.duckdb"
+    store = DuckDBStore(path)
+    assert persist_prepared_book_cycle(store, prepared) is True
+    store.close()
+    with duckdb.connect(str(path), read_only=True) as connection:
+        counts = tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "book_snapshots",
+                "book_levels",
+                "book_collection_cycles",
+            )
+        )
+    assert counts == (2, 6, 12, 1)
 
 
 def test_invalid_batch_evidence_is_excluded_while_failed_cycle_persists(

@@ -18,6 +18,7 @@ import pytest
 
 import polytrading.cli as cli
 import polytrading.trial.books as trial_books
+import polytrading.trial.writer_lease as trial_writer_lease
 from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.cli import RetryingTransport, collect_book_cycles, main
 from polytrading.corpus_intake.evidence import (
@@ -1678,6 +1679,236 @@ def test_trial_books_store_close_failure_uses_underlying_safe_classification(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_FILESYSTEM_ERROR\n"
+    assert secret not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("cause_type", "expected_code"),
+    [(OSError, "FILESYSTEM_ERROR"), (asyncio.CancelledError, "OPERATION_ERROR")],
+    ids=("exception", "base-exception"),
+)
+def test_trial_books_writer_lease_cleanup_failure_uses_underlying_safe_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    cause_type: type[BaseException],
+    expected_code: str,
+) -> None:
+    secret = (
+        "/private/evidence/books.duckdb "
+        "https://private.example.test/books?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, object]]:
+        yield object(), object()
+
+    async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
+        cause = cause_type(secret)
+        raise trial_writer_lease.WriterLeaseCleanupError() from cause
+
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session)
+    monkeypatch.setattr(cli, "run_trial_book_session", run)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"polytrading: collection failed: TRIAL_BOOKS_{expected_code}\n"
+    assert secret not in captured.err
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [RuntimeError("primary persistence failure"), asyncio.CancelledError("exact cancellation")],
+    ids=("body", "cancellation"),
+)
+def test_persist_trial_funding_store_close_does_not_replace_exact_primary(
+    monkeypatch: pytest.MonkeyPatch, primary: BaseException
+) -> None:
+    close_error = asyncio.CancelledError("hostile cleanup cancellation")
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _database: Path) -> None:
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise close_error
+
+    def persist(_store: object, _prepared: object) -> None:
+        events.append("persist")
+        raise primary
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "persist_lighter_dydx_funding_cycle", persist)
+
+    with pytest.raises(BaseException) as captured:
+        cli._persist_trial_funding(Path("trial.duckdb"), object())  # type: ignore[arg-type]
+
+    assert captured.value is primary
+    assert events == ["open", "persist", "close"]
+
+
+def test_trial_funding_body_failure_wins_over_store_close_and_is_sanitized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_secret = "database body https://private.example.test?token=body-secret"
+    close_secret = "/private/funding.duckdb lock-owner=close-secret"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _database: Path) -> None:
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise OSError(close_secret)
+
+    def persist(_store: object, _prepared: object) -> None:
+        events.append("persist")
+        raise duckdb.Error(body_secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "persist_lighter_dydx_funding_cycle", persist)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--current",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: FUNDING_CYCLE_DATABASE_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+    assert events == ["open", "persist", "close"]
+
+
+@pytest.mark.parametrize(
+    ("close_error", "expected_code"),
+    [
+        (OSError("hostile /private/funding.duckdb?token=secret"), "FILESYSTEM_ERROR"),
+        (LookupError("hostile response-body=secret lock-owner=private"), "COLLECTION_ERROR"),
+        (asyncio.CancelledError("hostile cleanup cancellation token=secret"), "COLLECTION_ERROR"),
+    ],
+    ids=("filesystem", "unexpected", "base-exception"),
+)
+def test_trial_funding_store_close_only_failure_is_exit_one_and_sanitized(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    close_error: BaseException,
+    expected_code: str,
+) -> None:
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _database: Path) -> None:
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise close_error
+
+    def persist(_store: object, _prepared: object) -> None:
+        events.append("persist")
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "persist_lighter_dydx_funding_cycle", persist)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--current",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (f"polytrading: collection failed: FUNDING_CYCLE_{expected_code}\n")
+    assert str(close_error) not in captured.err
+    assert events == ["open", "persist", "close"]
+
+
+@pytest.mark.parametrize(
+    ("cause_type", "expected_code"),
+    [(OSError, "FILESYSTEM_ERROR"), (asyncio.CancelledError, "COLLECTION_ERROR")],
+    ids=("exception", "base-exception"),
+)
+def test_trial_funding_writer_lease_cleanup_failure_uses_underlying_safe_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    cause_type: type[BaseException],
+    expected_code: str,
+) -> None:
+    secret = "/private/trial.duckdb.writer.lock?token=secret lock-owner=private"
+
+    @contextmanager
+    def cleanup_failing_lease(*_args: object, **_kwargs: object) -> Iterator[None]:
+        yield
+        cause = cause_type(secret)
+        raise trial_writer_lease.WriterLeaseCleanupError() from cause
+
+    monkeypatch.setattr(cli, "database_writer_lease", cleanup_failing_lease)
+    monkeypatch.setattr(cli, "DuckDBStore", lambda _path: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(cli, "persist_lighter_dydx_funding_cycle", lambda *_args: True)
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: TRIAL_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--current",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"polytrading: collection failed: FUNDING_CYCLE_{expected_code}\n"
     assert secret not in captured.err
 
 
