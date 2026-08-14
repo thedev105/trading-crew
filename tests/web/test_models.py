@@ -13,6 +13,8 @@ from polytrading.carry.dossier import (
 )
 from polytrading.carry.economics_models import EconomicsDecision, FundingDirection
 from polytrading.domain.models import Asset, Venue
+from polytrading.trial.health import LighterDydxTrialHealthAuditor
+from polytrading.trial.health_models import LighterDydxTrialHealthReport
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
 from polytrading.web.models import (
     RESEARCH_WARNING,
@@ -32,6 +34,15 @@ EXPECTED_PAIRS = tuple((venue, asset) for venue in VENUES for asset in ASSETS)
 
 class EmptyFundingHistory:
     def funding_collection_cycles_between(self, start, end):
+        return ()
+
+    def lighter_dydx_funding_cycles_between(self, start, end, known_as_of):
+        return ()
+
+    def funding_revisions_between(self, venue, symbol, start, end, known_as_of):
+        return ()
+
+    def reviewed_fee_schedules_as_of(self, as_of):
         return ()
 
 
@@ -108,6 +119,7 @@ def _snapshot_values() -> dict[str, object]:
         "database_name": "research.duckdb",
         "warning": RESEARCH_WARNING,
         "funding_health": FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(AS_OF, 24),
+        "trial_health": LighterDydxTrialHealthAuditor(EmptyFundingHistory()).audit(AS_OF, 24),
         "latest_funding_cycle": None,
         "latest_book_cycle": None,
         "compatibility_dossier": None,
@@ -123,12 +135,22 @@ def _snapshot_values() -> dict[str, object]:
             book_snapshots=0,
             book_collection_cycles=0,
             funding_collection_cycles=0,
+            lighter_dydx_funding_cycles=0,
         ),
         "operation_recipes": OperationRecipes(
             collect_public="polytrading collect public",
             collect_books_once="polytrading collect books --once",
             collect_current_funding="polytrading collect funding-cycle --current",
             inspect_funding_health="polytrading funding health",
+            collect_trial_funding="polytrading trial funding --current",
+            collect_trial_books_burst=(
+                "polytrading trial books --duration-seconds 60 --interval-seconds 5"
+            ),
+            collect_trial_books_once="polytrading trial books --once",
+            inspect_trial_health="polytrading trial health --recent-hours 24",
+            import_trial_fees="polytrading fees import --input reviewed-fees.json",
+            evaluate_trial_btc="polytrading carry economics --policy policy/BTC.json",
+            trial_scheduler_example="58 * * * * polytrading trial funding --current",
         ),
     }
 
@@ -140,6 +162,19 @@ def test_snapshot_requires_every_market_pair_and_carry_asset_in_canonical_order(
     assert tuple((row.venue, row.asset) for row in snapshot.markets) == EXPECTED_PAIRS
     assert tuple(row.asset for row in snapshot.carry_rows) == ASSETS
     assert tuple(row.asset for row in snapshot.economics_rows) == ASSETS
+    assert snapshot.trial_health.as_of == snapshot.as_of
+    assert snapshot.evidence_counts.lighter_dydx_funding_cycles >= 0
+    assert "trial funding --current" in snapshot.operation_recipes.collect_trial_funding
+    assert "trial books --duration-seconds 60 --interval-seconds 5" in (
+        snapshot.operation_recipes.collect_trial_books_burst
+    )
+    assert "trial books --once" in snapshot.operation_recipes.collect_trial_books_once
+    assert "trial health --recent-hours 24" in snapshot.operation_recipes.inspect_trial_health
+    assert "fees import --input reviewed-fees.json" in snapshot.operation_recipes.import_trial_fees
+    assert "carry economics --policy policy/BTC.json" in (
+        snapshot.operation_recipes.evaluate_trial_btc
+    )
+    assert "58 * * * *" in snapshot.operation_recipes.trial_scheduler_example
 
     values["markets"] = tuple(reversed(_market_rows()))
     with pytest.raises(ValidationError, match="markets must cover"):
@@ -154,6 +189,48 @@ def test_snapshot_requires_every_market_pair_and_carry_asset_in_canonical_order(
     values["economics_rows"] = tuple(reversed(_economics_rows()))
     with pytest.raises(ValidationError, match="economics rows must cover"):
         DashboardSnapshot(**values)
+
+
+def test_snapshot_requires_trial_health_to_share_dashboard_cutoff() -> None:
+    values = _snapshot_values()
+    values["trial_health"] = LighterDydxTrialHealthAuditor(EmptyFundingHistory()).audit(
+        AS_OF + datetime.resolution, 24
+    )
+
+    with pytest.raises(ValidationError, match="trial health must use dashboard as-of"):
+        DashboardSnapshot(**values)
+
+
+def test_snapshot_rejects_future_trial_evidence_timestamp() -> None:
+    values = _snapshot_values()
+    health = values["trial_health"]
+    assert isinstance(health, LighterDydxTrialHealthReport)
+    values["trial_health"] = LighterDydxTrialHealthReport.model_construct(
+        **(health.__dict__ | {"trial_started_at": AS_OF + datetime.resolution})
+    )
+    snapshot = DashboardSnapshot.model_construct(**values)
+
+    with pytest.raises(ValueError, match="trial evidence must not follow dashboard as-of"):
+        snapshot.require_one_point_in_time()
+
+
+def test_new_count_is_nonnegative_and_recipe_shape_is_exact_and_nonblank() -> None:
+    count_values = _snapshot_values()["evidence_counts"].model_dump()
+    count_values["lighter_dydx_funding_cycles"] = -1
+    with pytest.raises(ValidationError):
+        EvidenceCounts(**count_values)
+
+    recipes = _snapshot_values()["operation_recipes"].model_dump()
+    for field in recipes:
+        with pytest.raises(ValidationError, match="must not be blank"):
+            OperationRecipes(**(recipes | {field: "   "}))
+
+    omitted = dict(recipes)
+    omitted.pop("collect_trial_funding")
+    with pytest.raises(ValidationError):
+        OperationRecipes(**omitted)
+    with pytest.raises(ValidationError):
+        OperationRecipes(**(recipes | {"unexpected_recipe": "do something"}))
 
 
 def test_economics_summary_requires_coherent_nullable_groups() -> None:
@@ -296,6 +373,9 @@ def test_snapshot_rejects_dossier_observed_after_snapshot_cutoff() -> None:
     values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
         values["as_of"], 24
     )
+    values["trial_health"] = LighterDydxTrialHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
     values["compatibility_dossier"] = report
 
     with pytest.raises(ValidationError, match="dossier must not follow dashboard as-of"):
@@ -309,6 +389,9 @@ def test_snapshot_rejects_discovery_observed_after_snapshot_cutoff() -> None:
     )
     values["as_of"] = discovery.observed_at - datetime.resolution
     values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
+    values["trial_health"] = LighterDydxTrialHealthAuditor(EmptyFundingHistory()).audit(
         values["as_of"], 24
     )
     values["venue_discovery"] = discovery
@@ -325,6 +408,9 @@ def test_snapshot_requires_legacy_dossier_to_match_discovery_candidate() -> None
     )
     values["as_of"] = discovery.observed_at
     values["funding_health"] = FundingCollectionHealthAuditor(EmptyFundingHistory()).audit(
+        values["as_of"], 24
+    )
+    values["trial_health"] = LighterDydxTrialHealthAuditor(EmptyFundingHistory()).audit(
         values["as_of"], 24
     )
     values["compatibility_dossier"] = legacy.model_copy(

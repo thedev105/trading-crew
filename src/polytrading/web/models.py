@@ -16,6 +16,7 @@ from polytrading.carry.economics_models import (
     FundingDirection,
 )
 from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
+from polytrading.trial.health_models import LighterDydxTrialHealthReport
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.funding_health_models import FundingCollectionHealthReport
 
@@ -239,6 +240,7 @@ class EvidenceCounts(StrictRecord):
     book_snapshots: Annotated[int, Field(ge=0)]
     book_collection_cycles: Annotated[int, Field(ge=0)]
     funding_collection_cycles: Annotated[int, Field(ge=0)]
+    lighter_dydx_funding_cycles: Annotated[int, Field(ge=0)]
 
 
 class OperationRecipes(StrictRecord):
@@ -246,6 +248,20 @@ class OperationRecipes(StrictRecord):
     collect_books_once: str
     collect_current_funding: str
     inspect_funding_health: str
+    collect_trial_funding: str
+    collect_trial_books_burst: str
+    collect_trial_books_once: str
+    inspect_trial_health: str
+    import_trial_fees: str
+    evaluate_trial_btc: str
+    trial_scheduler_example: str
+
+    @field_validator("*")
+    @classmethod
+    def require_nonblank_recipe(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("operation recipe must not be blank")
+        return value
 
 
 class DashboardSnapshot(StrictRecord):
@@ -254,6 +270,7 @@ class DashboardSnapshot(StrictRecord):
     database_name: str
     warning: Literal["Research only — no trading authority."]
     funding_health: FundingCollectionHealthReport
+    trial_health: LighterDydxTrialHealthReport
     latest_funding_cycle: FundingCycleSummary | None
     latest_book_cycle: BookCycleSummary | None
     compatibility_dossier: ContractDossierReport | None
@@ -307,6 +324,19 @@ class DashboardSnapshot(StrictRecord):
     def require_one_point_in_time(self) -> DashboardSnapshot:
         if self.funding_health.as_of != self.as_of:
             raise ValueError("funding health must use dashboard as-of")
+        if self.trial_health.as_of != self.as_of:
+            raise ValueError("trial health must use dashboard as-of")
+        trial_timestamps = (
+            self.trial_health.latest_auditable_boundary,
+            self.trial_health.trial_started_at,
+            *(item.cycle_end for item in self.trial_health.recent_boundaries),
+            *(item.latest_funding_boundary for item in self.trial_health.assets),
+            *(item.latest_book_completed_at for item in self.trial_health.assets),
+            *(item.effective_from for item in self.trial_health.reviewed_fees),
+            *(item.observed_at for item in self.trial_health.reviewed_fees),
+        )
+        if any(timestamp is not None and timestamp > self.as_of for timestamp in trial_timestamps):
+            raise ValueError("trial evidence must not follow dashboard as-of")
         if (
             self.latest_funding_cycle is not None
             and self.latest_funding_cycle.request_completed_at > self.as_of

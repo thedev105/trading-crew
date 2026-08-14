@@ -22,6 +22,7 @@ from polytrading.carry.economics_models import (
 )
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.health import LighterDydxTrialHealthAuditor
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
 from polytrading.web.models import (
     RESEARCH_WARNING,
@@ -63,6 +64,7 @@ class DashboardBuilder:
     def build(self, as_of: datetime) -> DashboardSnapshot:
         normalized_as_of = normalize_utc_timestamp(as_of)
         health = FundingCollectionHealthAuditor(self._store).audit(normalized_as_of, 24)
+        trial_health = LighterDydxTrialHealthAuditor(self._store).audit(normalized_as_of, 24)
         funding_cycle = self._store.latest_funding_collection_cycle_as_of(normalized_as_of)
         book_cycle = self._store.latest_book_cycle_as_of(normalized_as_of)
         carry = CarryAuditor(
@@ -93,6 +95,7 @@ class DashboardBuilder:
             database_name=self._database_path.name,
             warning=RESEARCH_WARNING,
             funding_health=health,
+            trial_health=trial_health,
             latest_funding_cycle=(
                 None
                 if funding_cycle is None
@@ -256,6 +259,35 @@ def _operation_recipes(database_path: Path) -> OperationRecipes:
             f".venv/bin/polytrading collect funding-cycle --current --db {database}"
         ),
         inspect_funding_health=(f".venv/bin/polytrading funding health --hours 24 --db {database}"),
+        collect_trial_funding=(
+            f".venv/bin/polytrading trial funding --current --db {database} --format json"
+        ),
+        collect_trial_books_burst=(
+            ".venv/bin/polytrading trial books --duration-seconds 60 --interval-seconds 5 "
+            f"--db {database}"
+        ),
+        collect_trial_books_once=(f".venv/bin/polytrading trial books --once --db {database}"),
+        inspect_trial_health=(
+            f".venv/bin/polytrading trial health --recent-hours 24 --db {database}"
+        ),
+        import_trial_fees=(
+            f".venv/bin/polytrading fees import --input reviewed-fees.json --db {database}"
+        ),
+        evaluate_trial_btc=(
+            ".venv/bin/polytrading carry economics --policy policy/BTC.json "
+            f"--db {database} --evaluated-at REPLACE_WITH_EVALUATED_AT "
+            "--evaluation-id REPLACE_WITH_EVALUATION_UUID --format json"
+        ),
+        trial_scheduler_example=(
+            "1 * * * * .venv/bin/polytrading trial funding --current "
+            f"--db {database} --format json\n"
+            "4 * * * * .venv/bin/polytrading trial funding --current "
+            f"--db {database} --format json\n"
+            "6 * * * * .venv/bin/polytrading trial health --recent-hours 24 "
+            f"--db {database} --format json\n"
+            "58 * * * * .venv/bin/polytrading trial books --duration-seconds 60 "
+            f"--interval-seconds 5 --db {database}"
+        ),
     )
 
 

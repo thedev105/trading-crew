@@ -86,8 +86,9 @@ class DashboardApplication:
                 render_dashboard_json(snapshot),
                 dict(_SECURITY_HEADERS),
             )
-        except (duckdb.Error, OSError, RuntimeError):
-            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, "DATABASE_UNAVAILABLE")
+        except (duckdb.Error, OSError, RuntimeError) as error:
+            code = "DATABASE_BUSY" if _is_database_busy(error) else "DATABASE_UNAVAILABLE"
+            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, code)
         except Exception:
             _LOGGER.exception("unexpected dashboard snapshot failure")
             return _error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
@@ -181,6 +182,10 @@ def _valid_host(host: str) -> bool:
         return False
     port = match.group("port")
     return port is None or 1 <= int(port) <= 65_535
+
+
+def _is_database_busy(error: BaseException) -> bool:
+    return isinstance(error, duckdb.IOException) and "Could not set lock on file" in str(error)
 
 
 def _json_response(status: HTTPStatus, document: object) -> WebResponse:

@@ -3,7 +3,9 @@ import socket
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
+from typing import NoReturn
 
+import duckdb
 import pytest
 
 import polytrading.web.server as web_server
@@ -118,6 +120,68 @@ def test_dashboard_returns_stable_database_error_without_path_details(
     assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
     assert json.loads(response.body) == {"error": {"code": "DATABASE_UNAVAILABLE"}}
     assert str(database_path).encode() not in response.body
+
+
+def test_dashboard_distinguishes_database_lock_without_leaking_path(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def busy(*_args: object, **_kwargs: object) -> NoReturn:
+        raise duckdb.IOException(f"Could not set lock on file {database_path}")
+
+    monkeypatch.setattr(web_server, "DuckDBStore", busy)
+
+    response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+        "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+    )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_BUSY"}}
+    assert str(database_path).encode() not in response.body
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Connection"] == "close"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        duckdb.IOException("different I/O failure"),
+        duckdb.Error("Could not set lock on file /tmp/not-an-io-error.duckdb"),
+        OSError("Could not set lock on file /tmp/not-a-duckdb-error.duckdb"),
+        OSError("filesystem unavailable"),
+        RuntimeError("schema is not current"),
+    ),
+)
+def test_dashboard_keeps_non_lock_database_failures_unavailable(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(web_server, "DuckDBStore", unavailable)
+
+    response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+        "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+    )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_UNAVAILABLE"}}
+
+
+def test_dashboard_keeps_unexpected_failures_internal(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
+        raise ValueError("unexpected failure")
+
+    monkeypatch.setattr(web_server, "DuckDBStore", unexpected)
+
+    response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+        "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+    )
+
+    assert response.status is HTTPStatus.INTERNAL_SERVER_ERROR
+    assert json.loads(response.body) == {"error": {"code": "INTERNAL_ERROR"}}
 
 
 def test_database_validation_requires_existing_current_schema(tmp_path: Path) -> None:

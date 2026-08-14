@@ -4,6 +4,9 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+import pytest
+
+import polytrading.web.dashboard as web_dashboard
 from polytrading.carry.audit import AuditStatus
 from polytrading.carry.dossier import (
     evaluate_dossier,
@@ -11,8 +14,9 @@ from polytrading.carry.dossier import (
 )
 from polytrading.carry.dossier_models import DossierStatus
 from polytrading.carry.economics_models import EconomicsDecision
-from polytrading.domain.models import Asset, BookLevel, Venue
+from polytrading.domain.models import Asset, BookLevel, FundingObservation, Venue
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.health_models import TrialCollectionStatus
 from polytrading.web.dashboard import DashboardBuilder, render_dashboard_json
 from tests.carry.test_economics_models import KNOWN_AS_OF, legacy_report_json
 from tests.carry.test_economics_models import report as economics_report
@@ -22,6 +26,9 @@ from tests.domain.factories import (
     funding_observation,
     instrument_spec,
 )
+from tests.trial.funding_helpers import trial_funding_cycle
+from tests.trial.test_book_evidence import append_pair
+from tests.trial.test_health_models import report as ready_trial_health_report
 
 AS_OF = datetime(2026, 8, 13, 16, 6, tzinfo=UTC)
 SOURCE_HASH = "a" * 64
@@ -29,6 +36,53 @@ FUTURE_HASH = "f" * 64
 BOOK_CYCLE_ID = UUID("00000000-0000-0000-0000-000000000a01")
 DOSSIER_AT = datetime(2026, 8, 13, 15, 58, 12, tzinfo=UTC)
 DISCOVERY_AT = datetime(2026, 8, 13, 16, 23, 8, tzinfo=UTC)
+
+
+def _append_trial_cycle(store: DuckDBStore, *, boundary: datetime, identity: int) -> None:
+    cycle = trial_funding_cycle(cycle_id=UUID(int=identity), cycle_end=boundary)
+    for item in cycle.items:
+        store.append_funding(
+            FundingObservation(
+                schema_version=1,
+                venue=item.venue,
+                symbol=item.symbol,
+                asset=item.asset,
+                rate=Decimal("0.0001"),
+                interval_hours=Decimal("1"),
+                effective_at=boundary,
+                observed_at=item.funding_observed_at,
+                source_hash=item.funding_source_hashes[0],
+            )
+        )
+    store.append_lighter_dydx_funding_cycle(cycle)
+
+
+def _ready_trial_health_at(as_of: datetime):
+    boundary = as_of.replace(minute=0, second=0, microsecond=0)
+    base = ready_trial_health_report()
+    recent = base.recent_boundaries[0].model_copy(update={"cycle_end": boundary})
+    assets = tuple(
+        item.model_copy(
+            update={
+                "latest_funding_boundary": boundary,
+                "latest_book_completed_at": as_of - timedelta(seconds=30),
+                "latest_book_age_seconds": Decimal("30"),
+                "projected_earliest_evaluation_end": boundary,
+            }
+        )
+        for item in base.assets
+    )
+    return base.model_copy(
+        update={
+            "as_of": as_of,
+            "latest_auditable_boundary": boundary,
+            "trial_started_at": boundary,
+            "recent_boundaries": (recent,),
+            "assets": assets,
+            "reviewed_fees": (),
+            "source_hashes": (),
+        }
+    )
 
 
 def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Path) -> None:
@@ -41,6 +95,18 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
     assert snapshot.database_name == "empty.duckdb"
     assert snapshot.funding_health.requested_hours == 24
     assert snapshot.funding_health.missing_boundary_count == 24
+    assert snapshot.trial_health.status is TrialCollectionStatus.NOT_STARTED
+    assert snapshot.trial_health.trial_started_at is None
+    assert snapshot.trial_health.elapsed_auditable_hours == 0
+    assert snapshot.trial_health.recent_boundaries == ()
+    assert all(item.paired_total_funding_hours == 0 for item in snapshot.trial_health.assets)
+    assert all(item.paired_book_hours == 0 for item in snapshot.trial_health.assets)
+    assert all(
+        item.latest_funding_boundary is None
+        and item.latest_book_completed_at is None
+        and item.projected_earliest_evaluation_end is None
+        for item in snapshot.trial_health.assets
+    )
     assert snapshot.latest_funding_cycle is None
     assert snapshot.latest_book_cycle is None
     assert len(snapshot.markets) == 12
@@ -60,11 +126,68 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
     )
     assert all(not row.report_available for row in snapshot.economics_rows)
     assert set(snapshot.evidence_counts.model_dump().values()) == {0}
+    assert snapshot.evidence_counts.lighter_dydx_funding_cycles == 0
     assert snapshot.compatibility_dossier is not None
     assert snapshot.compatibility_dossier.status is DossierStatus.INELIGIBLE
     assert snapshot.venue_discovery is not None
     assert snapshot.venue_discovery.selected_dossier_id is None
     assert len(snapshot.venue_discovery.candidates) == 1
+    store.close()
+
+
+def test_builder_trial_health_and_counts_use_only_the_dashboard_cutoff(tmp_path: Path) -> None:
+    path = tmp_path / "trial-cutoff.duckdb"
+    store = DuckDBStore(path)
+    current_boundary = AS_OF.replace(minute=0, second=0, microsecond=0)
+    future_boundary = current_boundary + timedelta(hours=1)
+    with store.transaction():
+        _append_trial_cycle(store, boundary=current_boundary, identity=20_001)
+        _append_trial_cycle(store, boundary=future_boundary, identity=20_002)
+        for offset, asset in enumerate(Asset, start=1):
+            append_pair(store, 21_000 + offset, current_boundary, asset=asset)
+            append_pair(store, 22_000 + offset, AS_OF + timedelta(minutes=1), asset=asset)
+
+    snapshot = DashboardBuilder(store, path).build(AS_OF)
+    document = json.loads(render_dashboard_json(snapshot))
+
+    assert snapshot.trial_health.as_of == AS_OF
+    assert snapshot.trial_health.status is TrialCollectionStatus.COLLECTING
+    assert snapshot.trial_health.trial_started_at == current_boundary
+    assert len(snapshot.trial_health.recent_boundaries) == 1
+    assert snapshot.trial_health.recent_boundaries[0].attempt_count == 1
+    assert all(item.paired_total_funding_hours == 1 for item in snapshot.trial_health.assets)
+    assert all(item.paired_book_hours == 1 for item in snapshot.trial_health.assets)
+    assert snapshot.evidence_counts.lighter_dydx_funding_cycles == 1
+    assert snapshot.evidence_counts.book_collection_cycles == 3
+    assert document["trial_health"]["as_of"] == "2026-08-13T16:06:00Z"
+    assert document["trial_health"]["recent_boundaries"][0]["attempt_count"] == 1
+    assert document["evidence_counts"]["lighter_dydx_funding_cycles"] == 1
+    store.close()
+
+
+def test_collection_readiness_does_not_promote_an_absent_economics_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "ready-without-economics.duckdb"
+    store = DuckDBStore(path)
+    ready = _ready_trial_health_at(AS_OF)
+
+    class ReadyAuditor:
+        def __init__(self, selected_store: DuckDBStore) -> None:
+            assert selected_store is store
+
+        def audit(self, as_of: datetime, recent_hours: int):
+            assert as_of == AS_OF
+            assert recent_hours == 24
+            return ready
+
+    monkeypatch.setattr(web_dashboard, "LighterDydxTrialHealthAuditor", ReadyAuditor)
+
+    snapshot = DashboardBuilder(store, path).build(AS_OF)
+
+    assert snapshot.trial_health.status is TrialCollectionStatus.READY_FOR_ECONOMICS_EVALUATION
+    assert all(not row.report_available for row in snapshot.economics_rows)
+    assert all(row.decision is None for row in snapshot.economics_rows)
     store.close()
 
 
@@ -366,6 +489,14 @@ def test_recipes_shell_quote_database_path_and_json_uses_public_scalars(tmp_path
     quoted = "'/tmp/research data/owner'\"'\"'s.duckdb'"
     assert quoted in snapshot.operation_recipes.collect_public
     assert quoted in snapshot.operation_recipes.collect_books_once
+    for recipe in snapshot.operation_recipes.model_dump().values():
+        assert quoted in recipe
+    assert "REPLACE_WITH_EVALUATED_AT" in snapshot.operation_recipes.evaluate_trial_btc
+    assert "REPLACE_WITH_EVALUATION_UUID" in snapshot.operation_recipes.evaluate_trial_btc
+    assert "<" not in snapshot.operation_recipes.evaluate_trial_btc
+    assert ">" not in snapshot.operation_recipes.evaluate_trial_btc
+    assert "$(" not in snapshot.operation_recipes.evaluate_trial_btc
+    assert "`" not in snapshot.operation_recipes.evaluate_trial_btc
     document = json.loads(render_dashboard_json(snapshot))
     assert document["as_of"] == "2026-08-13T16:06:00Z"
     assert document["funding_health"]["complete_coverage"] == "0"
