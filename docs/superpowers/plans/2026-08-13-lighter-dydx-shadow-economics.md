@@ -232,12 +232,13 @@ class CandidateEconomicsReport(StrictRecord):
 ```
 
 Require UTC chronological windows, `evaluated_at >= known_as_of`, canonical hashes/reasons, exactly
-7/14/28-day horizon order for complete economics, `economics is None` for insufficient reports and
-for the directionless `TRAINING_FUNDING_MEDIAN_ZERO` rejection, no direction or long/short venues
-for those reports, exact long/short venues and complete economics for every direction-bearing
-decision, and a shadow decision only when all horizon and stress pass flags are true and reason
-codes are empty. Complete economics must retain the exact execution, margin, and fee assumptions
-used rather than only their calculated totals.
+7/14/28-day horizon order for complete economics, `economics is None` for insufficient reports, for
+the directionless `TRAINING_FUNDING_MEDIAN_ZERO` rejection, and for direction-bearing sizing
+rejections whose canonical reasons are limited to `DEPTH_*`, `DELTA_*`, or `CAPITAL_*`; no direction
+or long/short venues for insufficient and zero-median reports; exact long/short venues for every
+other direction-bearing decision; and a shadow decision only when complete economics passes every
+horizon and stress gate and reason codes are empty. Complete economics must retain the exact
+execution, margin, and fee assumptions used rather than only their calculated totals.
 
 - [ ] **Step 7: Add exact identity and decision-coherence tests**
 

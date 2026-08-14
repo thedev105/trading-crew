@@ -497,6 +497,32 @@ def test_candidate_report_supports_shadow_rejected_and_insufficient_contracts() 
     )
     assert economic_rejection.economics is not None
 
+    sizing_rejection = report(
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("DEPTH_COMPATIBLE_SIZE_UNAVAILABLE",),
+        economics=None,
+    )
+    assert sizing_rejection.direction is not None
+    assert sizing_rejection.economics is None
+
+    with pytest.raises(ValidationError, match="complete evidence coverage"):
+        report(
+            decision=EconomicsDecision.REJECTED,
+            reason_codes=("DEPTH_COMPATIBLE_SIZE_UNAVAILABLE",),
+            economics=None,
+            coverage=coverage(
+                paired_book_hours=1400,
+                book_coverage=Decimal(1400) / Decimal(1440),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="sizing reasons"):
+        report(
+            decision=EconomicsDecision.REJECTED,
+            reason_codes=("CURRENT_FUNDING_REGIME_REVERSED",),
+            economics=None,
+        )
+
 
 @pytest.mark.parametrize(
     ("overrides", "match"),

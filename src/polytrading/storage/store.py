@@ -8,14 +8,13 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import duckdb
 from pydantic import BaseModel
 
 from polytrading.ai.models import ModelCard, RelationshipCandidateArtifact, RuleExtractionArtifact
-from polytrading.carry.economics_models import CandidateEconomicsReport
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -33,6 +32,9 @@ from polytrading.ledger.models import JournalTransaction, TrialBalanceRow
 from polytrading.research.models import ExperimentRecord
 from polytrading.venues.funding_cycle_models import FundingCollectionCycle
 from polytrading.venues.synchronized import BookCollectionCycle
+
+if TYPE_CHECKING:
+    from polytrading.carry.economics_models import CandidateEconomicsReport
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -601,6 +603,8 @@ class DuckDBStore:
         ).fetchone()
         if row is None:
             return None
+        from polytrading.carry.economics_models import CandidateEconomicsReport
+
         return CandidateEconomicsReport.model_validate_json(row[0])
 
     def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:

@@ -571,10 +571,35 @@ class CandidateEconomicsReport(StrictRecord):
             if not zero_median or self.economics is not None:
                 raise ValueError("directionless rejection must be the zero-median result")
             return self
-        if self.direction is None or self.economics is None:
-            raise ValueError("direction-bearing decision requires complete economics")
+        if self.direction is None:
+            raise ValueError("direction-bearing decision requires a direction")
         if not self.source_hashes:
             raise ValueError("complete report must contain source lineage")
+        coverages = (
+            self.coverage.training_funding_coverage,
+            self.coverage.evaluation_funding_coverage,
+            self.coverage.funding_coverage,
+            self.coverage.book_coverage,
+        )
+        if any(value < Decimal("0.99") for value in coverages):
+            raise ValueError("direction-bearing report requires complete evidence coverage")
+        if (
+            self.coverage.latest_book_age_seconds is None
+            or self.coverage.latest_pair_skew_ms is None
+            or self.coverage.latency_sample_count == 0
+        ):
+            raise ValueError("direction-bearing report requires complete freshness evidence")
+        if self.coverage.latest_book_age_seconds > Decimal("30"):
+            raise ValueError("latest book age exceeds frozen protocol limit")
+        if self.coverage.latest_pair_skew_ms > Decimal("1000"):
+            raise ValueError("latest pair skew exceeds frozen protocol limit")
+        if self.economics is None:
+            sizing_prefixes = ("DEPTH_", "DELTA_", "CAPITAL_")
+            if self.decision is not EconomicsDecision.REJECTED or not self.reason_codes or any(
+                not code.startswith(sizing_prefixes) for code in self.reason_codes
+            ):
+                raise ValueError("economics-free rejection requires only canonical sizing reasons")
+            return self
         required_hashes = {
             self.economics.operational_source_hash,
             *(item.source_hash for item in self.economics.execution_assumptions),
@@ -597,24 +622,6 @@ class CandidateEconomicsReport(StrictRecord):
             raise ValueError("complete report evidence must be known by cutoff")
         if any(fee.effective_from > self.known_as_of for fee in self.economics.fee_schedules):
             raise ValueError("complete report fee must be effective by cutoff")
-        coverages = (
-            self.coverage.training_funding_coverage,
-            self.coverage.evaluation_funding_coverage,
-            self.coverage.funding_coverage,
-            self.coverage.book_coverage,
-        )
-        if any(value < Decimal("0.99") for value in coverages):
-            raise ValueError("direction-bearing report requires complete evidence coverage")
-        if (
-            self.coverage.latest_book_age_seconds is None
-            or self.coverage.latest_pair_skew_ms is None
-            or self.coverage.latency_sample_count == 0
-        ):
-            raise ValueError("direction-bearing report requires complete freshness evidence")
-        if self.coverage.latest_book_age_seconds > Decimal("30"):
-            raise ValueError("latest book age exceeds frozen protocol limit")
-        if self.coverage.latest_pair_skew_ms > Decimal("1000"):
-            raise ValueError("latest pair skew exceeds frozen protocol limit")
         if self.decision is EconomicsDecision.REJECTED:
             if not self.reason_codes:
                 raise ValueError("rejected report must contain reason codes")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import math
 import sys
 import time
@@ -9,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequen
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import duckdb
 import httpx
@@ -23,6 +25,11 @@ from polytrading.carry.dossier import (
     load_bundled_dossiers,
 )
 from polytrading.carry.dossier_report import render_dossier_json, render_dossier_text
+from polytrading.carry.economics import CandidateEconomicsEvaluator
+from polytrading.carry.economics_assembler import EconomicsEvidenceAssembler
+from polytrading.carry.economics_models import EconomicsPolicy
+from polytrading.carry.economics_report import render_economics_json, render_economics_text
+from polytrading.carry.fee_import import parse_reviewed_fee_document, record_reviewed_fees
 from polytrading.carry.report import render_json, render_text
 from polytrading.carry.study import CarryPersistenceStudy, validate_study_window
 from polytrading.carry.study_report import render_study_json, render_study_text
@@ -158,6 +165,20 @@ def build_parser() -> argparse.ArgumentParser:
         "discovery", help="rank the bundled venue-compatibility evidence"
     )
     discovery.add_argument("--format", choices=("text", "json"), default="text")
+    economics = carry_commands.add_parser(
+        "economics", help="evaluate frozen Lighter-dYdX shadow economics"
+    )
+    economics.add_argument("--policy", required=True, type=Path)
+    economics.add_argument("--db", required=True, type=Path)
+    economics.add_argument("--evaluated-at", required=True)
+    economics.add_argument("--evaluation-id", required=True)
+    economics.add_argument("--format", choices=("text", "json"), default="text")
+
+    fees = commands.add_parser("fees", help="reviewed fee evidence operations")
+    fee_commands = fees.add_subparsers(dest="fees_command", required=True)
+    fee_import = fee_commands.add_parser("import", help="import reviewed fee evidence")
+    fee_import.add_argument("--input", required=True, type=Path)
+    fee_import.add_argument("--db", required=True, type=Path)
 
     funding = commands.add_parser("funding", help="prospective funding evidence operations")
     funding_commands = funding.add_subparsers(dest="funding_command", required=True)
@@ -256,7 +277,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _carry_study(arguments)
             if arguments.carry_command == "dossier":
                 return _carry_dossier(arguments)
-            return _carry_discovery(arguments)
+            if arguments.carry_command == "discovery":
+                return _carry_discovery(arguments)
+            return _carry_economics(arguments)
+        if arguments.command == "fees":
+            return _fees_import(arguments)
         if arguments.command == "funding":
             return _funding_health(arguments)
         if arguments.command == "ai":
@@ -338,6 +363,141 @@ def _carry_discovery(arguments: argparse.Namespace) -> int:
     report = evaluate_discovery(reports)
     renderer = render_discovery_json if arguments.format == "json" else render_discovery_text
     print(renderer(report))
+    return 0
+
+
+class _DuplicatePolicyKeyError(ValueError):
+    pass
+
+
+def _unique_policy_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicatePolicyKeyError("economics policy contains a duplicate JSON key")
+        result[key] = value
+    return result
+
+
+_POLICY_DECIMAL_FIELDS = frozenset(
+    {
+        "account_equity_usd",
+        "cash_benchmark_annual_rate",
+        "operational_cost_usd",
+        "minimum_coverage",
+        "maximum_book_age_seconds",
+        "maximum_cycle_skew_ms",
+        "maximum_hourly_book_age_seconds",
+        "maximum_assigned_equity_fraction",
+        "maximum_assigned_usd",
+        "incomplete_leg_shock",
+        "maximum_incomplete_loss_equity_fraction",
+        "minimum_hold_return",
+        "minimum_profit_usd",
+        "minimum_annualized_return",
+        "cash_benchmark_spread",
+        "maximum_stress_loss_equity_fraction",
+        "maximum_drawdown_fraction",
+        "forced_exit_depth_multiplier",
+        "doubled_cost_multiplier",
+    }
+)
+
+
+def _parse_economics_policy_document(payload: bytes) -> EconomicsPolicy:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        raw = json.loads(text, object_pairs_hook=_unique_policy_object)
+    except _DuplicatePolicyKeyError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise CliUsageError("invalid economics policy document") from error
+    if not isinstance(raw, dict):
+        raise CliUsageError("invalid economics policy document")
+    decimal_values = tuple(raw.get(name) for name in _POLICY_DECIMAL_FIELDS if name in raw)
+    execution = raw.get("execution_assumptions")
+    margins = raw.get("margin_assumptions")
+    if isinstance(execution, list):
+        decimal_values += tuple(
+            item.get("taker_latency_ms")
+            for item in execution
+            if isinstance(item, dict) and "taker_latency_ms" in item
+        )
+    if isinstance(margins, list):
+        decimal_values += tuple(
+            item.get(name)
+            for item in margins
+            if isinstance(item, dict)
+            for name in (
+                "initial_margin_fraction",
+                "maintenance_margin_fraction",
+                "close_out_margin_fraction",
+                "liquidation_penalty_fraction",
+            )
+            if name in item
+        )
+    if any(not isinstance(value, str) for value in decimal_values):
+        raise CliUsageError("invalid economics policy document")
+    try:
+        return EconomicsPolicy.model_validate_json(text)
+    except ValueError as error:
+        raise CliUsageError("invalid economics policy document") from error
+
+
+def _read_cli_bytes(path: Path, label: str) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise CliUsageError(f"{label} is unavailable") from error
+
+
+def _fees_import(arguments: argparse.Namespace) -> int:
+    document = parse_reviewed_fee_document(
+        _read_cli_bytes(arguments.input, "reviewed fee document")
+    )
+    store: DuckDBStore | None = None
+    try:
+        store = DuckDBStore(arguments.db)
+        inserted = record_reviewed_fees(store, document)
+    except (duckdb.Error, ConflictingRecordError, RuntimeError) as error:
+        raise CliUsageError("reviewed fee import failed") from error
+    finally:
+        if store is not None:
+            store.close()
+    print(f"imported {inserted} reviewed fee schedules")
+    return 0
+
+
+def _carry_economics(arguments: argparse.Namespace) -> int:
+    loaded_policy = _parse_economics_policy_document(
+        _read_cli_bytes(arguments.policy, "economics policy")
+    )
+    evaluated_at = _parse_timestamp(arguments.evaluated_at)
+    try:
+        evaluation_id = UUID(arguments.evaluation_id)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise CliUsageError("invalid evaluation UUID") from error
+    if not arguments.db.is_file():
+        raise CliUsageError("economics database is unavailable or not current")
+    store: DuckDBStore | None = None
+    try:
+        store = DuckDBStore(arguments.db)
+        assembly = EconomicsEvidenceAssembler(store).assemble(loaded_policy)
+        report = CandidateEconomicsEvaluator().evaluate(
+            assembly,
+            evaluated_at=evaluated_at,
+            evaluation_id=evaluation_id,
+        )
+        store.append_economic_evaluation(report)
+    except ConflictingRecordError as error:
+        raise CliUsageError("economics report persistence conflict") from error
+    except (duckdb.Error, RuntimeError) as error:
+        raise CliUsageError("economics database is unavailable or not current") from error
+    finally:
+        if store is not None:
+            store.close()
+    renderer = render_economics_json if arguments.format == "json" else render_economics_text
+    print(renderer(report), end="" if arguments.format == "text" else "\n")
     return 0
 
 

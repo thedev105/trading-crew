@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 import polytrading.cli as cli
+from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.cli import RetryingTransport, collect_book_cycles, main
 from polytrading.corpus_intake.evidence import (
     POLYMARKET_EVIDENCE_TARGETS,
@@ -42,6 +43,9 @@ from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.public import AdapterBatch, AdapterWarning
 from tests.carry.study_helpers import at, complete_block
+from tests.carry.test_economics import EVALUATION_ID, evaluate_bundle, passing_bundle
+from tests.carry.test_economics_models import KNOWN_AS_OF, policy
+from tests.carry.test_fee_import import payload as fee_payload
 from tests.domain.factories import funding_observation, instrument_spec
 from tests.venues.funding_cycle_helpers import (
     CYCLE_END as FUNDING_CYCLE_END,
@@ -58,6 +62,183 @@ from tests.venues.funding_health_helpers import HEALTH_AS_OF, LATEST_BOUNDARY, f
 
 FIXTURE = Path("tests/fixtures/replay/public_snapshot.jsonl")
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
+
+
+def policy_payload(**updates: object) -> bytes:
+    document = policy().model_dump(mode="json")
+    document.update(updates)
+    return json.dumps(document, separators=(",", ":")).encode()
+
+
+def test_shadow_economics_and_fee_import_parsers_are_explicit() -> None:
+    fees = cli.build_parser().parse_args(
+        ["fees", "import", "--input", "reviewed.json", "--db", "research.duckdb"]
+    )
+    economics = cli.build_parser().parse_args(
+        [
+            "carry",
+            "economics",
+            "--policy",
+            "policy.json",
+            "--db",
+            "research.duckdb",
+            "--evaluated-at",
+            "2026-08-13T17:00:07Z",
+            "--evaluation-id",
+            str(EVALUATION_ID),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert (fees.command, fees.fees_command) == ("fees", "import")
+    assert fees.input == Path("reviewed.json")
+    assert economics.carry_command == "economics"
+    assert economics.format == "json"
+
+
+def test_fee_import_cli_records_one_atomic_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    input_path = tmp_path / "reviewed.json"
+    input_path.write_bytes(fee_payload())
+    database = tmp_path / "research.duckdb"
+
+    assert main(["fees", "import", "--input", str(input_path), "--db", str(database)]) == 0
+
+    assert capsys.readouterr().out == "imported 2 reviewed fee schedules\n"
+    store = DuckDBStore(database, read_only=True)
+    assert store.latest_fee_as_of(Venue.DYDX, "reviewed-tier", KNOWN_AS_OF) is not None
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        b'{"schema_version":1,"schema_version":1}',
+        policy_payload(account_equity_usd=8000),
+    ],
+)
+def test_economics_policy_cli_rejects_duplicate_keys_and_json_numbers(
+    bad_payload: bytes,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_bytes(bad_payload)
+    database = tmp_path / "research.duckdb"
+    database.touch()
+
+    result = main(
+        [
+            "carry",
+            "economics",
+            "--policy",
+            str(policy_path),
+            "--db",
+            str(database),
+            "--evaluated-at",
+            "2026-08-13T17:00:07Z",
+            "--evaluation-id",
+            str(EVALUATION_ID),
+        ]
+    )
+
+    assert result == 2
+    assert "policy" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        EconomicsDecision.INSUFFICIENT_EVIDENCE,
+        EconomicsDecision.REJECTED,
+        EconomicsDecision.SHADOW_CANDIDATE,
+    ],
+)
+def test_economics_cli_is_offline_persists_once_and_returns_decisions_as_success(
+    decision: EconomicsDecision,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_bytes(policy_payload())
+    database = tmp_path / "research.duckdb"
+    database.touch()
+    baseline = evaluate_bundle(passing_bundle())
+    if decision is EconomicsDecision.INSUFFICIENT_EVIDENCE:
+        selected = baseline.model_copy(
+            update={
+                "decision": decision,
+                "reason_codes": ("BOOK_COVERAGE_INSUFFICIENT",),
+                "direction": None,
+                "short_venue": None,
+                "long_venue": None,
+                "economics": None,
+            }
+        )
+    elif decision is EconomicsDecision.REJECTED:
+        selected = baseline.model_copy(
+            update={"decision": decision, "reason_codes": ("COMPATIBILITY_BLOCKING",)}
+        )
+    else:
+        selected = baseline
+    calls: list[object] = []
+
+    class FakeStore:
+        def __init__(self, path: Path) -> None:
+            calls.append(("store", path))
+
+        def append_economic_evaluation(self, report: object) -> bool:
+            calls.append(("append", report))
+            return True
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class FakeAssembler:
+        def __init__(self, store: object) -> None:
+            calls.append(("assembler", store))
+
+        def assemble(self, loaded_policy: object) -> object:
+            calls.append(("assemble", loaded_policy))
+            return object()
+
+    class FakeEvaluator:
+        def evaluate(self, result: object, *, evaluated_at: datetime, evaluation_id: UUID):
+            calls.append(("evaluate", result, evaluated_at, evaluation_id))
+            return selected
+
+    def reject_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("economics command must remain offline")
+
+    monkeypatch.setattr(cli, "DuckDBStore", FakeStore)
+    monkeypatch.setattr(cli, "EconomicsEvidenceAssembler", FakeAssembler)
+    monkeypatch.setattr(cli, "CandidateEconomicsEvaluator", FakeEvaluator)
+    monkeypatch.setattr(cli, "make_public_http_client", reject_network)
+
+    exit_code = main(
+        [
+            "carry",
+            "economics",
+            "--policy",
+            str(policy_path),
+            "--db",
+            str(database),
+            "--evaluated-at",
+            "2026-08-13T17:00:07Z",
+            "--evaluation-id",
+            str(EVALUATION_ID),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == decision.value
+    assert sum(isinstance(call, tuple) and call[0] == "append" for call in calls) == 1
+    assert calls[-1] == "close"
 
 
 def test_dashboard_parser_has_local_read_only_arguments_only() -> None:
