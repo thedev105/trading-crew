@@ -14,7 +14,7 @@ from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.domain.models import Asset, BookLevel, Venue
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.dashboard import DashboardBuilder, render_dashboard_json
-from tests.carry.test_economics_models import KNOWN_AS_OF
+from tests.carry.test_economics_models import KNOWN_AS_OF, legacy_report_json
 from tests.carry.test_economics_models import report as economics_report
 from tests.domain.factories import (
     book_collection_cycle,
@@ -120,6 +120,40 @@ def test_builder_selects_only_point_in_time_economics_reports(tmp_path: Path) ->
     assert len(document["markets"]) == 12
     assert len(document["carry_rows"]) == 3
     assert len(document["funding_health"]["boundaries"]) == 24
+    store.close()
+
+
+def test_builder_keeps_legacy_economics_visible_but_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-economics.duckdb"
+    store = DuckDBStore(path)
+    current_shape = economics_report()
+    store._connection.execute(
+        """
+        INSERT INTO economic_evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?::JSON, ?, ?)
+        """,
+        [
+            current_shape.evaluation_id,
+            current_shape.asset.value,
+            current_shape.known_as_of,
+            current_shape.evaluated_at,
+            current_shape.decision.value,
+            current_shape.direction.value,
+            current_shape.policy_hash,
+            legacy_report_json(current_shape),
+            1,
+            "9" * 64,
+        ],
+    )
+
+    row = DashboardBuilder(store, path).build(current_shape.evaluated_at).economics_rows[0]
+
+    assert row.report_available is True
+    assert row.decision is EconomicsDecision.INSUFFICIENT_EVIDENCE
+    assert row.direction is None
+    assert row.primary_reason_code == "LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED"
+    assert row.assigned_capital_usd is None
+    assert row.known_as_of == current_shape.known_as_of
+    assert row.evaluated_at == current_shape.evaluated_at
     store.close()
 
 

@@ -74,7 +74,7 @@ class CandidateEconomicsEvaluator:
         )
         training_end = policy.study_end - timedelta(days=policy.evaluation_days)
         common = {
-            "schema_version": 1,
+            "schema_version": 2,
             "protocol_version": policy.protocol_version,
             "evaluation_id": evaluation_id,
             "asset": policy.asset,
@@ -467,7 +467,7 @@ def _complete_economics(
         assigned_return = net / position.assigned_capital_usd
         annualized = assigned_return * Decimal(365) / Decimal(stats.holding_days)
         horizon = HorizonEconomics(
-            schema_version=1,
+            schema_version=2,
             holding_days=stats.holding_days,
             conservative_funding_rate=gross / position.assigned_capital_usd,
             lighter_funding_rate_sum=stats.lighter_rate_sum,
@@ -570,7 +570,7 @@ def _complete_economics(
         reasons.add("STRESS_QUOTE_OBSERVATIONS_INSUFFICIENT")
 
     economics = CompleteEconomics(
-        schema_version=1,
+        schema_version=2,
         execution_assumptions=policy.execution_assumptions,
         margin_assumptions=policy.margin_assumptions,
         fee_schedules=bundle.fees,

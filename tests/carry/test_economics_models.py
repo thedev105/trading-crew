@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -15,6 +16,7 @@ from polytrading.carry.economics_models import (
     EvidenceCoverage,
     FundingDirection,
     HorizonEconomics,
+    LegacyEconomicEvaluationSummary,
     VenueExecutionAssumption,
     VenueMarginAssumption,
     canonical_policy_json,
@@ -172,7 +174,7 @@ def horizon(days: int, **overrides: object) -> HorizonEconomics:
     net = gross - Decimal("1.00") - reversal - basis
     assigned_return = net / Decimal("500")
     values: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "holding_days": days,
         "conservative_funding_rate": funding_rate,
         "lighter_funding_rate_sum": funding_rate * Decimal(2),
@@ -199,7 +201,7 @@ def complete_economics(**overrides: object) -> CompleteEconomics:
     horizon_rows = (horizon(7), horizon(14), horizon(28))
     twenty_eight = horizon_rows[-1]
     values: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "execution_assumptions": (
             execution_assumption(Venue.DYDX),
             execution_assumption(Venue.LIGHTER),
@@ -256,7 +258,7 @@ def complete_economics(**overrides: object) -> CompleteEconomics:
 
 def report(**overrides: object) -> CandidateEconomicsReport:
     values: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol_version": "lighter-dydx-shadow-economics-v1",
         "evaluation_id": UUID("00000000-0000-0000-0000-000000000701"),
         "asset": Asset.BTC,
@@ -278,6 +280,39 @@ def report(**overrides: object) -> CandidateEconomicsReport:
     }
     values.update(overrides)
     return CandidateEconomicsReport(**values)
+
+
+def legacy_report_json(item: CandidateEconomicsReport | None = None) -> str:
+    payload = (item or report()).model_dump(mode="json")
+    payload["schema_version"] = 1
+    economics = payload.get("economics")
+    if isinstance(economics, dict):
+        economics["schema_version"] = 1
+        for horizon_payload in economics["horizons"]:
+            horizon_payload["schema_version"] = 1
+            for key in (
+                "lighter_funding_rate_sum",
+                "dydx_funding_rate_sum",
+                "lighter_funding_usd",
+                "dydx_funding_usd",
+                "basis_divergence_rate",
+            ):
+                horizon_payload.pop(key)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def test_report_schema_two_and_legacy_summary_are_explicitly_distinct() -> None:
+    current = report()
+    legacy = LegacyEconomicEvaluationSummary.from_report_json(legacy_report_json(current))
+
+    assert current.schema_version == 2
+    assert current.economics is not None
+    assert current.economics.schema_version == 2
+    assert {item.schema_version for item in current.economics.horizons} == {2}
+    assert legacy.schema_version == 1
+    assert legacy.evaluation_id == current.evaluation_id
+    assert legacy.decision is current.decision
+    assert not hasattr(legacy, "economics")
 
 
 def test_policy_freezes_protocol_thresholds_and_assumption_order() -> None:

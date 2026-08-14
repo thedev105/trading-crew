@@ -34,7 +34,10 @@ from polytrading.venues.funding_cycle_models import FundingCollectionCycle
 from polytrading.venues.synchronized import BookCollectionCycle
 
 if TYPE_CHECKING:
-    from polytrading.carry.economics_models import CandidateEconomicsReport
+    from polytrading.carry.economics_models import (
+        CandidateEconomicsReport,
+        LegacyEconomicEvaluationSummary,
+    )
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -589,11 +592,11 @@ class DuckDBStore:
 
     def latest_economic_evaluation_as_of(
         self, asset: Asset, as_of: datetime
-    ) -> CandidateEconomicsReport | None:
+    ) -> CandidateEconomicsReport | LegacyEconomicEvaluationSummary | None:
         normalized_as_of = normalize_utc_timestamp(as_of)
         row = self._connection.execute(
             """
-            SELECT CAST(report_json AS VARCHAR)
+            SELECT CAST(report_json AS VARCHAR), schema_version
             FROM economic_evaluations
             WHERE asset = ? AND known_as_of <= ? AND evaluated_at <= ?
             ORDER BY evaluated_at DESC, evaluation_id DESC
@@ -603,9 +606,16 @@ class DuckDBStore:
         ).fetchone()
         if row is None:
             return None
-        from polytrading.carry.economics_models import CandidateEconomicsReport
+        from polytrading.carry.economics_models import (
+            CandidateEconomicsReport,
+            LegacyEconomicEvaluationSummary,
+        )
 
-        return CandidateEconomicsReport.model_validate_json(row[0])
+        if row[1] == 2:
+            return CandidateEconomicsReport.model_validate_json(row[0])
+        if row[1] == 1:
+            return LegacyEconomicEvaluationSummary.from_report_json(row[0])
+        raise ValueError(f"unsupported economic evaluation schema version: {row[1]}")
 
     def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
         normalized_as_of = normalize_utc_timestamp(as_of)

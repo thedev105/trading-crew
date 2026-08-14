@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -311,7 +311,7 @@ class EconomicsCostBreakdown(StrictRecord):
 
 
 class HorizonEconomics(StrictRecord):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     holding_days: Literal[7, 14, 28]
     conservative_funding_rate: Decimal
     lighter_funding_rate_sum: Decimal
@@ -345,7 +345,7 @@ class HorizonEconomics(StrictRecord):
 
 
 class CompleteEconomics(StrictRecord):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     execution_assumptions: tuple[VenueExecutionAssumption, VenueExecutionAssumption]
     margin_assumptions: tuple[VenueMarginAssumption, VenueMarginAssumption]
     fee_schedules: tuple[FeeSchedule, FeeSchedule]
@@ -504,8 +504,55 @@ class CompleteEconomics(StrictRecord):
         )
 
 
-class CandidateEconomicsReport(StrictRecord):
+class LegacyEconomicEvaluationSummary(StrictRecord):
+    """Top-level identity for immutable schema-one reports with invalid legacy math."""
+
     schema_version: Literal[1]
+    protocol_version: Literal["lighter-dydx-shadow-economics-v1"]
+    evaluation_id: UUID
+    asset: Asset
+    known_as_of: datetime
+    evaluated_at: datetime
+    decision: EconomicsDecision
+    reason_codes: tuple[str, ...]
+    direction: FundingDirection | None
+
+    @classmethod
+    def from_report_json(cls, report_json: str) -> Self:
+        payload = json.loads(report_json)
+        if not isinstance(payload, dict):
+            raise ValueError("legacy economic evaluation must be a JSON object")
+        summary_keys = (
+            "schema_version",
+            "protocol_version",
+            "evaluation_id",
+            "asset",
+            "known_as_of",
+            "evaluated_at",
+            "decision",
+            "reason_codes",
+            "direction",
+        )
+        summary = {key: payload.get(key) for key in summary_keys}
+        return cls.model_validate_json(json.dumps(summary, separators=(",", ":"), sort_keys=True))
+
+    @field_validator("known_as_of", "evaluated_at")
+    @classmethod
+    def require_legacy_timestamp(cls, value: datetime) -> datetime:
+        return normalize_utc_timestamp(value)
+
+    @field_validator("reason_codes")
+    @classmethod
+    def require_legacy_reason_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("reason codes must be sorted and unique")
+        if any(_REASON_CODE.fullmatch(code) is None for code in value):
+            raise ValueError("reason code must be an uppercase machine identifier")
+        return value
+
+
+class CandidateEconomicsReport(StrictRecord):
+    schema_version: Literal[2]
     protocol_version: Literal["lighter-dydx-shadow-economics-v1"]
     evaluation_id: UUID
     asset: Asset

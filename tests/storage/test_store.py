@@ -1,4 +1,5 @@
 import importlib.resources
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -7,7 +8,10 @@ from uuid import UUID
 import duckdb
 import pytest
 
-from polytrading.carry.economics_models import EconomicsDecision
+from polytrading.carry.economics_models import (
+    EconomicsDecision,
+    LegacyEconomicEvaluationSummary,
+)
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -28,7 +32,7 @@ from polytrading.venues.funding_cycle_models import (
     FundingCycleStatus,
     InstrumentCaptureOutcome,
 )
-from tests.carry.test_economics_models import report
+from tests.carry.test_economics_models import legacy_report_json, report
 from tests.domain.factories import (
     NOW,
     SOURCE_HASH,
@@ -841,6 +845,40 @@ def test_economic_evaluations_round_trip_all_decisions_and_retry_exactly(
         assert store.append_economic_evaluation(item) is False
         assert store.latest_economic_evaluation_as_of(item.asset, item.evaluated_at) == item
 
+    store.close()
+
+
+def test_economic_reader_preserves_legacy_schema_one_as_unsupported_summary(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    current_shape = report()
+    payload = legacy_report_json(current_shape)
+    store._connection.execute(
+        """
+        INSERT INTO economic_evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?::JSON, ?, ?)
+        """,
+        [
+            current_shape.evaluation_id,
+            current_shape.asset.value,
+            current_shape.known_as_of,
+            current_shape.evaluated_at,
+            current_shape.decision.value,
+            current_shape.direction.value,
+            current_shape.policy_hash,
+            payload,
+            1,
+            "9" * 64,
+        ],
+    )
+
+    stored = store.latest_economic_evaluation_as_of(current_shape.asset, current_shape.evaluated_at)
+
+    assert isinstance(stored, LegacyEconomicEvaluationSummary)
+    assert stored.evaluation_id == current_shape.evaluation_id
+    assert stored.decision is EconomicsDecision.SHADOW_CANDIDATE
+    assert stored.direction == current_shape.direction
+    assert json.loads(payload)["economics"]["horizons"][0].get("lighter_funding_usd") is None
     store.close()
 
 

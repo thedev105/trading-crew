@@ -144,6 +144,13 @@ A new append-only `economic_evaluations` table stores:
 identical content is idempotent; different content raises the existing conflicting-record error.
 Reports are never updated in place.
 
+Corrected reports use report, complete-economics, and horizon schema version 2. Development
+schema-one reports may already exist in an append-only store, but their missing per-venue
+components cannot be reconstructed. Readers preserve their top-level identity and timestamps as a
+minimal legacy summary; the dashboard displays `LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED` as
+`INSUFFICIENT_EVIDENCE` and withholds every economic value. It never rewrites the stored JSON,
+silently drops the record, or synthesizes the missing components.
+
 ### 5.5 Interfaces
 
 The CLI adds two read/research workflows:
@@ -478,7 +485,7 @@ ledger reconciliation, and a distinct user approval.
 
 `CandidateEconomicsReport` contains:
 
-- schema and protocol versions;
+- report schema version 2 and the protocol version;
 - evaluation UUID, asset, cutoff, evaluation time, training window, and evaluation window;
 - policy and source hashes;
 - decision and canonical reason codes;
@@ -552,7 +559,8 @@ hashes.
 - same-cycle book identity, age, skew, and historical selection;
 - missing, conflicting, duplicate, crossed, or lineage-free records fail closed;
 - immutable report insert, idempotent retry, conflict rejection, and migration packaging; and
-- existing databases migrate without rewriting prior records.
+- existing databases migrate without rewriting prior records; schema-one economics remain visible
+  as unsupported legacy summaries rather than being parsed as corrected economics.
 
 ### 14.3 Economic identity tests
 

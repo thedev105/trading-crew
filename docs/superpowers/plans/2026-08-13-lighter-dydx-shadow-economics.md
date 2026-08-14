@@ -50,6 +50,9 @@ The completed implementation and its regression tests incorporate these mandator
   source book's timestamp for freshness, skew, and lineage; and
 - include doubled opposite-side forced-exit depth in quantity sizing, downsizing before rejecting,
   and apply basis divergence to the average one-leg entry notional.
+- version corrected report, complete-economics, and horizon records as schema 2; retain any
+  development schema-one report as a minimal unsupported legacy summary with no reconstructed
+  economics.
 
 ## File Structure
 
@@ -222,7 +225,7 @@ Use nested models so missing evidence can withhold dependent values:
 
 ```python
 class CandidateEconomicsReport(StrictRecord):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     protocol_version: Literal["lighter-dydx-shadow-economics-v1"]
     evaluation_id: UUID
     asset: Asset
@@ -547,12 +550,16 @@ def append_economic_evaluation(self, record: CandidateEconomicsReport) -> bool: 
 
 def latest_economic_evaluation_as_of(
     self, asset: Asset, as_of: datetime
-) -> CandidateEconomicsReport | None: ...
+) -> CandidateEconomicsReport | LegacyEconomicEvaluationSummary | None: ...
 ```
 
 Use `_canonical_json`, `_record_hash`, and `_normalized_retry`. The latest reader must filter both
 `known_as_of <= ?` and `evaluated_at <= ?`, order by `evaluated_at DESC, evaluation_id DESC`, and
 validate stored JSON back into the strict report model.
+Dispatch on the stored schema version. Schema 2 is the corrected strict report. Parse schema 1 only
+into a top-level legacy identity/timestamp summary; never infer its missing venue components. The
+dashboard must keep that record visible as `LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED`, fail closed to
+`INSUFFICIENT_EVIDENCE`, and withhold every economic value.
 
 - [ ] **Step 4: Write failing cycle/book reader tests**
 

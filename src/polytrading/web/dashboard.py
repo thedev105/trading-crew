@@ -16,6 +16,10 @@ from polytrading.carry.audit import CarryAuditor
 from polytrading.carry.discovery import evaluate_discovery
 from polytrading.carry.dossier import evaluate_dossier, load_bundled_dossiers
 from polytrading.carry.dossier_models import ContractCompatibilityDossier
+from polytrading.carry.economics_models import (
+    EconomicsDecision,
+    LegacyEconomicEvaluationSummary,
+)
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
@@ -185,6 +189,22 @@ class DashboardBuilder:
                 conservative_28d_net_usd=None,
                 known_as_of=None,
                 evaluated_at=None,
+                stress_pass=None,
+            )
+        if isinstance(report, LegacyEconomicEvaluationSummary):
+            return EconomicsSummaryRow(
+                schema_version=1,
+                asset=asset,
+                report_available=True,
+                decision=EconomicsDecision.INSUFFICIENT_EVIDENCE,
+                direction=None,
+                primary_reason_code="LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED",
+                assigned_capital_usd=None,
+                conservative_7d_net_usd=None,
+                conservative_14d_net_usd=None,
+                conservative_28d_net_usd=None,
+                known_as_of=report.known_as_of,
+                evaluated_at=report.evaluated_at,
                 stress_pass=None,
             )
         economics = report.economics

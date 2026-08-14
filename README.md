@@ -564,6 +564,12 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
+Corrected shadow-economics reports use schema 2. If a development database contains a schema-one
+economics report from before the per-venue cashflow correction, the reader preserves its identity
+and timestamps but the dashboard labels it `LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED`, treats it as
+insufficient evidence, and withholds all economic values. Those missing venue components cannot be
+safely reconstructed from the old aggregate.
+
 ## 13. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
