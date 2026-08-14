@@ -31,6 +31,7 @@
 
   <nav class="section-nav" aria-label="Dashboard sections">
     <a href="#overview">Overview</a>
+    <a href="#trial">Trial</a>
     <a href="#markets">Markets</a>
     <a href="#compatibility">Discovery</a>
     <a href="#economics">Economics</a>
@@ -56,9 +57,49 @@
       </div>
     </section>
 
+    <section id="trial" class="dashboard-section" aria-labelledby="trial-title">
+      <div class="section-heading">
+        <div><p class="section-index">02 / PROSPECTIVE EVIDENCE</p><h2 id="trial-title">Lighter-dYdX prospective trial</h2></div>
+        <p>Research only. No trading authority. Evidence timing and a collection-only projection are shown without assessing returns.</p>
+      </div>
+      <div id="trial-summary" class="trial-summary" aria-live="polite"></div>
+      <div class="boundary-heading"><h3>Asset coverage</h3><p>Three canonical assets · exact study windows</p></div>
+      <div class="table-shell trial-table-shell">
+        <table class="trial-asset-table">
+          <thead><tr><th scope="col">Asset</th><th scope="col">Training funding</th><th scope="col">Evaluation funding</th><th scope="col">Total funding</th><th scope="col">Evaluation books</th><th scope="col">Current funding</th><th scope="col">Dense pairs</th><th scope="col">Consecutive samples</th><th scope="col">Latest funding</th><th scope="col">Latest book</th><th scope="col">Book age</th><th scope="col">Book skew</th><th scope="col">Mature windows</th><th scope="col">Fresh depth</th><th scope="col">Asset projection</th><th scope="col">Reasons</th></tr></thead>
+          <tbody id="trial-asset-rows"></tbody>
+        </table>
+      </div>
+      <div class="boundary-heading"><h3>Recent 24-hour boundary matrix</h3><p>Funding and representative book status by asset</p></div>
+      <div class="table-shell trial-matrix-shell">
+        <table class="trial-boundary-table">
+          <thead><tr><th scope="col">Boundary UTC</th><th scope="col">Status</th><th scope="col">Attempts</th><th scope="col">Complete</th><th scope="col">Degraded</th><th scope="col">Late</th><th scope="col">BTC funding</th><th scope="col">BTC book</th><th scope="col">ETH funding</th><th scope="col">ETH book</th><th scope="col">SOL funding</th><th scope="col">SOL book</th><th scope="col">Reasons</th></tr></thead>
+          <tbody id="trial-boundary-rows"></tbody>
+        </table>
+      </div>
+      <div class="trial-detail-grid">
+        <article class="trial-detail-card">
+          <div class="boundary-heading"><h3>Recent evidence reasons</h3><p>Exact sanitized codes</p></div>
+          <ul id="trial-gap-reasons" class="reason-list" aria-live="polite"></ul>
+        </article>
+        <article class="trial-detail-card">
+          <div class="boundary-heading"><h3>Evaluation handoff</h3><p>Closed until separately reviewed</p></div>
+          <p class="policy-note">Operator policy not assessed.</p>
+          <p>Readiness permits deterministic economics evaluation only; this console cannot start collection, import fees, evaluate policy, or trade.</p>
+        </article>
+      </div>
+      <div class="boundary-heading"><h3>Reviewed fee evidence</h3><p>Inventory only · no tier selected</p></div>
+      <div class="table-shell trial-fee-shell">
+        <table class="trial-fee-table">
+          <thead><tr><th scope="col">Venue</th><th scope="col">Tier</th><th scope="col">Effective from</th><th scope="col">Observed</th><th scope="col">Source hash</th></tr></thead>
+          <tbody id="trial-fees"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="markets" class="dashboard-section" aria-labelledby="markets-title">
       <div class="section-heading">
-        <div><p class="section-index">02 / PUBLIC EVIDENCE</p><h2 id="markets-title">Venue × market matrix</h2></div>
+        <div><p class="section-index">03 / PUBLIC EVIDENCE</p><h2 id="markets-title">Venue × market matrix</h2></div>
         <p>Native realized rates and the latest complete top-of-book. Unavailable means unavailable.</p>
       </div>
       <div class="table-shell">
@@ -71,7 +112,7 @@
 
     <section id="compatibility" class="dashboard-section" aria-labelledby="compatibility-title">
       <div class="section-heading">
-        <div><p class="section-index">03 / VENUE DISCOVERY</p><h2 id="compatibility-title">Venue discovery</h2></div>
+        <div><p class="section-index">04 / VENUE DISCOVERY</p><h2 id="compatibility-title">Venue discovery</h2></div>
         <p>Official-source facts ranked by structural admission status. Selection opens another research gate; it never authorizes trading.</p>
       </div>
       <div id="discovery-summary" class="dossier-summary" aria-live="polite"></div>
@@ -93,7 +134,7 @@
 
     <section id="economics" class="dashboard-section" aria-labelledby="economics-title">
       <div class="section-heading">
-        <div><p class="section-index">04 / SHADOW ECONOMICS</p><h2 id="economics-title">Conservative shadow economics</h2></div>
+        <div><p class="section-index">05 / SHADOW ECONOMICS</p><h2 id="economics-title">Conservative shadow economics</h2></div>
         <p>Research only — shadow candidate, not a fill, recommendation, or trading authorization.</p>
       </div>
       <div class="table-shell economics-table-shell">
@@ -106,7 +147,7 @@
 
     <section id="research" class="dashboard-section" aria-labelledby="research-title">
       <div class="section-heading">
-        <div><p class="section-index">05 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
+        <div><p class="section-index">06 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
         <p>Bybit ↔ Hyperliquid diagnostics only. No dYdX compatibility is inferred.</p>
       </div>
       <div id="carry-rows" class="carry-grid"></div>
@@ -114,7 +155,7 @@
 
     <section id="evidence" class="dashboard-section" aria-labelledby="evidence-title">
       <div class="section-heading">
-        <div><p class="section-index">06 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
+        <div><p class="section-index">07 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
         <p>Records known at this snapshot cutoff, not unfiltered table totals.</p>
       </div>
       <dl id="evidence-counts" class="count-grid"></dl>
@@ -122,7 +163,7 @@
 
     <section id="operations" class="dashboard-section" aria-labelledby="operations-title">
       <div class="section-heading">
-        <div><p class="section-index">07 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
+        <div><p class="section-index">08 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
         <p>Copy-only commands. This page never starts a collector or executes a process.</p>
       </div>
       <div id="recipe-list" class="recipe-list"></div>
