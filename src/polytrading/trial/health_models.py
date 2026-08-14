@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Literal
+from itertools import pairwise
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
@@ -37,6 +39,14 @@ _MAXIMUM_BOOK_AGE_SECONDS = Decimal("30")
 _MAXIMUM_BOOK_SKEW_MS = Decimal("1000")
 
 
+class _ValidatedCopyRecord(StrictRecord):
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        values = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            values.update(update)
+        return type(self).model_validate(values)
+
+
 class TrialCollectionStatus(StrEnum):
     NOT_STARTED = "NOT_STARTED"
     COLLECTING = "COLLECTING"
@@ -58,6 +68,37 @@ class TrialWindowBoundaries:
     total_funding: tuple[datetime, ...]
     evaluation_books: tuple[datetime, ...]
     current_funding: tuple[datetime, ...]
+
+    def __post_init__(self) -> None:
+        named_windows = (
+            ("training funding", self.training_funding, _TRAINING_HOURS),
+            ("evaluation funding", self.evaluation_funding, _EVALUATION_HOURS),
+            ("total funding", self.total_funding, _TOTAL_FUNDING_HOURS),
+            ("evaluation books", self.evaluation_books, _EVALUATION_HOURS),
+            ("current funding", self.current_funding, _CURRENT_FUNDING_HOURS),
+        )
+        for name, boundaries, expected_length in named_windows:
+            if not isinstance(boundaries, tuple) or len(boundaries) != expected_length:
+                raise ValueError(f"{name} must contain exactly {expected_length} boundaries")
+            if any(
+                boundary.tzinfo is None or boundary.utcoffset() != timedelta(0)
+                for boundary in boundaries
+            ):
+                raise ValueError(f"{name} boundaries must be UTC-aware")
+            if any(
+                any((boundary.minute, boundary.second, boundary.microsecond))
+                for boundary in boundaries
+            ):
+                raise ValueError(f"{name} boundaries must align to whole UTC hours")
+            if any(right - left != _HOUR for left, right in pairwise(boundaries)):
+                raise ValueError(f"{name} boundaries must be strictly hourly consecutive")
+
+        if self.training_funding + self.evaluation_funding != self.total_funding:
+            raise ValueError("training and evaluation funding must partition total funding")
+        if self.evaluation_books != self.evaluation_funding:
+            raise ValueError("evaluation book and funding boundaries must be identical")
+        if self.current_funding != self.total_funding[-_CURRENT_FUNDING_HOURS:]:
+            raise ValueError("current funding must share the final total-funding anchor")
 
 
 def resolve_latest_auditable_trial_boundary(as_of: datetime) -> datetime:
@@ -94,7 +135,7 @@ def trial_window_boundaries(study_end: datetime) -> TrialWindowBoundaries:
     )
 
 
-class TrialBoundaryAssetHealth(StrictRecord):
+class TrialBoundaryAssetHealth(_ValidatedCopyRecord):
     schema_version: Literal[1]
     asset: Asset
     funding_status: TrialEvidenceStatus
@@ -117,8 +158,35 @@ class TrialBoundaryAssetHealth(StrictRecord):
             raise ValueError("reason codes must be sorted and unique")
         return value
 
+    @model_validator(mode="after")
+    def require_consistent_asset_evidence(self) -> TrialBoundaryAssetHealth:
+        reasons: set[str] = set()
+        if self.funding_status is TrialEvidenceStatus.COMPLETE:
+            if not self.selected_funding_cycle_ids:
+                raise ValueError("complete funding requires selected cycle IDs")
+        else:
+            if self.selected_funding_cycle_ids:
+                raise ValueError("nonqualifying funding cannot select cycle IDs")
+            reasons.add(
+                f"FUNDING_{self.asset.value}_REVISION_CONFLICT"
+                if self.funding_status is TrialEvidenceStatus.DEGRADED
+                else f"FUNDING_{self.asset.value}_MISSING"
+            )
 
-class TrialBoundaryHealth(StrictRecord):
+        if self.book_status is TrialEvidenceStatus.COMPLETE:
+            if self.selected_book_cycle_id is None:
+                raise ValueError("complete book requires a selected cycle ID")
+        else:
+            if self.selected_book_cycle_id is not None:
+                raise ValueError("nonqualifying book cannot select a cycle ID")
+            reasons.add(f"BOOK_{self.asset.value}_MISSING")
+
+        if self.reason_codes != tuple(sorted(reasons)):
+            raise ValueError("reason codes do not match asset evidence")
+        return self
+
+
+class TrialBoundaryHealth(_ValidatedCopyRecord):
     schema_version: Literal[1]
     cycle_end: datetime
     status: TrialEvidenceStatus
@@ -165,16 +233,20 @@ class TrialBoundaryHealth(StrictRecord):
         )
         if self.status is not expected_status:
             raise ValueError("boundary status does not match conservative asset evidence")
-        if self.reason_codes != _boundary_reasons(
-            self.status,
-            attempt_count=self.attempt_count,
-            complete_attempt_count=self.complete_attempt_count,
-        ):
+        expected_reasons = set(
+            _boundary_reasons(
+                self.status,
+                attempt_count=self.attempt_count,
+                complete_attempt_count=self.complete_attempt_count,
+            )
+        )
+        expected_reasons.update(reason for asset in self.assets for reason in asset.reason_codes)
+        if self.reason_codes != tuple(sorted(expected_reasons)):
             raise ValueError("reason codes do not match boundary evidence")
         return self
 
 
-class ReviewedFeeEvidenceSummary(StrictRecord):
+class ReviewedFeeEvidenceSummary(_ValidatedCopyRecord):
     schema_version: Literal[1]
     venue: Venue
     tier_name: str
@@ -198,7 +270,7 @@ class ReviewedFeeEvidenceSummary(StrictRecord):
         return self
 
 
-class TrialAssetCoverage(StrictRecord):
+class TrialAssetCoverage(_ValidatedCopyRecord):
     schema_version: Literal[1]
     asset: Asset
     requested_training_funding_hours: Literal[720]
@@ -377,7 +449,7 @@ class TrialAssetCoverage(StrictRecord):
                 raise ValueError(f"missing {name} boundaries must belong to its fixed window")
 
 
-class LighterDydxTrialHealthReport(StrictRecord):
+class LighterDydxTrialHealthReport(_ValidatedCopyRecord):
     schema_version: Literal[1]
     protocol_version: Literal["lighter-dydx-trial-health-v1"]
     as_of: datetime
@@ -455,6 +527,34 @@ class LighterDydxTrialHealthReport(StrictRecord):
             or any(item.observed_at > self.as_of for item in self.reviewed_fees)
         ):
             raise ValueError("report must not contain future evidence")
+        for asset in self.assets:
+            if asset.latest_book_completed_at is not None:
+                if asset.latest_book_completed_at > self.as_of:
+                    raise ValueError("latest book completion must not follow as-of")
+                assert asset.latest_book_age_seconds is not None
+                expected_age = Decimal(
+                    (self.as_of - asset.latest_book_completed_at) // timedelta(microseconds=1)
+                ) / Decimal(1_000_000)
+                if asset.latest_book_age_seconds != expected_age:
+                    raise ValueError("latest book age must equal as-of minus completion")
+            if (
+                asset.historical_windows_mature
+                and asset.latest_funding_boundary != self.latest_auditable_boundary
+            ):
+                raise ValueError("mature asset funding anchor must equal latest boundary")
+
+        current_windows = trial_window_boundaries(self.latest_auditable_boundary)
+        for asset in self.assets:
+            current_missing_windows = (
+                (asset.missing_training_funding_boundaries, current_windows.training_funding),
+                (asset.missing_evaluation_funding_boundaries, current_windows.evaluation_funding),
+                (asset.missing_book_boundaries, current_windows.evaluation_books),
+                (asset.missing_current_funding_boundaries, current_windows.current_funding),
+            )
+            if any(
+                not set(missing).issubset(allowed) for missing, allowed in current_missing_windows
+            ):
+                raise ValueError("missing boundaries must belong to the current study window")
 
         if self.trial_started_at is None:
             if self.status is not TrialCollectionStatus.NOT_STARTED:

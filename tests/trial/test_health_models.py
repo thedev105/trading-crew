@@ -17,6 +17,7 @@ from polytrading.trial.health_models import (
     TrialBoundaryHealth,
     TrialCollectionStatus,
     TrialEvidenceStatus,
+    TrialWindowBoundaries,
     resolve_latest_auditable_trial_boundary,
     trial_window_boundaries,
 )
@@ -76,6 +77,48 @@ def test_latest_boundary_rejects_naive_and_pre_epoch_cutoffs(as_of: datetime) ->
 def test_trial_windows_require_whole_hour_end() -> None:
     with pytest.raises(ValueError, match="whole UTC hour"):
         trial_window_boundaries(at(17, 1))
+
+
+def test_direct_trial_window_construction_is_fail_closed() -> None:
+    windows = trial_window_boundaries(at(17))
+    values = {
+        "training_funding": windows.training_funding,
+        "evaluation_funding": windows.evaluation_funding,
+        "total_funding": windows.total_funding,
+        "evaluation_books": windows.evaluation_books,
+        "current_funding": windows.current_funding,
+    }
+    assert TrialWindowBoundaries(**values) == windows
+
+    invalid_updates = (
+        {"training_funding": windows.training_funding[:-1]},
+        {
+            "evaluation_funding": (
+                windows.evaluation_funding[0].replace(tzinfo=None),
+                *windows.evaluation_funding[1:],
+            )
+        },
+        {
+            "total_funding": (
+                *windows.total_funding[:100],
+                windows.total_funding[99],
+                *windows.total_funding[101:],
+            )
+        },
+        {
+            "evaluation_books": tuple(
+                boundary - timedelta(hours=1) for boundary in windows.evaluation_books
+            )
+        },
+        {
+            "current_funding": tuple(
+                boundary - timedelta(hours=1) for boundary in windows.current_funding
+            )
+        },
+    )
+    for update in invalid_updates:
+        with pytest.raises(ValueError):
+            TrialWindowBoundaries(**(values | update))
 
 
 def asset_health(asset: Asset, **overrides: object) -> TrialBoundaryAssetHealth:
@@ -138,7 +181,7 @@ def coverage(asset: Asset, **overrides: object) -> TrialAssetCoverage:
         "dense_book_pair_count": 1,
         "consecutive_dense_sample_count": 1,
         "latest_funding_boundary": windows.total_funding[-1],
-        "latest_book_completed_at": at(17),
+        "latest_book_completed_at": at(17, 4, 30),
         "latest_book_age_seconds": Decimal("30"),
         "latest_book_skew_ms": Decimal("1000"),
         "fresh_book_ready": True,
@@ -163,6 +206,13 @@ def fee(venue: Venue, **overrides: object) -> ReviewedFeeEvidenceSummary:
     return ReviewedFeeEvidenceSummary(**values)
 
 
+def test_reviewed_fee_evidence_rejects_unsupported_venue_and_blank_tier() -> None:
+    with pytest.raises(ValidationError, match="dYdX or Lighter"):
+        fee(Venue.BYBIT)
+    with pytest.raises(ValidationError, match="must not be blank"):
+        fee(Venue.DYDX, tier_name="   ")
+
+
 def report(**overrides: object) -> LighterDydxTrialHealthReport:
     current = boundary()
     values: dict[str, object] = {
@@ -185,6 +235,27 @@ def report(**overrides: object) -> LighterDydxTrialHealthReport:
     return LighterDydxTrialHealthReport(**values)
 
 
+@pytest.mark.parametrize(
+    ("record", "update"),
+    [
+        (asset_health(Asset.BTC), {"reason_codes": ("Z", "A")}),
+        (boundary(), {"status": TrialEvidenceStatus.DEGRADED}),
+        (fee(Venue.DYDX), {"venue": Venue.BYBIT}),
+        (coverage(Asset.BTC), {"paired_total_funding_hours": 0}),
+        (report(), {"warnings": ("changed", *TRIAL_HEALTH_WARNINGS[1:])}),
+    ],
+)
+def test_health_record_copy_revalidates_updates(record: object, update: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        record.model_copy(update=update)  # type: ignore[attr-defined]
+
+
+def test_boundary_asset_validated_copy_supports_asset_helpers() -> None:
+    copied = asset_health(Asset.BTC).model_copy(update={"asset": Asset.ETH})
+
+    assert copied.asset is Asset.ETH
+
+
 def test_boundary_health_requires_canonical_assets_counts_status_and_reasons() -> None:
     assert boundary().status is TrialEvidenceStatus.COMPLETE
     with pytest.raises(ValidationError, match="assets must use canonical"):
@@ -195,6 +266,71 @@ def test_boundary_health_requires_canonical_assets_counts_status_and_reasons() -
         boundary(status=TrialEvidenceStatus.DEGRADED)
     with pytest.raises(ValidationError, match="reason codes do not match"):
         boundary(reason_codes=("BOUNDARY_MISSING",))
+
+
+def test_boundary_asset_statuses_require_exact_selections_and_reasons() -> None:
+    missing = asset_health(
+        Asset.BTC,
+        funding_status=TrialEvidenceStatus.MISSING,
+        book_status=TrialEvidenceStatus.MISSING,
+        selected_funding_cycle_ids=(),
+        selected_book_cycle_id=None,
+        reason_codes=("BOOK_BTC_MISSING", "FUNDING_BTC_MISSING"),
+    )
+    conflict = asset_health(
+        Asset.ETH,
+        funding_status=TrialEvidenceStatus.DEGRADED,
+        book_status=TrialEvidenceStatus.COMPLETE,
+        selected_funding_cycle_ids=(),
+        reason_codes=("FUNDING_ETH_REVISION_CONFLICT",),
+    )
+    assert missing.reason_codes == ("BOOK_BTC_MISSING", "FUNDING_BTC_MISSING")
+    assert conflict.reason_codes == ("FUNDING_ETH_REVISION_CONFLICT",)
+
+    invalid_updates = (
+        {"selected_funding_cycle_ids": ()},
+        {
+            "funding_status": TrialEvidenceStatus.MISSING,
+            "reason_codes": ("FUNDING_BTC_MISSING",),
+        },
+        {"selected_book_cycle_id": None},
+        {
+            "book_status": TrialEvidenceStatus.MISSING,
+            "reason_codes": ("BOOK_BTC_MISSING",),
+        },
+        {
+            "funding_status": TrialEvidenceStatus.MISSING,
+            "selected_funding_cycle_ids": (),
+        },
+    )
+    for update in invalid_updates:
+        with pytest.raises(ValidationError):
+            asset_health(Asset.BTC).model_copy(update=update)
+
+
+def test_boundary_reasons_are_exact_union_of_boundary_and_asset_reasons() -> None:
+    btc = asset_health(
+        Asset.BTC,
+        funding_status=TrialEvidenceStatus.MISSING,
+        selected_funding_cycle_ids=(),
+        reason_codes=("FUNDING_BTC_MISSING",),
+    )
+    reasons = ("BOUNDARY_MISSING", "FUNDING_BTC_MISSING")
+
+    assert (
+        boundary(
+            status=TrialEvidenceStatus.MISSING,
+            assets=(btc, asset_health(Asset.ETH), asset_health(Asset.SOL)),
+            reason_codes=reasons,
+        ).reason_codes
+        == reasons
+    )
+    with pytest.raises(ValidationError, match="reason codes do not match"):
+        boundary(
+            status=TrialEvidenceStatus.MISSING,
+            assets=(btc, asset_health(Asset.ETH), asset_health(Asset.SOL)),
+            reason_codes=("BOUNDARY_MISSING",),
+        )
 
 
 def coverage_values(
@@ -280,6 +416,31 @@ def test_asset_coverage_requires_exact_current_window_and_derived_booleans() -> 
         TrialAssetCoverage(**invalid)
 
 
+def test_missing_boundary_containment_is_fail_closed_for_direct_and_copy() -> None:
+    values = coverage_values(training=712, books=1426)
+    outside = trial_window_boundaries(at(17)).total_funding[0] - timedelta(hours=1)
+    invalid_missing = (outside, *values["missing_training_funding_boundaries"][1:])
+    values["missing_training_funding_boundaries"] = invalid_missing
+
+    with pytest.raises(ValidationError, match="fixed window"):
+        TrialAssetCoverage(**values)
+    with pytest.raises(ValidationError, match="fixed window"):
+        coverage(Asset.BTC).model_copy(
+            update={
+                "paired_training_funding_hours": 712,
+                "training_funding_coverage": Decimal(712) / Decimal(720),
+                "paired_total_funding_hours": 2_152,
+                "total_funding_coverage": Decimal(2_152) / Decimal(2_160),
+                "missing_training_funding_boundaries": invalid_missing,
+                "historical_windows_mature": False,
+                "reason_codes": (
+                    "FUNDING_COVERAGE_INSUFFICIENT",
+                    "FUNDING_TRAINING_COVERAGE_INSUFFICIENT",
+                ),
+            }
+        )
+
+
 def test_report_requires_exact_statuses_ordering_and_elapsed_inclusive_count() -> None:
     assert report().elapsed_auditable_hours == 1
     with pytest.raises(ValidationError, match="elapsed"):
@@ -290,6 +451,73 @@ def test_report_requires_exact_statuses_ordering_and_elapsed_inclusive_count() -
         report(source_hashes=(HASH_B, HASH_A))
     with pytest.raises(ValidationError, match="exact research warnings"):
         report(warnings=("changed", *TRIAL_HEALTH_WARNINGS[1:]))
+
+
+def test_recent_boundaries_cover_only_started_intersection() -> None:
+    at_16 = boundary(cycle_end=at(16))
+    at_17 = boundary()
+    started = report(
+        recent_hours=3,
+        trial_started_at=at(16),
+        elapsed_auditable_hours=2,
+        recent_boundaries=(at_16, at_17),
+    )
+    assert tuple(item.cycle_end for item in started.recent_boundaries) == (at(16), at(17))
+
+    with pytest.raises(ValidationError, match="exact started recent window"):
+        report(
+            recent_hours=3,
+            trial_started_at=at(16),
+            elapsed_auditable_hours=2,
+            recent_boundaries=(boundary(cycle_end=at(15)), at_16, at_17),
+        )
+    with pytest.raises(ValidationError, match="exact started recent window"):
+        started.model_copy(update={"recent_boundaries": (at_17,)})
+
+
+@pytest.mark.parametrize(
+    ("completed_at", "age_seconds"),
+    [
+        (at(17, 5, microsecond=1), Decimal("0")),
+        (at(17, 4, 30), Decimal("29")),
+    ],
+)
+def test_report_rejects_future_or_fabricated_latest_book_age(
+    completed_at: datetime, age_seconds: Decimal
+) -> None:
+    assets = tuple(
+        coverage(
+            asset,
+            latest_book_completed_at=completed_at,
+            latest_book_age_seconds=age_seconds,
+        )
+        for asset in Asset
+    )
+
+    with pytest.raises(ValidationError, match="latest book"):
+        report(assets=assets)
+
+
+@pytest.mark.parametrize("anchor", [None, at(16)])
+def test_mature_assets_require_current_funding_anchor(anchor: datetime | None) -> None:
+    assets = tuple(coverage(asset, latest_funding_boundary=anchor) for asset in Asset)
+
+    with pytest.raises(ValidationError, match="funding anchor"):
+        report(assets=assets)
+
+
+def test_report_anchors_missing_windows_to_current_study_end() -> None:
+    stale_windows = trial_window_boundaries(at(16))
+    values = coverage_values(training=712, books=1426)
+    values.update(
+        latest_funding_boundary=at(16),
+        missing_training_funding_boundaries=stale_windows.training_funding[:8],
+    )
+    stale = TrialAssetCoverage(**values)
+    assets = tuple(stale.model_copy(update={"asset": asset}) for asset in Asset)
+
+    with pytest.raises(ValidationError, match="current study window"):
+        report(status=TrialCollectionStatus.COLLECTING, assets=assets)
 
 
 def test_report_status_coherence_including_calendar_immaturity() -> None:
