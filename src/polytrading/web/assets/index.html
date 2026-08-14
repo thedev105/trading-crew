@@ -32,6 +32,7 @@
     <a href="#overview">Overview</a>
     <a href="#markets">Markets</a>
     <a href="#compatibility">Discovery</a>
+    <a href="#economics">Economics</a>
     <a href="#research">Research gate</a>
     <a href="#evidence">Evidence</a>
     <a href="#operations">Operations</a>
@@ -89,9 +90,22 @@
       </div>
     </section>
 
+    <section id="economics" class="dashboard-section" aria-labelledby="economics-title">
+      <div class="section-heading">
+        <div><p class="section-index">04 / SHADOW ECONOMICS</p><h2 id="economics-title">Conservative shadow economics</h2></div>
+        <p>Research only — shadow candidate, not a fill, recommendation, or trading authorization.</p>
+      </div>
+      <div class="table-shell economics-table-shell">
+        <table class="economics-table">
+          <thead><tr><th scope="col">Asset</th><th scope="col">Decision</th><th scope="col">Direction</th><th scope="col">Primary reason</th><th scope="col">Assigned capital</th><th scope="col">7-day net</th><th scope="col">14-day net</th><th scope="col">28-day net</th><th scope="col">Evidence cutoff</th><th scope="col">Evaluated</th><th scope="col">Stress</th></tr></thead>
+          <tbody id="economics-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="research" class="dashboard-section" aria-labelledby="research-title">
       <div class="section-heading">
-        <div><p class="section-index">04 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
+        <div><p class="section-index">05 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
         <p>Bybit ↔ Hyperliquid diagnostics only. No dYdX compatibility is inferred.</p>
       </div>
       <div id="carry-rows" class="carry-grid"></div>
@@ -99,7 +113,7 @@
 
     <section id="evidence" class="dashboard-section" aria-labelledby="evidence-title">
       <div class="section-heading">
-        <div><p class="section-index">05 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
+        <div><p class="section-index">06 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
         <p>Records known at this snapshot cutoff, not unfiltered table totals.</p>
       </div>
       <dl id="evidence-counts" class="count-grid"></dl>
@@ -107,7 +121,7 @@
 
     <section id="operations" class="dashboard-section" aria-labelledby="operations-title">
       <div class="section-heading">
-        <div><p class="section-index">06 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
+        <div><p class="section-index">07 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
         <p>Copy-only commands. This page never starts a collector or executes a process.</p>
       </div>
       <div id="recipe-list" class="recipe-list"></div>

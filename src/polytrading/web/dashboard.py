@@ -24,6 +24,7 @@ from polytrading.web.models import (
     BookCycleSummary,
     CarryEvidenceRow,
     DashboardSnapshot,
+    EconomicsSummaryRow,
     EvidenceCounts,
     FundingCycleSummary,
     MarketEvidenceRow,
@@ -131,6 +132,7 @@ class DashboardBuilder:
                 )
                 for row in carry.assets
             ),
+            economics_rows=tuple(self._economics_row(asset, normalized_as_of) for asset in _ASSETS),
             evidence_counts=EvidenceCounts(**self._store.evidence_counts_as_of(normalized_as_of)),
             operation_recipes=_operation_recipes(self._database_path),
         )
@@ -165,6 +167,58 @@ class DashboardBuilder:
             spread_bps=spread_bps,
             book_effective_at=book_effective_at,
             book_observed_at=book_observed_at,
+        )
+
+    def _economics_row(self, asset: Asset, as_of: datetime) -> EconomicsSummaryRow:
+        report = self._store.latest_economic_evaluation_as_of(asset, as_of)
+        if report is None:
+            return EconomicsSummaryRow(
+                schema_version=1,
+                asset=asset,
+                report_available=False,
+                decision=None,
+                direction=None,
+                primary_reason_code=None,
+                assigned_capital_usd=None,
+                conservative_7d_net_usd=None,
+                conservative_14d_net_usd=None,
+                conservative_28d_net_usd=None,
+                known_as_of=None,
+                evaluated_at=None,
+                stress_pass=None,
+            )
+        economics = report.economics
+        if economics is None:
+            assigned = seven = fourteen = twenty_eight = stress_pass = None
+        else:
+            horizons = {item.holding_days: item for item in economics.horizons}
+            assigned = economics.assigned_capital_usd
+            seven = horizons[7].conservative_net_usd
+            fourteen = horizons[14].conservative_net_usd
+            twenty_eight = horizons[28].conservative_net_usd
+            stress_pass = all(
+                (
+                    economics.doubled_cost_28d_pass,
+                    economics.stress_loss_pass,
+                    economics.drawdown_pass,
+                    economics.liquidation_pass,
+                    economics.quote_observations_pass,
+                )
+            )
+        return EconomicsSummaryRow(
+            schema_version=1,
+            asset=asset,
+            report_available=True,
+            decision=report.decision,
+            direction=report.direction,
+            primary_reason_code=(report.reason_codes[0] if report.reason_codes else None),
+            assigned_capital_usd=assigned,
+            conservative_7d_net_usd=seven,
+            conservative_14d_net_usd=fourteen,
+            conservative_28d_net_usd=twenty_eight,
+            known_as_of=report.known_as_of,
+            evaluated_at=report.evaluated_at,
+            stress_pass=stress_pass,
         )
 
 

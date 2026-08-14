@@ -35,6 +35,8 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
     assert [item["dossier_id"] for item in document["venue_discovery"]["candidates"]] == [
         "hyperliquid-dydx-core-v1"
     ]
+    assert [item["asset"] for item in document["economics_rows"]] == ["BTC", "ETH", "SOL"]
+    assert all(not item["report_available"] for item in document["economics_rows"])
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"

@@ -10,9 +10,12 @@ from polytrading.carry.dossier import (
     load_bundled_dossier,
 )
 from polytrading.carry.dossier_models import DossierStatus
+from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.domain.models import Asset, BookLevel, Venue
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.dashboard import DashboardBuilder, render_dashboard_json
+from tests.carry.test_economics_models import KNOWN_AS_OF
+from tests.carry.test_economics_models import report as economics_report
 from tests.domain.factories import (
     book_collection_cycle,
     book_snapshot,
@@ -50,12 +53,73 @@ def test_empty_store_snapshot_fails_closed_without_invented_values(tmp_path: Pat
         AuditStatus.INSUFFICIENT_DATA,
         AuditStatus.INSUFFICIENT_DATA,
     )
+    assert tuple(row.asset for row in snapshot.economics_rows) == (
+        Asset.BTC,
+        Asset.ETH,
+        Asset.SOL,
+    )
+    assert all(not row.report_available for row in snapshot.economics_rows)
     assert set(snapshot.evidence_counts.model_dump().values()) == {0}
     assert snapshot.compatibility_dossier is not None
     assert snapshot.compatibility_dossier.status is DossierStatus.INELIGIBLE
     assert snapshot.venue_discovery is not None
     assert snapshot.venue_discovery.selected_dossier_id is None
     assert len(snapshot.venue_discovery.candidates) == 1
+    store.close()
+
+
+def test_builder_selects_only_point_in_time_economics_reports(tmp_path: Path) -> None:
+    path = tmp_path / "economics.duckdb"
+    store = DuckDBStore(path)
+    insufficient = economics_report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000b01"),
+        evaluated_at=KNOWN_AS_OF + timedelta(seconds=1),
+        decision=EconomicsDecision.INSUFFICIENT_EVIDENCE,
+        reason_codes=("BOOK_COVERAGE_INSUFFICIENT",),
+        direction=None,
+        short_venue=None,
+        long_venue=None,
+        economics=None,
+    )
+    rejected = economics_report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000b02"),
+        evaluated_at=KNOWN_AS_OF + timedelta(seconds=5),
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("COMPATIBILITY_BLOCKING",),
+    )
+    future = economics_report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000b03"),
+        evaluated_at=KNOWN_AS_OF + timedelta(seconds=9),
+    )
+    for item in (insufficient, rejected, future):
+        store.append_economic_evaluation(item)
+
+    before = DashboardBuilder(store, path).build(KNOWN_AS_OF)
+    at_insufficient = DashboardBuilder(store, path).build(insufficient.evaluated_at)
+    at_rejected = DashboardBuilder(store, path).build(rejected.evaluated_at)
+    before_future = DashboardBuilder(store, path).build(future.evaluated_at - timedelta(seconds=1))
+
+    assert not before.economics_rows[0].report_available
+    insufficient_row = at_insufficient.economics_rows[0]
+    assert insufficient_row.decision is EconomicsDecision.INSUFFICIENT_EVIDENCE
+    assert insufficient_row.primary_reason_code == "BOOK_COVERAGE_INSUFFICIENT"
+    assert insufficient_row.assigned_capital_usd is None
+    rejected_row = at_rejected.economics_rows[0]
+    assert rejected_row.decision is EconomicsDecision.REJECTED
+    assert rejected_row.assigned_capital_usd == Decimal("500")
+    assert rejected_row.conservative_7d_net_usd == Decimal("8.80")
+    assert rejected_row.conservative_14d_net_usd == Decimal("13.80")
+    assert rejected_row.conservative_28d_net_usd == Decimal("18.80")
+    assert rejected_row.stress_pass is True
+    assert before_future.economics_rows[0] == rejected_row
+    assert all(not row.report_available for row in at_rejected.economics_rows[1:])
+
+    document = json.loads(render_dashboard_json(at_rejected))
+    assert len(document["economics_rows"]) == 3
+    assert document["economics_rows"][0]["assigned_capital_usd"] == "500"
+    assert len(document["markets"]) == 12
+    assert len(document["carry_rows"]) == 3
+    assert len(document["funding_health"]["boundaries"]) == 24
     store.close()
 
 

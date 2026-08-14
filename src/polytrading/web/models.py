@@ -11,6 +11,10 @@ from pydantic import Field, field_validator, model_validator
 from polytrading.carry.audit import AuditStatus
 from polytrading.carry.discovery_models import VenueDiscoveryReport
 from polytrading.carry.dossier_models import ContractDossierReport
+from polytrading.carry.economics_models import (
+    EconomicsDecision,
+    FundingDirection,
+)
 from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
 from polytrading.venues.funding_health_models import FundingCollectionHealthReport
@@ -127,6 +131,80 @@ class CarryEvidenceRow(StrictRecord):
         return value
 
 
+class EconomicsSummaryRow(StrictRecord):
+    schema_version: Literal[1]
+    asset: Asset
+    report_available: bool
+    decision: EconomicsDecision | None
+    direction: FundingDirection | None
+    primary_reason_code: str | None
+    assigned_capital_usd: Annotated[Decimal, Field(gt=0, allow_inf_nan=False)] | None
+    conservative_7d_net_usd: Decimal | None
+    conservative_14d_net_usd: Decimal | None
+    conservative_28d_net_usd: Decimal | None
+    known_as_of: datetime | None
+    evaluated_at: datetime | None
+    stress_pass: bool | None
+
+    @field_validator("known_as_of", "evaluated_at")
+    @classmethod
+    def normalize_optional_timestamp(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_timestamp(value)
+
+    @field_validator("primary_reason_code")
+    @classmethod
+    def require_nonblank_reason(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("primary reason code must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def require_coherent_availability(self) -> EconomicsSummaryRow:
+        report_fields = (
+            self.decision,
+            self.direction,
+            self.primary_reason_code,
+            self.assigned_capital_usd,
+            self.conservative_7d_net_usd,
+            self.conservative_14d_net_usd,
+            self.conservative_28d_net_usd,
+            self.known_as_of,
+            self.evaluated_at,
+            self.stress_pass,
+        )
+        if not self.report_available:
+            if any(value is not None for value in report_fields):
+                raise ValueError("unavailable economics row must withhold report fields")
+            return self
+        if self.decision is None or self.known_as_of is None or self.evaluated_at is None:
+            raise ValueError("available economics row requires decision and timestamps")
+        if self.evaluated_at < self.known_as_of:
+            raise ValueError("economics evaluation time must not precede evidence cutoff")
+        complete_fields = (
+            self.assigned_capital_usd,
+            self.conservative_7d_net_usd,
+            self.conservative_14d_net_usd,
+            self.conservative_28d_net_usd,
+            self.stress_pass,
+        )
+        has_complete = all(value is not None for value in complete_fields)
+        has_partial = any(value is not None for value in complete_fields)
+        if has_partial and not has_complete:
+            raise ValueError("complete economics fields must be present together")
+        if has_complete and self.direction is None:
+            raise ValueError("complete economics fields require a direction")
+        if self.decision is EconomicsDecision.SHADOW_CANDIDATE:
+            if not has_complete or self.primary_reason_code is not None:
+                raise ValueError("shadow summary requires complete fields and no reason")
+        elif self.primary_reason_code is None:
+            raise ValueError("non-shadow summary requires a primary reason")
+        if self.decision is EconomicsDecision.INSUFFICIENT_EVIDENCE and (
+            self.direction is not None or has_complete
+        ):
+            raise ValueError("insufficient summary must withhold direction and economics")
+        return self
+
+
 class FundingCycleSummary(StrictRecord):
     schema_version: Literal[1]
     cycle_id: UUID
@@ -182,6 +260,7 @@ class DashboardSnapshot(StrictRecord):
     venue_discovery: VenueDiscoveryReport | None
     markets: tuple[MarketEvidenceRow, ...]
     carry_rows: tuple[CarryEvidenceRow, ...]
+    economics_rows: tuple[EconomicsSummaryRow, ...]
     evidence_counts: EvidenceCounts
     operation_recipes: OperationRecipes
 
@@ -213,6 +292,15 @@ class DashboardSnapshot(StrictRecord):
     ) -> tuple[CarryEvidenceRow, ...]:
         if tuple(row.asset for row in value) != _ASSETS:
             raise ValueError("carry rows must cover BTC, ETH, and SOL in canonical order")
+        return value
+
+    @field_validator("economics_rows")
+    @classmethod
+    def require_canonical_economics(
+        cls, value: tuple[EconomicsSummaryRow, ...]
+    ) -> tuple[EconomicsSummaryRow, ...]:
+        if tuple(row.asset for row in value) != _ASSETS:
+            raise ValueError("economics rows must cover BTC, ETH, and SOL in canonical order")
         return value
 
     @model_validator(mode="after")
@@ -261,4 +349,10 @@ class DashboardSnapshot(StrictRecord):
         )
         if any(timestamp > self.as_of for timestamp in timestamps):
             raise ValueError("market evidence must not follow dashboard as-of")
+        if any(
+            timestamp is not None and timestamp > self.as_of
+            for row in self.economics_rows
+            for timestamp in (row.known_as_of, row.evaluated_at)
+        ):
+            raise ValueError("economics report must not follow dashboard as-of")
         return self

@@ -17,6 +17,7 @@ const nodes = {
   dossierRows: document.querySelector("#dossier-rows"),
   dossierLeftHeading: document.querySelector("#dossier-left-heading"),
   dossierRightHeading: document.querySelector("#dossier-right-heading"),
+  economicsRows: document.querySelector("#economics-rows"),
   carryRows: document.querySelector("#carry-rows"),
   evidenceCounts: document.querySelector("#evidence-counts"),
   recipeList: document.querySelector("#recipe-list"),
@@ -258,6 +259,41 @@ function renderCarry(snapshot) {
   nodes.carryRows.replaceChildren(...cards);
 }
 
+const economicsTones = {
+  SHADOW_CANDIDATE: "shadow_candidate",
+  REJECTED: "rejected",
+  INSUFFICIENT_EVIDENCE: "insufficient_evidence",
+};
+
+function usd(value) {
+  return value === null || value === undefined ? null : `${value} USD`;
+}
+
+function renderEconomics(snapshot) {
+  const rows = snapshot.economics_rows.map((item) => {
+    const row = document.createElement("tr");
+    const decision = tableCell(item.decision, "decision-cell");
+    decision.dataset.tone = item.report_available
+      ? economicsTones[item.decision] || "missing"
+      : "missing";
+    row.append(
+      tableCell(item.asset, "venue-name"),
+      decision,
+      tableCell(item.direction),
+      tableCell(item.primary_reason_code, "summary-cell"),
+      tableCell(usd(item.assigned_capital_usd)),
+      tableCell(usd(item.conservative_7d_net_usd), numericClass(item.conservative_7d_net_usd)),
+      tableCell(usd(item.conservative_14d_net_usd), numericClass(item.conservative_14d_net_usd)),
+      tableCell(usd(item.conservative_28d_net_usd), numericClass(item.conservative_28d_net_usd)),
+      tableCell(compactTime(item.known_as_of)),
+      tableCell(compactTime(item.evaluated_at)),
+      tableCell(item.stress_pass === null ? null : item.stress_pass ? "Pass" : "Fail"),
+    );
+    return row;
+  });
+  nodes.economicsRows.replaceChildren(...rows);
+}
+
 const countLabels = {
   raw_envelopes: "Raw envelopes",
   instrument_specs: "Instrument specs",
@@ -314,6 +350,7 @@ function render(snapshot) {
   renderOverview(snapshot);
   renderMarkets(snapshot);
   renderDiscovery(snapshot);
+  renderEconomics(snapshot);
   renderCarry(snapshot);
   renderCounts(snapshot);
   renderRecipes(snapshot);
@@ -324,6 +361,9 @@ function validateSnapshot(snapshot) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!snapshot.funding_health || !Array.isArray(snapshot.funding_health.boundaries)) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (!Array.isArray(snapshot.economics_rows) || snapshot.economics_rows.length !== 3) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!Object.prototype.hasOwnProperty.call(snapshot, "compatibility_dossier")) {

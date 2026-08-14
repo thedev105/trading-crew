@@ -10,6 +10,7 @@
   --cyan-soft: #183d37;
   --amber: #f1bd67;
   --coral: #ff7c70;
+  --info: #8eb7ff;
   --quiet: #465853;
   --radius: 18px;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -241,10 +242,12 @@ footer {
 [data-tone="complete"],
 [data-tone="diagnostic_only"],
 [data-tone="matched"] { --tone: var(--cyan); }
+[data-tone="shadow_candidate"] { --tone: var(--info); }
 [data-tone="degraded"],
 [data-tone="late"],
 [data-tone="stale"],
 [data-tone="model_required"] { --tone: var(--amber); }
+[data-tone="insufficient_evidence"] { --tone: var(--amber); }
 [data-tone="critical"],
 [data-tone="missing"],
 [data-tone="ineligible"],
@@ -252,6 +255,7 @@ footer {
 [data-tone="failed"],
 [data-tone="blocking"],
 [data-tone="missing_evidence"] { --tone: var(--coral); }
+[data-tone="rejected"] { --tone: var(--coral); }
 
 .status-card { box-shadow: inset 0 3px 0 var(--tone, var(--quiet)); }
 .status-card .value, .status-pill { color: var(--tone, var(--muted)); }
@@ -308,6 +312,10 @@ tbody tr:hover { background: rgba(98, 230, 207, 0.035); }
 .dossier-table .check-name { color: var(--cyan); }
 .dossier-table .summary-cell { min-width: 285px; white-space: normal; line-height: 1.55; }
 .judgment-cell { color: var(--tone, var(--muted)); text-transform: uppercase; }
+
+.economics-table { min-width: 1460px; }
+.economics-table .summary-cell { min-width: 260px; white-space: normal; line-height: 1.45; }
+.economics-table .decision-cell { color: var(--tone, var(--muted)); font-weight: 700; }
 
 .carry-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .carry-card { padding: 22px; }

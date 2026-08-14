@@ -36,6 +36,8 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         "dossier-left-heading",
         "dossier-right-heading",
         "research",
+        "economics",
+        "economics-rows",
         "operations",
         "refresh",
         "refresh-status",
@@ -44,6 +46,7 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         tag == "a" and attrs.get("class") == "skip-link" and attrs.get("href") == "#main"
         for tag, attrs in tags
     )
+    assert any(tag == "a" and attrs.get("href") == "#economics" for tag, attrs in tags)
     assert any(
         tag == "script" and attrs.get("type") == "module" and attrs.get("src") == "/assets/app.js"
         for tag, attrs in tags
@@ -74,6 +77,8 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
     assert "nodes.candidateRows.replaceChildren" in javascript
     assert "nodes.dossierLeftHeading.textContent" in javascript
     assert "nodes.dossierRightHeading.textContent" in javascript
+    assert "renderEconomics(snapshot)" in javascript
+    assert "nodes.economicsRows.replaceChildren" in javascript
     assert 'hasOwnProperty.call(snapshot, "venue_discovery")' in javascript
     for forbidden in (
         "innerhtml",
@@ -98,6 +103,23 @@ def test_dashboard_client_accepts_the_canonical_twelve_market_rows() -> None:
 
     assert "snapshot.markets.length !== 12" in javascript
     assert "snapshot.markets.length !== 9" not in javascript
+    assert "snapshot.economics_rows.length !== 3" in javascript
+
+
+def test_economics_section_is_research_only_and_has_explicit_unavailable_values() -> None:
+    html = _asset("index.html")
+    javascript = _asset("app.js")
+
+    assert "Conservative shadow economics" in html
+    assert (
+        "Research only — shadow candidate, not a fill, recommendation, or trading authorization."
+        in html
+    )
+    assert "Unavailable" in javascript
+    assert "SHADOW_CANDIDATE" in javascript
+    assert "INSUFFICIENT_EVIDENCE" in javascript
+    assert "REJECTED" in javascript
+    assert "<form" not in html.lower()
 
 
 def test_discovery_copy_is_neutral_and_keeps_activation_closed() -> None:
@@ -123,3 +145,6 @@ def test_dashboard_styles_cover_focus_mobile_and_reduced_motion() -> None:
     assert '[data-tone="model_required"]' in css
     assert '[data-tone="missing_evidence"]' in css
     assert '[data-tone="matched"]' in css
+    assert '[data-tone="shadow_candidate"]' in css
+    assert '[data-tone="rejected"]' in css
+    assert '[data-tone="insufficient_evidence"]' in css

@@ -11,12 +11,14 @@ from polytrading.carry.dossier import (
     load_bundled_dossier,
     load_bundled_dossiers,
 )
+from polytrading.carry.economics_models import EconomicsDecision, FundingDirection
 from polytrading.domain.models import Asset, Venue
 from polytrading.venues.funding_health import FundingCollectionHealthAuditor
 from polytrading.web.models import (
     RESEARCH_WARNING,
     CarryEvidenceRow,
     DashboardSnapshot,
+    EconomicsSummaryRow,
     EvidenceCounts,
     MarketEvidenceRow,
     OperationRecipes,
@@ -78,6 +80,27 @@ def _carry_rows() -> tuple[CarryEvidenceRow, ...]:
     )
 
 
+def _economics_rows() -> tuple[EconomicsSummaryRow, ...]:
+    return tuple(
+        EconomicsSummaryRow(
+            schema_version=1,
+            asset=asset,
+            report_available=False,
+            decision=None,
+            direction=None,
+            primary_reason_code=None,
+            assigned_capital_usd=None,
+            conservative_7d_net_usd=None,
+            conservative_14d_net_usd=None,
+            conservative_28d_net_usd=None,
+            known_as_of=None,
+            evaluated_at=None,
+            stress_pass=None,
+        )
+        for asset in ASSETS
+    )
+
+
 def _snapshot_values() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -91,6 +114,7 @@ def _snapshot_values() -> dict[str, object]:
         "venue_discovery": None,
         "markets": _market_rows(),
         "carry_rows": _carry_rows(),
+        "economics_rows": _economics_rows(),
         "evidence_counts": EvidenceCounts(
             raw_envelopes=0,
             instrument_specs=0,
@@ -115,6 +139,7 @@ def test_snapshot_requires_every_market_pair_and_carry_asset_in_canonical_order(
 
     assert tuple((row.venue, row.asset) for row in snapshot.markets) == EXPECTED_PAIRS
     assert tuple(row.asset for row in snapshot.carry_rows) == ASSETS
+    assert tuple(row.asset for row in snapshot.economics_rows) == ASSETS
 
     values["markets"] = tuple(reversed(_market_rows()))
     with pytest.raises(ValidationError, match="markets must cover"):
@@ -123,6 +148,77 @@ def test_snapshot_requires_every_market_pair_and_carry_asset_in_canonical_order(
     values = _snapshot_values()
     values["carry_rows"] = tuple(reversed(_carry_rows()))
     with pytest.raises(ValidationError, match="carry rows must cover"):
+        DashboardSnapshot(**values)
+
+    values = _snapshot_values()
+    values["economics_rows"] = tuple(reversed(_economics_rows()))
+    with pytest.raises(ValidationError, match="economics rows must cover"):
+        DashboardSnapshot(**values)
+
+
+def test_economics_summary_requires_coherent_nullable_groups() -> None:
+    unavailable = _economics_rows()[0]
+    assert unavailable.report_available is False
+
+    insufficient = EconomicsSummaryRow(
+        schema_version=1,
+        asset=Asset.BTC,
+        report_available=True,
+        decision=EconomicsDecision.INSUFFICIENT_EVIDENCE,
+        direction=None,
+        primary_reason_code="BOOK_COVERAGE_INSUFFICIENT",
+        assigned_capital_usd=None,
+        conservative_7d_net_usd=None,
+        conservative_14d_net_usd=None,
+        conservative_28d_net_usd=None,
+        known_as_of=AS_OF - datetime.resolution,
+        evaluated_at=AS_OF,
+        stress_pass=None,
+    )
+    assert insufficient.primary_reason_code == "BOOK_COVERAGE_INSUFFICIENT"
+
+    values = insufficient.model_dump()
+    values["assigned_capital_usd"] = Decimal("100")
+    with pytest.raises(ValidationError, match="complete economics fields"):
+        EconomicsSummaryRow(**values)
+
+    complete = insufficient.model_dump()
+    complete.update(
+        {
+            "decision": EconomicsDecision.SHADOW_CANDIDATE,
+            "direction": FundingDirection.SHORT_LIGHTER_LONG_DYDX,
+            "primary_reason_code": None,
+            "assigned_capital_usd": Decimal("397.98"),
+            "conservative_7d_net_usd": Decimal("4"),
+            "conservative_14d_net_usd": Decimal("17"),
+            "conservative_28d_net_usd": Decimal("44"),
+            "stress_pass": True,
+        }
+    )
+    assert EconomicsSummaryRow(**complete).stress_pass is True
+
+
+def test_snapshot_rejects_economics_report_after_dashboard_cutoff() -> None:
+    values = _snapshot_values()
+    rows = list(_economics_rows())
+    rows[0] = EconomicsSummaryRow(
+        schema_version=1,
+        asset=Asset.BTC,
+        report_available=True,
+        decision=EconomicsDecision.INSUFFICIENT_EVIDENCE,
+        direction=None,
+        primary_reason_code="BOOK_COVERAGE_INSUFFICIENT",
+        assigned_capital_usd=None,
+        conservative_7d_net_usd=None,
+        conservative_14d_net_usd=None,
+        conservative_28d_net_usd=None,
+        known_as_of=AS_OF,
+        evaluated_at=AS_OF + datetime.resolution,
+        stress_pass=None,
+    )
+    values["economics_rows"] = tuple(rows)
+
+    with pytest.raises(ValidationError, match="economics report must not follow"):
         DashboardSnapshot(**values)
 
 
