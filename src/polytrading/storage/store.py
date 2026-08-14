@@ -30,6 +30,7 @@ from polytrading.domain.models import (
 )
 from polytrading.ledger.models import JournalTransaction, TrialBalanceRow
 from polytrading.research.models import ExperimentRecord
+from polytrading.trial.funding_models import LighterDydxFundingCycle
 from polytrading.venues.funding_cycle_models import FundingCollectionCycle
 from polytrading.venues.synchronized import BookCollectionCycle
 
@@ -272,6 +273,12 @@ class DuckDBStore:
             return self._append_funding_collection_cycle(record)
         with self.transaction():
             return self._append_funding_collection_cycle(record)
+
+    def append_lighter_dydx_funding_cycle(self, record: LighterDydxFundingCycle) -> bool:
+        if self._in_transaction:
+            return self._append_lighter_dydx_funding_cycle(record)
+        with self.transaction():
+            return self._append_lighter_dydx_funding_cycle(record)
 
     def append_fee_schedule(self, record: FeeSchedule) -> bool:
         if self._normalized_retry(
@@ -683,6 +690,43 @@ class DuckDBStore:
         ).fetchone()
         return None if row is None else FundingCollectionCycle.model_validate_json(row[0])
 
+    def lighter_dydx_funding_cycles_between(
+        self, start: datetime, end: datetime, known_as_of: datetime
+    ) -> tuple[LighterDydxFundingCycle, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
+        if normalized_known_as_of < normalized_end:
+            raise ValueError("known_as_of must be greater than or equal to end")
+        rows = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM lighter_dydx_funding_cycles
+            WHERE cycle_end >= ? AND cycle_end <= ? AND request_completed_at <= ?
+            ORDER BY cycle_end, request_completed_at, cycle_id
+            """,
+            [normalized_start, normalized_end, normalized_known_as_of],
+        ).fetchall()
+        return tuple(LighterDydxFundingCycle.model_validate_json(row[0]) for row in rows)
+
+    def latest_lighter_dydx_funding_cycle_as_of(
+        self, as_of: datetime
+    ) -> LighterDydxFundingCycle | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM lighter_dydx_funding_cycles
+            WHERE request_completed_at <= ?
+            ORDER BY request_completed_at DESC, cycle_end DESC, cycle_id DESC
+            LIMIT 1
+            """,
+            [normalized_as_of],
+        ).fetchone()
+        return None if row is None else LighterDydxFundingCycle.model_validate_json(row[0])
+
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         normalized_as_of = normalize_utc_timestamp(as_of)
         queries = (
@@ -701,6 +745,10 @@ class DuckDBStore:
             (
                 "funding_collection_cycles",
                 "SELECT count(*) FROM funding_collection_cycles WHERE request_completed_at <= ?",
+            ),
+            (
+                "lighter_dydx_funding_cycles",
+                "SELECT count(*) FROM lighter_dydx_funding_cycles WHERE request_completed_at <= ?",
             ),
         )
         return {
@@ -764,6 +812,40 @@ class DuckDBStore:
             source_url=row[6],
             source_hash=row[7],
             schema_version=row[8],
+        )
+
+    def reviewed_fee_schedules_as_of(self, as_of: datetime) -> tuple[FeeSchedule, ...]:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        rows = self._connection.execute(
+            """
+            SELECT venue, tier_name, maker_rate, taker_rate, epoch_us(effective_from),
+                   epoch_us(observed_at), source_url, source_hash, schema_version
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY venue, tier_name
+                    ORDER BY effective_from DESC, observed_at DESC, source_hash DESC
+                ) AS revision_rank
+                FROM fee_schedules
+                WHERE effective_from <= ? AND observed_at <= ?
+            ) AS applicable_fees
+            WHERE revision_rank = 1
+            ORDER BY venue, tier_name, effective_from, observed_at, source_hash
+            """,
+            [normalized_as_of, normalized_as_of],
+        ).fetchall()
+        return tuple(
+            FeeSchedule(
+                venue=Venue(row[0]),
+                tier_name=row[1],
+                maker_rate=row[2],
+                taker_rate=row[3],
+                effective_from=_utc_from_epoch_us(row[4]),
+                observed_at=_utc_from_epoch_us(row[5]),
+                source_url=row[6],
+                source_hash=row[7],
+                schema_version=row[8],
+            )
+            for row in rows
         )
 
     def funding_between(
@@ -954,6 +1036,28 @@ class DuckDBStore:
             return False
         self._connection.execute(
             "INSERT INTO funding_collection_cycles VALUES (?, ?, ?, ?, ?::JSON, ?)",
+            [
+                record.cycle_id,
+                record.cycle_end,
+                record.request_completed_at,
+                record.status.value,
+                _canonical_json(record),
+                _record_hash(record),
+            ],
+        )
+        return True
+
+    def _append_lighter_dydx_funding_cycle(self, record: LighterDydxFundingCycle) -> bool:
+        if self._normalized_retry(
+            "Lighter-dYdX funding cycle",
+            record,
+            "lighter_dydx_funding_cycles",
+            "cycle_id = ?",
+            [record.cycle_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO lighter_dydx_funding_cycles VALUES (?, ?, ?, ?, ?::JSON, ?)",
             [
                 record.cycle_id,
                 record.cycle_end,

@@ -23,6 +23,15 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.funding_models import (
+    TRIAL_FUNDING_PROTOCOL_VERSION,
+    TRIAL_FUNDING_WARNINGS,
+    LighterDydxFundingCycle,
+    LighterDydxFundingItem,
+    TrialFundingCycleStatus,
+    TrialFundingOutcome,
+    TrialInstrumentOutcome,
+)
 from polytrading.venues.funding_cycle_models import (
     FUNDING_CYCLE_PROTOCOL_VERSION,
     FUNDING_CYCLE_WARNINGS,
@@ -205,8 +214,181 @@ def funding_collection_cycle(**overrides: object) -> FundingCollectionCycle:
     return FundingCollectionCycle(**values)
 
 
+def trial_funding_cycle(**overrides: object) -> LighterDydxFundingCycle:
+    cycle_end = overrides.pop("cycle_end", NOW)
+    items = (
+        LighterDydxFundingItem(
+            schema_version=1,
+            venue=Venue.DYDX,
+            asset=Asset.BTC,
+            symbol="BTC-USD",
+            instrument_outcome=TrialInstrumentOutcome.CAPTURED,
+            funding_outcome=TrialFundingOutcome.CAPTURED,
+            instrument_observed_at=cycle_end + timedelta(minutes=1),
+            funding_effective_at=cycle_end,
+            funding_observed_at=cycle_end + timedelta(minutes=2),
+            instrument_source_hashes=(SOURCE_HASH,),
+            funding_source_hashes=(OTHER_SOURCE_HASH,),
+            reason_codes=(),
+        ),
+        LighterDydxFundingItem(
+            schema_version=1,
+            venue=Venue.LIGHTER,
+            asset=Asset.BTC,
+            symbol="BTC",
+            instrument_outcome=TrialInstrumentOutcome.CAPTURED,
+            funding_outcome=TrialFundingOutcome.CAPTURED,
+            instrument_observed_at=cycle_end + timedelta(minutes=1),
+            funding_effective_at=cycle_end,
+            funding_observed_at=cycle_end + timedelta(minutes=2),
+            instrument_source_hashes=(THIRD_SOURCE_HASH,),
+            funding_source_hashes=(FOURTH_SOURCE_HASH,),
+            reason_codes=(),
+        ),
+    )
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "protocol_version": TRIAL_FUNDING_PROTOCOL_VERSION,
+        "cycle_id": UUID("00000000-0000-0000-0000-000000000905"),
+        "cycle_end": cycle_end,
+        "assets": (Asset.BTC,),
+        "venues": (Venue.DYDX, Venue.LIGHTER),
+        "request_started_at": cycle_end + timedelta(seconds=30),
+        "request_completed_at": cycle_end + timedelta(minutes=2),
+        "items": items,
+        "status": TrialFundingCycleStatus.COMPLETE,
+        "source_hashes": (SOURCE_HASH, OTHER_SOURCE_HASH, THIRD_SOURCE_HASH, FOURTH_SOURCE_HASH),
+        "warnings": TRIAL_FUNDING_WARNINGS,
+    }
+    values.update(overrides)
+    return LighterDydxFundingCycle(**values)
+
+
 def open_store(path: Path) -> DuckDBStore:
     return DuckDBStore(path)
+
+
+def test_current_schema_contains_lighter_dydx_trial_cycles(tmp_path: Path) -> None:
+    path = tmp_path / "trial.duckdb"
+    store = DuckDBStore(path)
+    tables = {row[0] for row in store._connection.execute("SHOW TABLES").fetchall()}
+    store.close()
+
+    assert "lighter_dydx_funding_cycles" in tables
+
+
+def test_lighter_dydx_cycle_round_trip_is_idempotent_and_cutoff_safe(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "trial.duckdb")
+    cycle = trial_funding_cycle()
+
+    assert store.append_lighter_dydx_funding_cycle(cycle) is True
+    assert store.append_lighter_dydx_funding_cycle(cycle) is False
+    assert store.lighter_dydx_funding_cycles_between(
+        cycle.cycle_end, cycle.cycle_end, cycle.request_completed_at
+    ) == (cycle,)
+    assert (
+        store.lighter_dydx_funding_cycles_between(
+            cycle.cycle_end,
+            cycle.cycle_end,
+            cycle.request_completed_at - timedelta(microseconds=1),
+        )
+        == ()
+    )
+    assert store.latest_lighter_dydx_funding_cycle_as_of(cycle.request_completed_at) == cycle
+    store.close()
+
+
+def test_lighter_dydx_cycle_conflicts_and_reader_windows_fail_closed(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "trial.duckdb")
+    cycle = trial_funding_cycle()
+    store.append_lighter_dydx_funding_cycle(cycle)
+
+    with pytest.raises(
+        ConflictingRecordError,
+        match="conflicting Lighter-dYdX funding cycle for immutable identity",
+    ):
+        store.append_lighter_dydx_funding_cycle(
+            trial_funding_cycle(
+                request_completed_at=cycle.request_completed_at + timedelta(seconds=1)
+            )
+        )
+    with pytest.raises(ValueError, match="start must be less than or equal to end"):
+        store.lighter_dydx_funding_cycles_between(
+            cycle.cycle_end, cycle.cycle_end - timedelta(hours=1), cycle.request_completed_at
+        )
+    with pytest.raises(ValueError, match="known_as_of must be greater than or equal to end"):
+        store.lighter_dydx_funding_cycles_between(
+            cycle.cycle_end, cycle.cycle_end, cycle.cycle_end - timedelta(microseconds=1)
+        )
+    store.close()
+
+
+def test_reviewed_fee_inventory_is_point_in_time_and_canonical(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "trial.duckdb")
+    as_of = NOW + timedelta(hours=1)
+    retail_old = fee_schedule(
+        venue=Venue.DYDX,
+        tier_name="retail",
+        effective_from=as_of - timedelta(days=2),
+        observed_at=as_of - timedelta(days=2),
+    )
+    retail_current = fee_schedule(
+        venue=Venue.DYDX,
+        tier_name="retail",
+        maker_rate=Decimal("0.0002"),
+        effective_from=as_of - timedelta(days=1),
+        observed_at=as_of - timedelta(days=1),
+        source_hash=OTHER_SOURCE_HASH,
+    )
+    volume_one = fee_schedule(
+        venue=Venue.DYDX,
+        tier_name="volume-1",
+        effective_from=as_of - timedelta(days=1),
+        observed_at=as_of - timedelta(days=1),
+        source_hash=THIRD_SOURCE_HASH,
+    )
+    standard = fee_schedule(
+        venue=Venue.LIGHTER,
+        tier_name="standard",
+        effective_from=as_of - timedelta(days=1),
+        observed_at=as_of - timedelta(days=1),
+        source_hash=FOURTH_SOURCE_HASH,
+    )
+    future_effective = fee_schedule(
+        venue=Venue.LIGHTER,
+        tier_name="future-effective",
+        effective_from=as_of + timedelta(microseconds=1),
+        observed_at=as_of,
+        source_hash=OTHER_SOURCE_HASH,
+    )
+    future_observed = fee_schedule(
+        venue=Venue.LIGHTER,
+        tier_name="future-observed",
+        effective_from=as_of - timedelta(days=1),
+        observed_at=as_of + timedelta(microseconds=1),
+        source_hash=THIRD_SOURCE_HASH,
+    )
+    for record in (
+        future_observed,
+        standard,
+        retail_current,
+        future_effective,
+        volume_one,
+        retail_old,
+    ):
+        store.append_fee_schedule(record)
+    store.append_lighter_dydx_funding_cycle(trial_funding_cycle())
+
+    fees = store.reviewed_fee_schedules_as_of(as_of)
+
+    assert fees == (retail_current, volume_one, standard)
+    assert tuple((item.venue, item.tier_name) for item in fees) == (
+        (Venue.DYDX, "retail"),
+        (Venue.DYDX, "volume-1"),
+        (Venue.LIGHTER, "standard"),
+    )
+    assert store.evidence_counts_as_of(as_of)["lighter_dydx_funding_cycles"] == 1
+    store.close()
 
 
 def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Path) -> None:
@@ -218,14 +400,14 @@ def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Pat
     with duckdb.connect(str(path), read_only=True) as connection:
         assert connection.execute(
             "SELECT version, count(*) FROM schema_migrations GROUP BY version"
-        ).fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1)]
+        ).fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
 
 
 def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [5, NOW])
+        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [6, NOW])
 
     with pytest.raises(RuntimeError, match="not a known prefix"):
         open_store(path)
@@ -235,7 +417,7 @@ def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> No
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
 
     with pytest.raises(RuntimeError, match="read-only store requires current schema"):
         DuckDBStore(path, read_only=True)
@@ -258,6 +440,14 @@ def test_migration_sql_is_available_as_packaged_data() -> None:
     )
     assert economics_migration.is_file()
     assert "CREATE TABLE economic_evaluations" in economics_migration.read_text(encoding="utf-8")
+
+    trial_operations_migration = importlib.resources.files("polytrading.storage.schema").joinpath(
+        "005_lighter_dydx_trial_operations.sql"
+    )
+    assert trial_operations_migration.is_file()
+    assert "CREATE TABLE lighter_dydx_funding_cycles" in trial_operations_migration.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_existing_version_three_database_migrates_without_rewriting_prior_rows(
@@ -297,7 +487,7 @@ def test_existing_version_three_database_migrates_without_rewriting_prior_rows(
         ).fetchone() == (1, "9" * 64)
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
 
 
 def test_funding_collection_cycle_round_trips_and_exact_retry_is_idempotent(
@@ -397,6 +587,7 @@ def test_latest_funding_cycle_and_evidence_counts_are_point_in_time(tmp_path: Pa
         "book_snapshots": 0,
         "book_collection_cycles": 0,
         "funding_collection_cycles": 1,
+        "lighter_dydx_funding_cycles": 0,
     }
     store.close()
 
@@ -413,6 +604,7 @@ def test_dashboard_reads_are_empty_and_require_aware_cutoff(tmp_path: Path) -> N
         "book_snapshots": 0,
         "book_collection_cycles": 0,
         "funding_collection_cycles": 0,
+        "lighter_dydx_funding_cycles": 0,
     }
     for reader in (
         store.latest_funding_collection_cycle_as_of,
