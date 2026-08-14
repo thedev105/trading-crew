@@ -32,6 +32,7 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         "trial-asset-rows",
         "trial-boundary-rows",
         "trial-gap-reasons",
+        "trial-economics",
         "trial-fees",
         "markets",
         "market-rows",
@@ -144,6 +145,7 @@ def test_trial_client_validates_and_renders_the_complete_trial_contract() -> Non
     assert "function renderTrial(snapshot)" in javascript
     assert "function renderTrialAssets(trial)" in javascript
     assert "function renderTrialBoundaries(trial)" in javascript
+    assert "function renderTrialEconomics(trial)" in javascript
     assert "renderTrial(snapshot);" in javascript
     assert 'NOT_STARTED: "missing"' in javascript
     assert 'COLLECTING: "collecting"' in javascript
@@ -179,6 +181,11 @@ def test_trial_client_validates_and_renders_the_complete_trial_contract() -> Non
         "complete_attempt_count",
         "degraded_attempt_count",
         "late_attempt_count",
+        "failed_book_attempt_count",
+        "skewed_book_attempt_count",
+        "evaluation_schema_version",
+        "evaluation_id",
+        "policy_hash",
         "reason_codes",
     ):
         assert required_field in javascript

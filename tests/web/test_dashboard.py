@@ -235,6 +235,11 @@ def test_builder_selects_only_point_in_time_economics_reports(tmp_path: Path) ->
     assert rejected_row.conservative_28d_net_usd == Decimal("18.80")
     assert rejected_row.stress_pass is True
     assert before_future.economics_rows[0] == rejected_row
+    trial_economics = at_rejected.trial_health.economics[0]
+    assert trial_economics.evaluation_id == rejected.evaluation_id
+    assert trial_economics.policy_hash == rejected.policy_hash
+    assert trial_economics.reason_codes == rejected.reason_codes
+    assert before_future.trial_health.economics[0] == trial_economics
     assert all(not row.report_available for row in at_rejected.economics_rows[1:])
 
     document = json.loads(render_dashboard_json(at_rejected))
@@ -277,6 +282,13 @@ def test_builder_keeps_legacy_economics_visible_but_fails_closed(tmp_path: Path)
     assert row.assigned_capital_usd is None
     assert row.known_as_of == current_shape.known_as_of
     assert row.evaluated_at == current_shape.evaluated_at
+    trial_summary = (
+        DashboardBuilder(store, path).build(current_shape.evaluated_at).trial_health.economics[0]
+    )
+    assert trial_summary.evaluation_schema_version == 1
+    assert trial_summary.policy_hash is None
+    assert trial_summary.decision is current_shape.decision
+    assert "LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED" in trial_summary.reason_codes
     store.close()
 
 

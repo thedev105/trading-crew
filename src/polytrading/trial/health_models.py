@@ -11,6 +11,7 @@ from uuid import UUID
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
+from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.domain.models import Asset, StrictRecord, Venue, normalize_utc_timestamp
 
 NonnegativeInt = Annotated[int, Field(ge=0)]
@@ -142,6 +143,8 @@ class TrialBoundaryAssetHealth(_ValidatedCopyRecord):
     book_status: TrialEvidenceStatus
     selected_funding_cycle_ids: tuple[UUID, ...]
     selected_book_cycle_id: UUID | None
+    failed_book_attempt_count: NonnegativeInt
+    skewed_book_attempt_count: NonnegativeInt
     reason_codes: tuple[str, ...]
 
     @field_validator("selected_funding_cycle_ids")
@@ -167,11 +170,30 @@ class TrialBoundaryAssetHealth(_ValidatedCopyRecord):
         else:
             if self.selected_funding_cycle_ids:
                 raise ValueError("nonqualifying funding cannot select cycle IDs")
-            reasons.add(
-                f"FUNDING_{self.asset.value}_REVISION_CONFLICT"
-                if self.funding_status is TrialEvidenceStatus.DEGRADED
-                else f"FUNDING_{self.asset.value}_MISSING"
-            )
+            if self.funding_status is TrialEvidenceStatus.DEGRADED:
+                asset = self.asset.value
+                degraded = {
+                    f"FUNDING_{asset}_REVISION_CONFLICT",
+                    f"FUNDING_{asset}_LINKAGE_MISSING",
+                    *(
+                        f"FUNDING_{asset}_{venue}_{outcome}"
+                        for venue in ("DYDX", "LIGHTER")
+                        for outcome in ("FAILED", "MISSING_EXPECTED")
+                    ),
+                    *(f"INSTRUMENT_{asset}_{venue}_FAILED" for venue in ("DYDX", "LIGHTER")),
+                }
+                selected_degraded = set(self.reason_codes) & degraded
+                if not selected_degraded or any(
+                    code.startswith((f"FUNDING_{asset}_", f"INSTRUMENT_{asset}_"))
+                    and code not in degraded
+                    for code in self.reason_codes
+                ):
+                    raise ValueError("degraded funding requires sanitized reason codes")
+                reasons.update(selected_degraded)
+            elif self.funding_status is TrialEvidenceStatus.LATE:
+                reasons.add(f"FUNDING_{self.asset.value}_LATE_ONLY")
+            else:
+                reasons.add(f"FUNDING_{self.asset.value}_MISSING")
 
         if self.book_status is TrialEvidenceStatus.COMPLETE:
             if self.selected_book_cycle_id is None:
@@ -179,7 +201,20 @@ class TrialBoundaryAssetHealth(_ValidatedCopyRecord):
         else:
             if self.selected_book_cycle_id is not None:
                 raise ValueError("nonqualifying book cannot select a cycle ID")
-            reasons.add(f"BOOK_{self.asset.value}_MISSING")
+            if self.book_status is TrialEvidenceStatus.DEGRADED:
+                if self.failed_book_attempt_count == 0 and self.skewed_book_attempt_count == 0:
+                    raise ValueError("degraded book requires failed or skewed attempts")
+            elif self.book_status is TrialEvidenceStatus.MISSING:
+                if self.failed_book_attempt_count or self.skewed_book_attempt_count:
+                    raise ValueError("missing book cannot hide failed or skewed attempts")
+                reasons.add(f"BOOK_{self.asset.value}_MISSING")
+            else:
+                raise ValueError("book evidence does not use a late status")
+
+        if self.failed_book_attempt_count:
+            reasons.add(f"BOOK_{self.asset.value}_FAILED_ATTEMPTS")
+        if self.skewed_book_attempt_count:
+            reasons.add(f"BOOK_{self.asset.value}_SKEWED_ATTEMPTS")
 
         if self.reason_codes != tuple(sorted(reasons)):
             raise ValueError("reason codes do not match asset evidence")
@@ -194,6 +229,8 @@ class TrialBoundaryHealth(_ValidatedCopyRecord):
     complete_attempt_count: NonnegativeInt
     degraded_attempt_count: NonnegativeInt
     late_attempt_count: NonnegativeInt
+    failed_book_attempt_count: NonnegativeInt
+    skewed_book_attempt_count: NonnegativeInt
     assets: tuple[TrialBoundaryAssetHealth, ...]
     reason_codes: tuple[str, ...]
 
@@ -226,6 +263,18 @@ class TrialBoundaryHealth(_ValidatedCopyRecord):
             self.complete_attempt_count + self.degraded_attempt_count + self.late_attempt_count
         ):
             raise ValueError("attempt counts must sum to attempt count")
+        if self.failed_book_attempt_count < max(
+            item.failed_book_attempt_count for item in self.assets
+        ) or self.skewed_book_attempt_count < max(
+            item.skewed_book_attempt_count for item in self.assets
+        ):
+            raise ValueError("book attempt counts must cover asset attempt history")
+        if (self.failed_book_attempt_count == 0) != all(
+            item.failed_book_attempt_count == 0 for item in self.assets
+        ) or (self.skewed_book_attempt_count == 0) != all(
+            item.skewed_book_attempt_count == 0 for item in self.assets
+        ):
+            raise ValueError("book attempt counts must match asset attempt history")
 
         expected_status = min((item.funding_status for item in self.assets), key=_evidence_rank)
         expected_status = min(
@@ -267,6 +316,61 @@ class ReviewedFeeEvidenceSummary(_ValidatedCopyRecord):
             raise ValueError("fee tier name must not be blank")
         if self.effective_from > self.observed_at:
             raise ValueError("fee effective time must not follow observation")
+        return self
+
+
+class TrialEconomicsEvaluationSummary(_ValidatedCopyRecord):
+    schema_version: Literal[1]
+    asset: Asset
+    available: bool
+    evaluation_schema_version: Literal[1, 2] | None
+    evaluation_id: UUID | None
+    policy_hash: Sha256 | None
+    known_as_of: datetime | None
+    evaluated_at: datetime | None
+    decision: EconomicsDecision | None
+    reason_codes: tuple[str, ...]
+
+    @field_validator("known_as_of", "evaluated_at")
+    @classmethod
+    def normalize_optional_economics_timestamp(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_timestamp(value)
+
+    @field_validator("reason_codes")
+    @classmethod
+    def require_canonical_economics_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("economics reason codes must be sorted and unique")
+        return value
+
+    @model_validator(mode="after")
+    def require_coherent_economics_summary(self) -> TrialEconomicsEvaluationSummary:
+        identity = (
+            self.evaluation_schema_version,
+            self.evaluation_id,
+            self.known_as_of,
+            self.evaluated_at,
+            self.decision,
+        )
+        if not self.available:
+            if (
+                any(value is not None for value in (*identity, self.policy_hash))
+                or self.reason_codes
+            ):
+                raise ValueError("unavailable economics summary must withhold evaluation evidence")
+            return self
+        if any(value is None for value in identity):
+            raise ValueError("available economics summary requires immutable evaluation identity")
+        assert self.known_as_of is not None and self.evaluated_at is not None
+        if self.evaluated_at < self.known_as_of:
+            raise ValueError("economics evaluation must not precede its evidence cutoff")
+        if self.evaluation_schema_version == 1:
+            if self.policy_hash is not None:
+                raise ValueError("legacy economics summary cannot invent a policy hash")
+            if "LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED" not in self.reason_codes:
+                raise ValueError("legacy economics summary requires an explicit blocker")
+        elif self.policy_hash is None:
+            raise ValueError("schema-two economics summary requires a policy hash")
         return self
 
 
@@ -444,6 +548,7 @@ class LighterDydxTrialHealthReport(_ValidatedCopyRecord):
     assets: tuple[TrialAssetCoverage, ...]
     dossier_available: bool
     reviewed_fees: tuple[ReviewedFeeEvidenceSummary, ...]
+    economics: tuple[TrialEconomicsEvaluationSummary, ...]
     source_hashes: tuple[Sha256, ...]
     warnings: tuple[str, str, str]
 
@@ -492,6 +597,15 @@ class LighterDydxTrialHealthReport(_ValidatedCopyRecord):
             raise ValueError("reviewed fees must use canonical dYdX/Lighter order")
         return value
 
+    @field_validator("economics")
+    @classmethod
+    def require_canonical_economics(
+        cls, value: tuple[TrialEconomicsEvaluationSummary, ...]
+    ) -> tuple[TrialEconomicsEvaluationSummary, ...]:
+        if tuple(item.asset for item in value) != _ASSETS:
+            raise ValueError("economics must use canonical BTC/ETH/SOL order")
+        return value
+
     @field_validator("source_hashes")
     @classmethod
     def require_canonical_hashes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -519,6 +633,11 @@ class LighterDydxTrialHealthReport(_ValidatedCopyRecord):
                 for item in self.assets
             )
             or any(item.observed_at > self.as_of for item in self.reviewed_fees)
+            or any(
+                timestamp is not None and timestamp > self.as_of
+                for item in self.economics
+                for timestamp in (item.known_as_of, item.evaluated_at)
+            )
         ):
             raise ValueError("report must not contain future evidence")
         for asset in self.assets:

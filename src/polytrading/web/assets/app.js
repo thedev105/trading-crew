@@ -18,6 +18,7 @@ const nodes = {
   trialAssetRows: document.querySelector("#trial-asset-rows"),
   trialBoundaryRows: document.querySelector("#trial-boundary-rows"),
   trialGapReasons: document.querySelector("#trial-gap-reasons"),
+  trialEconomics: document.querySelector("#trial-economics"),
   trialFees: document.querySelector("#trial-fees"),
   marketRows: document.querySelector("#market-rows"),
   discoverySummary: document.querySelector("#discovery-summary"),
@@ -168,7 +169,7 @@ function renderTrialAssets(trial) {
 function renderTrialBoundaries(trial) {
   if (!trial.recent_boundaries.length) {
     nodes.trialBoundaryRows.replaceChildren(
-      unavailableTableRow("Unavailable · trial collection has not started", 13),
+      unavailableTableRow("Unavailable · trial collection has not started", 15),
     );
   } else {
     const rows = trial.recent_boundaries.map((boundary) => {
@@ -184,6 +185,8 @@ function renderTrialBoundaries(trial) {
         tableCell(boundary.complete_attempt_count),
         tableCell(boundary.degraded_attempt_count),
         tableCell(boundary.late_attempt_count),
+        tableCell(boundary.failed_book_attempt_count),
+        tableCell(boundary.skewed_book_attempt_count),
         ...evidenceCells,
         tableCell(
           boundary.reason_codes.length
@@ -223,6 +226,25 @@ function renderTrialBoundaries(trial) {
   );
 }
 
+function renderTrialEconomics(trial) {
+  const rows = trial.economics.map((item) => {
+    const row = document.createElement("tr");
+    row.append(
+      tableCell(item.asset, "venue-name"),
+      tableCell(item.available ? "Available" : "Unavailable"),
+      tableCell(item.evaluation_schema_version),
+      tableCell(item.evaluation_id, "source-hash"),
+      tableCell(item.policy_hash, "source-hash"),
+      tableCell(compactTime(item.known_as_of)),
+      tableCell(compactTime(item.evaluated_at)),
+      evidenceStatusCell(item.decision),
+      tableCell(item.reason_codes.length ? item.reason_codes.join(" · ") : "No blocker reasons", "summary-cell"),
+    );
+    return row;
+  });
+  nodes.trialEconomics.replaceChildren(...rows);
+}
+
 function renderTrial(snapshot) {
   const trial = snapshot.trial_health;
   const projections = trial.assets.map((item) => item.projected_earliest_evaluation_end);
@@ -253,6 +275,7 @@ function renderTrial(snapshot) {
   );
   renderTrialAssets(trial);
   renderTrialBoundaries(trial);
+  renderTrialEconomics(trial);
 }
 
 function numericClass(value) {
@@ -549,6 +572,9 @@ function validateSnapshot(snapshot) {
     || snapshot.trial_health.assets.map((item) => item.asset).join(",") !== "BTC,ETH,SOL"
     || !Array.isArray(snapshot.trial_health.recent_boundaries)
     || !Array.isArray(snapshot.trial_health.reviewed_fees)
+    || !Array.isArray(snapshot.trial_health.economics)
+    || snapshot.trial_health.economics.length !== 3
+    || snapshot.trial_health.economics.map((item) => item.asset).join(",") !== "BTC,ETH,SOL"
   ) {
     throw new Error("INVALID_SNAPSHOT");
   }

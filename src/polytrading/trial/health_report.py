@@ -65,6 +65,24 @@ def render_trial_health_text(report: LighterDydxTrialHealthReport) -> str:
         )
     else:
         lines.append("recent gaps: none")
+    lines.append(
+        "recent book attempts: "
+        f"failed_books={sum(item.failed_book_attempt_count for item in report.recent_boundaries)} "
+        f"skewed_books={sum(item.skewed_book_attempt_count for item in report.recent_boundaries)}"
+    )
+    for item in report.economics:
+        if not item.available:
+            lines.append(f"{item.asset.value} economics: unavailable")
+            continue
+        lines.append(
+            f"{item.asset.value} economics: schema={item.evaluation_schema_version} "
+            f"evaluation_id={item.evaluation_id} "
+            f"policy_hash={item.policy_hash or 'unavailable'} "
+            f"evidence_cutoff={_optional_timestamp(item.known_as_of)} "
+            f"evaluated={_optional_timestamp(item.evaluated_at)} "
+            f"decision={item.decision.value if item.decision is not None else 'unavailable'} "
+            f"reasons={','.join(item.reason_codes) if item.reason_codes else 'none'}"
+        )
     lines.extend(
         (
             "dossier evidence: " + ("available" if report.dossier_available else "unavailable"),

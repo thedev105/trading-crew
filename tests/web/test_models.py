@@ -45,6 +45,9 @@ class EmptyFundingHistory:
     def reviewed_fee_schedules_as_of(self, as_of):
         return ()
 
+    def latest_economic_evaluation_as_of(self, asset, as_of):
+        return None
+
 
 def _symbol(venue: Venue, asset: Asset) -> str:
     if venue is Venue.BYBIT:

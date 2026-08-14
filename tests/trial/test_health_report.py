@@ -22,6 +22,10 @@ def test_health_json_is_canonical_and_preserves_model_order(tmp_path: Path) -> N
         "2026-08-14T07:00:00Z",
     ]
     assert document["warnings"] == list(TRIAL_HEALTH_WARNINGS)
+    assert [item["asset"] for item in document["economics"]] == ["BTC", "ETH", "SOL"]
+    assert all(item["available"] is False for item in document["economics"])
+    assert document["recent_boundaries"][0]["failed_book_attempt_count"] == 0
+    assert document["recent_boundaries"][0]["skewed_book_attempt_count"] == 0
     store.close()
 
 
@@ -43,6 +47,8 @@ def test_health_text_is_complete_research_only_and_non_authorizing(tmp_path: Pat
     assert "dossier evidence:" in rendered
     assert "fee evidence:" in rendered
     assert "operator policy: not assessed" in rendered
+    assert "BTC economics: unavailable" in rendered
+    assert "failed_books=0 skewed_books=0" in rendered
     for warning in TRIAL_HEALTH_WARNINGS:
         assert rendered.count(warning) == 1
     lowered = rendered.lower()

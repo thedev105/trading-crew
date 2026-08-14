@@ -1893,9 +1893,80 @@ def test_trial_funding_lease_failure_preventing_persistence_returns_one(
         )
         == 1
     )
-    assert "collection failed" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert stderr == ("polytrading: collection failed: FUNDING_CYCLE_WRITER_LEASE_UNAVAILABLE\n")
+    assert "busy" not in stderr
     assert entered is False
     assert not database.exists()
+
+
+def test_trial_funding_http_failure_uses_stable_sanitized_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "https://private.example.test/funding?token=secret response-body=/tmp/private.json"
+
+    @contextmanager
+    def lease(*_args: object, **_kwargs: object) -> Iterator[None]:
+        yield
+
+    @asynccontextmanager
+    async def failed_session() -> Iterator[tuple[object, ...]]:
+        raise httpx.ConnectError(secret)
+        yield ()
+
+    monkeypatch.setattr(cli, "database_writer_lease", lease)
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", failed_session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: TRIAL_CYCLE_END + timedelta(seconds=10))
+
+    assert (
+        main(
+            [
+                "trial",
+                "funding",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    stderr = capsys.readouterr().err
+    assert stderr == "polytrading: collection failed: FUNDING_CYCLE_HTTP_ERROR\n"
+    assert secret not in stderr
+
+
+def test_existing_funding_cycle_filesystem_failure_uses_stable_sanitized_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "/Users/private/evidence.duckdb https://private.example.test body=secret"
+
+    def failed_store(_path: Path) -> object:
+        raise OSError(secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", failed_store)
+    monkeypatch.setattr(cli, "_utc_now", lambda: TRIAL_CYCLE_END + timedelta(seconds=10))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--cycle-end",
+                TRIAL_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "funding.duckdb"),
+            ]
+        )
+        == 1
+    )
+    stderr = capsys.readouterr().err
+    assert stderr == "polytrading: collection failed: FUNDING_CYCLE_FILESYSTEM_ERROR\n"
+    assert secret not in stderr
 
 
 def test_trial_funding_malformed_timestamp_returns_two(
@@ -2241,7 +2312,8 @@ def test_funding_cycle_cli_classifies_persistence_conflict_as_collection_failure
     )
     message = capsys.readouterr().err
     assert "collection failed" in message
-    assert "conflicting funding cycle persistence" in message
+    assert "FUNDING_CYCLE_PERSISTENCE_CONFLICT" in message
+    assert "conflicting funding cycle persistence" not in message
 
 
 def _seed_health_database(

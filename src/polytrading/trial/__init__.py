@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from polytrading.trial.health_models import (
         LighterDydxTrialHealthReport,
         TrialCollectionStatus,
+        TrialEconomicsEvaluationSummary,
         TrialEvidenceStatus,
     )
     from polytrading.trial.health_report import (
@@ -31,6 +32,7 @@ __all__ = [
     "LighterDydxTrialHealthReport",
     "ProjectedAssetEvidence",
     "TrialCollectionStatus",
+    "TrialEconomicsEvaluationSummary",
     "TrialEvidenceStatus",
     "eligible_lighter_dydx_book_pair",
     "project_earliest_evaluation_end",
@@ -60,6 +62,7 @@ def __getattr__(name: str) -> Any:
     if name in {
         "LighterDydxTrialHealthReport",
         "TrialCollectionStatus",
+        "TrialEconomicsEvaluationSummary",
         "TrialEvidenceStatus",
     }:
         from polytrading.trial import health_models

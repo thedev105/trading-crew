@@ -334,6 +334,8 @@ class DashboardSnapshot(StrictRecord):
             *(item.latest_book_completed_at for item in self.trial_health.assets),
             *(item.effective_from for item in self.trial_health.reviewed_fees),
             *(item.observed_at for item in self.trial_health.reviewed_fees),
+            *(item.known_as_of for item in self.trial_health.economics),
+            *(item.evaluated_at for item in self.trial_health.economics),
         )
         if any(timestamp is not None and timestamp > self.as_of for timestamp in trial_timestamps):
             raise ValueError("trial evidence must not follow dashboard as-of")

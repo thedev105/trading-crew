@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.domain.models import Asset, Venue
 from polytrading.trial.health_models import (
     TRIAL_HEALTH_PROTOCOL_VERSION,
@@ -16,6 +17,7 @@ from polytrading.trial.health_models import (
     TrialBoundaryAssetHealth,
     TrialBoundaryHealth,
     TrialCollectionStatus,
+    TrialEconomicsEvaluationSummary,
     TrialEvidenceStatus,
     TrialWindowBoundaries,
     resolve_latest_auditable_trial_boundary,
@@ -129,6 +131,8 @@ def asset_health(asset: Asset, **overrides: object) -> TrialBoundaryAssetHealth:
         "book_status": TrialEvidenceStatus.COMPLETE,
         "selected_funding_cycle_ids": (UUID(int=asset_index(asset) + 1),),
         "selected_book_cycle_id": UUID(int=asset_index(asset) + 11),
+        "failed_book_attempt_count": 0,
+        "skewed_book_attempt_count": 0,
         "reason_codes": (),
     }
     values.update(overrides)
@@ -148,6 +152,8 @@ def boundary(**overrides: object) -> TrialBoundaryHealth:
         "complete_attempt_count": 1,
         "degraded_attempt_count": 0,
         "late_attempt_count": 0,
+        "failed_book_attempt_count": 0,
+        "skewed_book_attempt_count": 0,
         "assets": tuple(asset_health(asset) for asset in Asset),
         "reason_codes": (),
     }
@@ -206,6 +212,23 @@ def fee(venue: Venue, **overrides: object) -> ReviewedFeeEvidenceSummary:
     return ReviewedFeeEvidenceSummary(**values)
 
 
+def economics(asset: Asset, **overrides: object) -> TrialEconomicsEvaluationSummary:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "asset": asset,
+        "available": False,
+        "evaluation_schema_version": None,
+        "evaluation_id": None,
+        "policy_hash": None,
+        "known_as_of": None,
+        "evaluated_at": None,
+        "decision": None,
+        "reason_codes": (),
+    }
+    values.update(overrides)
+    return TrialEconomicsEvaluationSummary(**values)
+
+
 def test_reviewed_fee_evidence_rejects_unsupported_venue_and_blank_tier() -> None:
     with pytest.raises(ValidationError, match="dYdX or Lighter"):
         fee(Venue.BYBIT)
@@ -243,6 +266,7 @@ def report(**overrides: object) -> LighterDydxTrialHealthReport:
         "assets": tuple(coverage(asset) for asset in Asset),
         "dossier_available": True,
         "reviewed_fees": (fee(Venue.DYDX), fee(Venue.LIGHTER)),
+        "economics": tuple(economics(asset) for asset in Asset),
         "source_hashes": (HASH_A, HASH_B),
         "warnings": TRIAL_HEALTH_WARNINGS,
     }
@@ -321,6 +345,15 @@ def test_boundary_asset_statuses_require_exact_selections_and_reasons() -> None:
     for update in invalid_updates:
         with pytest.raises(ValidationError):
             asset_health(Asset.BTC).model_copy(update=update)
+
+    with pytest.raises(ValidationError, match="sanitized"):
+        asset_health(Asset.BTC).model_copy(
+            update={
+                "funding_status": TrialEvidenceStatus.DEGRADED,
+                "selected_funding_cycle_ids": (),
+                "reason_codes": ("FUNDING_BTC_MACHINE_PATH_SECRET",),
+            }
+        )
 
 
 def test_boundary_reasons_are_exact_union_of_boundary_and_asset_reasons() -> None:
@@ -453,6 +486,44 @@ def test_report_requires_exact_statuses_ordering_and_elapsed_inclusive_count() -
         report(source_hashes=(HASH_B, HASH_A))
     with pytest.raises(ValidationError, match="exact research warnings"):
         report(warnings=("changed", *TRIAL_HEALTH_WARNINGS[1:]))
+
+
+def test_economics_summary_rejects_partial_legacy_and_future_evidence() -> None:
+    unavailable = economics(Asset.BTC)
+    with pytest.raises(ValidationError, match="withhold"):
+        unavailable.model_copy(update={"evaluation_id": UUID(int=88)})
+
+    current = economics(
+        Asset.BTC,
+        available=True,
+        evaluation_schema_version=2,
+        evaluation_id=UUID(int=89),
+        policy_hash="c" * 64,
+        known_as_of=at(16),
+        evaluated_at=at(16, second=1),
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("COMPATIBILITY_BLOCKING",),
+    )
+    assert current.policy_hash == "c" * 64
+    with pytest.raises(ValidationError, match="policy hash"):
+        current.model_copy(update={"policy_hash": None})
+    with pytest.raises(ValidationError, match="legacy"):
+        current.model_copy(
+            update={
+                "evaluation_schema_version": 1,
+                "reason_codes": ("LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED",),
+            }
+        )
+
+    future = current.model_copy(update={"evaluated_at": at(17, 5, microsecond=1)})
+    values = report().model_dump()
+    values["economics"] = (
+        future,
+        economics(Asset.ETH),
+        economics(Asset.SOL),
+    )
+    with pytest.raises(ValidationError, match="future evidence"):
+        LighterDydxTrialHealthReport(**values)
 
 
 def test_recent_boundaries_cover_only_started_intersection() -> None:

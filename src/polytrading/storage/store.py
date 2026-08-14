@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import resources
@@ -46,6 +47,19 @@ _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 class ConflictingRecordError(ValueError):
     """Raised when an immutable identity is retried with different content."""
+
+
+@dataclass(frozen=True)
+class BookSnapshotHeader:
+    """Level-free book identity and timing metadata for read-only evidence audits."""
+
+    cycle_id: UUID
+    venue: Venue
+    symbol: str
+    asset: Asset
+    effective_at: datetime
+    observed_at: datetime
+    source_hash: str
 
 
 def _canonical_json(record: BaseModel) -> str:
@@ -621,6 +635,40 @@ class DuckDBStore:
         ).fetchall()
         return tuple(
             snapshot for row in rows if (snapshot := self._book_snapshot_from_row(row)) is not None
+        )
+
+    def book_snapshot_headers_for_cycles(
+        self,
+        cycle_ids: tuple[UUID, ...],
+        known_as_of: datetime,
+    ) -> tuple[BookSnapshotHeader, ...]:
+        """Return cutoff-safe snapshot headers without reading book levels."""
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if not cycle_ids:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT cycle_id, venue, symbol, asset,
+                   epoch_us(effective_at), epoch_us(observed_at), source_hash
+            FROM book_snapshots
+            WHERE cycle_id IN (SELECT unnest(?::UUID[]))
+              AND effective_at <= ?
+              AND observed_at <= ?
+            ORDER BY cycle_id, venue, symbol
+            """,
+            [list(cycle_ids), normalized_known_as_of, normalized_known_as_of],
+        ).fetchall()
+        return tuple(
+            BookSnapshotHeader(
+                cycle_id=row[0],
+                venue=Venue(row[1]),
+                symbol=row[2],
+                asset=Asset(row[3]),
+                effective_at=_utc_from_epoch_us(row[4]),
+                observed_at=_utc_from_epoch_us(row[5]),
+                source_hash=row[6],
+            )
+            for row in rows
         )
 
     def latest_economic_evaluation_as_of(

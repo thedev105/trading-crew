@@ -73,7 +73,7 @@
       <div class="boundary-heading"><h3>Recent 24-hour boundary matrix</h3><p>Funding and representative book status by asset</p></div>
       <div class="table-shell trial-matrix-shell">
         <table class="trial-boundary-table">
-          <thead><tr><th scope="col">Boundary UTC</th><th scope="col">Status</th><th scope="col">Attempts</th><th scope="col">Complete</th><th scope="col">Degraded</th><th scope="col">Late</th><th scope="col">BTC funding</th><th scope="col">BTC book</th><th scope="col">ETH funding</th><th scope="col">ETH book</th><th scope="col">SOL funding</th><th scope="col">SOL book</th><th scope="col">Reasons</th></tr></thead>
+          <thead><tr><th scope="col">Boundary UTC</th><th scope="col">Status</th><th scope="col">Attempts</th><th scope="col">Complete</th><th scope="col">Degraded</th><th scope="col">Late</th><th scope="col">Failed books</th><th scope="col">Skewed books</th><th scope="col">BTC funding</th><th scope="col">BTC book</th><th scope="col">ETH funding</th><th scope="col">ETH book</th><th scope="col">SOL funding</th><th scope="col">SOL book</th><th scope="col">Reasons</th></tr></thead>
           <tbody id="trial-boundary-rows"></tbody>
         </table>
       </div>
@@ -87,6 +87,13 @@
           <p class="policy-note">Operator policy not assessed.</p>
           <p>Readiness permits deterministic economics evaluation only; this console cannot start collection, import fees, evaluate policy, or trade.</p>
         </article>
+      </div>
+      <div class="boundary-heading"><h3>Latest immutable economics</h3><p>Display only · never invoked or reinterpreted</p></div>
+      <div class="table-shell trial-economics-shell">
+        <table class="trial-economics-table">
+          <thead><tr><th scope="col">Asset</th><th scope="col">Availability</th><th scope="col">Schema</th><th scope="col">Evaluation ID</th><th scope="col">Policy hash</th><th scope="col">Evidence cutoff</th><th scope="col">Evaluated</th><th scope="col">Decision</th><th scope="col">Reasons</th></tr></thead>
+          <tbody id="trial-economics"></tbody>
+        </table>
       </div>
       <div class="boundary-heading"><h3>Reviewed fee evidence</h3><p>Inventory only · no tier selected</p></div>
       <div class="table-shell trial-fee-shell">

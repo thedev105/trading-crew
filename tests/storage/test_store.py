@@ -1161,15 +1161,32 @@ def test_book_cycle_range_and_cycle_books_are_canonical_and_point_in_time(
         observed_at=NOW,
         source_hash=OTHER_SOURCE_HASH,
     )
+    future_book = book_snapshot(
+        cycle_id=future.cycle_id,
+        venue=Venue.DYDX,
+        symbol="BTC-USD",
+        effective_at=NOW + timedelta(minutes=1),
+        observed_at=NOW + timedelta(minutes=1),
+        source_hash=THIRD_SOURCE_HASH,
+    )
     for item in (future, selected):
         store.append_book_collection_cycle(item)
-    for item in (lighter, dydx):
+    for item in (lighter, dydx, future_book):
         store.append_book_snapshot(item)
 
     assert store.book_collection_cycles_between(effective_at - timedelta(minutes=1), NOW, NOW) == (
         selected,
     )
     assert store.books_for_cycle(cycle_id) == (dydx, lighter)
+    headers = store.book_snapshot_headers_for_cycles((cycle_id, future.cycle_id), NOW)
+    assert tuple((item.venue, item.symbol) for item in headers) == (
+        (Venue.DYDX, "BTC-USD"),
+        (Venue.LIGHTER, "BTC"),
+    )
+    assert tuple(item.source_hash for item in headers) == (
+        OTHER_SOURCE_HASH,
+        SOURCE_HASH,
+    )
     with pytest.raises(ValueError, match="start must be less than or equal to end"):
         store.book_collection_cycles_between(NOW, effective_at, NOW)
     with pytest.raises(ValueError, match="knowledge cutoff"):

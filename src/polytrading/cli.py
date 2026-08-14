@@ -144,6 +144,24 @@ class FundingCycleCollectionError(RuntimeError):
     """A point-in-time funding cycle could not be durably recorded."""
 
 
+def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollectionError:
+    if isinstance(error, ConflictingRecordError):
+        code = "FUNDING_CYCLE_PERSISTENCE_CONFLICT"
+    elif isinstance(error, WriterLeaseUnavailable):
+        code = "FUNDING_CYCLE_WRITER_LEASE_UNAVAILABLE"
+    elif isinstance(error, duckdb.Error):
+        code = "FUNDING_CYCLE_DATABASE_ERROR"
+    elif isinstance(error, httpx.HTTPError):
+        code = "FUNDING_CYCLE_HTTP_ERROR"
+    elif isinstance(error, OSError):
+        code = "FUNDING_CYCLE_FILESYSTEM_ERROR"
+    elif isinstance(error, ValueError):
+        code = "FUNDING_CYCLE_VALIDATION_ERROR"
+    else:
+        code = "FUNDING_CYCLE_COLLECTION_ERROR"
+    return FundingCycleCollectionError(code)
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CliUsageError(message)
@@ -748,22 +766,28 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     )
     _, _, is_late = validate_cycle_timing(cycle_end, now)
 
-    store = DuckDBStore(arguments.db)
+    store: DuckDBStore | None = None
     try:
-        try:
-            if is_late:
-                cycle = record_late_funding_cycle(store, assets, cycle_end, now)
-            else:
-                async with public_adapter_session(
-                    store, (Venue.BYBIT, Venue.HYPERLIQUID)
-                ) as adapters:
-                    cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
-                        adapters, assets, cycle_end
-                    )
-        except ConflictingRecordError as error:
-            raise FundingCycleCollectionError(str(error)) from error
+        store = DuckDBStore(arguments.db)
+        if is_late:
+            cycle = record_late_funding_cycle(store, assets, cycle_end, now)
+        else:
+            async with public_adapter_session(store, (Venue.BYBIT, Venue.HYPERLIQUID)) as adapters:
+                cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
+                    adapters, assets, cycle_end
+                )
+    except (
+        ConflictingRecordError,
+        duckdb.Error,
+        httpx.HTTPError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        raise _classified_funding_cycle_error(error) from error
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
     renderer = (
         render_funding_cycle_json if arguments.format == "json" else render_funding_cycle_text
@@ -820,7 +844,7 @@ async def _trial_funding(arguments: argparse.Namespace) -> int:
         RuntimeError,
         ValueError,
     ) as error:
-        raise FundingCycleCollectionError(str(error)) from error
+        raise _classified_funding_cycle_error(error) from error
 
     renderer = (
         render_trial_funding_json if arguments.format == "json" else render_trial_funding_text

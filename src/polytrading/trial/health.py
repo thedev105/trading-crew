@@ -7,15 +7,16 @@ from itertools import pairwise
 from uuid import UUID
 
 from polytrading.carry.dossier import load_bundled_dossier
+from polytrading.carry.economics_models import LegacyEconomicEvaluationSummary
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
-from polytrading.storage.store import DuckDBStore
-from polytrading.trial.book_evidence import (
-    EligibleTrialBookPair,
-    _select_hourly_trial_books_from_eligible,
-    eligible_lighter_dydx_book_pair,
-)
+from polytrading.storage.store import BookSnapshotHeader, DuckDBStore
 from polytrading.trial.funding_lineage import select_prospective_funding
-from polytrading.trial.funding_models import LighterDydxFundingCycle, TrialFundingCycleStatus
+from polytrading.trial.funding_models import (
+    LighterDydxFundingCycle,
+    TrialFundingCycleStatus,
+    TrialFundingOutcome,
+    TrialInstrumentOutcome,
+)
 from polytrading.trial.health_models import (
     TRIAL_HEALTH_PROTOCOL_VERSION,
     TRIAL_HEALTH_WARNINGS,
@@ -25,11 +26,13 @@ from polytrading.trial.health_models import (
     TrialBoundaryAssetHealth,
     TrialBoundaryHealth,
     TrialCollectionStatus,
+    TrialEconomicsEvaluationSummary,
     TrialEvidenceStatus,
     TrialWindowBoundaries,
     resolve_latest_auditable_trial_boundary,
     trial_window_boundaries,
 )
+from polytrading.venues.synchronized import BookCollectionCycle
 
 _ASSETS = (Asset.BTC, Asset.ETH, Asset.SOL)
 _HOUR = timedelta(hours=1)
@@ -83,9 +86,100 @@ class _AssetAuditEvidence:
     funding_complete: frozenset[datetime]
     funding_conflicts: frozenset[datetime]
     funding_cycle_ids: dict[Venue, dict[datetime, UUID]]
-    hourly_books: dict[datetime, EligibleTrialBookPair]
-    dense_books: tuple[EligibleTrialBookPair, ...]
-    latest_book: EligibleTrialBookPair | None
+    hourly_books: dict[datetime, _EligibleBookHeaderPair]
+    dense_books: tuple[_EligibleBookHeaderPair, ...]
+    latest_book: _EligibleBookHeaderPair | None
+
+
+@dataclass(frozen=True)
+class _EligibleBookHeaderPair:
+    cycle: BookCollectionCycle
+    dydx: BookSnapshotHeader
+    lighter: BookSnapshotHeader
+    effective_at: datetime
+
+
+def _eligible_book_header_pair(
+    cycle: BookCollectionCycle,
+    asset: Asset,
+    headers: tuple[BookSnapshotHeader, ...],
+    known_as_of: datetime,
+) -> _EligibleBookHeaderPair | None:
+    if (
+        cycle.status != "complete"
+        or asset not in cycle.assets
+        or not {Venue.DYDX, Venue.LIGHTER}.issubset(cycle.venues)
+        or not cycle.source_hashes
+        or cycle.max_effective_skew_ms > _MAXIMUM_BOOK_SKEW_MS
+        or cycle.request_completed_at > known_as_of
+    ):
+        return None
+    selected = {
+        venue: tuple(item for item in headers if item.venue is venue and item.asset is asset)
+        for venue in (Venue.DYDX, Venue.LIGHTER)
+    }
+    if any(len(rows) != 1 for rows in selected.values()):
+        return None
+    dydx = selected[Venue.DYDX][0]
+    lighter = selected[Venue.LIGHTER][0]
+    if (
+        dydx.symbol != _SYMBOLS[asset][Venue.DYDX]
+        or lighter.symbol != _SYMBOLS[asset][Venue.LIGHTER]
+        or not dydx.source_hash
+        or not lighter.source_hash
+        or dydx.source_hash not in cycle.source_hashes
+        or lighter.source_hash not in cycle.source_hashes
+        or dydx.observed_at > cycle.request_completed_at
+        or lighter.observed_at > cycle.request_completed_at
+        or dydx.effective_at > cycle.request_completed_at
+        or lighter.effective_at > cycle.request_completed_at
+        or _duration_milliseconds(abs(dydx.effective_at - lighter.effective_at))
+        > _MAXIMUM_BOOK_SKEW_MS
+    ):
+        return None
+    return _EligibleBookHeaderPair(
+        cycle=cycle,
+        dydx=dydx,
+        lighter=lighter,
+        effective_at=max(dydx.effective_at, lighter.effective_at),
+    )
+
+
+def _select_hourly_book_headers(
+    eligible: tuple[_EligibleBookHeaderPair, ...],
+    start: datetime,
+    end: datetime,
+    maximum_age_seconds: Decimal,
+) -> tuple[_EligibleBookHeaderPair, ...]:
+    ordered = tuple(
+        sorted(eligible, key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
+    )
+    selected: list[_EligibleBookHeaderPair] = []
+    boundary = start + _HOUR
+    while boundary <= end:
+        representative = next(
+            (
+                item
+                for item in reversed(ordered)
+                if item.cycle.request_completed_at <= boundary
+                and _duration_seconds(boundary - item.cycle.request_completed_at)
+                <= maximum_age_seconds
+                and item.dydx.observed_at <= boundary
+                and item.lighter.observed_at <= boundary
+            ),
+            None,
+        )
+        if representative is not None:
+            selected.append(
+                _EligibleBookHeaderPair(
+                    cycle=representative.cycle,
+                    dydx=representative.dydx,
+                    lighter=representative.lighter,
+                    effective_at=boundary,
+                )
+            )
+        boundary += _HOUR
+    return tuple(selected)
 
 
 class LighterDydxTrialHealthAuditor:
@@ -116,6 +210,26 @@ class LighterDydxTrialHealthAuditor:
             default=None,
         )
 
+        book_cycles = (
+            ()
+            if trial_started_at is None
+            else self._store.book_collection_cycles_completed_between(
+                trial_started_at,
+                normalized_as_of,
+                normalized_as_of,
+            )
+        )
+        book_headers_by_cycle: dict[UUID, tuple[BookSnapshotHeader, ...]] = {}
+        if book_cycles:
+            mutable_headers: dict[UUID, list[BookSnapshotHeader]] = {}
+            for header in self._store.book_snapshot_headers_for_cycles(
+                tuple(cycle.cycle_id for cycle in book_cycles), normalized_as_of
+            ):
+                mutable_headers.setdefault(header.cycle_id, []).append(header)
+            book_headers_by_cycle = {
+                cycle_id: tuple(headers) for cycle_id, headers in mutable_headers.items()
+            }
+
         source_hashes: set[str] = set()
         asset_evidence = tuple(
             self._asset_evidence(
@@ -123,6 +237,8 @@ class LighterDydxTrialHealthAuditor:
                 windows,
                 normalized_as_of,
                 trial_started_at,
+                book_cycles,
+                book_headers_by_cycle,
                 source_hashes,
             )
             for asset in _ASSETS
@@ -145,6 +261,7 @@ class LighterDydxTrialHealthAuditor:
             recent_hours,
             attempts_by_boundary,
             asset_evidence,
+            book_cycles,
         )
         assets = tuple(
             self._coverage(item, windows, normalized_as_of, projected) for item in asset_evidence
@@ -180,6 +297,8 @@ class LighterDydxTrialHealthAuditor:
         )
         source_hashes.update(item.source_hash for item in reviewed_fees)
 
+        economics = tuple(self._economics_summary(asset, normalized_as_of) for asset in _ASSETS)
+
         if trial_started_at is None:
             status = TrialCollectionStatus.NOT_STARTED
             elapsed = 0
@@ -205,8 +324,51 @@ class LighterDydxTrialHealthAuditor:
             assets=assets,
             dossier_available=dossier_available,
             reviewed_fees=reviewed_fees,
+            economics=economics,
             source_hashes=tuple(sorted(source_hashes)),
             warnings=TRIAL_HEALTH_WARNINGS,
+        )
+
+    def _economics_summary(self, asset: Asset, as_of: datetime) -> TrialEconomicsEvaluationSummary:
+        report = self._store.latest_economic_evaluation_as_of(asset, as_of)
+        if report is None:
+            return TrialEconomicsEvaluationSummary(
+                schema_version=1,
+                asset=asset,
+                available=False,
+                evaluation_schema_version=None,
+                evaluation_id=None,
+                policy_hash=None,
+                known_as_of=None,
+                evaluated_at=None,
+                decision=None,
+                reason_codes=(),
+            )
+        if isinstance(report, LegacyEconomicEvaluationSummary):
+            reasons = tuple(sorted({*report.reason_codes, "LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED"}))
+            return TrialEconomicsEvaluationSummary(
+                schema_version=1,
+                asset=asset,
+                available=True,
+                evaluation_schema_version=1,
+                evaluation_id=report.evaluation_id,
+                policy_hash=None,
+                known_as_of=report.known_as_of,
+                evaluated_at=report.evaluated_at,
+                decision=report.decision,
+                reason_codes=reasons,
+            )
+        return TrialEconomicsEvaluationSummary(
+            schema_version=1,
+            asset=asset,
+            available=True,
+            evaluation_schema_version=2,
+            evaluation_id=report.evaluation_id,
+            policy_hash=report.policy_hash,
+            known_as_of=report.known_as_of,
+            evaluated_at=report.evaluated_at,
+            decision=report.decision,
+            reason_codes=report.reason_codes,
         )
 
     def _asset_evidence(
@@ -215,12 +377,13 @@ class LighterDydxTrialHealthAuditor:
         windows: TrialWindowBoundaries,
         as_of: datetime,
         trial_started_at: datetime | None,
+        book_cycles: tuple[BookCollectionCycle, ...],
+        book_headers_by_cycle: dict[UUID, tuple[BookSnapshotHeader, ...]],
         source_hashes: set[str],
     ) -> _AssetAuditEvidence:
         total_boundaries = windows.total_funding
         selection_start = total_boundaries[0] - _HOUR
         funding_cycle_ids: dict[Venue, dict[datetime, UUID]] = {}
-        funding_hashes: dict[Venue, dict[datetime, str]] = {}
         complete_by_venue: dict[Venue, set[datetime]] = {}
         conflicts: set[datetime] = set()
         for venue in (Venue.DYDX, Venue.LIGHTER):
@@ -240,32 +403,20 @@ class LighterDydxTrialHealthAuditor:
                 )
             }
             funding_cycle_ids[venue] = ids
-            funding_hashes[venue] = {
-                observation.effective_at: observation.source_hash
-                for observation in selection.observations
-            }
+            source_hashes.update(selection.source_hashes)
             complete_by_venue[venue] = set(ids)
             conflicts.update(selection.conflict_boundaries)
         funding_complete = complete_by_venue[Venue.DYDX] & complete_by_venue[Venue.LIGHTER]
-        for boundary in funding_complete:
-            for venue in (Venue.DYDX, Venue.LIGHTER):
-                source_hashes.add(funding_hashes[venue][boundary])
 
-        all_book_cycles = (
-            ()
-            if trial_started_at is None
-            else self._store.book_collection_cycles_completed_between(
-                trial_started_at,
-                as_of,
-                as_of,
-            )
-        )
         all_eligible = tuple(
             item
-            for cycle in all_book_cycles
+            for cycle in book_cycles
             if (
-                item := eligible_lighter_dydx_book_pair(
-                    self._store, cycle, asset, as_of, _MAXIMUM_BOOK_SKEW_MS
+                item := _eligible_book_header_pair(
+                    cycle,
+                    asset,
+                    book_headers_by_cycle.get(cycle.cycle_id, ()),
+                    as_of,
                 )
             )
             is not None
@@ -275,13 +426,13 @@ class LighterDydxTrialHealthAuditor:
             for item in all_eligible
             if trial_started_at is not None and item.cycle.request_completed_at >= trial_started_at
         )
-        hourly = _select_hourly_trial_books_from_eligible(
+        hourly = _select_hourly_book_headers(
             prospective_eligible,
             selection_start,
             total_boundaries[-1],
             _MAXIMUM_HOURLY_BOOK_AGE_SECONDS,
         )
-        hourly_by_boundary = {item.pair.effective_at: item for item in hourly}
+        hourly_by_boundary = {item.effective_at: item for item in hourly}
         evaluation_start = windows.evaluation_books[0] - _HOUR
         dense = tuple(
             sorted(
@@ -290,7 +441,7 @@ class LighterDydxTrialHealthAuditor:
                     for item in prospective_eligible
                     if evaluation_start < item.cycle.request_completed_at <= as_of
                 ),
-                key=lambda item: (item.pair.effective_at, item.cycle.cycle_id),
+                key=lambda item: (item.effective_at, item.cycle.cycle_id),
             )
         )
         latest = max(
@@ -303,7 +454,7 @@ class LighterDydxTrialHealthAuditor:
             used_books[latest.cycle.cycle_id] = latest
         for item in used_books.values():
             source_hashes.update(item.cycle.source_hashes)
-            source_hashes.update((item.pair.dydx.source_hash, item.pair.lighter.source_hash))
+            source_hashes.update((item.dydx.source_hash, item.lighter.source_hash))
 
         return _AssetAuditEvidence(
             asset=asset,
@@ -322,6 +473,7 @@ class LighterDydxTrialHealthAuditor:
         recent_hours: int,
         attempts_by_boundary: dict[datetime, list[LighterDydxFundingCycle]],
         evidence: tuple[_AssetAuditEvidence, ...],
+        book_cycles: tuple[BookCollectionCycle, ...],
     ) -> tuple[TrialBoundaryHealth, ...]:
         if trial_started_at is None:
             return ()
@@ -340,9 +492,19 @@ class LighterDydxTrialHealthAuditor:
                 ),
                 default=None,
             )
-            late_only = best is not None and best.status is TrialFundingCycleStatus.LATE
+            boundary_book_cycles = tuple(
+                cycle
+                for cycle in book_cycles
+                if boundary - timedelta(minutes=5) <= cycle.request_completed_at <= boundary
+                and {Venue.DYDX, Venue.LIGHTER}.issubset(cycle.venues)
+            )
             assets = tuple(
-                self._boundary_asset(evidence_by_asset[asset], boundary, late_only)
+                self._boundary_asset(
+                    evidence_by_asset[asset],
+                    boundary,
+                    best,
+                    boundary_book_cycles,
+                )
                 for asset in _ASSETS
             )
             status = min(
@@ -359,6 +521,10 @@ class LighterDydxTrialHealthAuditor:
                 item.status is TrialFundingCycleStatus.DEGRADED for item in attempts
             )
             late_attempts = sum(item.status is TrialFundingCycleStatus.LATE for item in attempts)
+            failed_book_attempts = sum(item.status == "failed" for item in boundary_book_cycles)
+            skewed_book_attempts = sum(
+                item.status == "skew_exceeds_research_target" for item in boundary_book_cycles
+            )
             reasons = {reason for item in assets for reason in item.reason_codes}
             if status is TrialEvidenceStatus.MISSING:
                 reasons.add("BOUNDARY_MISSING")
@@ -379,6 +545,8 @@ class LighterDydxTrialHealthAuditor:
                     complete_attempt_count=complete_attempts,
                     degraded_attempt_count=degraded_attempts,
                     late_attempt_count=late_attempts,
+                    failed_book_attempt_count=failed_book_attempts,
+                    skewed_book_attempt_count=skewed_book_attempts,
                     assets=assets,
                     reason_codes=tuple(sorted(reasons)),
                 )
@@ -388,8 +556,12 @@ class LighterDydxTrialHealthAuditor:
 
     @staticmethod
     def _boundary_asset(
-        evidence: _AssetAuditEvidence, boundary: datetime, late_only: bool
+        evidence: _AssetAuditEvidence,
+        boundary: datetime,
+        best_funding_attempt: LighterDydxFundingCycle | None,
+        book_attempts: tuple[BookCollectionCycle, ...],
     ) -> TrialBoundaryAssetHealth:
+        funding_reasons: set[str] = set()
         if boundary in evidence.funding_complete:
             funding_status = TrialEvidenceStatus.COMPLETE
             funding_ids = tuple(
@@ -403,24 +575,44 @@ class LighterDydxTrialHealthAuditor:
         elif boundary in evidence.funding_conflicts:
             funding_status = TrialEvidenceStatus.DEGRADED
             funding_ids = ()
+            funding_reasons.add(funding_conflict_reason(evidence.asset))
+        elif (
+            best_funding_attempt is not None
+            and best_funding_attempt.status is not TrialFundingCycleStatus.LATE
+        ):
+            funding_status = TrialEvidenceStatus.DEGRADED
+            funding_ids = ()
+            funding_reasons.update(_degraded_funding_reasons(best_funding_attempt, evidence.asset))
         else:
-            funding_status = TrialEvidenceStatus.LATE if late_only else TrialEvidenceStatus.MISSING
+            funding_status = (
+                TrialEvidenceStatus.LATE
+                if best_funding_attempt is not None
+                else TrialEvidenceStatus.MISSING
+            )
             funding_ids = ()
         selected_book = evidence.hourly_books.get(boundary)
-        book_status = (
-            TrialEvidenceStatus.COMPLETE
-            if selected_book is not None
-            else TrialEvidenceStatus.LATE
-            if late_only
-            else TrialEvidenceStatus.MISSING
+        asset_book_attempts = tuple(item for item in book_attempts if evidence.asset in item.assets)
+        failed_book_attempts = sum(item.status == "failed" for item in asset_book_attempts)
+        skewed_book_attempts = sum(
+            item.status == "skew_exceeds_research_target" for item in asset_book_attempts
         )
-        reasons: set[str] = set()
-        if funding_status is TrialEvidenceStatus.DEGRADED:
-            reasons.add(funding_conflict_reason(evidence.asset))
-        elif funding_status is not TrialEvidenceStatus.COMPLETE:
+        if selected_book is not None:
+            book_status = TrialEvidenceStatus.COMPLETE
+        elif failed_book_attempts or skewed_book_attempts:
+            book_status = TrialEvidenceStatus.DEGRADED
+        else:
+            book_status = TrialEvidenceStatus.MISSING
+        reasons = funding_reasons
+        if funding_status is TrialEvidenceStatus.LATE:
+            reasons.add(funding_late_reason(evidence.asset))
+        elif funding_status is TrialEvidenceStatus.MISSING:
             reasons.add(funding_missing_reason(evidence.asset))
-        if book_status is not TrialEvidenceStatus.COMPLETE:
+        if book_status is TrialEvidenceStatus.MISSING:
             reasons.add(book_missing_reason(evidence.asset))
+        if failed_book_attempts:
+            reasons.add(book_failed_reason(evidence.asset))
+        if skewed_book_attempts:
+            reasons.add(book_skewed_reason(evidence.asset))
         return TrialBoundaryAssetHealth(
             schema_version=1,
             asset=evidence.asset,
@@ -428,6 +620,8 @@ class LighterDydxTrialHealthAuditor:
             book_status=book_status,
             selected_funding_cycle_ids=funding_ids,
             selected_book_cycle_id=None if selected_book is None else selected_book.cycle.cycle_id,
+            failed_book_attempt_count=failed_book_attempts,
+            skewed_book_attempt_count=skewed_book_attempts,
             reason_codes=tuple(sorted(reasons)),
         )
 
@@ -458,7 +652,7 @@ class LighterDydxTrialHealthAuditor:
         paired_current = _CURRENT_HOURS - len(missing_current)
 
         consecutive_dense = sum(
-            timedelta(0) < right.pair.effective_at - left.pair.effective_at <= timedelta(seconds=5)
+            timedelta(0) < right.effective_at - left.effective_at <= timedelta(seconds=5)
             for left, right in pairwise(evidence.dense_books)
         )
         latest_completed: datetime | None = None
@@ -469,8 +663,8 @@ class LighterDydxTrialHealthAuditor:
             latest_age = _duration_seconds(as_of - latest_completed)
             latest_skew = _duration_milliseconds(
                 abs(
-                    evidence.latest_book.pair.dydx.effective_at
-                    - evidence.latest_book.pair.lighter.effective_at
+                    evidence.latest_book.dydx.effective_at
+                    - evidence.latest_book.lighter.effective_at
                 )
             )
         fresh = (
@@ -551,12 +745,41 @@ def funding_missing_reason(asset: Asset) -> str:
     return f"FUNDING_{asset.value}_MISSING"
 
 
+def funding_late_reason(asset: Asset) -> str:
+    return f"FUNDING_{asset.value}_LATE_ONLY"
+
+
 def funding_conflict_reason(asset: Asset) -> str:
     return f"FUNDING_{asset.value}_REVISION_CONFLICT"
 
 
 def book_missing_reason(asset: Asset) -> str:
     return f"BOOK_{asset.value}_MISSING"
+
+
+def book_failed_reason(asset: Asset) -> str:
+    return f"BOOK_{asset.value}_FAILED_ATTEMPTS"
+
+
+def book_skewed_reason(asset: Asset) -> str:
+    return f"BOOK_{asset.value}_SKEWED_ATTEMPTS"
+
+
+def _degraded_funding_reasons(cycle: LighterDydxFundingCycle, asset: Asset) -> tuple[str, ...]:
+    reasons: set[str] = set()
+    for item in cycle.items:
+        if item.asset is not asset:
+            continue
+        venue = item.venue.value.upper()
+        if item.instrument_outcome is TrialInstrumentOutcome.FAILED:
+            reasons.add(f"INSTRUMENT_{asset.value}_{venue}_FAILED")
+        if item.funding_outcome is TrialFundingOutcome.FAILED:
+            reasons.add(f"FUNDING_{asset.value}_{venue}_FAILED")
+        elif item.funding_outcome is TrialFundingOutcome.MISSING_EXPECTED:
+            reasons.add(f"FUNDING_{asset.value}_{venue}_MISSING_EXPECTED")
+    if not reasons:
+        reasons.add(f"FUNDING_{asset.value}_LINKAGE_MISSING")
+    return tuple(sorted(reasons))
 
 
 def _duration_microseconds(value: timedelta) -> int:
