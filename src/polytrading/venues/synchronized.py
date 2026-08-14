@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, Protocol
@@ -12,6 +13,7 @@ from pydantic import field_validator, model_validator
 from polytrading.domain.models import (
     Asset,
     Level2BookSnapshot,
+    RawEnvelope,
     StrictRecord,
     Venue,
     normalize_utc_timestamp,
@@ -77,10 +79,18 @@ class BookCollectionStore(PublicRecordStore, Protocol):
     def append_book_collection_cycle(self, record: BookCollectionCycle) -> bool: ...
 
 
+@dataclass(frozen=True)
+class PreparedBookCollectionCycle:
+    raw_records: tuple[RawEnvelope, ...]
+    books: tuple[Level2BookSnapshot, ...]
+    cycle: BookCollectionCycle
+    warnings: tuple[AdapterWarning, ...]
+
+
 class SynchronizedBookCollector:
     def __init__(
         self,
-        store: BookCollectionStore,
+        store: BookCollectionStore | None,
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         cycle_id_factory: Callable[[], UUID] = uuid4,
@@ -99,6 +109,21 @@ class SynchronizedBookCollector:
         assets: frozenset[Asset],
         observed_at: datetime,
     ) -> BookCollectionCycle:
+        if self._store is None:
+            raise RuntimeError("synchronized book collection requires a configured store")
+        prepared = await self.prepare_once(adapters, assets, observed_at)
+        persist_prepared_book_cycle(self._store, prepared)
+        if self._warning_sink is not None:
+            for warning in prepared.warnings:
+                self._warning_sink(warning)
+        return prepared.cycle
+
+    async def prepare_once(
+        self,
+        adapters: Iterable[PublicVenueAdapter],
+        assets: frozenset[Asset],
+        observed_at: datetime,
+    ) -> PreparedBookCollectionCycle:
         requested_assets = frozenset(assets)
         if not requested_assets:
             raise ValueError("at least one asset is required")
@@ -184,16 +209,8 @@ class SynchronizedBookCollector:
             failure_codes=tuple(sorted(failure_codes)),
             source_hashes=tuple(raw.source_hash for raw in raw_records),
         )
-
-        with self._store.transaction() as transaction:
-            for raw in raw_records:
-                transaction.append_raw(raw)
-            if cycle.status != "failed":
-                for book in books:
-                    append_normalized(transaction, book)
-            transaction.append_book_collection_cycle(cycle)
-        if self._warning_sink is not None:
-            warnings = sorted(
+        warnings = tuple(
+            sorted(
                 (warning for _venue, batch in successful_batches for warning in batch.warnings),
                 key=lambda warning: (
                     warning.venue.value,
@@ -203,9 +220,8 @@ class SynchronizedBookCollector:
                     warning.message,
                 ),
             )
-            for warning in warnings:
-                self._warning_sink(warning)
-        return cycle
+        )
+        return PreparedBookCollectionCycle(raw_records, books, cycle, warnings)
 
     @staticmethod
     def _validate_book_batch(
@@ -232,6 +248,19 @@ class SynchronizedBookCollector:
         ):
             return "asset_coverage_mismatch"
         return None
+
+
+def persist_prepared_book_cycle(
+    store: BookCollectionStore,
+    prepared: PreparedBookCollectionCycle,
+) -> bool:
+    with store.transaction() as transaction:
+        for raw in prepared.raw_records:
+            transaction.append_raw(raw)
+        if prepared.cycle.status != "failed":
+            for book in prepared.books:
+                append_normalized(transaction, book)
+        return transaction.append_book_collection_cycle(prepared.cycle)
 
 
 def _max_timestamp_skew_ms(values: tuple[datetime, ...]) -> Decimal:

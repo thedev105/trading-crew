@@ -48,6 +48,7 @@ from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.books import run_trial_book_session
 from polytrading.trial.funding import (
     LighterDydxFundingCollector,
     PreparedLighterDydxFundingCycle,
@@ -214,6 +215,14 @@ def build_parser() -> argparse.ArgumentParser:
     trial_funding_mode.add_argument("--cycle-end")
     trial_funding_mode.add_argument("--current", action="store_true")
     trial_funding.add_argument("--format", choices=("text", "json"), default="text")
+    trial_books = trial_commands.add_parser(
+        "books", help="collect bounded synchronized Lighter-dYdX books"
+    )
+    trial_books.add_argument("--db", required=True, type=Path)
+    trial_books_mode = trial_books.add_mutually_exclusive_group(required=True)
+    trial_books_mode.add_argument("--once", action="store_true")
+    trial_books_mode.add_argument("--duration-seconds", type=float)
+    trial_books.add_argument("--interval-seconds", type=float, default=5.0)
 
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
@@ -312,7 +321,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "funding":
             return _funding_health(arguments)
         if arguments.command == "trial":
-            return asyncio.run(_trial_funding(arguments))
+            if arguments.trial_command == "funding":
+                return asyncio.run(_trial_funding(arguments))
+            return asyncio.run(_trial_books(arguments))
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.collect_command == "public":
@@ -793,6 +804,34 @@ async def _trial_funding(arguments: argparse.Namespace) -> int:
     )
     print(renderer(cycle))
     return 0
+
+
+async def _trial_books(arguments: argparse.Namespace) -> int:
+    duration = None if arguments.once else arguments.duration_seconds
+    if duration is not None and (not math.isfinite(duration) or duration <= 0):
+        raise CliUsageError("duration seconds must be a finite positive number")
+    if not math.isfinite(arguments.interval_seconds) or arguments.interval_seconds <= 0:
+        raise CliUsageError("interval seconds must be a finite positive number")
+
+    async with _lighter_dydx_adapter_session() as adapters:
+        summary = await run_trial_book_session(
+            adapters,
+            arguments.db,
+            duration_seconds=duration,
+            interval_seconds=arguments.interval_seconds,
+            monotonic=time.monotonic,
+            wall_clock=_utc_now,
+            sleep=asyncio.sleep,
+            store_factory=DuckDBStore,
+        )
+    print(
+        f"trial books: attempted_cycles={summary.attempted_cycles} "
+        f"persisted_cycles={summary.persisted_cycles} failed_cycles={summary.failed_cycles} "
+        f"skewed_cycles={summary.skewed_cycles} "
+        f"lease_skipped_cycles={summary.lease_skipped_cycles}; "
+        "Research only — no trading authority."
+    )
+    return 0 if summary.persisted_cycles else 1
 
 
 def _persist_trial_funding(database: Path, prepared: PreparedLighterDydxFundingCycle) -> None:

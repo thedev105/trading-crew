@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -20,9 +21,14 @@ from polytrading.domain.models import (
 )
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.public import AdapterBatch, AdapterWarning
-from polytrading.venues.synchronized import SynchronizedBookCollector
+from polytrading.venues.synchronized import (
+    PreparedBookCollectionCycle,
+    SynchronizedBookCollector,
+    persist_prepared_book_cycle,
+)
 
 NOW = datetime(2026, 8, 12, 12, tzinfo=UTC)
+LATER = NOW + timedelta(milliseconds=50)
 CYCLE_ID = UUID("00000000-0000-0000-0000-000000000777")
 ASSETS = frozenset({Asset.SOL, Asset.BTC, Asset.ETH})
 VENUE_PAYLOADS = {
@@ -245,6 +251,53 @@ class SequenceClock:
 
     def __call__(self) -> datetime:
         return next(self._values)
+
+
+class RecordingStore:
+    def __init__(self, *, fail_cycle: bool = False) -> None:
+        self.events: list[str] = []
+        self.fail_cycle = fail_cycle
+
+    @contextmanager
+    def transaction(self):  # type: ignore[no-untyped-def]
+        self.events.append("begin")
+        try:
+            yield self
+        except BaseException:
+            self.events.append("rollback")
+            raise
+        else:
+            self.events.append("commit")
+
+    def append_raw(self, record: object) -> bool:
+        self.events.append(f"raw:{record.event_id}")
+        return True
+
+    def append_book_snapshot(self, record: object) -> bool:
+        self.events.append(f"book:{record.venue.value}:{record.asset.value}")
+        return True
+
+    def append_book_collection_cycle(self, record: object) -> bool:
+        self.events.append(f"cycle:{record.cycle_id}")
+        if self.fail_cycle:
+            raise RuntimeError("cycle insert failed")
+        return True
+
+
+def complete_adapters() -> tuple[ImmediateBookAdapter, ImmediateBookAdapter]:
+    return (
+        ImmediateBookAdapter(Venue.BYBIT),
+        ImmediateBookAdapter(Venue.HYPERLIQUID),
+    )
+
+
+def complete_prepared_book_cycle() -> PreparedBookCollectionCycle:
+    collector = SynchronizedBookCollector(
+        store=None,
+        clock=SequenceClock(NOW, LATER),
+        cycle_id_factory=lambda: CYCLE_ID,
+    )
+    return asyncio.run(collector.prepare_once(complete_adapters(), frozenset(Asset), NOW))
 
 
 def collector(
@@ -580,3 +633,54 @@ def test_invalid_book_batch_does_not_send_untrusted_warning(tmp_path: Path) -> N
     assert cycle.status == "failed"
     assert warnings == []
     store.close()
+
+
+def test_prepare_once_has_no_store_side_effect() -> None:
+    store = RecordingStore()
+    collector = SynchronizedBookCollector(store=None, clock=SequenceClock(NOW, LATER))
+    prepared = asyncio.run(collector.prepare_once(complete_adapters(), frozenset(Asset), NOW))
+
+    assert prepared.cycle.status == "complete"
+    assert store.events == []
+
+
+def test_prepared_book_cycle_persists_in_one_transaction() -> None:
+    store = RecordingStore()
+    prepared = complete_prepared_book_cycle()
+
+    assert persist_prepared_book_cycle(store, prepared) is True
+    assert store.events[0] == "begin"
+    assert store.events[-1] == "commit"
+
+
+def test_prepared_book_cycle_rolls_back_when_cycle_append_fails() -> None:
+    store = RecordingStore(fail_cycle=True)
+    prepared = complete_prepared_book_cycle()
+
+    with pytest.raises(RuntimeError, match="cycle insert failed"):
+        persist_prepared_book_cycle(store, prepared)
+
+    assert store.events[0] == "begin"
+    assert store.events[-1] == "rollback"
+    assert "commit" not in store.events
+
+
+def test_collect_once_delegates_to_prepare_then_persist() -> None:
+    store = RecordingStore()
+    prepared = complete_prepared_book_cycle()
+    collector = SynchronizedBookCollector(store)
+    calls: list[tuple[object, object, object]] = []
+
+    async def prepare_once(adapters: object, assets: object, observed_at: object):  # type: ignore[no-untyped-def]
+        calls.append((adapters, assets, observed_at))
+        return prepared
+
+    collector.prepare_once = prepare_once  # type: ignore[method-assign]
+    adapters = complete_adapters()
+
+    cycle = asyncio.run(collector.collect_once(adapters, ASSETS, NOW))
+
+    assert calls == [(adapters, ASSETS, NOW)]
+    assert cycle == prepared.cycle
+    assert store.events[0] == "begin"
+    assert store.events[-1] == "commit"

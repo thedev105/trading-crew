@@ -40,6 +40,7 @@ from polytrading.domain.models import (
 )
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.books import TrialBookRunSummary
 from polytrading.trial.funding_models import TrialFundingCycleStatus
 from polytrading.trial.writer_lease import WriterLeaseUnavailable
 from polytrading.venues.funding_cycle_models import FundingCycleStatus
@@ -1141,6 +1142,171 @@ def test_trial_funding_parser_requires_exactly_one_boundary_mode_without_scope_o
         == 2
     )
     assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_trial_books_parser_requires_exactly_one_mode_without_scope_options(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parsed = cli.build_parser().parse_args(["trial", "books", "--once", "--db", "var/trial.duckdb"])
+
+    assert parsed.command == "trial"
+    assert parsed.trial_command == "books"
+    assert parsed.once is True
+    assert parsed.interval_seconds == 5.0
+    assert not hasattr(parsed, "venue")
+    assert not hasattr(parsed, "assets")
+
+    assert main(["trial", "books", "--db", str(tmp_path / "neither.duckdb")]) == 2
+    assert "--once" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--db",
+                str(tmp_path / "both.duckdb"),
+                "--once",
+                "--duration-seconds",
+                "60",
+            ]
+        )
+        == 2
+    )
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("option", "mode", "value"),
+    [
+        ("--duration-seconds", (), "0"),
+        ("--duration-seconds", (), "-1"),
+        ("--duration-seconds", (), "nan"),
+        ("--duration-seconds", (), "inf"),
+        ("--interval-seconds", ("--once",), "0"),
+        ("--interval-seconds", ("--once",), "-1"),
+        ("--interval-seconds", ("--once",), "nan"),
+        ("--interval-seconds", ("--once",), "inf"),
+    ],
+)
+def test_trial_books_rejects_non_positive_or_non_finite_timing_before_clients(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    option: str,
+    mode: tuple[str, ...],
+    value: str,
+) -> None:
+    @asynccontextmanager
+    async def reject_session() -> Iterator[tuple[object, ...]]:
+        raise AssertionError("invalid timing opened public clients")
+        yield ()
+
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", reject_session)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--db",
+                str(tmp_path / "invalid.duckdb"),
+                *mode,
+                option,
+                value,
+            ]
+        )
+        == 2
+    )
+    assert "finite positive" in capsys.readouterr().err
+
+
+def test_trial_books_keeps_exact_pair_clients_alive_for_whole_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    adapters = (object(), object())
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, object]]:
+        events.append("clients-open")
+        yield adapters
+        events.append("clients-close")
+
+    async def run(received: object, database: Path, **kwargs: object) -> TrialBookRunSummary:
+        assert received is adapters
+        assert database == tmp_path / "trial.duckdb"
+        assert kwargs["duration_seconds"] is None
+        assert kwargs["interval_seconds"] == 5.0
+        assert kwargs["store_factory"] is cli.DuckDBStore
+        events.append("run")
+        return TrialBookRunSummary(1, 1, 0, 0, 0)
+
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session)
+    monkeypatch.setattr(cli, "run_trial_book_session", run, raising=False)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 0
+    )
+    assert events == ["clients-open", "run", "clients-close"]
+    assert capsys.readouterr().out == (
+        "trial books: attempted_cycles=1 persisted_cycles=1 failed_cycles=0 "
+        "skewed_cycles=0 lease_skipped_cycles=0; "
+        "Research only — no trading authority.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_exit"),
+    [
+        (TrialBookRunSummary(1, 0, 0, 0, 1), 1),
+        (TrialBookRunSummary(2, 2, 1, 1, 0), 0),
+    ],
+)
+def test_trial_books_exit_and_summary_follow_durable_diagnostic_cycles(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    summary: TrialBookRunSummary,
+    expected_exit: int,
+) -> None:
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, object]]:
+        yield object(), object()
+
+    async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
+        return summary
+
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session)
+    monkeypatch.setattr(cli, "run_trial_book_session", run, raising=False)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == expected_exit
+    )
+    assert capsys.readouterr().out == (
+        f"trial books: attempted_cycles={summary.attempted_cycles} "
+        f"persisted_cycles={summary.persisted_cycles} failed_cycles={summary.failed_cycles} "
+        f"skewed_cycles={summary.skewed_cycles} "
+        f"lease_skipped_cycles={summary.lease_skipped_cycles}; "
+        "Research only — no trading authority.\n"
+    )
 
 
 def test_trial_funding_current_uses_one_clock_read_for_boundary_and_late_routing(
