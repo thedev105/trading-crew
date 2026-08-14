@@ -448,7 +448,108 @@ authorization. The system has no wallet, signer, balance, position, transfer, or
 or venue-account client. KYC, residency, entity, sanctions, custody, transfer-route, tax, and legal
 eligibility—including Germany or Estonia—remain deferred reviews outside this model.
 
-## 9. Synchronized 20-level book collection
+## 9. Prospective Lighter–dYdX trial operations
+
+The trial commands collect the candidate-specific, append-only public evidence that the shadow
+economics gate needs. They use exactly dYdX and Lighter, exactly BTC, ETH, and SOL, and one shared
+database. They do not access accounts or install a scheduler. Run this manual smoke only when the
+current hourly funding boundary is inside its five-minute collection window:
+
+```bash
+mkdir -p var
+.venv/bin/polytrading trial funding --current \
+  --db var/lighter-dydx-trial.duckdb --format json
+.venv/bin/polytrading trial books --duration-seconds 60 --interval-seconds 5 \
+  --db var/lighter-dydx-trial.duckdb
+.venv/bin/polytrading trial health --recent-hours 24 \
+  --db var/lighter-dydx-trial.duckdb --format text
+.venv/bin/polytrading dashboard \
+  --db var/lighter-dydx-trial.duckdb --port 8787
+```
+
+The funding command validates whole-hour UTC timing. From the boundary through minute 5 inclusive,
+it may request public venue data; after that cutoff it makes no venue request and persists a `late`
+diagnostic. Every invocation receives a new cycle UUID, including two attempts for the same hourly
+boundary. The second attempt is therefore an independent append-only observation, not an in-place
+retry: health can choose a later complete attempt while retaining the first attempt and reporting
+the duplicate-attempt count.
+
+Exit codes are intended for external monitoring:
+
+- `trial funding` exits `0` when one immutable cycle was durably appended, even when its status is
+  `degraded` or `late`; it exits `1` when collection, locking, or persistence prevents a durable
+  cycle, and `2` for invalid input.
+- `trial books` exits `0` when at least one cycle was durably appended, `1` when no cycle became
+  durable, and `2` for invalid input.
+- `trial health` exits `0` for `COLLECTING` or `READY_FOR_ECONOMICS_EVALUATION`, `1` for
+  `NOT_STARTED` or `DEGRADED`, and `2` for invalid input or an unavailable/non-current database.
+
+These four portable cron entries use the same database and keep the one-minute book burst separate
+from the funding attempts. They are documentation only. Replace `/absolute/path/poly-trading` with
+the absolute path to the checkout; the project does not install or modify cron or any other
+scheduler. UTC boundary math is internal, so cron's configured timezone does not define the funding
+boundary.
+
+```cron
+1 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial funding --current --db var/lighter-dydx-trial.duckdb --format json >> var/trial-funding.log 2>&1
+4 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial funding --current --db var/lighter-dydx-trial.duckdb --format json >> var/trial-funding.log 2>&1
+6 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial health --recent-hours 24 --db var/lighter-dydx-trial.duckdb --format json >> var/trial-health.log 2>&1
+58 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial books --duration-seconds 60 --interval-seconds 5 --db var/lighter-dydx-trial.duckdb >> var/trial-books.log 2>&1
+```
+
+Do not point unrelated legacy writer commands at this trial database while scheduled collection is
+active. The local writer lease reduces brief write collisions; it is not a distributed lock and it
+does not make a network filesystem safe for concurrent writers.
+
+### Storage volume, gaps, and retention
+
+At a five-second interval, a 60-second burst produces at most 12 synchronized book cycles per hour.
+For two venues, three assets, two sides, and 20 levels, that is up to 2,880 normalized level rows per
+hour, or approximately 4.15 million normalized book levels over 60 days, before evaluator
+eligibility exclusions. Exact raw public payloads are also retained; their size is venue-dependent,
+so monitor actual database growth, free disk capacity, and collector logs on the target host.
+
+The system performs no automatic retention or deletion. Disk provisioning, backups, retention
+policy, and tested restoration remain operator responsibilities. Close collectors before copying a
+DuckDB file, preserve the original database before schema upgrades, and never delete a gap merely
+to improve a coverage percentage.
+
+Historical collection cannot repair prospective trial lineage. Missing boundaries, late attempts,
+and generic historical funding or book rows remain visible for diagnosis, but they are ineligible
+for trial readiness and the shadow-economics windows. The health report and dashboard expose those
+gaps; neither inserts synthetic evidence nor moves the trial start to hide an eligible-hour miss.
+
+### Dashboard and economics handoff
+
+The loopback dashboard renders this trial's status, per-asset coverage, recent boundary matrix,
+fees, projection, and immutable economics evidence from the same database. Its recipes are
+copy-only; the page has no collection or execution controls. A transient writer collision returns
+`DATABASE_BUSY`; the browser retries within a bounded budget and preserves its prior snapshot with
+a visible stale label if refresh still cannot complete.
+
+Immediately before an economics evaluation, persist a fresh synchronized book cycle, inspect trial
+health, and then run the separately frozen evaluator:
+
+```bash
+.venv/bin/polytrading trial books --once --db var/lighter-dydx-trial.duckdb
+.venv/bin/polytrading trial health --recent-hours 24 --db var/lighter-dydx-trial.duckdb
+.venv/bin/polytrading carry economics --policy policy/BTC.json \
+  --db var/lighter-dydx-trial.duckdb --evaluated-at 2026-11-12T17:59:10Z \
+  --evaluation-id 00000000-0000-0000-0000-000000000001 --format json
+```
+
+After the fresh immutable book cycle is stored, update the explicit policy `known_as_of` to a UTC
+timestamp at or after that cycle's completion and no later than `evaluated-at`; do not weaken the
+30-second latest-book limit or backdate the policy cutoff. Confirm the frozen `study_end`, reviewed
+fee tier, margin facts, latency facts, operating cost, and source hashes before evaluation.
+
+READY_FOR_ECONOMICS_EVALUATION is not trading authorization. It means only that the collection
+windows can be handed to the separate research evaluator. `INSUFFICIENT_EVIDENCE`, `REJECTED`, and
+`SHADOW_CANDIDATE` are research results; none can authorize, create, size, submit, cancel, or manage
+an order. Account access, credentials, capital allocation, custody, KYC, residency, sanctions, tax,
+and legal eligibility remain outside this system.
+
+## 10. Synchronized 20-level book collection
 
 Book cycles start the selected venue requests concurrently and request exactly 20 levels for each
 asset. Run one cycle with `--once`, or collect for a bounded duration:
@@ -501,7 +602,7 @@ book uses local post-response receipt time and the CLI prints
 `LIGHTER_REST_BOOK_LOCAL_TIMESTAMP`. This is executable-depth research evidence, not queue-position
 or continuous-book proof.
 
-## 10. Carry audit interpretation
+## 11. Carry audit interpretation
 
 Every audit requires an explicit point-in-time cutoff. Text and canonical JSON always order assets
 as BTC, ETH, and SOL and report research-only warnings. `DIAGNOSTIC_ONLY` means current compatible
@@ -514,7 +615,7 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 11. Cross-venue funding persistence study
+## 12. Cross-venue funding persistence study
 
 The read-only study tests one frozen direction: long the Bybit perpetual and short the
 Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
@@ -552,7 +653,7 @@ create a commercial data product. The current Bybit API agreement and any applic
 terms must be reviewed for the exact intended use before expanding collection or proprietary
 deployment.
 
-## 12. Database backup, replay, and schema versions
+## 13. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -570,7 +671,7 @@ and timestamps but the dashboard labels it `LEGACY_ECONOMICS_SCHEMA_UNSUPPORTED`
 insufficient evidence, and withholds all economic values. Those missing venue components cannot be
 safely reconstructed from the old aggregate.
 
-## 13. Explicit read-only boundary
+## 14. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -578,7 +679,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 14. Evidence still required by the Class C activation gate
+## 15. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
@@ -594,7 +695,7 @@ requires all of the following evidence:
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
 
-## 15. Offline semantic scout experiment
+## 16. Offline semantic scout experiment
 
 The semantic scout is an offline research layer. AI-like components may retrieve similar rule
 text and propose structured interpretations; only deterministic schema, source-span, corpus,
