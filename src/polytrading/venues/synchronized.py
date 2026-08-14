@@ -207,7 +207,7 @@ class SynchronizedBookCollector:
             max_effective_skew_ms=max_effective_skew_ms,
             status=status,
             failure_codes=tuple(sorted(failure_codes)),
-            source_hashes=tuple(raw.source_hash for raw in raw_records),
+            source_hashes=tuple(sorted({raw.source_hash for raw in raw_records})),
         )
         warnings = tuple(
             sorted(
@@ -230,6 +230,11 @@ class SynchronizedBookCollector:
         requested_assets: frozenset[Asset],
         cycle_id: UUID,
     ) -> str | None:
+        if any(raw.venue is not venue for raw in batch.raw):
+            return "venue_mismatch"
+        raw_event_ids = tuple(raw.event_id for raw in batch.raw)
+        if len(set(raw_event_ids)) != len(raw_event_ids):
+            return "duplicate_raw_identity"
         books = batch.normalized
         if any(type(record) is not Level2BookSnapshot for record in books):
             return "invalid_normalized_record"

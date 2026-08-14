@@ -116,9 +116,11 @@ class RecordingStore:
         events: list[str],
         *,
         cancel_on_cycle: bool = False,
+        close_error: BaseException | None = None,
     ) -> None:
         self.events = events
         self.cancel_on_cycle = cancel_on_cycle
+        self.close_error = close_error
 
     @contextmanager
     def transaction(self):  # type: ignore[no-untyped-def]
@@ -137,16 +139,28 @@ class RecordingStore:
 
     def close(self) -> None:
         self.events.append("close")
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class RecordingStoreFactory:
-    def __init__(self, *, cancel_on_cycle: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        cancel_on_cycle: bool = False,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.events: list[str] = []
         self.cancel_on_cycle = cancel_on_cycle
+        self.close_error = close_error
 
     def __call__(self, _path: Path) -> RecordingStore:
         self.events.append("open")
-        return RecordingStore(self.events, cancel_on_cycle=self.cancel_on_cycle)
+        return RecordingStore(
+            self.events,
+            cancel_on_cycle=self.cancel_on_cycle,
+            close_error=self.close_error,
+        )
 
 
 class AdvancingClock:
@@ -406,6 +420,64 @@ def test_trial_book_session_closes_store_and_releases_lease_on_cancellation(tmp_
             )
         )
 
+    assert stores.events == ["open", "close"]
+    with database_writer_lease(database, timeout_seconds=0):
+        pass
+
+
+def test_trial_book_store_close_failure_does_not_replace_primary_cancellation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    close_secret = OSError("/private/evidence/books.duckdb token=secret lock-owner=private")
+    stores = RecordingStoreFactory(cancel_on_cycle=True, close_error=close_secret)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            run_trial_book_session(
+                complete_trial_adapters(),
+                database,
+                duration_seconds=None,
+                interval_seconds=5,
+                monotonic=lambda: 0,
+                wall_clock=lambda: NOW,
+                sleep=asyncio.sleep,
+                store_factory=stores,
+            )
+        )
+
+    assert stores.events == ["open", "close"]
+    with database_writer_lease(database, timeout_seconds=0):
+        pass
+
+
+def test_trial_book_store_close_only_failure_escapes_as_sanitizable_error(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    close_secret = OSError(
+        "/private/evidence/books.duckdb "
+        "https://private.example.test/books?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+    stores = RecordingStoreFactory(close_error=close_secret)
+
+    with pytest.raises(RuntimeError, match=r"^TRIAL_BOOK_STORE_CLOSE_ERROR$") as captured:
+        asyncio.run(
+            run_trial_book_session(
+                complete_trial_adapters(),
+                database,
+                duration_seconds=None,
+                interval_seconds=5,
+                monotonic=lambda: 0,
+                wall_clock=lambda: NOW,
+                sleep=asyncio.sleep,
+                store_factory=stores,
+            )
+        )
+
+    assert captured.value.__cause__ is close_secret
+    assert str(close_secret) not in str(captured.value)
     assert stores.events == ["open", "close"]
     with database_writer_lease(database, timeout_seconds=0):
         pass

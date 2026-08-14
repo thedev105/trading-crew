@@ -182,6 +182,79 @@ class WrongVenueBatchAdapter:
         )
 
 
+class ForeignExtraRawAdapter:
+    venue = Venue.HYPERLIQUID
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        del observed_at
+        return AdapterBatch(
+            raw=(
+                raw_envelope(self.venue),
+                distinct_raw_envelope(
+                    Venue.BYBIT,
+                    UUID("00000000-0000-0000-0000-000000000003"),
+                ),
+            ),
+            normalized=tuple(
+                book_snapshot(self.venue, asset, cycle_id, NOW)
+                for asset in sorted(assets, key=lambda item: item.value)
+            ),
+        )
+
+
+class DuplicateRawIdentityAdapter:
+    venue = Venue.HYPERLIQUID
+
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        del observed_at
+        primary = raw_envelope(self.venue)
+        extra_payload = '{"venue":"hyperliquid","request":"duplicate-id"}'
+        duplicate = primary.model_copy(
+            update={
+                "endpoint": "/hyperliquid/public/book/duplicate",
+                "payload_json": extra_payload,
+                "source_hash": hashlib.sha256(extra_payload.encode()).hexdigest(),
+            }
+        )
+        return AdapterBatch(
+            raw=(primary, duplicate),
+            normalized=tuple(
+                book_snapshot(self.venue, asset, cycle_id, NOW)
+                for asset in sorted(assets, key=lambda item: item.value)
+            ),
+        )
+
+
+class DuplicateSourceHashAdapter(ImmediateBookAdapter):
+    async def fetch_order_books(
+        self,
+        assets: frozenset[Asset],
+        observed_at: datetime,
+        cycle_id: UUID,
+    ) -> AdapterBatch:
+        batch = await super().fetch_order_books(assets, observed_at, cycle_id)
+        return AdapterBatch(
+            raw=(
+                *batch.raw,
+                distinct_raw_envelope(
+                    self.venue,
+                    UUID("00000000-0000-0000-0000-000000000004"),
+                ),
+            ),
+            normalized=batch.normalized,
+        )
+
+
 class DuplicateBookIdentityAdapter:
     venue = Venue.HYPERLIQUID
 
@@ -360,7 +433,7 @@ def test_collect_once_starts_both_requests_and_persists_six_high_skew_books(
     assert cycle.max_effective_skew_ms == Decimal("2500")
     assert cycle.status == "skew_exceeds_research_target"
     assert cycle.failure_codes == ()
-    assert cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT], VENUE_HASHES[Venue.HYPERLIQUID])
+    assert cycle.source_hashes == tuple(sorted(VENUE_HASHES.values()))
     assert store.latest_book_cycle_as_of(NOW + timedelta(seconds=1)) == cycle
     assert store.latest_book_cycle_as_of(NOW - timedelta(microseconds=1)) is None
     assert store.latest_book_as_of(Venue.BYBIT, "BTCUSDT", NOW + timedelta(seconds=1)) is None
@@ -440,6 +513,104 @@ def test_invalid_batch_evidence_is_excluded_while_failed_cycle_persists(
         assert connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (1,)
 
 
+def test_foreign_extra_raw_is_scoped_failure_with_canonical_queryable_valid_evidence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "foreign-extra.duckdb"
+    store = DuckDBStore(path)
+    prepared = asyncio.run(
+        SynchronizedBookCollector(
+            store=None,
+            clock=SequenceClock(NOW, LATER),
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once(
+            (ImmediateBookAdapter(Venue.BYBIT), ForeignExtraRawAdapter()),
+            ASSETS,
+            NOW,
+        )
+    )
+
+    assert prepared.cycle.status == "failed"
+    assert prepared.cycle.failure_codes == ("hyperliquid:venue_mismatch",)
+    assert tuple(raw.event_id for raw in prepared.raw_records) == (UUID(int=1),)
+    assert {(book.venue, book.asset) for book in prepared.books} == {
+        (Venue.BYBIT, Asset.BTC),
+        (Venue.BYBIT, Asset.ETH),
+        (Venue.BYBIT, Asset.SOL),
+    }
+    assert prepared.cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+
+    assert persist_prepared_book_cycle(store, prepared) is True
+    assert store.latest_book_cycle_as_of(LATER) == prepared.cycle
+    assert store.book_collection_cycles_completed_between(NOW, LATER, LATER) == (prepared.cycle,)
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        counts = tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "book_snapshots",
+                "book_levels",
+                "book_collection_cycles",
+            )
+        )
+        raw_rows = connection.execute(
+            "SELECT event_id, venue, source_hash FROM raw_envelopes"
+        ).fetchall()
+    assert counts == (1, 0, 0, 1)
+    assert raw_rows == [(UUID(int=1), Venue.BYBIT.value, VENUE_HASHES[Venue.BYBIT])]
+
+
+def test_duplicate_raw_event_id_is_scoped_failure_instead_of_database_rollback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "duplicate-event.duckdb"
+    store = DuckDBStore(path)
+    prepared = asyncio.run(
+        SynchronizedBookCollector(
+            store=None,
+            clock=SequenceClock(NOW, LATER),
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once(
+            (DuplicateSourceHashAdapter(Venue.BYBIT), DuplicateRawIdentityAdapter()),
+            ASSETS,
+            NOW,
+        )
+    )
+
+    assert prepared.cycle.status == "failed"
+    assert prepared.cycle.failure_codes == ("hyperliquid:duplicate_raw_identity",)
+    assert tuple(raw.event_id for raw in prepared.raw_records) == (UUID(int=1), UUID(int=4))
+    assert {(book.venue, book.asset) for book in prepared.books} == {
+        (Venue.BYBIT, Asset.BTC),
+        (Venue.BYBIT, Asset.ETH),
+        (Venue.BYBIT, Asset.SOL),
+    }
+    assert prepared.cycle.source_hashes == (VENUE_HASHES[Venue.BYBIT],)
+
+    assert persist_prepared_book_cycle(store, prepared) is True
+    assert store.latest_book_cycle_as_of(LATER) == prepared.cycle
+    assert store.book_collection_cycles_completed_between(NOW, LATER, LATER) == (prepared.cycle,)
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        counts = tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "book_snapshots",
+                "book_levels",
+                "book_collection_cycles",
+            )
+        )
+        event_ids = connection.execute(
+            "SELECT event_id FROM raw_envelopes ORDER BY event_id"
+        ).fetchall()
+    assert counts == (2, 0, 0, 1)
+    assert event_ids == [(UUID(int=1),), (UUID(int=4),)]
+
+
 def test_duplicate_book_identity_is_failed_cycle_instead_of_database_rollback(
     tmp_path: Path,
 ) -> None:
@@ -473,7 +644,7 @@ def test_duplicate_book_identity_is_failed_cycle_instead_of_database_rollback(
     [
         ("bad_digest", "raw_source_hash_mismatch"),
         ("orphan_lineage", "normalized_lineage_mismatch"),
-        ("cross_venue_lineage", "normalized_lineage_mismatch"),
+        ("cross_venue_lineage", "venue_mismatch"),
     ],
 )
 def test_invalid_evidence_batch_is_venue_failure_without_persisted_evidence(

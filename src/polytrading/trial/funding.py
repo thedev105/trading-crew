@@ -136,63 +136,78 @@ class LighterDydxFundingCollector:
                     reason_codes=(),
                 )
 
-        calls = tuple((adapter, asset) for adapter in ordered_adapters for asset in ordered_assets)
-        funding_results = await asyncio.gather(
-            *(
-                adapter.fetch_funding_history(
-                    asset,
-                    normalized_cycle_end,
-                    normalized_cycle_end,
-                    request_started_at,
-                )
-                for adapter, asset in calls
-            ),
-            return_exceptions=True,
-        )
         valid_funding: list[FundingObservation] = []
         funding_by_pair: dict[tuple[Venue, Asset], _FundingResult] = {}
-        for (adapter, asset), result in zip(calls, funding_results, strict=True):
-            pair = (adapter.venue, asset)
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                funding_by_pair[pair] = _funding_failure(adapter.venue, asset, result)
-                continue
-            try:
-                observations = _validate_funding_batch(
-                    result,
-                    venue=adapter.venue,
-                    asset=asset,
-                    cycle_end=normalized_cycle_end,
-                    request_started_at=request_started_at,
-                )
-                _require_new_raw_identities(result.raw, valid_raws)
-            except (TypeError, ValueError, AdapterBatchIntegrityError) as error:
-                funding_by_pair[pair] = _funding_failure(adapter.venue, asset, error)
-                continue
-            hashes = tuple(sorted({raw.source_hash for raw in result.raw}))
-            response_observed_at = max(raw.observed_at for raw in result.raw)
-            valid_raws.extend(result.raw)
-            if observations:
-                observation = observations[0]
-                valid_funding.append(observation)
-                funding_by_pair[pair] = _FundingResult(
-                    outcome=TrialFundingOutcome.CAPTURED,
-                    effective_at=observation.effective_at,
-                    observed_at=observation.observed_at,
-                    source_hashes=hashes,
-                    reason_codes=(),
-                )
-            else:
-                funding_by_pair[pair] = _FundingResult(
-                    outcome=TrialFundingOutcome.MISSING_EXPECTED,
+        funding_request_started_at = normalize_utc_timestamp(self._clock())
+        _, _, funding_cutoff_missed = validate_trial_cycle_timing(
+            normalized_cycle_end, funding_request_started_at
+        )
+        calls = tuple((adapter, asset) for adapter in ordered_adapters for asset in ordered_assets)
+        if funding_cutoff_missed:
+            for adapter, asset in calls:
+                funding_by_pair[(adapter.venue, asset)] = _FundingResult(
+                    outcome=TrialFundingOutcome.LATE_NOT_COLLECTED,
                     effective_at=None,
-                    observed_at=response_observed_at,
-                    source_hashes=hashes,
-                    reason_codes=("FUNDING_MISSING_EXPECTED",),
+                    observed_at=None,
+                    source_hashes=(),
+                    reason_codes=("COLLECTION_WINDOW_MISSED",),
                 )
+            request_completed_at = funding_request_started_at
+        else:
+            funding_results = await asyncio.gather(
+                *(
+                    adapter.fetch_funding_history(
+                        asset,
+                        normalized_cycle_end,
+                        normalized_cycle_end,
+                        funding_request_started_at,
+                    )
+                    for adapter, asset in calls
+                ),
+                return_exceptions=True,
+            )
+            for (adapter, asset), result in zip(calls, funding_results, strict=True):
+                pair = (adapter.venue, asset)
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
+                    funding_by_pair[pair] = _funding_failure(adapter.venue, asset, result)
+                    continue
+                try:
+                    observations = _validate_funding_batch(
+                        result,
+                        venue=adapter.venue,
+                        asset=asset,
+                        cycle_end=normalized_cycle_end,
+                        request_started_at=funding_request_started_at,
+                    )
+                    _require_new_raw_identities(result.raw, valid_raws)
+                except (TypeError, ValueError, AdapterBatchIntegrityError) as error:
+                    funding_by_pair[pair] = _funding_failure(adapter.venue, asset, error)
+                    continue
+                hashes = tuple(sorted({raw.source_hash for raw in result.raw}))
+                response_observed_at = max(raw.observed_at for raw in result.raw)
+                valid_raws.extend(result.raw)
+                if observations:
+                    observation = observations[0]
+                    valid_funding.append(observation)
+                    funding_by_pair[pair] = _FundingResult(
+                        outcome=TrialFundingOutcome.CAPTURED,
+                        effective_at=observation.effective_at,
+                        observed_at=observation.observed_at,
+                        source_hashes=hashes,
+                        reason_codes=(),
+                    )
+                else:
+                    funding_by_pair[pair] = _FundingResult(
+                        outcome=TrialFundingOutcome.MISSING_EXPECTED,
+                        effective_at=None,
+                        observed_at=response_observed_at,
+                        source_hashes=hashes,
+                        reason_codes=("FUNDING_MISSING_EXPECTED",),
+                    )
 
-        request_completed_at = normalize_utc_timestamp(self._clock())
+            request_completed_at = normalize_utc_timestamp(self._clock())
         items = tuple(
             _make_item(
                 venue,
@@ -441,6 +456,10 @@ def _cycle_status(
 ) -> TrialFundingCycleStatus:
     cutoff = cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG
     if any(
+        item.instrument_outcome is TrialInstrumentOutcome.LATE_NOT_COLLECTED
+        or item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
+        for item in items
+    ) or any(
         observed_at is not None and observed_at > cutoff
         for item in items
         for observed_at in (item.instrument_observed_at, item.funding_observed_at)

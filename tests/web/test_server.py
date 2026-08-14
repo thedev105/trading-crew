@@ -169,19 +169,112 @@ def test_dashboard_keeps_non_lock_database_failures_unavailable(
 
 
 def test_dashboard_keeps_unexpected_failures_internal(
-    database_path: Path, monkeypatch: pytest.MonkeyPatch
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    secret = (
+        "/private/evidence/dashboard.duckdb "
+        "https://private.example.test/dashboard?token=secret response-body=confidential"
+    )
+
     def unexpected(*_args: object, **_kwargs: object) -> NoReturn:
-        raise ValueError("unexpected failure")
+        raise ValueError(secret)
 
     monkeypatch.setattr(web_server, "DuckDBStore", unexpected)
 
-    response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
-        "GET", "/api/v1/dashboard", "127.0.0.1:8787"
-    )
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
 
     assert response.status is HTTPStatus.INTERNAL_SERVER_ERROR
     assert json.loads(response.body) == {"error": {"code": "INTERNAL_ERROR"}}
+    assert [record.getMessage() for record in caplog.records] == [
+        "dashboard snapshot failure: INTERNAL_ERROR"
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert secret not in caplog.text
+
+
+def test_dashboard_close_failure_returns_sanitized_database_unavailable(
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = (
+        "/private/evidence/dashboard.duckdb "
+        "https://private.example.test/dashboard?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+
+    class CloseFailingStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+
+        def close(self) -> None:
+            raise OSError(secret)
+
+    class SuccessfulBuilder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> object:
+            return object()
+
+    monkeypatch.setattr(web_server, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(web_server, "DashboardBuilder", SuccessfulBuilder)
+    monkeypatch.setattr(web_server, "render_dashboard_json", lambda _snapshot: b"{}")
+
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_UNAVAILABLE"}}
+    assert secret.encode() not in response.body
+    assert secret not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_dashboard_busy_body_failure_wins_over_sanitized_close_failure(
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_secret = f"Could not set lock on file {database_path}?token=secret"
+    close_secret = "/private/evidence/dashboard.duckdb response-body=secret lock-owner=private"
+
+    class CloseFailingStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+
+        def close(self) -> None:
+            raise OSError(close_secret)
+
+    class BusyBuilder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> object:
+            raise duckdb.IOException(body_secret)
+
+    monkeypatch.setattr(web_server, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(web_server, "DashboardBuilder", BusyBuilder)
+
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_BUSY"}}
+    assert body_secret.encode() not in response.body
+    assert close_secret.encode() not in response.body
+    assert body_secret not in caplog.text
+    assert close_secret not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_database_validation_requires_existing_current_schema(tmp_path: Path) -> None:
@@ -193,5 +286,65 @@ def test_database_validation_requires_existing_current_schema(tmp_path: Path) ->
 
     outdated = tmp_path / "outdated.duckdb"
     outdated.write_bytes(b"not a DuckDB database")
-    with pytest.raises(RuntimeError, match="dashboard database is unavailable"):
+    with pytest.raises(RuntimeError, match="DATABASE_UNAVAILABLE"):
         validate_dashboard_database(outdated)
+
+
+def test_dashboard_database_validation_sanitizes_close_failure(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = OSError(
+        "/private/evidence/dashboard.duckdb "
+        "https://private.example.test/dashboard?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+
+    class CloseFailingStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+
+        def close(self) -> None:
+            raise secret
+
+    monkeypatch.setattr(web_server, "DuckDBStore", CloseFailingStore)
+
+    with pytest.raises(RuntimeError, match=r"^DATABASE_UNAVAILABLE$") as captured:
+        validate_dashboard_database(database_path)
+
+    assert captured.value.__cause__ is secret
+    assert str(secret) not in str(captured.value)
+
+
+@pytest.mark.parametrize("body_fails", (False, True))
+def test_dashboard_server_sanitizes_close_and_preserves_primary_failure(
+    database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_fails: bool,
+) -> None:
+    body_secret = RuntimeError(
+        "https://private.example.test/server?token=secret response-body=confidential"
+    )
+    close_secret = OSError("/private/evidence/server.lock lock-owner=private")
+
+    class FailingServer:
+        server_port = 8787
+
+        def __init__(self, address: tuple[str, int], _handler: object) -> None:
+            assert address == ("127.0.0.1", 8787)
+
+        def serve_forever(self) -> None:
+            if body_fails:
+                raise body_secret
+
+        def server_close(self) -> None:
+            raise close_secret
+
+    monkeypatch.setattr(web_server, "HTTPServer", FailingServer)
+
+    with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
+        web_server.serve_dashboard(database_path, 8787)
+
+    expected_cause = body_secret if body_fails else close_secret
+    assert captured.value.__cause__ is expected_cause
+    assert str(body_secret) not in str(captured.value)
+    assert str(close_secret) not in str(captured.value)

@@ -48,7 +48,7 @@ from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
-from polytrading.trial.books import run_trial_book_session
+from polytrading.trial.books import TrialBookStoreCloseError, run_trial_book_session
 from polytrading.trial.funding import (
     LighterDydxFundingCollector,
     PreparedLighterDydxFundingCycle,
@@ -144,6 +144,10 @@ class FundingCycleCollectionError(RuntimeError):
     """A point-in-time funding cycle could not be durably recorded."""
 
 
+class TrialCommandError(RuntimeError):
+    """A trial command failed without exposing machine-local details."""
+
+
 def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollectionError:
     if isinstance(error, ConflictingRecordError):
         code = "FUNDING_CYCLE_PERSISTENCE_CONFLICT"
@@ -160,6 +164,26 @@ def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollect
     else:
         code = "FUNDING_CYCLE_COLLECTION_ERROR"
     return FundingCycleCollectionError(code)
+
+
+def _classified_trial_error(command: str, error: BaseException) -> TrialCommandError:
+    prefix = {"books": "TRIAL_BOOKS", "health": "TRIAL_HEALTH"}[command]
+    classified_error = (
+        error.__cause__
+        if isinstance(error, TrialBookStoreCloseError) and error.__cause__ is not None
+        else error
+    )
+    if isinstance(classified_error, duckdb.Error):
+        suffix = "DATABASE_ERROR"
+    elif isinstance(classified_error, httpx.HTTPError):
+        suffix = "HTTP_ERROR"
+    elif isinstance(classified_error, OSError):
+        suffix = "FILESYSTEM_ERROR"
+    elif isinstance(classified_error, ValueError):
+        suffix = "VALIDATION_ERROR"
+    else:
+        suffix = "OPERATION_ERROR"
+    return TrialCommandError(f"{prefix}_{suffix}")
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -673,6 +697,7 @@ async def public_adapter_session(
 @asynccontextmanager
 async def _lighter_dydx_adapter_session() -> AsyncIterator[tuple[PublicVenueAdapter, ...]]:
     clients: list[httpx.AsyncClient] = []
+    active_error: BaseException | None = None
     try:
         dydx_client = make_public_http_client()
         clients.append(dydx_client)
@@ -682,8 +707,15 @@ async def _lighter_dydx_adapter_session() -> AsyncIterator[tuple[PublicVenueAdap
             DydxPublicAdapter(dydx_client, _utc_now, time.monotonic_ns),
             LighterPublicAdapter(lighter_client, _utc_now, time.monotonic_ns),
         )
+    except BaseException as error:
+        active_error = error
+        raise
     finally:
-        await asyncio.gather(*(client.aclose() for client in clients))
+        try:
+            await asyncio.gather(*(client.aclose() for client in clients))
+        except Exception:
+            if active_error is None:
+                raise
 
 
 def _render_adapter_warning(warning: AdapterWarning) -> str:
@@ -871,17 +903,20 @@ async def _trial_books(arguments: argparse.Namespace) -> int:
     if not math.isfinite(arguments.interval_seconds) or arguments.interval_seconds <= 0:
         raise CliUsageError("interval seconds must be a finite positive number")
 
-    async with _lighter_dydx_adapter_session() as adapters:
-        summary = await run_trial_book_session(
-            adapters,
-            arguments.db,
-            duration_seconds=duration,
-            interval_seconds=arguments.interval_seconds,
-            monotonic=time.monotonic,
-            wall_clock=_utc_now,
-            sleep=asyncio.sleep,
-            store_factory=DuckDBStore,
-        )
+    try:
+        async with _lighter_dydx_adapter_session() as adapters:
+            summary = await run_trial_book_session(
+                adapters,
+                arguments.db,
+                duration_seconds=duration,
+                interval_seconds=arguments.interval_seconds,
+                monotonic=time.monotonic,
+                wall_clock=_utc_now,
+                sleep=asyncio.sleep,
+                store_factory=DuckDBStore,
+            )
+    except Exception as error:
+        raise _classified_trial_error("books", error) from error
     print(
         f"trial books: attempted_cycles={summary.attempted_cycles} "
         f"persisted_cycles={summary.persisted_cycles} failed_cycles={summary.failed_cycles} "
@@ -908,18 +943,27 @@ def _trial_health(arguments: argparse.Namespace) -> int:
         raise CliUsageError("trial health database is unavailable or not current")
 
     store: DuckDBStore | None = None
+    active_error: BaseException | None = None
     try:
-        store = DuckDBStore(arguments.db, read_only=True)
-        report = LighterDydxTrialHealthAuditor(store).audit(as_of, arguments.recent_hours)
-        renderer = (
-            render_trial_health_json if arguments.format == "json" else render_trial_health_text
-        )
-        rendered = renderer(report)
-    except (duckdb.Error, ValueError, RuntimeError, OSError) as error:
-        raise CliUsageError("trial health database is unavailable or not current") from error
-    finally:
-        if store is not None:
-            store.close()
+        try:
+            store = DuckDBStore(arguments.db, read_only=True)
+            report = LighterDydxTrialHealthAuditor(store).audit(as_of, arguments.recent_hours)
+            renderer = (
+                render_trial_health_json if arguments.format == "json" else render_trial_health_text
+            )
+            rendered = renderer(report)
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    if active_error is None:
+                        raise
+    except Exception as error:
+        raise _classified_trial_error("health", error) from error
 
     print(rendered, end="" if arguments.format == "text" else "\n")
     return (

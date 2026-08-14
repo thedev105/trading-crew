@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -45,6 +46,10 @@ class WebResponse:
     headers: Mapping[str, str]
 
 
+class DashboardLifecycleError(RuntimeError):
+    """A dashboard lifecycle failed without exposing machine-local details."""
+
+
 class DashboardApplication:
     def __init__(self, database_path: Path, clock: Callable[[], datetime]) -> None:
         self._database_path = database_path
@@ -76,40 +81,55 @@ class DashboardApplication:
 
     def _dashboard_response(self) -> WebResponse:
         store: DuckDBStore | None = None
+        active_error: BaseException | None = None
         try:
-            as_of = normalize_utc_timestamp(self._clock())
-            store = DuckDBStore(self._database_path, read_only=True)
-            snapshot = DashboardBuilder(store, self._database_path).build(as_of)
-            return WebResponse(
-                HTTPStatus.OK,
-                "application/json; charset=utf-8",
-                render_dashboard_json(snapshot),
-                dict(_SECURITY_HEADERS),
-            )
-        except (duckdb.Error, OSError, RuntimeError) as error:
-            code = "DATABASE_BUSY" if _is_database_busy(error) else "DATABASE_UNAVAILABLE"
-            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, code)
-        except Exception:
-            _LOGGER.exception("unexpected dashboard snapshot failure")
-            return _error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
-        finally:
-            if store is not None:
-                store.close()
+            try:
+                as_of = normalize_utc_timestamp(self._clock())
+                store = DuckDBStore(self._database_path, read_only=True)
+                snapshot = DashboardBuilder(store, self._database_path).build(as_of)
+                return WebResponse(
+                    HTTPStatus.OK,
+                    "application/json; charset=utf-8",
+                    render_dashboard_json(snapshot),
+                    dict(_SECURITY_HEADERS),
+                )
+            except BaseException as error:
+                active_error = error
+                raise
+            finally:
+                if store is not None:
+                    try:
+                        store.close()
+                    except Exception:
+                        if active_error is None:
+                            raise
+        except Exception as error:
+            status, code = _classify_dashboard_failure(error)
+            _LOGGER.error("dashboard snapshot failure: %s", code)
+            return _error_response(status, code)
 
 
 def validate_dashboard_database(path: Path) -> None:
     if not path.is_file():
         raise ValueError("dashboard requires an existing database file")
     store: DuckDBStore | None = None
+    active_error: BaseException | None = None
     try:
-        store = DuckDBStore(path, read_only=True)
-    except (duckdb.Error, OSError, RuntimeError) as error:
-        raise RuntimeError(
-            "dashboard database is unavailable or not at the current schema"
-        ) from error
-    finally:
-        if store is not None:
-            store.close()
+        try:
+            store = DuckDBStore(path, read_only=True)
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    if active_error is None:
+                        raise
+    except Exception as error:
+        _status, code = _classify_dashboard_failure(error)
+        raise DashboardLifecycleError(code) from error
 
 
 def serve_dashboard(
@@ -119,14 +139,26 @@ def serve_dashboard(
     clock: Callable[[], datetime] | None = None,
 ) -> None:
     application = DashboardApplication(database_path, clock=clock or _utc_now)
-    server = HTTPServer(("127.0.0.1", port), _handler_for(application))
-    print(f"polytrading dashboard: http://127.0.0.1:{server.server_port}")
+    server: HTTPServer | None = None
+    active_error: BaseException | None = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+        try:
+            server = HTTPServer(("127.0.0.1", port), _handler_for(application))
+            print(f"polytrading dashboard: http://127.0.0.1:{server.server_port}")
+            with suppress(KeyboardInterrupt):
+                server.serve_forever()
+        except BaseException as error:
+            active_error = error
+            raise
+        finally:
+            if server is not None:
+                try:
+                    server.server_close()
+                except Exception:
+                    if active_error is None:
+                        raise
+    except Exception as error:
+        raise DashboardLifecycleError("DASHBOARD_SERVER_ERROR") from error
 
 
 def _handler_for(application: DashboardApplication) -> type[BaseHTTPRequestHandler]:
@@ -186,6 +218,14 @@ def _valid_host(host: str) -> bool:
 
 def _is_database_busy(error: BaseException) -> bool:
     return isinstance(error, duckdb.IOException) and "Could not set lock on file" in str(error)
+
+
+def _classify_dashboard_failure(error: BaseException) -> tuple[HTTPStatus, str]:
+    if _is_database_busy(error):
+        return HTTPStatus.SERVICE_UNAVAILABLE, "DATABASE_BUSY"
+    if isinstance(error, (duckdb.Error, OSError, RuntimeError)):
+        return HTTPStatus.SERVICE_UNAVAILABLE, "DATABASE_UNAVAILABLE"
+    return HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"
 
 
 def _json_response(status: HTTPStatus, document: object) -> WebResponse:

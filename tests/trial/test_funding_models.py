@@ -289,6 +289,71 @@ def test_cycle_status_follows_late_then_degraded_component_evidence() -> None:
         trial_funding_cycle(status=TrialFundingCycleStatus.DEGRADED)
 
 
+def _post_discovery_late_items() -> tuple[LighterDydxFundingItem, ...]:
+    return tuple(
+        LighterDydxFundingItem(
+            **(
+                item.model_dump()
+                | {
+                    "funding_outcome": TrialFundingOutcome.LATE_NOT_COLLECTED,
+                    "funding_effective_at": None,
+                    "funding_observed_at": None,
+                    "funding_source_hashes": (),
+                    "reason_codes": ("COLLECTION_WINDOW_MISSED",),
+                }
+            )
+        )
+        for item in trial_funding_cycle().items
+    )
+
+
+def test_cycle_accepts_on_time_instrument_evidence_with_all_funding_skipped_after_cutoff() -> None:
+    cycle = trial_funding_cycle(
+        request_completed_at=CYCLE_END + timedelta(minutes=5, microseconds=1),
+        items=_post_discovery_late_items(),
+        status=TrialFundingCycleStatus.LATE,
+    )
+
+    assert cycle.status is TrialFundingCycleStatus.LATE
+    assert all(
+        item.instrument_outcome is TrialInstrumentOutcome.CAPTURED
+        and item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
+        for item in cycle.items
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("partial_funding", "completion_at_cutoff", "instrument_marked_late"),
+)
+def test_cycle_rejects_incoherent_post_discovery_cutoff_skip(mutation: str) -> None:
+    items = list(_post_discovery_late_items())
+    completed_at = CYCLE_END + timedelta(minutes=5, microseconds=1)
+    if mutation == "partial_funding":
+        items[0] = trial_funding_cycle().items[0]
+    elif mutation == "completion_at_cutoff":
+        completed_at = CYCLE_END + timedelta(minutes=5)
+    else:
+        first = items[0]
+        items[0] = LighterDydxFundingItem(
+            **(
+                first.model_dump()
+                | {
+                    "instrument_outcome": TrialInstrumentOutcome.LATE_NOT_COLLECTED,
+                    "instrument_observed_at": None,
+                    "instrument_source_hashes": (),
+                }
+            )
+        )
+
+    with pytest.raises(ValidationError):
+        trial_funding_cycle(
+            request_completed_at=completed_at,
+            items=tuple(items),
+            status=TrialFundingCycleStatus.LATE,
+        )
+
+
 @given(
     now=st.datetimes(
         min_value=datetime(2026, 1, 1),

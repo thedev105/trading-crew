@@ -236,22 +236,31 @@ class LighterDydxFundingCycle(StrictRecord):
             and item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
             for item in self.items
         )
-        any_component_missed = any(
+        any_instrument_missed = any(
             item.instrument_outcome is TrialInstrumentOutcome.LATE_NOT_COLLECTED
-            or item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
             for item in self.items
         )
-        if (invocation_started_late and not all_components_missed) or (
-            not invocation_started_late and any_component_missed
-        ):
+        any_funding_missed = any(
+            item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED for item in self.items
+        )
+        all_funding_missed = all(
+            item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED for item in self.items
+        )
+        cutoff = self.cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG
+        if invocation_started_late and not all_components_missed:
             raise ValueError("late invocation requires every component missed")
+        if not invocation_started_late and (
+            any_instrument_missed
+            or (any_funding_missed and not all_funding_missed)
+            or (all_funding_missed and self.request_completed_at <= cutoff)
+        ):
+            raise ValueError("post-discovery cutoff skip requires every funding component missed")
 
         expected_pairs = tuple((venue, asset) for venue in self.venues for asset in self.assets)
         actual_pairs = tuple((item.venue, item.asset) for item in self.items)
         if actual_pairs != expected_pairs:
             raise ValueError("items must cover every requested venue and asset")
 
-        cutoff = self.cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG
         for item in self.items:
             if (
                 item.funding_effective_at is not None
@@ -283,10 +292,14 @@ class LighterDydxFundingCycle(StrictRecord):
         if self.warnings != TRIAL_FUNDING_WARNINGS:
             raise ValueError("cycle must contain the exact research warnings")
 
-        has_late_component = invocation_started_late or any(
-            observed_at is not None and observed_at > cutoff
-            for item in self.items
-            for observed_at in (item.instrument_observed_at, item.funding_observed_at)
+        has_late_component = (
+            invocation_started_late
+            or any_funding_missed
+            or any(
+                observed_at is not None and observed_at > cutoff
+                for item in self.items
+                for observed_at in (item.instrument_observed_at, item.funding_observed_at)
+            )
         )
         has_degraded_component = any(
             item.instrument_outcome is TrialInstrumentOutcome.FAILED

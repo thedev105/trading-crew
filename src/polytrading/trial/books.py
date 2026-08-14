@@ -30,6 +30,13 @@ class TrialBookRunSummary:
     lease_skipped_cycles: int
 
 
+class TrialBookStoreCloseError(RuntimeError):
+    """A per-cycle trial store failed during cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__("TRIAL_BOOK_STORE_CLOSE_ERROR")
+
+
 async def run_trial_book_session(
     adapters: Iterable[PublicVenueAdapter],
     database_path: Path,
@@ -75,17 +82,27 @@ async def run_trial_book_session(
         try:
             with database_writer_lease(database_path, timeout_seconds=0):
                 store: DuckDBStore | None = None
+                active_error: BaseException | None = None
                 try:
                     store = store_factory(database_path)
                     persist_prepared_book_cycle(store, prepared)
+                except BaseException as error:
+                    active_error = error
+                    raise
                 finally:
                     if store is not None:
-                        store.close()
+                        try:
+                            store.close()
+                        except Exception as error:
+                            if active_error is None:
+                                raise TrialBookStoreCloseError() from error
             persisted_cycles += 1
             if prepared.cycle.status == "failed":
                 failed_cycles += 1
             elif prepared.cycle.status == "skew_exceeds_research_target":
                 skewed_cycles += 1
+        except TrialBookStoreCloseError:
+            raise
         except WriterLeaseUnavailable:
             lease_skipped_cycles += 1
             persistence_failed = True

@@ -29,6 +29,7 @@ from polytrading.trial.funding_models import (
     LighterDydxFundingCycle,
     TrialFundingCycleStatus,
     TrialFundingOutcome,
+    TrialInstrumentOutcome,
 )
 from polytrading.venues.public import AdapterBatch
 from tests.trial.funding_helpers import CYCLE_END, CYCLE_ID
@@ -201,9 +202,21 @@ class FakeAdapter:
 class SequenceClock:
     def __init__(self, *values: datetime) -> None:
         self._values = iter(values)
+        self.calls = 0
 
     def __call__(self) -> datetime:
+        self.calls += 1
         return next(self._values)
+
+
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+        self.calls = 0
+
+    def __call__(self) -> datetime:
+        self.calls += 1
+        return self.value
 
 
 def _collect(
@@ -214,7 +227,11 @@ def _collect(
     return asyncio.run(
         LighterDydxFundingCollector(
             clock=clock
-            or SequenceClock(CYCLE_END + timedelta(seconds=10), CYCLE_END + timedelta(seconds=20)),
+            or SequenceClock(
+                CYCLE_END + timedelta(seconds=10),
+                CYCLE_END + timedelta(seconds=11),
+                CYCLE_END + timedelta(seconds=20),
+            ),
             cycle_id_factory=lambda: CYCLE_ID,
         ).prepare_once(adapters, ASSETS, CYCLE_END)
     )
@@ -251,7 +268,9 @@ def test_collector_requests_every_exact_lighter_dydx_boundary() -> None:
     prepared = asyncio.run(
         LighterDydxFundingCollector(
             clock=SequenceClock(
-                CYCLE_END + timedelta(seconds=10), CYCLE_END + timedelta(seconds=20)
+                CYCLE_END + timedelta(seconds=10),
+                CYCLE_END + timedelta(seconds=11),
+                CYCLE_END + timedelta(seconds=20),
             ),
             cycle_id_factory=lambda: CYCLE_ID,
         ).prepare_once(adapters, frozenset(Asset), CYCLE_END)
@@ -270,7 +289,9 @@ def test_collector_rejects_asset_subset_before_adapter_requests() -> None:
         asyncio.run(
             LighterDydxFundingCollector(
                 clock=SequenceClock(
-                    CYCLE_END + timedelta(seconds=10), CYCLE_END + timedelta(seconds=20)
+                    CYCLE_END + timedelta(seconds=10),
+                    CYCLE_END + timedelta(seconds=11),
+                    CYCLE_END + timedelta(seconds=20),
                 ),
                 cycle_id_factory=lambda: CYCLE_ID,
             ).prepare_once(adapters, frozenset({Asset.BTC}), CYCLE_END)
@@ -440,12 +461,176 @@ def test_response_after_cutoff_is_preserved_and_marks_cycle_late() -> None:
 
     prepared = _collect(
         (FakeAdapter(Venue.DYDX), lighter),
-        clock=SequenceClock(CYCLE_END + timedelta(seconds=10), late),
+        clock=SequenceClock(
+            CYCLE_END + timedelta(seconds=10),
+            CYCLE_END + timedelta(seconds=11),
+            late,
+        ),
     )
 
     assert prepared.cycle.status is TrialFundingCycleStatus.LATE
     assert prepared.cycle.items[-1].funding_observed_at == late
     assert any(raw.event_id == UUID(int=999) for raw in prepared.raw)
+
+
+def test_slow_instrument_discovery_past_cutoff_skips_all_funding_and_conserves_evidence(
+    tmp_path: Path,
+) -> None:
+    cutoff_missed_at = CYCLE_END + timedelta(minutes=5, microseconds=1)
+    clock = MutableClock(CYCLE_END + timedelta(seconds=10))
+    funding_coroutines_constructed: list[tuple[Venue, Asset]] = []
+
+    class SlowInstrumentAdapter(FakeAdapter):
+        async def fetch_instruments(
+            self, assets: frozenset[Asset], observed_at: datetime
+        ) -> AdapterBatch:
+            batch = await super().fetch_instruments(assets, observed_at)
+            clock.value = cutoff_missed_at
+            return batch
+
+        def fetch_funding_history(  # type: ignore[override]
+            self, asset: Asset, start: datetime, end: datetime, observed_at: datetime
+        ) -> object:
+            funding_coroutines_constructed.append((self.venue, asset))
+            return super().fetch_funding_history(asset, start, end, observed_at)
+
+    adapters = (SlowInstrumentAdapter(Venue.DYDX), SlowInstrumentAdapter(Venue.LIGHTER))
+    database = tmp_path / "preparation-must-not-open.duckdb"
+
+    prepared = asyncio.run(
+        LighterDydxFundingCollector(
+            clock=clock,
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once(adapters, ASSETS, CYCLE_END)
+    )
+
+    assert funding_coroutines_constructed == []
+    assert all(adapter.funding_calls == [] for adapter in adapters)
+    assert prepared.funding == ()
+    assert tuple(raw.event_id for raw in prepared.raw) == (UUID(int=100), UUID(int=200))
+    assert len(prepared.instruments) == 6
+    assert [(item.venue, item.asset) for item in prepared.cycle.items] == [
+        (Venue.DYDX, Asset.BTC),
+        (Venue.DYDX, Asset.ETH),
+        (Venue.DYDX, Asset.SOL),
+        (Venue.LIGHTER, Asset.BTC),
+        (Venue.LIGHTER, Asset.ETH),
+        (Venue.LIGHTER, Asset.SOL),
+    ]
+    assert all(
+        item.instrument_outcome is TrialInstrumentOutcome.CAPTURED
+        and item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
+        and item.funding_effective_at is None
+        and item.funding_observed_at is None
+        and item.funding_source_hashes == ()
+        and item.reason_codes == ("COLLECTION_WINDOW_MISSED",)
+        for item in prepared.cycle.items
+    )
+    expected_hashes = tuple(
+        sorted(
+            {
+                raw.source_hash
+                for adapter in adapters
+                for raw in adapter.instrument_result.raw  # type: ignore[union-attr]
+            }
+        )
+    )
+    assert prepared.cycle.status is TrialFundingCycleStatus.LATE
+    assert prepared.cycle.request_completed_at == cutoff_missed_at
+    assert prepared.cycle.source_hashes == expected_hashes
+    assert clock.calls == 2
+    assert not database.exists()
+
+
+def test_exact_cutoff_after_instrument_discovery_starts_all_six_funding_requests_concurrently() -> (
+    None
+):
+    cutoff = CYCLE_END + timedelta(minutes=5)
+    clock = SequenceClock(CYCLE_END + timedelta(seconds=10), cutoff, cutoff)
+    started: list[tuple[Venue, Asset]] = []
+
+    async def run() -> PreparedLighterDydxFundingCycle:
+        release = asyncio.Event()
+
+        class GatedFundingAdapter(FakeAdapter):
+            async def fetch_funding_history(
+                self, asset: Asset, start: datetime, end: datetime, observed_at: datetime
+            ) -> AdapterBatch:
+                started.append((self.venue, asset))
+                if len(started) == 6:
+                    release.set()
+                await release.wait()
+                return await super().fetch_funding_history(asset, start, end, observed_at)
+
+        adapters = tuple(
+            GatedFundingAdapter(
+                venue,
+                funding_results={
+                    asset: _funding_batch(venue, asset, cutoff, offset + index)
+                    for index, asset in enumerate(sorted(ASSETS, key=lambda item: item.value))
+                },
+            )
+            for venue, offset in ((Venue.DYDX, 700), (Venue.LIGHTER, 800))
+        )
+        prepared = await asyncio.wait_for(
+            LighterDydxFundingCollector(
+                clock=clock,
+                cycle_id_factory=lambda: CYCLE_ID,
+            ).prepare_once(adapters, ASSETS, CYCLE_END),
+            timeout=1,
+        )
+        assert all(call[3] == cutoff for adapter in adapters for call in adapter.funding_calls)
+        return prepared
+
+    prepared = asyncio.run(run())
+
+    assert len(started) == 6
+    assert set(started) == {
+        (venue, asset) for venue in (Venue.DYDX, Venue.LIGHTER) for asset in Asset
+    }
+    assert clock.calls == 3
+    assert prepared.cycle.status is TrialFundingCycleStatus.COMPLETE
+
+
+def test_slow_instrument_discovery_past_cutoff_preserves_scoped_instrument_failure() -> None:
+    cutoff_missed_at = CYCLE_END + timedelta(minutes=5, microseconds=1)
+    clock = MutableClock(CYCLE_END + timedelta(seconds=10))
+    dydx = FakeAdapter(Venue.DYDX, instrument_result=TimeoutError("private timeout detail"))
+
+    class SlowLighterAdapter(FakeAdapter):
+        async def fetch_instruments(
+            self, assets: frozenset[Asset], observed_at: datetime
+        ) -> AdapterBatch:
+            batch = await super().fetch_instruments(assets, observed_at)
+            clock.value = cutoff_missed_at
+            return batch
+
+    lighter = SlowLighterAdapter(Venue.LIGHTER)
+    prepared = asyncio.run(
+        LighterDydxFundingCollector(
+            clock=clock,
+            cycle_id_factory=lambda: CYCLE_ID,
+        ).prepare_once((dydx, lighter), ASSETS, CYCLE_END)
+    )
+
+    assert all(adapter.funding_calls == [] for adapter in (dydx, lighter))
+    assert prepared.cycle.status is TrialFundingCycleStatus.LATE
+    assert len(prepared.raw) == 1
+    assert len(prepared.instruments) == 3
+    assert all(
+        item.funding_outcome is TrialFundingOutcome.LATE_NOT_COLLECTED
+        for item in prepared.cycle.items
+    )
+    assert all(
+        item.instrument_outcome is TrialInstrumentOutcome.FAILED
+        and item.reason_codes
+        == (
+            "COLLECTION_WINDOW_MISSED",
+            "INSTRUMENT_FAILED:dydx:TimeoutError",
+        )
+        for item in prepared.cycle.items
+        if item.venue is Venue.DYDX
+    )
 
 
 def test_prepared_output_is_invariant_to_adapter_and_response_order() -> None:

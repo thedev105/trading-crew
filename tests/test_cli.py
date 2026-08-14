@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 import polytrading.cli as cli
+import polytrading.trial.books as trial_books
 from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.cli import RetryingTransport, collect_book_cycles, main
 from polytrading.corpus_intake.evidence import (
@@ -1313,12 +1314,80 @@ def test_trial_health_uses_one_clock_read_and_sanitizes_stale_schema(
         return datetime(2026, 8, 14, 7, 6, tzinfo=UTC)
 
     monkeypatch.setattr(cli, "_utc_now", clock)
-    assert main(["trial", "health", "--db", str(database)]) == 2
+    assert main(["trial", "health", "--db", str(database)]) == 1
     assert clock_reads == 1
     assert (
-        capsys.readouterr().err
-        == "polytrading: error: trial health database is unavailable or not current\n"
+        capsys.readouterr().err == "polytrading: collection failed: TRIAL_HEALTH_DATABASE_ERROR\n"
     )
+
+
+def test_trial_health_close_failure_uses_stable_sanitized_classification(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    database.write_bytes(b"fixture")
+    secret = (
+        "/private/evidence/health.duckdb "
+        "https://private.example.test/health?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+
+    class CloseFailingStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database, True)
+
+        def close(self) -> None:
+            raise OSError(secret)
+
+    class HealthyAuditor:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def audit(self, _as_of: datetime, _recent_hours: int) -> SimpleNamespace:
+            return SimpleNamespace(status=TrialCollectionStatus.COLLECTING)
+
+    monkeypatch.setattr(cli, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", HealthyAuditor)
+    monkeypatch.setattr(cli, "render_trial_health_text", lambda _report: "must not print")
+
+    assert main(["trial", "health", "--db", str(database)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_HEALTH_FILESYSTEM_ERROR\n"
+    assert secret not in captured.err
+
+
+def test_trial_health_body_failure_wins_over_sanitized_close_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "trial.duckdb"
+    database.write_bytes(b"fixture")
+    body_secret = "https://private.example.test/health?token=secret response-body=confidential"
+    close_secret = "/private/evidence/health.duckdb lock-owner=private"
+
+    class CloseFailingStore:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database, True)
+
+        def close(self) -> None:
+            raise OSError(close_secret)
+
+    class FailingAuditor:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def audit(self, _as_of: datetime, _recent_hours: int) -> object:
+            raise duckdb.Error(body_secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", CloseFailingStore)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", FailingAuditor)
+
+    assert main(["trial", "health", "--db", str(database)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_HEALTH_DATABASE_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
 
 
 def test_trial_books_parser_requires_exactly_one_mode_without_scope_options(
@@ -1484,6 +1553,132 @@ def test_trial_books_exit_and_summary_follow_durable_diagnostic_cycles(
         f"lease_skipped_cycles={summary.lease_skipped_cycles}; "
         "Research only — no trading authority.\n"
     )
+
+
+def test_trial_books_client_close_failure_uses_stable_sanitized_classification(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = (
+        "/private/evidence/books.duckdb "
+        "https://private.example.test/books?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+    clients: list[object] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            if self.index == 0:
+                raise OSError(secret)
+
+    async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
+        return TrialBookRunSummary(1, 1, 0, 0, 0)
+
+    monkeypatch.setattr(cli, "make_public_http_client", FakeClient)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: ("dydx", client))
+    monkeypatch.setattr(cli, "LighterPublicAdapter", lambda client, *_args: ("lighter", client))
+    monkeypatch.setattr(cli, "run_trial_book_session", run)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_FILESYSTEM_ERROR\n"
+    assert secret not in captured.err
+
+
+def test_trial_books_body_failure_wins_over_sanitized_client_close_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_secret = "https://private.example.test/books?token=secret response-body=confidential"
+    close_secret = "/private/evidence/books.duckdb lock-owner=private"
+    clients: list[object] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            if self.index == 0:
+                raise OSError(close_secret)
+
+    async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
+        raise httpx.ConnectError(body_secret)
+
+    monkeypatch.setattr(cli, "make_public_http_client", FakeClient)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: ("dydx", client))
+    monkeypatch.setattr(cli, "LighterPublicAdapter", lambda client, *_args: ("lighter", client))
+    monkeypatch.setattr(cli, "run_trial_book_session", run)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_HTTP_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+
+
+def test_trial_books_store_close_failure_uses_underlying_safe_classification(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = (
+        "/private/evidence/books.duckdb "
+        "https://private.example.test/books?token=secret "
+        "response-body=confidential lock-owner=private"
+    )
+
+    @asynccontextmanager
+    async def session() -> Iterator[tuple[object, object]]:
+        yield object(), object()
+
+    async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
+        cause = OSError(secret)
+        raise trial_books.TrialBookStoreCloseError() from cause
+
+    monkeypatch.setattr(cli, "_lighter_dydx_adapter_session", session)
+    monkeypatch.setattr(cli, "run_trial_book_session", run)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_FILESYSTEM_ERROR\n"
+    assert secret not in captured.err
 
 
 def test_trial_funding_current_uses_one_clock_read_for_boundary_and_late_routing(
@@ -1812,7 +2007,11 @@ def test_trial_funding_persists_honest_late_response_started_on_time(
     lighter.funding_results[Asset.SOL] = _funding_batch(Venue.LIGHTER, Asset.SOL, late, 991)
     prepared = _collect(
         (FakeAdapter(Venue.DYDX), lighter),
-        clock=SequenceClock(TRIAL_CYCLE_END + timedelta(seconds=10), late),
+        clock=SequenceClock(
+            TRIAL_CYCLE_END + timedelta(seconds=10),
+            TRIAL_CYCLE_END + timedelta(seconds=11),
+            late,
+        ),
     )
 
     @asynccontextmanager
