@@ -595,8 +595,10 @@ class CandidateEconomicsReport(StrictRecord):
             raise ValueError("latest pair skew exceeds frozen protocol limit")
         if self.economics is None:
             sizing_prefixes = ("DEPTH_", "DELTA_", "CAPITAL_")
-            if self.decision is not EconomicsDecision.REJECTED or not self.reason_codes or any(
-                not code.startswith(sizing_prefixes) for code in self.reason_codes
+            if (
+                self.decision is not EconomicsDecision.REJECTED
+                or not self.reason_codes
+                or any(not code.startswith(sizing_prefixes) for code in self.reason_codes)
             ):
                 raise ValueError("economics-free rejection requires only canonical sizing reasons")
             return self

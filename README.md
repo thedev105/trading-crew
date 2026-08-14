@@ -201,7 +201,9 @@ into a historical dashboard view.
 
 The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
 dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
-records exist. They do not display a strategy signal, expected return, or execution action.
+records exist. The economics table contains exactly one BTC, ETH, and SOL row selected from reports
+known by the same dashboard cutoff; it displays unavailable values rather than substituting zero.
+These rows do not display an execution action.
 
 The database must already exist and have the current schema. A temporary database lock or other
 availability conflict can make a refresh fail; the browser retains its last successful snapshot and
@@ -263,7 +265,180 @@ evidence stream; the following engineering gate is a separate point-in-time mode
 marketable depth, forced exits, basis, and funding reversals after enough observations accumulate.
 No account or execution surface belongs in that gate.
 
-## 8. Synchronized 20-level book collection
+## 8. Lighter–dYdX shadow economics gate
+
+This deterministic gate asks whether one fixed Lighter–dYdX funding direction survives explicit
+costs and stress reserves using only evidence already stored in the local database. It does not
+connect to an account or venue. Before evaluation, import a human-reviewed fee document whose
+rates are JSON strings and whose URLs and hashes identify the exact point-in-time evidence used:
+
+```json
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-08-13T17:00:00Z",
+  "fees": [
+    {
+      "schema_version": 1,
+      "venue": "dydx",
+      "tier_name": "reviewed-tier",
+      "maker_rate": "0",
+      "taker_rate": "0.0005",
+      "effective_from": "2026-08-13T00:00:00Z",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://help.dydx.trade/en/articles/166995-trading-fees-on-dydx",
+      "source_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "schema_version": 1,
+      "venue": "lighter",
+      "tier_name": "reviewed-tier",
+      "maker_rate": "0",
+      "taker_rate": "0",
+      "effective_from": "2026-08-13T00:00:00Z",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://docs.lighter.xyz/trading/trading-fees",
+      "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}
+```
+
+Save that document as `reviewed-fees.json`, then import it atomically:
+
+```bash
+.venv/bin/polytrading fees import \
+  --input reviewed-fees.json \
+  --db var/forward.duckdb
+```
+
+The evaluation policy freezes all protocol thresholds while making the account equity, approved
+cash benchmark, actual fee tier/account type, operational cost, and cited evidence explicit. Every
+decimal is a JSON string:
+
+```json
+{
+  "schema_version": 1,
+  "protocol_version": "lighter-dydx-shadow-economics-v1",
+  "asset": "BTC",
+  "study_end": "2026-08-13T16:00:00Z",
+  "known_as_of": "2026-08-13T17:00:00Z",
+  "account_equity_usd": "8000",
+  "cash_benchmark_annual_rate": "0.04",
+  "operational_cost_usd": "2",
+  "prefunded": false,
+  "operational_source_url": "https://example.com/reviewed-operational-cost",
+  "operational_source_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "execution_assumptions": [
+    {
+      "schema_version": 1,
+      "venue": "dydx",
+      "fee_tier_name": "reviewed-tier",
+      "account_type": "standard",
+      "taker_latency_ms": "300",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://help.dydx.trade/en/articles/166995-trading-fees-on-dydx",
+      "source_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "schema_version": 1,
+      "venue": "lighter",
+      "fee_tier_name": "reviewed-tier",
+      "account_type": "standard",
+      "taker_latency_ms": "300",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://docs.lighter.xyz/trading/trading-fees",
+      "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "margin_assumptions": [
+    {
+      "schema_version": 1,
+      "venue": "dydx",
+      "asset": "BTC",
+      "initial_margin_fraction": "1",
+      "maintenance_margin_fraction": "0.05",
+      "close_out_margin_fraction": "0.04",
+      "liquidation_penalty_fraction": "0.01",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://help.dydx.trade/en/articles/166991-liquidations-on-dydx-chain",
+      "source_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "schema_version": 1,
+      "venue": "lighter",
+      "asset": "BTC",
+      "initial_margin_fraction": "1",
+      "maintenance_margin_fraction": "0.05",
+      "close_out_margin_fraction": "0.04",
+      "liquidation_penalty_fraction": "0.01",
+      "observed_at": "2026-08-13T16:00:00Z",
+      "source_url": "https://docs.lighter.xyz/trading/contract-specifications",
+      "source_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "training_days": 30,
+  "evaluation_days": 60,
+  "minimum_coverage": "0.99",
+  "maximum_book_age_seconds": "30",
+  "maximum_cycle_skew_ms": "1000",
+  "maximum_hourly_book_age_seconds": "300",
+  "maximum_assigned_equity_fraction": "0.10",
+  "maximum_assigned_usd": "500",
+  "incomplete_leg_shock": "0.10",
+  "maximum_incomplete_loss_equity_fraction": "0.0025",
+  "minimum_hold_return": "0.003",
+  "minimum_profit_usd": "3",
+  "minimum_annualized_return": "0.12",
+  "cash_benchmark_spread": "0.05",
+  "maximum_stress_loss_equity_fraction": "0.0025",
+  "maximum_drawdown_fraction": "0.08",
+  "forced_exit_depth_multiplier": "2",
+  "doubled_cost_multiplier": "2",
+  "minimum_normal_quote_observations": 25,
+  "minimum_stress_quote_observations": 10
+}
+```
+
+Save it as `policy.json`. Use a caller-created UUID and evaluation timestamp so the result is
+reproducible:
+
+```bash
+.venv/bin/polytrading carry economics \
+  --policy policy.json \
+  --db var/forward.duckdb \
+  --evaluated-at 2026-08-13T17:00:07Z \
+  --evaluation-id 00000000-0000-0000-0000-000000000801 \
+  --format json
+```
+
+The command returns zero for all three research decisions and persists exactly one immutable
+report. `INSUFFICIENT_EVIDENCE` means a required point-in-time input is absent, stale, conflicting,
+or below coverage. `REJECTED` means evidence is complete enough to evaluate but one or more
+compatibility, economics, capacity, or stress gates failed. `SHADOW_CANDIDATE` means the complete
+report passed the frozen numeric gates; it is still research only. Invalid input, an unavailable
+database, or an immutable-record conflict exits with code 2.
+
+The database needs 90 prospective days: the first 30 select one direction from only the training
+funding median, and the next 60 evaluate that fixed direction without hindsight switching. It also
+needs at least 99% paired hourly funding and book coverage, recent synchronized depth, consecutive
+dense book samples for latency, the actual reviewed fee tiers, documented latency and margin facts,
+and a reviewed operational-cost amount. An empty or young database should normally produce
+`INSUFFICIENT_EVIDENCE`, not zero-valued economics.
+
+Sizing uses equal base quantity on both legs, rounds down to a compatible step, assumes both legs
+are fully collateralized, and caps assigned capital at the smallest of 10% of account equity,
+USD 500, available depth, and the incomplete-leg loss limit. Funding uses fifth-percentile rolling
+7-, 14-, and 28-day sums. Funding reversal, adverse basis divergence, forced exit, latency, fees,
+and operations are additive reserves; favorable basis convergence receives no credit. Reports show
+return on assigned capital and on total account equity so unused cash is never removed from the
+account denominator.
+
+`SHADOW_CANDIDATE` is not a recommendation, simulated fill, paper order, promise of profit, or live
+authorization. The system has no wallet, signer, balance, position, transfer, order, cancellation,
+or venue-account client. KYC, residency, entity, sanctions, custody, transfer-route, tax, and legal
+eligibility—including Germany or Estonia—remain deferred reviews outside this model.
+
+## 9. Synchronized 20-level book collection
 
 Book cycles start the selected venue requests concurrently and request exactly 20 levels for each
 asset. Run one cycle with `--once`, or collect for a bounded duration:
@@ -316,7 +491,7 @@ book uses local post-response receipt time and the CLI prints
 `LIGHTER_REST_BOOK_LOCAL_TIMESTAMP`. This is executable-depth research evidence, not queue-position
 or continuous-book proof.
 
-## 9. Carry audit interpretation
+## 10. Carry audit interpretation
 
 Every audit requires an explicit point-in-time cutoff. Text and canonical JSON always order assets
 as BTC, ETH, and SOL and report research-only warnings. `DIAGNOSTIC_ONLY` means current compatible
@@ -329,7 +504,7 @@ assets, funding timing, stale observations, book gaps, or excessive effective-ti
 invalidate comparison. The current public metadata intentionally leaves several compatibility
 fields unknown, while Hyperliquid uses USDC and Bybit settles the selected contracts in USDT.
 
-## 10. Cross-venue funding persistence study
+## 11. Cross-venue funding persistence study
 
 The read-only study tests one frozen direction: long the Bybit perpetual and short the
 Hyperliquid perpetual for the same asset. It sums native settlements into common eight-hour UTC
@@ -367,7 +542,7 @@ create a commercial data product. The current Bybit API agreement and any applic
 terms must be reviewed for the exact intended use before expanding collection or proprietary
 deployment.
 
-## 11. Database backup, replay, and schema versions
+## 12. Database backup, replay, and schema versions
 
 DuckDB files are append-only research stores. Close collectors before copying a database file for
 backup, retain the source JSONL beside it, and test restoration by replaying into a new database
@@ -379,7 +554,7 @@ version. SQL migrations are embedded in the installed package, recorded in `sche
 and applied forward-only when a store opens. Older facts are not rewritten to impersonate a newer
 schema. Preserve the original database before upgrading code across schema versions.
 
-## 12. Explicit read-only boundary
+## 13. Explicit read-only boundary
 
 The package contains no credentials, account authentication, private-key or wallet handling,
 balance or position access, signing, deposit, withdrawal, transfer, order placement, order
@@ -387,7 +562,7 @@ cancellation, allocation, or execution methods. Venue adapters expose public ins
 market snapshots, and order-book snapshots only. Do not add account or trading surfaces to this
 research increment.
 
-## 13. Evidence still required by the Class C activation gate
+## 14. Evidence still required by the Class C activation gate
 
 This increment does not activate automated trading. A separate reviewed activation decision still
 requires all of the following evidence:
@@ -403,7 +578,7 @@ requires all of the following evidence:
 
 Until that gate is satisfied, the only valid output is read-only research evidence and diagnostics.
 
-## 14. Offline semantic scout experiment
+## 15. Offline semantic scout experiment
 
 The semantic scout is an offline research layer. AI-like components may retrieve similar rule
 text and propose structured interpretations; only deterministic schema, source-span, corpus,

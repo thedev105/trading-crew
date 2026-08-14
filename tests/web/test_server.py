@@ -38,6 +38,7 @@ def test_dashboard_api_returns_one_secured_point_in_time_snapshot(database_path:
     assert [item["asset"] for item in document["economics_rows"]] == ["BTC", "ETH", "SOL"]
     assert all(not item["report_available"] for item in document["economics_rows"])
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
+    assert "img-src 'self' data:" in response.headers["Content-Security-Policy"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"

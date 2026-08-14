@@ -47,6 +47,14 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         for tag, attrs in tags
     )
     assert any(tag == "a" and attrs.get("href") == "#economics" for tag, attrs in tags)
+    favicon_urls = {
+        attrs["href"]
+        for tag, attrs in tags
+        if tag == "link"
+        and attrs.get("rel") == "icon"
+        and (attrs.get("href") or "").startswith("data:image/svg+xml,")
+    }
+    assert len(favicon_urls) == 1
     assert any(
         tag == "script" and attrs.get("type") == "module" and attrs.get("src") == "/assets/app.js"
         for tag, attrs in tags
@@ -58,7 +66,11 @@ def test_dashboard_document_has_semantic_landmarks_and_local_resources() -> None
         for name, value in attrs.items()
         if name in {"src", "href"} and value is not None and not value.startswith("#")
     }
-    assert resource_urls == {"/assets/app.css", "/assets/app.js"}
+    assert resource_urls == {
+        "/assets/app.css",
+        "/assets/app.js",
+        *favicon_urls,
+    }
 
 
 def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surfaces() -> None:

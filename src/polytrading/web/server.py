@@ -28,7 +28,7 @@ _STATIC_ASSETS = {
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; object-src 'none'; base-uri 'none'; "
-        "frame-ancestors 'none'; connect-src 'self'"
+        "frame-ancestors 'none'; connect-src 'self'; img-src 'self' data:"
     ),
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
