@@ -1,4 +1,6 @@
+import errno
 import multiprocessing
+import sys
 from pathlib import Path
 
 import pytest
@@ -95,6 +97,43 @@ def test_writer_lease_retries_only_until_its_deadline(
         pass
 
     assert sleeps == [0.05, 0.05]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock behavior")
+@pytest.mark.parametrize("lock_errno", [errno.EACCES, errno.EAGAIN])
+def test_posix_contention_errnos_follow_bounded_lease_handling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_errno: int
+) -> None:
+    def raise_lock_error(file_descriptor: int, operation: int) -> None:
+        del file_descriptor, operation
+        raise OSError(lock_errno, "simulated flock contention")
+
+    monkeypatch.setattr(writer_lease.fcntl, "flock", raise_lock_error)
+
+    with (
+        pytest.raises(WriterLeaseUnavailable, match="database writer lease is busy"),
+        database_writer_lease(tmp_path / "trial.duckdb", timeout_seconds=0),
+    ):
+        raise AssertionError("contended lease entered")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock behavior")
+def test_posix_unexpected_lock_errno_is_propagated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def raise_lock_error(file_descriptor: int, operation: int) -> None:
+        del file_descriptor, operation
+        raise OSError(errno.EIO, "simulated flock failure")
+
+    monkeypatch.setattr(writer_lease.fcntl, "flock", raise_lock_error)
+
+    with (
+        pytest.raises(OSError) as exception,
+        database_writer_lease(tmp_path / "trial.duckdb", timeout_seconds=0),
+    ):
+        pass
+
+    assert exception.value.errno == errno.EIO
 
 
 def test_writer_lease_excludes_a_second_process_and_releases_afterward(tmp_path: Path) -> None:

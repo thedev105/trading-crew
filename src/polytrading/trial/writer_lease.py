@@ -1,3 +1,4 @@
+import errno
 import math
 import sys
 import time
@@ -78,8 +79,10 @@ def _try_lock(handle: BinaryIO) -> bool:
     else:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
     return True
 
 
