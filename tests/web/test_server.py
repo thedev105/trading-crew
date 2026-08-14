@@ -1,3 +1,4 @@
+import asyncio
 import json
 import socket
 from datetime import UTC, datetime
@@ -238,6 +239,127 @@ def test_dashboard_close_failure_returns_sanitized_database_unavailable(
     assert all(record.exc_info is None for record in caplog.records)
 
 
+def test_dashboard_cleanup_cancellation_returns_sanitized_internal_error(
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "dashboard cleanup cancellation /private/db?token=secret response-body=hidden"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise asyncio.CancelledError(secret)
+
+    class Builder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> object:
+            events.append("build")
+            return object()
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+    monkeypatch.setattr(web_server, "DashboardBuilder", Builder)
+    monkeypatch.setattr(web_server, "render_dashboard_json", lambda _snapshot: b"{}")
+
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert response.status is HTTPStatus.INTERNAL_SERVER_ERROR
+    assert json.loads(response.body) == {"error": {"code": "INTERNAL_ERROR"}}
+    assert events == ["open", "build", "close"]
+    assert [record.getMessage() for record in caplog.records] == [
+        "dashboard snapshot failure: INTERNAL_ERROR"
+    ]
+    assert secret.encode() not in response.body
+    assert secret not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_dashboard_cleanup_database_busy_preserves_retry_classification(
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = duckdb.IOException(f"Could not set lock on file {database_path}?token=secret")
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+
+        def close(self) -> None:
+            raise secret
+
+    class Builder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> object:
+            return object()
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+    monkeypatch.setattr(web_server, "DashboardBuilder", Builder)
+    monkeypatch.setattr(web_server, "render_dashboard_json", lambda _snapshot: b"{}")
+
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_BUSY"}}
+    assert [record.getMessage() for record in caplog.records] == [
+        "dashboard snapshot failure: DATABASE_BUSY"
+    ]
+    assert str(secret).encode() not in response.body
+    assert str(secret) not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_dashboard_active_cancellation_wins_over_cleanup_cancellation(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = asyncio.CancelledError("primary dashboard cancellation token=primary")
+    cleanup = asyncio.CancelledError("cleanup dashboard cancellation token=cleanup")
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _path: Path, *, read_only: bool = False) -> None:
+            assert read_only is True
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise cleanup
+
+    class Builder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> NoReturn:
+            events.append("build")
+            raise primary
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+    monkeypatch.setattr(web_server, "DashboardBuilder", Builder)
+
+    with pytest.raises(BaseException) as captured:
+        DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert captured.value is primary
+    assert events == ["open", "build", "close"]
+
+
 def test_dashboard_busy_body_failure_wins_over_sanitized_close_failure(
     database_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -270,6 +392,53 @@ def test_dashboard_busy_body_failure_wins_over_sanitized_close_failure(
 
     assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
     assert json.loads(response.body) == {"error": {"code": "DATABASE_BUSY"}}
+    assert body_secret.encode() not in response.body
+    assert close_secret.encode() not in response.body
+    assert body_secret not in caplog.text
+    assert close_secret not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_dashboard_busy_body_failure_wins_over_cleanup_base_exception(
+    database_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_secret = f"Could not set lock on file {database_path}?token=body"
+    close_secret = "/private/dashboard.duckdb?token=cleanup response-body=hidden"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise asyncio.CancelledError(close_secret)
+
+    class Builder:
+        def __init__(self, _store: object, _path: Path) -> None:
+            pass
+
+        def build(self, _as_of: datetime) -> NoReturn:
+            events.append("build")
+            raise duckdb.IOException(body_secret)
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+    monkeypatch.setattr(web_server, "DashboardBuilder", Builder)
+
+    with caplog.at_level("ERROR", logger=web_server.__name__):
+        response = DashboardApplication(database_path, clock=lambda: AS_OF).respond(
+            "GET", "/api/v1/dashboard", "127.0.0.1:8787"
+        )
+
+    assert response.status is HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "DATABASE_BUSY"}}
+    assert [record.getMessage() for record in caplog.records] == [
+        "dashboard snapshot failure: DATABASE_BUSY"
+    ]
+    assert events == ["open", "build", "close"]
     assert body_secret.encode() not in response.body
     assert close_secret.encode() not in response.body
     assert body_secret not in caplog.text
@@ -315,6 +484,77 @@ def test_dashboard_database_validation_sanitizes_close_failure(
     assert str(secret) not in str(captured.value)
 
 
+def test_dashboard_database_validation_cleanup_cancellation_is_sanitized(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = asyncio.CancelledError(
+        "validation cleanup /private/dashboard.duckdb?token=secret response-body=hidden"
+    )
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise secret
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+
+    with pytest.raises(RuntimeError, match=r"^INTERNAL_ERROR$") as captured:
+        validate_dashboard_database(database_path)
+
+    assert captured.value.__cause__ is secret
+    assert str(secret) not in str(captured.value)
+    assert events == ["open", "close"]
+
+
+def test_dashboard_database_validation_cleanup_database_busy_preserves_code(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = duckdb.IOException(f"Could not set lock on file {database_path}?token=secret")
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database_path, True)
+
+        def close(self) -> None:
+            raise secret
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+
+    with pytest.raises(RuntimeError, match=r"^DATABASE_BUSY$") as captured:
+        validate_dashboard_database(database_path)
+
+    assert captured.value.__cause__ is secret
+    assert str(secret) not in str(captured.value)
+
+
+def test_dashboard_database_validation_preserves_constructor_cancellation(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = asyncio.CancelledError("validation acquisition cancellation token=primary")
+    close_calls: list[str] = []
+
+    class Store:
+        def __init__(self, _path: Path, *, read_only: bool = False) -> None:
+            assert read_only is True
+            raise primary
+
+        def close(self) -> None:
+            close_calls.append("close")
+
+    monkeypatch.setattr(web_server, "DuckDBStore", Store)
+
+    with pytest.raises(BaseException) as captured:
+        validate_dashboard_database(database_path)
+
+    assert captured.value is primary
+    assert close_calls == []
+
+
 @pytest.mark.parametrize("body_fails", (False, True))
 def test_dashboard_server_sanitizes_close_and_preserves_primary_failure(
     database_path: Path,
@@ -348,3 +588,117 @@ def test_dashboard_server_sanitizes_close_and_preserves_primary_failure(
     assert captured.value.__cause__ is expected_cause
     assert str(body_secret) not in str(captured.value)
     assert str(close_secret) not in str(captured.value)
+
+
+def test_dashboard_server_body_failure_wins_over_cleanup_base_exception(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_secret = RuntimeError(
+        "https://private.example.test/server?token=body response-body=hidden"
+    )
+    close_secret = KeyboardInterrupt("/private/server.lock?token=cleanup lock-owner=hidden")
+    events: list[str] = []
+
+    class Server:
+        server_port = 8787
+
+        def __init__(self, address: tuple[str, int], _handler: object) -> None:
+            assert address == ("127.0.0.1", 8787)
+            events.append("construct")
+
+        def serve_forever(self) -> NoReturn:
+            events.append("serve")
+            raise body_secret
+
+        def server_close(self) -> None:
+            events.append("close")
+            raise close_secret
+
+    monkeypatch.setattr(web_server, "HTTPServer", Server)
+
+    with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
+        web_server.serve_dashboard(database_path, 8787)
+
+    assert captured.value.__cause__ is body_secret
+    assert str(body_secret) not in str(captured.value)
+    assert str(close_secret) not in str(captured.value)
+    assert events == ["construct", "serve", "close"]
+
+
+def test_dashboard_server_active_cancellation_wins_over_cleanup_cancellation(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = asyncio.CancelledError("primary server cancellation token=primary")
+    cleanup = asyncio.CancelledError("cleanup server cancellation token=cleanup")
+    events: list[str] = []
+
+    class Server:
+        server_port = 8787
+
+        def __init__(self, address: tuple[str, int], _handler: object) -> None:
+            assert address == ("127.0.0.1", 8787)
+            events.append("construct")
+
+        def serve_forever(self) -> NoReturn:
+            events.append("serve")
+            raise primary
+
+        def server_close(self) -> None:
+            events.append("close")
+            raise cleanup
+
+    monkeypatch.setattr(web_server, "HTTPServer", Server)
+
+    with pytest.raises(BaseException) as captured:
+        web_server.serve_dashboard(database_path, 8787)
+
+    assert captured.value is primary
+    assert events == ["construct", "serve", "close"]
+
+
+def test_dashboard_server_cleanup_keyboard_interrupt_is_stably_sanitized(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = KeyboardInterrupt(
+        "server cleanup /private/server.lock?token=secret response-body=hidden"
+    )
+    events: list[str] = []
+
+    class Server:
+        server_port = 8787
+
+        def __init__(self, _address: tuple[str, int], _handler: object) -> None:
+            events.append("construct")
+
+        def serve_forever(self) -> None:
+            events.append("serve")
+
+        def server_close(self) -> None:
+            events.append("close")
+            raise secret
+
+    monkeypatch.setattr(web_server, "HTTPServer", Server)
+
+    with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
+        web_server.serve_dashboard(database_path, 8787)
+
+    assert captured.value.__cause__ is secret
+    assert str(secret) not in str(captured.value)
+    assert events == ["construct", "serve", "close"]
+
+
+def test_dashboard_server_preserves_constructor_cancellation(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary = asyncio.CancelledError("server acquisition cancellation token=primary")
+
+    class Server:
+        def __init__(self, _address: tuple[str, int], _handler: object) -> None:
+            raise primary
+
+    monkeypatch.setattr(web_server, "HTTPServer", Server)
+
+    with pytest.raises(BaseException) as captured:
+        web_server.serve_dashboard(database_path, 8787)
+
+    assert captured.value is primary

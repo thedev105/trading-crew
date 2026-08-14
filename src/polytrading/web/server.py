@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import duckdb
 
 from polytrading.domain.models import normalize_utc_timestamp
+from polytrading.lifecycle import cleanup_error_cause, owned_resource_cleanup
 from polytrading.storage.store import DuckDBStore
 from polytrading.web.dashboard import DashboardBuilder, render_dashboard_json
 
@@ -80,12 +81,11 @@ class DashboardApplication:
         return _error_response(HTTPStatus.NOT_FOUND, "NOT_FOUND")
 
     def _dashboard_response(self) -> WebResponse:
-        store: DuckDBStore | None = None
-        active_error: BaseException | None = None
         try:
-            try:
+            with owned_resource_cleanup() as cleanup:
                 as_of = normalize_utc_timestamp(self._clock())
                 store = DuckDBStore(self._database_path, read_only=True)
+                cleanup.add(store.close)
                 snapshot = DashboardBuilder(store, self._database_path).build(as_of)
                 return WebResponse(
                     HTTPStatus.OK,
@@ -93,16 +93,6 @@ class DashboardApplication:
                     render_dashboard_json(snapshot),
                     dict(_SECURITY_HEADERS),
                 )
-            except BaseException as error:
-                active_error = error
-                raise
-            finally:
-                if store is not None:
-                    try:
-                        store.close()
-                    except Exception:
-                        if active_error is None:
-                            raise
         except Exception as error:
             status, code = _classify_dashboard_failure(error)
             _LOGGER.error("dashboard snapshot failure: %s", code)
@@ -112,24 +102,13 @@ class DashboardApplication:
 def validate_dashboard_database(path: Path) -> None:
     if not path.is_file():
         raise ValueError("dashboard requires an existing database file")
-    store: DuckDBStore | None = None
-    active_error: BaseException | None = None
     try:
-        try:
+        with owned_resource_cleanup() as cleanup:
             store = DuckDBStore(path, read_only=True)
-        except BaseException as error:
-            active_error = error
-            raise
-        finally:
-            if store is not None:
-                try:
-                    store.close()
-                except Exception:
-                    if active_error is None:
-                        raise
+            cleanup.add(store.close)
     except Exception as error:
         _status, code = _classify_dashboard_failure(error)
-        raise DashboardLifecycleError(code) from error
+        raise DashboardLifecycleError(code) from cleanup_error_cause(error)
 
 
 def serve_dashboard(
@@ -139,26 +118,15 @@ def serve_dashboard(
     clock: Callable[[], datetime] | None = None,
 ) -> None:
     application = DashboardApplication(database_path, clock=clock or _utc_now)
-    server: HTTPServer | None = None
-    active_error: BaseException | None = None
     try:
-        try:
+        with owned_resource_cleanup() as cleanup:
             server = HTTPServer(("127.0.0.1", port), _handler_for(application))
+            cleanup.add(server.server_close)
             print(f"polytrading dashboard: http://127.0.0.1:{server.server_port}")
             with suppress(KeyboardInterrupt):
                 server.serve_forever()
-        except BaseException as error:
-            active_error = error
-            raise
-        finally:
-            if server is not None:
-                try:
-                    server.server_close()
-                except Exception:
-                    if active_error is None:
-                        raise
     except Exception as error:
-        raise DashboardLifecycleError("DASHBOARD_SERVER_ERROR") from error
+        raise DashboardLifecycleError("DASHBOARD_SERVER_ERROR") from cleanup_error_cause(error)
 
 
 def _handler_for(application: DashboardApplication) -> type[BaseHTTPRequestHandler]:
@@ -221,9 +189,10 @@ def _is_database_busy(error: BaseException) -> bool:
 
 
 def _classify_dashboard_failure(error: BaseException) -> tuple[HTTPStatus, str]:
-    if _is_database_busy(error):
+    classified_error = cleanup_error_cause(error)
+    if _is_database_busy(classified_error):
         return HTTPStatus.SERVICE_UNAVAILABLE, "DATABASE_BUSY"
-    if isinstance(error, (duckdb.Error, OSError, RuntimeError)):
+    if isinstance(classified_error, (duckdb.Error, OSError, RuntimeError)):
         return HTTPStatus.SERVICE_UNAVAILABLE, "DATABASE_UNAVAILABLE"
     return HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"
 

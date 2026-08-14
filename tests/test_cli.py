@@ -10,6 +10,7 @@ from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 from uuid import UUID
 
 import duckdb
@@ -1358,6 +1359,88 @@ def test_trial_health_close_failure_uses_stable_sanitized_classification(
     assert secret not in captured.err
 
 
+@pytest.mark.parametrize(
+    ("cleanup_type", "expected_code"),
+    [(OSError, "FILESYSTEM_ERROR"), (asyncio.CancelledError, "OPERATION_ERROR")],
+    ids=("exception", "base-exception"),
+)
+def test_trial_health_cleanup_failure_uses_stable_sanitized_classification(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_type: type[BaseException],
+    expected_code: str,
+) -> None:
+    database = tmp_path / "trial-cleanup.duckdb"
+    database.write_bytes(b"fixture")
+    secret = "cleanup /private/health.duckdb?token=secret response-body=confidential"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database, True)
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise cleanup_type(secret)
+
+    class Auditor:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def audit(self, _as_of: datetime, _recent_hours: int) -> SimpleNamespace:
+            events.append("audit")
+            return SimpleNamespace(status=TrialCollectionStatus.COLLECTING)
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", Auditor)
+    monkeypatch.setattr(cli, "render_trial_health_text", lambda _report: "must not print")
+
+    assert main(["trial", "health", "--db", str(database)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"polytrading: collection failed: TRIAL_HEALTH_{expected_code}\n"
+    assert secret not in captured.err
+    assert events == ["open", "audit", "close"]
+
+
+def test_trial_health_active_cancellation_wins_over_cleanup_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "trial-active-cancel.duckdb"
+    database.write_bytes(b"fixture")
+    primary = asyncio.CancelledError("primary health cancellation token=primary")
+    cleanup = asyncio.CancelledError("cleanup health cancellation token=cleanup")
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _path: Path, *, read_only: bool = False) -> None:
+            assert read_only is True
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise cleanup
+
+    class Auditor:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def audit(self, _as_of: datetime, _recent_hours: int) -> NoReturn:
+            events.append("audit")
+            raise primary
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", Auditor)
+
+    with pytest.raises(BaseException) as captured:
+        cli._trial_health(SimpleNamespace(db=database, as_of=None, recent_hours=24, format="text"))
+
+    assert captured.value is primary
+    assert events == ["open", "audit", "close"]
+
+
 def test_trial_health_body_failure_wins_over_sanitized_close_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1382,6 +1465,39 @@ def test_trial_health_body_failure_wins_over_sanitized_close_failure(
 
     monkeypatch.setattr(cli, "DuckDBStore", CloseFailingStore)
     monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", FailingAuditor)
+
+    assert main(["trial", "health", "--db", str(database)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_HEALTH_DATABASE_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+
+
+def test_trial_health_body_failure_wins_over_cleanup_base_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "trial-base-cleanup.duckdb"
+    database.write_bytes(b"fixture")
+    body_secret = "database body https://private.example.test/health?token=body"
+    close_secret = "cleanup /private/health.duckdb?token=cleanup"
+
+    class Store:
+        def __init__(self, path: Path, *, read_only: bool = False) -> None:
+            assert (path, read_only) == (database, True)
+
+        def close(self) -> None:
+            raise asyncio.CancelledError(close_secret)
+
+    class Auditor:
+        def __init__(self, _store: object) -> None:
+            pass
+
+        def audit(self, _as_of: datetime, _recent_hours: int) -> NoReturn:
+            raise duckdb.Error(body_secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "LighterDydxTrialHealthAuditor", Auditor)
 
     assert main(["trial", "health", "--db", str(database)]) == 1
     captured = capsys.readouterr()
@@ -1556,8 +1672,17 @@ def test_trial_books_exit_and_summary_follow_durable_diagnostic_cycles(
     )
 
 
+@pytest.mark.parametrize(
+    ("cleanup_type", "expected_code"),
+    [(OSError, "FILESYSTEM_ERROR"), (asyncio.CancelledError, "OPERATION_ERROR")],
+    ids=("exception", "base-exception"),
+)
 def test_trial_books_client_close_failure_uses_stable_sanitized_classification(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_type: type[BaseException],
+    expected_code: str,
 ) -> None:
     secret = (
         "/private/evidence/books.duckdb "
@@ -1565,6 +1690,7 @@ def test_trial_books_client_close_failure_uses_stable_sanitized_classification(
         "response-body=confidential lock-owner=private"
     )
     clients: list[object] = []
+    closed: list[int] = []
 
     class FakeClient:
         def __init__(self) -> None:
@@ -1572,8 +1698,9 @@ def test_trial_books_client_close_failure_uses_stable_sanitized_classification(
             clients.append(self)
 
         async def aclose(self) -> None:
+            closed.append(self.index)
             if self.index == 0:
-                raise OSError(secret)
+                raise cleanup_type(secret)
 
     async def run(*_args: object, **_kwargs: object) -> TrialBookRunSummary:
         return TrialBookRunSummary(1, 1, 0, 0, 0)
@@ -1597,8 +1724,9 @@ def test_trial_books_client_close_failure_uses_stable_sanitized_classification(
     )
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_FILESYSTEM_ERROR\n"
+    assert captured.err == f"polytrading: collection failed: TRIAL_BOOKS_{expected_code}\n"
     assert secret not in captured.err
+    assert closed == [0, 1]
 
 
 def test_trial_books_body_failure_wins_over_sanitized_client_close_failure(
@@ -1642,6 +1770,52 @@ def test_trial_books_body_failure_wins_over_sanitized_client_close_failure(
     assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_HTTP_ERROR\n"
     assert body_secret not in captured.err
     assert close_secret not in captured.err
+
+
+def test_trial_books_body_failure_wins_over_client_cleanup_base_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_secret = "https://private.example.test/books?token=body response-body=hidden"
+    close_secret = "/private/books.client?token=cleanup lock-owner=hidden"
+    clients: list[object] = []
+    closed: list[int] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            closed.append(self.index)
+            if self.index == 0:
+                raise asyncio.CancelledError(close_secret)
+
+    async def run(*_args: object, **_kwargs: object) -> NoReturn:
+        raise httpx.ConnectError(body_secret)
+
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "LighterPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "run_trial_book_session", run)
+
+    assert (
+        main(
+            [
+                "trial",
+                "books",
+                "--once",
+                "--db",
+                str(tmp_path / "trial.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: TRIAL_BOOKS_HTTP_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+    assert closed == [0, 1]
 
 
 def test_trial_books_store_close_failure_uses_underlying_safe_classification(
@@ -2124,6 +2298,75 @@ def test_trial_funding_adapter_session_uses_independent_clients_and_closes_both(
     assert all(client.closed for client in clients)  # type: ignore[attr-defined]
 
 
+def test_trial_adapter_session_active_cancellation_wins_and_closes_every_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = asyncio.CancelledError("primary trial cancellation token=primary")
+    cleanup_errors = (
+        asyncio.CancelledError("first trial cleanup token=first"),
+        asyncio.CancelledError("second trial cleanup token=second"),
+    )
+    clients: list[object] = []
+    closed: list[int] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            closed.append(self.index)
+            raise cleanup_errors[self.index]
+
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "LighterPublicAdapter", lambda client, *_args: client)
+
+    async def exercise() -> BaseException:
+        with pytest.raises(BaseException) as captured:
+            async with cli._lighter_dydx_adapter_session():
+                raise primary
+        return captured.value
+
+    assert asyncio.run(exercise()) is primary
+    assert closed == [0, 1]
+
+
+def test_trial_adapter_session_cleanup_only_uses_first_cause_and_closes_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_errors = (
+        asyncio.CancelledError("first trial cleanup token=first"),
+        OSError("second trial cleanup token=second"),
+    )
+    clients: list[object] = []
+    closed: list[int] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            closed.append(self.index)
+            raise cleanup_errors[self.index]
+
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "LighterPublicAdapter", lambda client, *_args: client)
+
+    async def exercise() -> BaseException:
+        with pytest.raises(BaseException) as captured:
+            async with cli._lighter_dydx_adapter_session():
+                pass
+        return captured.value
+
+    captured = asyncio.run(exercise())
+    assert type(captured).__name__ == "OwnedResourceCleanupError"
+    assert captured.__cause__ is cleanup_errors[0]
+    assert closed == [0, 1]
+
+
 def test_trial_funding_degraded_persisted_cycle_returns_zero(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2501,6 +2744,149 @@ def test_funding_cycle_body_failure_wins_over_sanitized_close_failure(
     assert captured.err == "polytrading: collection failed: FUNDING_CYCLE_HTTP_ERROR\n"
     assert body_secret not in captured.err
     assert close_secret not in captured.err
+
+
+def test_funding_cycle_body_failure_wins_over_store_cleanup_base_exception(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_secret = "https://private.example.test/funding?token=body response-body=hidden"
+    close_secret = "/private/funding.duckdb?token=cleanup lock-owner=hidden"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, _path: Path) -> None:
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise asyncio.CancelledError(close_secret)
+
+    class Collector:
+        def __init__(self, _store: object, *, clock: object) -> None:
+            del clock
+
+        async def collect_once(self, *_args: object) -> NoReturn:
+            events.append("collect")
+            raise httpx.ConnectError(body_secret)
+
+    @asynccontextmanager
+    async def session(*_args: object) -> Iterator[tuple[object, ...]]:
+        yield ()
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "PointInTimeFundingCollector", Collector)
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: FUNDING_CYCLE_END + timedelta(seconds=30))
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--db",
+                str(tmp_path / "funding.duckdb"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: FUNDING_CYCLE_HTTP_ERROR\n"
+    assert body_secret not in captured.err
+    assert close_secret not in captured.err
+    assert events == ["open", "collect", "close"]
+
+
+def test_funding_cycle_active_cancellation_wins_over_store_cleanup_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "funding-active-cancel.duckdb"
+    primary = asyncio.CancelledError("primary funding cancellation token=primary")
+    cleanup = asyncio.CancelledError("cleanup funding cancellation token=cleanup")
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path) -> None:
+            assert path == database
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise cleanup
+
+    class Collector:
+        def __init__(self, _store: object, *, clock: object) -> None:
+            del clock
+
+        async def collect_once(self, *_args: object) -> NoReturn:
+            events.append("collect")
+            raise primary
+
+    @asynccontextmanager
+    async def session(*_args: object) -> Iterator[tuple[object, ...]]:
+        yield ()
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "PointInTimeFundingCollector", Collector)
+    monkeypatch.setattr(cli, "public_adapter_session", session)
+    monkeypatch.setattr(cli, "_utc_now", lambda: FUNDING_CYCLE_END + timedelta(seconds=30))
+
+    arguments = SimpleNamespace(
+        assets="BTC", current=False, cycle_end=FUNDING_CYCLE_END.isoformat(), db=database
+    )
+    with pytest.raises(BaseException) as captured:
+        asyncio.run(cli._collect_funding_cycle(arguments))
+
+    assert captured.value is primary
+    assert events == ["open", "collect", "close"]
+
+
+def test_funding_cycle_store_cleanup_keyboard_interrupt_is_stably_classified(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "funding-cleanup-interrupt.duckdb"
+    secret = "cleanup keyboard interrupt /private/funding.duckdb?token=secret"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path) -> None:
+            assert path == database
+            events.append("open")
+
+        def close(self) -> None:
+            events.append("close")
+            raise KeyboardInterrupt(secret)
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "record_late_funding_cycle", lambda *_args: object())
+    monkeypatch.setattr(
+        cli,
+        "_utc_now",
+        lambda: FUNDING_CYCLE_END + timedelta(minutes=5, microseconds=1),
+    )
+
+    assert (
+        main(
+            [
+                "collect",
+                "funding-cycle",
+                "--cycle-end",
+                FUNDING_CYCLE_END.isoformat(),
+                "--db",
+                str(database),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: FUNDING_CYCLE_COLLECTION_ERROR\n"
+    assert secret not in captured.err
+    assert events == ["open", "close"]
 
 
 def test_trial_funding_malformed_timestamp_returns_two(
@@ -3173,6 +3559,138 @@ def test_public_adapter_session_routes_every_venue_to_its_concrete_adapter(
         ("LighterPublicAdapter", Venue.LIGHTER),
     )
     store.close()
+
+
+def test_public_adapter_session_active_cancellation_wins_and_closes_every_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = asyncio.CancelledError("primary public cancellation token=primary")
+    cleanup_errors = (
+        asyncio.CancelledError("first public cleanup token=first"),
+        asyncio.CancelledError("second public cleanup token=second"),
+    )
+    clients: list[object] = []
+    closed: list[int] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            closed.append(self.index)
+            raise cleanup_errors[self.index]
+
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "HyperliquidPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: client)
+
+    async def exercise() -> BaseException:
+        with pytest.raises(BaseException) as captured:
+            async with cli.public_adapter_session(
+                object(),
+                (Venue.HYPERLIQUID, Venue.DYDX),  # type: ignore[arg-type]
+            ):
+                raise primary
+        return captured.value
+
+    assert asyncio.run(exercise()) is primary
+    assert closed == [0, 1]
+
+
+def test_public_adapter_session_cleanup_only_uses_first_cause_and_closes_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_errors = (
+        asyncio.CancelledError("first public cleanup token=first"),
+        OSError("second public cleanup token=second"),
+    )
+    clients: list[object] = []
+    closed: list[int] = []
+
+    class Client:
+        def __init__(self) -> None:
+            self.index = len(clients)
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            closed.append(self.index)
+            raise cleanup_errors[self.index]
+
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "HyperliquidPublicAdapter", lambda client, *_args: client)
+    monkeypatch.setattr(cli, "DydxPublicAdapter", lambda client, *_args: client)
+
+    async def exercise() -> BaseException:
+        with pytest.raises(BaseException) as captured:
+            async with cli.public_adapter_session(
+                object(),
+                (Venue.HYPERLIQUID, Venue.DYDX),  # type: ignore[arg-type]
+            ):
+                pass
+        return captured.value
+
+    captured = asyncio.run(exercise())
+    assert type(captured).__name__ == "OwnedResourceCleanupError"
+    assert captured.__cause__ is cleanup_errors[0]
+    assert closed == [0, 1]
+
+
+def test_generic_public_client_cleanup_cancellation_uses_fixed_sanitized_marker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "public-cleanup.duckdb"
+    secret = "public cleanup /private/client?token=secret response-body=hidden"
+    events: list[str] = []
+
+    class Store:
+        def __init__(self, path: Path) -> None:
+            assert path == database
+            events.append("store-open")
+
+        def close(self) -> None:
+            events.append("store-close")
+
+    class Client:
+        async def aclose(self) -> None:
+            events.append("client-close")
+            raise asyncio.CancelledError(secret)
+
+    class Adapter:
+        venue = Venue.HYPERLIQUID
+
+        def __init__(self, _client: object, *_args: object) -> None:
+            pass
+
+    async def collect(*_args: object, **_kwargs: object) -> None:
+        events.append("collect")
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "HyperliquidPublicAdapter", Adapter)
+    monkeypatch.setattr(cli, "collect_book_cycles", collect)
+
+    assert (
+        main(
+            [
+                "collect",
+                "books",
+                "--venue",
+                "hyperliquid",
+                "--once",
+                "--db",
+                str(database),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: OWNED_RESOURCE_CLEANUP_ERROR\n"
+    assert secret not in captured.err
+    assert events == ["store-open", "collect", "client-close", "store-close"]
 
 
 @pytest.mark.parametrize("command", ["public", "books"])

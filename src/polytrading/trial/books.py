@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
+from polytrading.lifecycle import OwnedResourceCleanupError, owned_resource_cleanup
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.trial.writer_lease import (
     WriterLeaseCleanupError,
@@ -34,7 +35,7 @@ class TrialBookRunSummary:
     lease_skipped_cycles: int
 
 
-class TrialBookStoreCloseError(RuntimeError):
+class TrialBookStoreCloseError(OwnedResourceCleanupError):
     """A per-cycle trial store failed during cleanup."""
 
     def __init__(self) -> None:
@@ -84,22 +85,13 @@ async def run_trial_book_session(
 
         persistence_failed = False
         try:
-            with database_writer_lease(database_path, timeout_seconds=0):
-                store: DuckDBStore | None = None
-                active_error: BaseException | None = None
-                try:
-                    store = store_factory(database_path)
-                    persist_prepared_book_cycle(store, prepared)
-                except BaseException as error:
-                    active_error = error
-                    raise
-                finally:
-                    if store is not None:
-                        try:
-                            store.close()
-                        except BaseException as error:
-                            if active_error is None:
-                                raise TrialBookStoreCloseError() from error
+            with (
+                database_writer_lease(database_path, timeout_seconds=0),
+                owned_resource_cleanup(marker_factory=TrialBookStoreCloseError) as cleanup,
+            ):
+                store = store_factory(database_path)
+                cleanup.add(store.close)
+                persist_prepared_book_cycle(store, prepared)
             persisted_cycles += 1
             if prepared.cycle.status == "failed":
                 failed_cycles += 1

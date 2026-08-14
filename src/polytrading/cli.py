@@ -45,10 +45,16 @@ from polytrading.corpus_intake.polymarket import acquire_polymarket
 from polytrading.corpus_intake.review_queue import prepare_review_queue
 from polytrading.corpus_intake.source_policy import IntendedUseScope, SourceUseApproval
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
+from polytrading.lifecycle import (
+    OwnedResourceCleanupError,
+    async_owned_resource_cleanup,
+    cleanup_error_cause,
+    owned_resource_cleanup,
+)
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
-from polytrading.trial.books import TrialBookStoreCloseError, run_trial_book_session
+from polytrading.trial.books import run_trial_book_session
 from polytrading.trial.funding import (
     LighterDydxFundingCollector,
     PreparedLighterDydxFundingCycle,
@@ -68,7 +74,6 @@ from polytrading.trial.health import LighterDydxTrialHealthAuditor
 from polytrading.trial.health_models import TrialCollectionStatus
 from polytrading.trial.health_report import render_trial_health_json, render_trial_health_text
 from polytrading.trial.writer_lease import (
-    WriterLeaseCleanupError,
     WriterLeaseUnavailable,
     database_writer_lease,
 )
@@ -148,7 +153,7 @@ class FundingCycleCollectionError(RuntimeError):
     """A point-in-time funding cycle could not be durably recorded."""
 
 
-class TrialFundingStoreCloseError(RuntimeError):
+class TrialFundingStoreCloseError(OwnedResourceCleanupError):
     """A trial-funding store failed during cleanup."""
 
     def __init__(self) -> None:
@@ -160,7 +165,7 @@ class TrialCommandError(RuntimeError):
 
 
 def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollectionError:
-    classified_error = _cleanup_error_cause(error)
+    classified_error = cleanup_error_cause(error)
     if isinstance(classified_error, ConflictingRecordError):
         code = "FUNDING_CYCLE_PERSISTENCE_CONFLICT"
     elif isinstance(classified_error, WriterLeaseUnavailable):
@@ -180,7 +185,7 @@ def _classified_funding_cycle_error(error: BaseException) -> FundingCycleCollect
 
 def _classified_trial_error(command: str, error: BaseException) -> TrialCommandError:
     prefix = {"books": "TRIAL_BOOKS", "health": "TRIAL_HEALTH"}[command]
-    classified_error = _cleanup_error_cause(error)
+    classified_error = cleanup_error_cause(error)
     if isinstance(classified_error, duckdb.Error):
         suffix = "DATABASE_ERROR"
     elif isinstance(classified_error, httpx.HTTPError):
@@ -192,18 +197,6 @@ def _classified_trial_error(command: str, error: BaseException) -> TrialCommandE
     else:
         suffix = "OPERATION_ERROR"
     return TrialCommandError(f"{prefix}_{suffix}")
-
-
-def _cleanup_error_cause(error: BaseException) -> BaseException:
-    if (
-        isinstance(
-            error,
-            (TrialBookStoreCloseError, TrialFundingStoreCloseError, WriterLeaseCleanupError),
-        )
-        and error.__cause__ is not None
-    ):
-        return error.__cause__
-    return error
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -686,12 +679,11 @@ def make_public_http_client(
 async def public_adapter_session(
     store: DuckDBStore, venues: Iterable[Venue]
 ) -> AsyncIterator[tuple[PublicVenueAdapter, ...]]:
-    clients: list[httpx.AsyncClient] = []
     adapters: list[PublicVenueAdapter] = []
-    try:
+    async with async_owned_resource_cleanup() as cleanup:
         for venue in venues:
             client = make_public_http_client()
-            clients.append(client)
+            cleanup.add(client.aclose)
             if venue is Venue.BYBIT:
                 adapters.append(
                     BybitPublicAdapter(
@@ -710,32 +702,19 @@ async def public_adapter_session(
             else:
                 raise ValueError(f"unsupported public venue: {venue.value}")
         yield tuple(adapters)
-    finally:
-        await asyncio.gather(*(client.aclose() for client in clients))
 
 
 @asynccontextmanager
 async def _lighter_dydx_adapter_session() -> AsyncIterator[tuple[PublicVenueAdapter, ...]]:
-    clients: list[httpx.AsyncClient] = []
-    active_error: BaseException | None = None
-    try:
+    async with async_owned_resource_cleanup() as cleanup:
         dydx_client = make_public_http_client()
-        clients.append(dydx_client)
+        cleanup.add(dydx_client.aclose)
         lighter_client = make_public_http_client()
-        clients.append(lighter_client)
+        cleanup.add(lighter_client.aclose)
         yield (
             DydxPublicAdapter(dydx_client, _utc_now, time.monotonic_ns),
             LighterPublicAdapter(lighter_client, _utc_now, time.monotonic_ns),
         )
-    except BaseException as error:
-        active_error = error
-        raise
-    finally:
-        try:
-            await asyncio.gather(*(client.aclose() for client in clients))
-        except Exception:
-            if active_error is None:
-                raise
 
 
 def _render_adapter_warning(warning: AdapterWarning) -> str:
@@ -818,11 +797,10 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     )
     _, _, is_late = validate_cycle_timing(cycle_end, now)
 
-    store: DuckDBStore | None = None
-    active_error: BaseException | None = None
     try:
-        try:
+        with owned_resource_cleanup() as cleanup:
             store = DuckDBStore(arguments.db)
+            cleanup.add(store.close)
             if is_late:
                 cycle = record_late_funding_cycle(store, assets, cycle_end, now)
             else:
@@ -832,16 +810,6 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
                     cycle = await PointInTimeFundingCollector(store, clock=_utc_now).collect_once(
                         adapters, assets, cycle_end
                     )
-        except BaseException as error:
-            active_error = error
-            raise
-        finally:
-            if store is not None:
-                try:
-                    store.close()
-                except Exception:
-                    if active_error is None:
-                        raise
     except (
         ConflictingRecordError,
         duckdb.Error,
@@ -940,22 +908,10 @@ async def _trial_books(arguments: argparse.Namespace) -> int:
 
 
 def _persist_trial_funding(database: Path, prepared: PreparedLighterDydxFundingCycle) -> None:
-    store: DuckDBStore | None = None
-    active_error: BaseException | None = None
-    try:
-        try:
-            store = DuckDBStore(database)
-            persist_lighter_dydx_funding_cycle(store, prepared)
-        except BaseException as error:
-            active_error = error
-            raise
-    finally:
-        if store is not None:
-            try:
-                store.close()
-            except BaseException as error:
-                if active_error is None:
-                    raise TrialFundingStoreCloseError() from error
+    with owned_resource_cleanup(marker_factory=TrialFundingStoreCloseError) as cleanup:
+        store = DuckDBStore(database)
+        cleanup.add(store.close)
+        persist_lighter_dydx_funding_cycle(store, prepared)
 
 
 def _trial_health(arguments: argparse.Namespace) -> int:
@@ -963,26 +919,15 @@ def _trial_health(arguments: argparse.Namespace) -> int:
     if not arguments.db.is_file():
         raise CliUsageError("trial health database is unavailable or not current")
 
-    store: DuckDBStore | None = None
-    active_error: BaseException | None = None
     try:
-        try:
+        with owned_resource_cleanup() as cleanup:
             store = DuckDBStore(arguments.db, read_only=True)
+            cleanup.add(store.close)
             report = LighterDydxTrialHealthAuditor(store).audit(as_of, arguments.recent_hours)
             renderer = (
                 render_trial_health_json if arguments.format == "json" else render_trial_health_text
             )
             rendered = renderer(report)
-        except BaseException as error:
-            active_error = error
-            raise
-        finally:
-            if store is not None:
-                try:
-                    store.close()
-                except Exception:
-                    if active_error is None:
-                        raise
     except Exception as error:
         raise _classified_trial_error("health", error) from error
 

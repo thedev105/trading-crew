@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
+from polytrading.lifecycle import OwnedResourceCleanupError, owned_resource_cleanup
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -20,7 +22,7 @@ __all__ = [
 ]
 
 
-class WriterLeaseCleanupError(RuntimeError):
+class WriterLeaseCleanupError(OwnedResourceCleanupError):
     """An owned database writer lease resource failed during cleanup."""
 
     def __init__(self) -> None:
@@ -47,35 +49,18 @@ def database_writer_lease(
     timeout = _finite_nonnegative(timeout_seconds, "writer lease timeout")
     poll = _finite_positive(poll_seconds, "writer lease poll interval")
     deadline = monotonic() + timeout
-    handle = writer_lease_path(database_path).open("a+b")
     locked = False
-    active_error: BaseException | None = None
-    try:
-        try:
-            while not _try_lock(handle):
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise WriterLeaseUnavailable("database writer lease is busy")
-                sleep(min(poll, remaining))
-            locked = True
-            yield
-        except BaseException as error:
-            active_error = error
-            raise
-    finally:
-        cleanup_error: BaseException | None = None
-        try:
-            if locked:
-                _unlock_if_held(handle)
-        except BaseException as error:
-            cleanup_error = error
-        try:
-            handle.close()
-        except BaseException as error:
-            if cleanup_error is None:
-                cleanup_error = error
-        if active_error is None and cleanup_error is not None:
-            raise WriterLeaseCleanupError() from cleanup_error
+    with owned_resource_cleanup(marker_factory=WriterLeaseCleanupError) as cleanup:
+        handle = writer_lease_path(database_path).open("a+b")
+        cleanup.add(lambda: _unlock_if_held(handle) if locked else None)
+        cleanup.add(handle.close)
+        while not _try_lock(handle):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise WriterLeaseUnavailable("database writer lease is busy")
+            sleep(min(poll, remaining))
+        locked = True
+        yield
 
 
 def _finite_nonnegative(value: float, label: str) -> float:
