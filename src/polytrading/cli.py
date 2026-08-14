@@ -757,22 +757,25 @@ async def _trial_funding(arguments: argparse.Namespace) -> int:
             with database_writer_lease(arguments.db, timeout_seconds=0.0):
                 _persist_trial_funding(arguments.db, prepared)
         else:
-            async with _lighter_dydx_adapter_session() as adapters:
-                prepared = await LighterDydxFundingCollector(clock=_utc_now).prepare_once(
-                    adapters, assets, normalized_cycle_end
-                )
-            cycle = prepared.cycle
-            lease_requested_at = _utc_now()
-            validate_trial_cycle_timing(normalized_cycle_end, lease_requested_at)
-            lease_timeout = max(
-                0.0,
-                (
-                    normalized_cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG - lease_requested_at
-                ).total_seconds(),
-            )
+            lease_timeout = (
+                normalized_cycle_end + TRIAL_FUNDING_POINT_IN_TIME_LAG - normalized_now
+            ).total_seconds()
             with database_writer_lease(arguments.db, timeout_seconds=lease_timeout):
                 acquired_at = _utc_now()
-                validate_trial_cycle_timing(normalized_cycle_end, acquired_at)
+                _, acquired_at, became_late = validate_trial_cycle_timing(
+                    normalized_cycle_end, acquired_at
+                )
+                if became_late:
+                    cycle = record_late_lighter_dydx_cycle(
+                        assets, normalized_cycle_end, acquired_at
+                    )
+                    prepared = PreparedLighterDydxFundingCycle((), (), (), cycle)
+                else:
+                    async with _lighter_dydx_adapter_session() as adapters:
+                        prepared = await LighterDydxFundingCollector(clock=_utc_now).prepare_once(
+                            adapters, assets, normalized_cycle_end
+                        )
+                    cycle = prepared.cycle
                 _persist_trial_funding(arguments.db, prepared)
     except (
         ConflictingRecordError,

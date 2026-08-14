@@ -83,8 +83,7 @@ class LighterDydxFundingCollector:
         cycle_end: datetime,
     ) -> PreparedLighterDydxFundingCycle:
         requested_assets = frozenset(assets)
-        if not requested_assets:
-            raise ValueError("at least one asset is required")
+        _require_exact_assets(requested_assets)
         ordered_adapters = tuple(sorted(adapters, key=lambda adapter: adapter.venue.value))
         adapter_venues = tuple(adapter.venue for adapter in ordered_adapters)
         if len(set(adapter_venues)) != len(adapter_venues):
@@ -127,13 +126,12 @@ class LighterDydxFundingCollector:
                 _record_instrument_failure(instrument_by_pair, adapter.venue, ordered_assets, error)
                 continue
             hashes = tuple(sorted({raw.source_hash for raw in result.raw}))
-            response_observed_at = max(raw.observed_at for raw in result.raw)
             valid_raws.extend(result.raw)
             valid_instruments.extend(specs)
             for spec in specs:
                 instrument_by_pair[(adapter.venue, spec.asset)] = _InstrumentResult(
                     outcome=TrialInstrumentOutcome.CAPTURED,
-                    observed_at=response_observed_at,
+                    observed_at=spec.observed_at,
                     source_hashes=hashes,
                     reason_codes=(),
                 )
@@ -181,7 +179,7 @@ class LighterDydxFundingCollector:
                 funding_by_pair[pair] = _FundingResult(
                     outcome=TrialFundingOutcome.CAPTURED,
                     effective_at=observation.effective_at,
-                    observed_at=response_observed_at,
+                    observed_at=observation.observed_at,
                     source_hashes=hashes,
                     reason_codes=(),
                 )
@@ -234,8 +232,7 @@ def record_late_lighter_dydx_cycle(
     cycle_id_factory: Callable[[], UUID] = uuid4,
 ) -> LighterDydxFundingCycle:
     requested_assets = frozenset(assets)
-    if not requested_assets:
-        raise ValueError("at least one asset is required")
+    _require_exact_assets(requested_assets)
     normalized_cycle_end, normalized_now, is_late = validate_trial_cycle_timing(cycle_end, now)
     if not is_late:
         raise ValueError("late cycle requires a clock after the five-minute cutoff")
@@ -277,6 +274,14 @@ def record_late_lighter_dydx_cycle(
 def persist_lighter_dydx_funding_cycle(
     store: DuckDBStore, prepared: PreparedLighterDydxFundingCycle
 ) -> bool:
+    _require_exact_assets(frozenset(prepared.cycle.assets))
+    expected_pairs = tuple(
+        (venue, asset)
+        for venue in _EXPECTED_VENUES
+        for asset in sorted(Asset, key=lambda item: item.value)
+    )
+    if tuple((item.venue, item.asset) for item in prepared.cycle.items) != expected_pairs:
+        raise ValueError("trial funding persistence requires six venue-asset items")
     _validate_prepared_conservation(prepared)
     with store.transaction() as transaction:
         for raw in prepared.raw:
@@ -314,6 +319,11 @@ def _validate_instrument_batch(
     validate_adapter_batch(batch)
     _require_normalized_observation_lineage(batch, specs)
     return tuple(sorted(specs, key=lambda record: record.asset.value))
+
+
+def _require_exact_assets(assets: frozenset[Asset]) -> None:
+    if assets != frozenset(Asset):
+        raise ValueError("trial funding requires exactly BTC, ETH, and SOL")
 
 
 def _validate_funding_batch(
@@ -462,21 +472,27 @@ def _item_source_hashes(items: tuple[LighterDydxFundingItem, ...]) -> tuple[str,
 
 
 def _validate_prepared_conservation(prepared: PreparedLighterDydxFundingCycle) -> None:
-    raw_lineage = {(raw.venue, raw.source_hash) for raw in prepared.raw}
+    raw_lineage = {(raw.venue, raw.source_hash, raw.observed_at) for raw in prepared.raw}
+    raw_hash_lineage = {(raw.venue, raw.source_hash) for raw in prepared.raw}
     raw_hashes = {raw.source_hash for raw in prepared.raw}
     if len({raw.event_id for raw in prepared.raw}) != len(prepared.raw):
         raise ValueError("prepared raw identities are not conserved uniquely")
     if raw_hashes != set(prepared.cycle.source_hashes):
         raise ValueError("prepared raw hashes are not conserved by cycle evidence")
     if any(
-        (item.venue, source_hash) not in raw_lineage
+        (item.venue, source_hash) not in raw_hash_lineage
         for item in prepared.cycle.items
         for source_hash in (*item.instrument_source_hashes, *item.funding_source_hashes)
     ):
         raise ValueError("prepared raw lineage is not conserved by cycle items")
     normalized = (*prepared.instruments, *prepared.funding)
-    if any((record.venue, record.source_hash) not in raw_lineage for record in normalized):
-        raise ValueError("prepared normalized lineage is not conserved by raw evidence")
+    if any(
+        (record.venue, record.source_hash, record.observed_at) not in raw_lineage
+        for record in normalized
+    ):
+        raise ValueError(
+            "prepared normalized observation timestamp is not conserved by raw evidence"
+        )
 
     instrument_by_pair: dict[tuple[Venue, Asset], list[InstrumentSpec]] = {}
     for record in prepared.instruments:
@@ -498,15 +514,21 @@ def _validate_prepared_conservation(prepared: PreparedLighterDydxFundingCycle) -
             if (
                 record.symbol != item.symbol
                 or record.source_hash not in item.instrument_source_hashes
+                or record.observed_at != item.instrument_observed_at
             ):
-                raise ValueError("prepared instrument evidence is not conserved by cycle item")
+                raise ValueError(
+                    "prepared instrument observation timestamp is not conserved by cycle item"
+                )
         for record in funding:
             if (
                 record.symbol != item.symbol
                 or record.effective_at != prepared.cycle.cycle_end
                 or record.source_hash not in item.funding_source_hashes
+                or record.observed_at != item.funding_observed_at
             ):
-                raise ValueError("prepared funding evidence is not conserved by cycle item")
+                raise ValueError(
+                    "prepared funding observation timestamp is not conserved by cycle item"
+                )
 
 
 def _raw_sort_key(raw: RawEnvelope) -> tuple[str, str, str, str]:

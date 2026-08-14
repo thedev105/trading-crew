@@ -237,6 +237,15 @@ def test_late_trial_cycle_uses_no_adapter_and_has_all_missed_items() -> None:
     )
 
 
+def test_late_trial_cycle_rejects_asset_subset() -> None:
+    with pytest.raises(ValueError, match="BTC, ETH, and SOL"):
+        record_late_lighter_dydx_cycle(
+            frozenset({Asset.BTC}),
+            CYCLE_END,
+            CYCLE_END + timedelta(minutes=5, microseconds=1),
+        )
+
+
 def test_collector_requests_every_exact_lighter_dydx_boundary() -> None:
     adapters = (FakeAdapter(Venue.DYDX), FakeAdapter(Venue.LIGHTER))
     prepared = asyncio.run(
@@ -252,6 +261,23 @@ def test_collector_requests_every_exact_lighter_dydx_boundary() -> None:
         (CYCLE_END, CYCLE_END),
     ] * 6
     assert prepared.cycle.status is TrialFundingCycleStatus.COMPLETE
+
+
+def test_collector_rejects_asset_subset_before_adapter_requests() -> None:
+    adapters = (FakeAdapter(Venue.DYDX), FakeAdapter(Venue.LIGHTER))
+
+    with pytest.raises(ValueError, match="BTC, ETH, and SOL"):
+        asyncio.run(
+            LighterDydxFundingCollector(
+                clock=SequenceClock(
+                    CYCLE_END + timedelta(seconds=10), CYCLE_END + timedelta(seconds=20)
+                ),
+                cycle_id_factory=lambda: CYCLE_ID,
+            ).prepare_once(adapters, frozenset({Asset.BTC}), CYCLE_END)
+        )
+
+    assert all(adapter.instrument_calls == [] for adapter in adapters)
+    assert all(adapter.funding_calls == [] for adapter in adapters)
 
 
 def test_empty_funding_responses_are_missing_expected_for_both_venues() -> None:
@@ -521,6 +547,132 @@ def test_persistence_rejects_prepared_evidence_not_conserved_by_cycle(tmp_path: 
         persist_lighter_dydx_funding_cycle(store, invalid)
     assert (
         store.evidence_counts_as_of(prepared.cycle.request_completed_at)[
+            "lighter_dydx_funding_cycles"
+        ]
+        == 0
+    )
+    store.close()
+
+
+def test_persistence_rejects_conserved_asset_subset_before_transaction(tmp_path: Path) -> None:
+    complete = complete_prepared_cycle()
+    items = tuple(item for item in complete.cycle.items if item.asset is Asset.BTC)
+    source_hashes = tuple(
+        sorted(
+            {
+                source_hash
+                for item in items
+                for source_hash in (
+                    *item.instrument_source_hashes,
+                    *item.funding_source_hashes,
+                )
+            }
+        )
+    )
+    cycle = LighterDydxFundingCycle(
+        schema_version=1,
+        protocol_version=complete.cycle.protocol_version,
+        cycle_id=complete.cycle.cycle_id,
+        cycle_end=complete.cycle.cycle_end,
+        assets=(Asset.BTC,),
+        venues=complete.cycle.venues,
+        request_started_at=complete.cycle.request_started_at,
+        request_completed_at=complete.cycle.request_completed_at,
+        items=items,
+        status=complete.cycle.status,
+        source_hashes=source_hashes,
+        warnings=complete.cycle.warnings,
+    )
+    prepared = PreparedLighterDydxFundingCycle(
+        raw=tuple(raw for raw in complete.raw if raw.source_hash in source_hashes),
+        instruments=tuple(record for record in complete.instruments if record.asset is Asset.BTC),
+        funding=tuple(record for record in complete.funding if record.asset is Asset.BTC),
+        cycle=cycle,
+    )
+    store = DuckDBStore(tmp_path / "subset.duckdb")
+
+    with pytest.raises(ValueError, match="BTC, ETH, and SOL"):
+        persist_lighter_dydx_funding_cycle(store, prepared)
+    assert (
+        store.evidence_counts_as_of(cycle.request_completed_at)["lighter_dydx_funding_cycles"] == 0
+    )
+    store.close()
+
+    claimed_full = PreparedLighterDydxFundingCycle(
+        raw=prepared.raw,
+        instruments=prepared.instruments,
+        funding=prepared.funding,
+        cycle=cycle.model_copy(
+            update={"assets": tuple(sorted(Asset, key=lambda asset: asset.value))}
+        ),
+    )
+    claimed_store = DuckDBStore(tmp_path / "claimed-full-subset.duckdb")
+    with pytest.raises(ValueError, match="six venue-asset items"):
+        persist_lighter_dydx_funding_cycle(claimed_store, claimed_full)
+    claimed_store.close()
+
+
+@pytest.mark.parametrize("record_type", ["instrument", "funding"])
+def test_persistence_rejects_normalized_timestamp_not_conserved_by_raw_and_item(
+    tmp_path: Path, record_type: str
+) -> None:
+    complete = complete_prepared_cycle()
+    records = complete.instruments if record_type == "instrument" else complete.funding
+    first = records[0]
+    mutated = first.model_copy(update={"observed_at": first.observed_at + timedelta(seconds=1)})
+    prepared = PreparedLighterDydxFundingCycle(
+        raw=complete.raw,
+        instruments=(mutated, *complete.instruments[1:])
+        if record_type == "instrument"
+        else complete.instruments,
+        funding=(mutated, *complete.funding[1:]) if record_type == "funding" else complete.funding,
+        cycle=complete.cycle,
+    )
+    database = tmp_path / f"{record_type}-timestamp-lineage.duckdb"
+    store = DuckDBStore(database)
+
+    with pytest.raises(ValueError, match="observation timestamp"):
+        persist_lighter_dydx_funding_cycle(store, prepared)
+    store.close()
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert tuple(
+            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in (
+                "raw_envelopes",
+                "instrument_specs",
+                "funding_observations",
+                "lighter_dydx_funding_cycles",
+            )
+        ) == (0, 0, 0, 0)
+
+
+def test_persistence_rejects_timestamp_replay_conserved_by_raw_but_not_item(
+    tmp_path: Path,
+) -> None:
+    complete = complete_prepared_cycle()
+    first = complete.funding[0]
+    replayed_at = first.observed_at + timedelta(seconds=1)
+    replayed_raw = tuple(
+        raw.model_copy(update={"observed_at": replayed_at})
+        if raw.venue is first.venue
+        and raw.source_hash == first.source_hash
+        and raw.observed_at == first.observed_at
+        else raw
+        for raw in complete.raw
+    )
+    replayed_funding = first.model_copy(update={"observed_at": replayed_at})
+    prepared = PreparedLighterDydxFundingCycle(
+        raw=replayed_raw,
+        instruments=complete.instruments,
+        funding=(replayed_funding, *complete.funding[1:]),
+        cycle=complete.cycle,
+    )
+    store = DuckDBStore(tmp_path / "item-timestamp-lineage.duckdb")
+
+    with pytest.raises(ValueError, match="cycle item"):
+        persist_lighter_dydx_funding_cycle(store, prepared)
+    assert (
+        store.evidence_counts_as_of(complete.cycle.request_completed_at)[
             "lighter_dydx_funding_cycles"
         ]
         == 0
