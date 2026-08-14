@@ -7,6 +7,7 @@ from uuid import UUID
 import duckdb
 import pytest
 
+from polytrading.carry.economics_models import EconomicsDecision
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -27,7 +28,13 @@ from polytrading.venues.funding_cycle_models import (
     FundingCycleStatus,
     InstrumentCaptureOutcome,
 )
-from tests.domain.factories import NOW, SOURCE_HASH, instrument_spec
+from tests.carry.test_economics_models import report
+from tests.domain.factories import (
+    NOW,
+    SOURCE_HASH,
+    book_collection_cycle,
+    instrument_spec,
+)
 
 OTHER_SOURCE_HASH = "b" * 64
 THIRD_SOURCE_HASH = "c" * 64
@@ -207,14 +214,14 @@ def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Pat
     with duckdb.connect(str(path), read_only=True) as connection:
         assert connection.execute(
             "SELECT version, count(*) FROM schema_migrations GROUP BY version"
-        ).fetchall() == [(1, 1), (2, 1), (3, 1)]
+        ).fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1)]
 
 
 def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [4, NOW])
+        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [5, NOW])
 
     with pytest.raises(RuntimeError, match="not a known prefix"):
         open_store(path)
@@ -224,7 +231,7 @@ def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> No
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 4")
 
     with pytest.raises(RuntimeError, match="read-only store requires current schema"):
         DuckDBStore(path, read_only=True)
@@ -241,6 +248,52 @@ def test_migration_sql_is_available_as_packaged_data() -> None:
     )
     assert forward_migration.is_file()
     assert "CREATE TABLE funding_collection_cycles" in forward_migration.read_text(encoding="utf-8")
+
+    economics_migration = importlib.resources.files("polytrading.storage.schema").joinpath(
+        "004_economic_evaluations.sql"
+    )
+    assert economics_migration.is_file()
+    assert "CREATE TABLE economic_evaluations" in economics_migration.read_text(encoding="utf-8")
+
+
+def test_existing_version_three_database_migrates_without_rewriting_prior_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "version-three.duckdb"
+    migration_root = importlib.resources.files("polytrading.storage.schema")
+    with duckdb.connect(str(path)) as connection:
+        for version, name in (
+            (1, "001_initial.sql"),
+            (2, "002_ai_registry.sql"),
+            (3, "003_forward_funding_cycles.sql"),
+        ):
+            connection.execute(migration_root.joinpath(name).read_text(encoding="utf-8"))
+            connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [version, NOW])
+        connection.execute(
+            "INSERT INTO fee_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                Venue.BYBIT.value,
+                "preserved-tier",
+                Decimal("0"),
+                Decimal("0.001"),
+                NOW - timedelta(days=1),
+                NOW,
+                "https://example.test/fees",
+                SOURCE_HASH,
+                1,
+                "9" * 64,
+            ],
+        )
+
+    open_store(path).close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT count(*), min(record_hash) FROM fee_schedules"
+        ).fetchone() == (1, "9" * 64)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
 
 
 def test_funding_collection_cycle_round_trips_and_exact_retry_is_idempotent(
@@ -756,4 +809,139 @@ def test_nested_transactions_are_rejected_without_committing_outer_work(tmp_path
             pass
 
     assert store.latest_instrument_as_of(Venue.BYBIT, "BTCUSDT", NOW) is None
+    store.close()
+
+
+def test_economic_evaluations_round_trip_all_decisions_and_retry_exactly(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    insufficient = report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000711"),
+        decision=EconomicsDecision.INSUFFICIENT_EVIDENCE,
+        reason_codes=("FUNDING_COVERAGE_INSUFFICIENT",),
+        direction=None,
+        short_venue=None,
+        long_venue=None,
+        economics=None,
+    )
+    rejected = report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000712"),
+        evaluated_at=insufficient.evaluated_at + timedelta(seconds=1),
+        decision=EconomicsDecision.REJECTED,
+        reason_codes=("COMPATIBILITY_MARGIN_MODEL_BLOCKING",),
+    )
+    shadow = report(
+        evaluation_id=UUID("00000000-0000-0000-0000-000000000713"),
+        evaluated_at=rejected.evaluated_at + timedelta(seconds=1),
+    )
+
+    for item in (insufficient, rejected, shadow):
+        assert store.append_economic_evaluation(item) is True
+        assert store.append_economic_evaluation(item) is False
+        assert store.latest_economic_evaluation_as_of(item.asset, item.evaluated_at) == item
+
+    store.close()
+
+
+def test_economic_evaluation_conflict_and_transaction_rollback(tmp_path: Path) -> None:
+    path = tmp_path / "research.duckdb"
+    store = open_store(path)
+    original = report()
+    conflict = report(
+        evaluation_id=original.evaluation_id,
+        evaluated_at=original.evaluated_at + timedelta(seconds=1),
+    )
+    store.append_economic_evaluation(original)
+
+    with pytest.raises(ConflictingRecordError, match="conflicting economic evaluation"):
+        store.append_economic_evaluation(conflict)
+
+    rolled_back = report(evaluation_id=UUID("00000000-0000-0000-0000-000000000799"))
+    with pytest.raises(RuntimeError, match="abort economics"), store.transaction():
+        store.append_economic_evaluation(rolled_back)
+        raise RuntimeError("abort economics")
+    assert (
+        store.latest_economic_evaluation_as_of(
+            rolled_back.asset, rolled_back.evaluated_at + timedelta(seconds=1)
+        )
+        == original
+    )
+    store.close()
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM economic_evaluations").fetchone() == (1,)
+
+
+def test_economic_reader_filters_known_and_evaluated_cutoffs(tmp_path: Path) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    item = report(evaluated_at=report().known_as_of + timedelta(minutes=30))
+    store.append_economic_evaluation(item)
+
+    assert (
+        store.latest_economic_evaluation_as_of(
+            item.asset, item.evaluated_at - timedelta(microseconds=1)
+        )
+        is None
+    )
+    assert store.latest_economic_evaluation_as_of(item.asset, item.evaluated_at) == item
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.latest_economic_evaluation_as_of(item.asset, item.evaluated_at.replace(tzinfo=None))
+    store.close()
+
+
+def test_book_cycle_range_and_cycle_books_are_canonical_and_point_in_time(
+    tmp_path: Path,
+) -> None:
+    store = open_store(tmp_path / "research.duckdb")
+    cycle_id = UUID("00000000-0000-0000-0000-000000000811")
+    effective_at = NOW - timedelta(minutes=1)
+    selected = book_collection_cycle(
+        cycle_id=cycle_id,
+        assets=(Asset.BTC,),
+        venues=(Venue.DYDX, Venue.LIGHTER),
+        request_started_at=NOW - timedelta(seconds=2),
+        request_completed_at=NOW,
+        effective_timestamps=(effective_at, effective_at + timedelta(milliseconds=100)),
+        max_effective_skew_ms=Decimal("100"),
+        source_hashes=(SOURCE_HASH, OTHER_SOURCE_HASH),
+    )
+    future = book_collection_cycle(
+        cycle_id=UUID("00000000-0000-0000-0000-000000000812"),
+        assets=(Asset.BTC,),
+        venues=(Venue.DYDX, Venue.LIGHTER),
+        request_started_at=NOW + timedelta(seconds=58),
+        request_completed_at=NOW + timedelta(minutes=1),
+        effective_timestamps=(NOW + timedelta(minutes=1),),
+        source_hashes=(THIRD_SOURCE_HASH,),
+    )
+    lighter = book_snapshot(
+        cycle_id=cycle_id,
+        venue=Venue.LIGHTER,
+        symbol="BTC",
+        effective_at=effective_at,
+        observed_at=NOW,
+        source_hash=SOURCE_HASH,
+    )
+    dydx = book_snapshot(
+        cycle_id=cycle_id,
+        venue=Venue.DYDX,
+        symbol="BTC-USD",
+        effective_at=effective_at + timedelta(milliseconds=100),
+        observed_at=NOW,
+        source_hash=OTHER_SOURCE_HASH,
+    )
+    for item in (future, selected):
+        store.append_book_collection_cycle(item)
+    for item in (lighter, dydx):
+        store.append_book_snapshot(item)
+
+    assert store.book_collection_cycles_between(effective_at - timedelta(minutes=1), NOW, NOW) == (
+        selected,
+    )
+    assert store.books_for_cycle(cycle_id) == (dydx, lighter)
+    with pytest.raises(ValueError, match="start must be less than or equal to end"):
+        store.book_collection_cycles_between(NOW, effective_at, NOW)
+    with pytest.raises(ValueError, match="knowledge cutoff"):
+        store.book_collection_cycles_between(effective_at, NOW, effective_at)
     store.close()

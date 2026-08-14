@@ -15,6 +15,7 @@ import duckdb
 from pydantic import BaseModel
 
 from polytrading.ai.models import ModelCard, RelationshipCandidateArtifact, RuleExtractionArtifact
+from polytrading.carry.economics_models import CandidateEconomicsReport
 from polytrading.domain.models import (
     Asset,
     BookLevel,
@@ -293,6 +294,12 @@ class DuckDBStore:
         )
         return True
 
+    def append_economic_evaluation(self, record: CandidateEconomicsReport) -> bool:
+        if self._in_transaction:
+            return self._append_economic_evaluation(record)
+        with self.transaction():
+            return self._append_economic_evaluation(record)
+
     def append_experiment(self, record: ExperimentRecord) -> bool:
         if self._normalized_retry(
             "experiment",
@@ -472,7 +479,7 @@ class DuckDBStore:
             """,
             [venue.value, symbol, normalized_as_of, normalized_as_of],
         ).fetchone()
-        return self._book_from_row(row)
+        return self._book_snapshot_from_row(row)
 
     def book_for_cycle_as_of(
         self,
@@ -493,9 +500,9 @@ class DuckDBStore:
             """,
             [cycle_id, venue.value, symbol, normalized_as_of, normalized_as_of],
         ).fetchone()
-        return self._book_from_row(row)
+        return self._book_snapshot_from_row(row)
 
-    def _book_from_row(self, row: tuple[Any, ...] | None) -> Level2BookSnapshot | None:
+    def _book_snapshot_from_row(self, row: tuple[Any, ...] | None) -> Level2BookSnapshot | None:
         if row is None:
             return None
         levels = self._connection.execute(
@@ -531,6 +538,70 @@ class DuckDBStore:
             source_hash=row[8],
             schema_version=row[9],
         )
+
+    def book_collection_cycles_between(
+        self,
+        start: datetime,
+        end: datetime,
+        known_as_of: datetime,
+    ) -> tuple[BookCollectionCycle, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
+        if normalized_known_as_of < normalized_end:
+            raise ValueError("knowledge cutoff must be greater than or equal to end")
+        rows = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM book_collection_cycles
+            WHERE request_completed_at <= ?
+            ORDER BY request_completed_at, cycle_id
+            """,
+            [normalized_known_as_of],
+        ).fetchall()
+        cycles = tuple(BookCollectionCycle.model_validate_json(row[0]) for row in rows)
+        return tuple(
+            cycle
+            for cycle in cycles
+            if cycle.effective_timestamps
+            and cycle.effective_timestamps[-1] >= normalized_start
+            and cycle.effective_timestamps[0] <= normalized_end
+        )
+
+    def books_for_cycle(self, cycle_id: UUID) -> tuple[Level2BookSnapshot, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT cycle_id, venue, symbol, asset, depth_limit, sequence,
+                   epoch_us(effective_at), epoch_us(observed_at), source_hash, schema_version
+            FROM book_snapshots
+            WHERE cycle_id = ?
+            ORDER BY venue, symbol
+            """,
+            [cycle_id],
+        ).fetchall()
+        return tuple(
+            snapshot for row in rows if (snapshot := self._book_snapshot_from_row(row)) is not None
+        )
+
+    def latest_economic_evaluation_as_of(
+        self, asset: Asset, as_of: datetime
+    ) -> CandidateEconomicsReport | None:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        row = self._connection.execute(
+            """
+            SELECT CAST(report_json AS VARCHAR)
+            FROM economic_evaluations
+            WHERE asset = ? AND known_as_of <= ? AND evaluated_at <= ?
+            ORDER BY evaluated_at DESC, evaluation_id DESC
+            LIMIT 1
+            """,
+            [asset.value, normalized_as_of, normalized_as_of],
+        ).fetchone()
+        if row is None:
+            return None
+        return CandidateEconomicsReport.model_validate_json(row[0])
 
     def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
         normalized_as_of = normalize_utc_timestamp(as_of)
@@ -807,6 +878,34 @@ class DuckDBStore:
                         record_hash,
                     ],
                 )
+        return True
+
+    def _append_economic_evaluation(self, record: CandidateEconomicsReport) -> bool:
+        if self._normalized_retry(
+            "economic evaluation",
+            record,
+            "economic_evaluations",
+            "evaluation_id = ?",
+            [record.evaluation_id],
+        ):
+            return False
+        self._connection.execute(
+            """
+            INSERT INTO economic_evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?::JSON, ?, ?)
+            """,
+            [
+                record.evaluation_id,
+                record.asset.value,
+                record.known_as_of,
+                record.evaluated_at,
+                record.decision.value,
+                None if record.direction is None else record.direction.value,
+                record.policy_hash,
+                _canonical_json(record),
+                record.schema_version,
+                _record_hash(record),
+            ],
+        )
         return True
 
     def _append_book_collection_cycle(self, record: BookCollectionCycle) -> bool:

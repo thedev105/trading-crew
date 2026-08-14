@@ -51,6 +51,17 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
     with ZipFile(wheel) as archive:
         dossier_members = [name for name in archive.namelist() if name.endswith(".json")]
         assert dossier_members == members
+        migration_members = [
+            name
+            for name in archive.namelist()
+            if name.startswith("polytrading/storage/schema/") and name.endswith(".sql")
+        ]
+        assert migration_members == [
+            "polytrading/storage/schema/001_initial.sql",
+            "polytrading/storage/schema/002_ai_registry.sql",
+            "polytrading/storage/schema/003_forward_funding_cycles.sql",
+            "polytrading/storage/schema/004_economic_evaluations.sql",
+        ]
         dossiers = tuple(
             ContractCompatibilityDossier.model_validate_json(archive.read(member))
             for member in members
