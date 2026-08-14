@@ -37,6 +37,44 @@ _FORBIDDEN_AUTHORITY_MODULE_LEAVES = {
     "wallet",
     "wallets",
 }
+_ALLOWED_EXECUTION_MODULE = "polytrading.carry.economics_execution"
+_FORBIDDEN_AUTHORITY_SYMBOLS = {
+    "cancel_order",
+    "create_order",
+    "load_credentials",
+    "place_order",
+    "private_client",
+    "sign_order",
+    "withdraw",
+}
+_FORBIDDEN_AUTHORITY_IDENTIFIER_MARKERS = (
+    "privateclient",
+    "credentialloader",
+    "walletclient",
+    "signerclient",
+    "orderclient",
+    "balanceclient",
+    "positionclient",
+    "fillclient",
+    "transferclient",
+    "executionclient",
+)
+_ROLLOUT_ORDERING = (
+    "Before configuring unattended scheduling, complete several successful manual funding and "
+    "book cycles and inspect `trial health`."
+)
+_TRIAL_CRON_LINES = (
+    "1 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial funding --current "
+    "--db var/lighter-dydx-trial.duckdb --format json >> var/trial-funding.log 2>&1",
+    "4 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial funding --current "
+    "--db var/lighter-dydx-trial.duckdb --format json >> var/trial-funding.log 2>&1",
+    "6 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial health "
+    "--recent-hours 24 --db var/lighter-dydx-trial.duckdb --format json >> "
+    "var/trial-health.log 2>&1",
+    "58 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial books "
+    "--duration-seconds 60 --interval-seconds 5 --db var/lighter-dydx-trial.duckdb >> "
+    "var/trial-books.log 2>&1",
+)
 
 
 def _trial_module_names() -> tuple[str, ...]:
@@ -60,39 +98,61 @@ def _forbidden_import_target(target: str) -> bool:
         component_tokens = component.split("_")
         if "private" in component_tokens:
             return True
-        if "execution" in component_tokens and component != "economics_execution":
+        if "execution" in component_tokens and target != _ALLOWED_EXECUTION_MODULE:
             return True
-    compact = "".join(character for character in target.casefold() if character.isalnum())
-    return any(
-        marker in compact
-        for marker in (
-            "privateclient",
-            "credentialloader",
-            "walletclient",
-            "signerclient",
-            "orderclient",
-            "balanceclient",
-            "positionclient",
-            "fillclient",
-            "transferclient",
-            "executionclient",
-        )
-    )
+    return _forbidden_authority_identifier(target)
 
 
-def _authority_import_violations(source: str) -> tuple[str, ...]:
+def _forbidden_authority_identifier(identifier: str) -> bool:
+    if identifier.casefold() in _FORBIDDEN_AUTHORITY_SYMBOLS:
+        return True
+    compact = "".join(character for character in identifier.casefold() if character.isalnum())
+    return any(marker in compact for marker in _FORBIDDEN_AUTHORITY_IDENTIFIER_MARKERS)
+
+
+def _authority_source_violations(source: str) -> tuple[str, ...]:
     violations: list[str] = []
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.Import, ast.ImportFrom)):
-            continue
-        targets = [alias.name for alias in node.names]
-        targets.extend(alias.asname for alias in node.names if alias.asname is not None)
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _forbidden_import_target(alias.name):
+                    violations.append(alias.name)
+                if alias.asname and _forbidden_authority_identifier(alias.asname):
+                    violations.append(alias.asname)
         if isinstance(node, ast.ImportFrom):
-            targets.append(node.module or "")
-        for target in targets:
-            if _forbidden_import_target(target):
-                violations.append(target)
+            module = node.module or ""
+            if _forbidden_import_target(module):
+                violations.append(module)
+            for alias in node.names:
+                target = ".".join(part for part in (module, alias.name) if part)
+                if module != _ALLOWED_EXECUTION_MODULE and _forbidden_import_target(target):
+                    violations.append(target)
+                if _forbidden_authority_identifier(alias.name):
+                    violations.append(alias.name)
+                if alias.asname and _forbidden_authority_identifier(alias.asname):
+                    violations.append(alias.asname)
+        if isinstance(
+            node,
+            (ast.Name, ast.Attribute, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            identifier = getattr(node, "id", None) or getattr(node, "attr", None) or node.name
+            if _forbidden_authority_identifier(identifier):
+                violations.append(identifier)
+    return tuple(violations)
+
+
+def _readme_rollout_violations(readme: str) -> tuple[str, ...]:
+    normalized_readme = " ".join(readme.split())
+    required_normalized_phrases = (
+        _ROLLOUT_ORDERING,
+        "the exact shared database path used by every command",
+    )
+    violations = [
+        phrase for phrase in required_normalized_phrases if phrase not in normalized_readme
+    ]
+    readme_lines = frozenset(readme.splitlines())
+    violations.extend(cron_line for cron_line in _TRIAL_CRON_LINES if cron_line not in readme_lines)
     return tuple(violations)
 
 
@@ -119,6 +179,28 @@ def test_readme_documents_prospective_trial_operations_contract() -> None:
     assert "Prospective timing failures cannot be repaired later." in normalized_readme
     assert "scheduler trigger timezone must be UTC" in normalized_readme
     assert "half-hour or quarter-hour offset" in normalized_lower
+    assert _readme_rollout_violations(readme) == ()
+
+
+def test_readme_rollout_contract_rejects_ordering_health_path_and_cron_mutations() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    mutations = {
+        "ordering": readme.replace("Before configuring", "After configuring", 1),
+        "health": readme.replace(" and inspect `trial health`", "", 1),
+        "database path": readme.replace(
+            "the exact\nshared database path used by every command",
+            "a shared database path",
+            1,
+        ),
+        "minute 1": readme.replace(
+            _TRIAL_CRON_LINES[0],
+            _TRIAL_CRON_LINES[0].replace("1 *", "11 *"),
+        ),
+    }
+
+    for label, mutated_readme in mutations.items():
+        assert mutated_readme != readme, label
+        assert _readme_rollout_violations(mutated_readme), label
 
 
 def test_trial_module_audit_includes_package_initializer() -> None:
@@ -134,7 +216,7 @@ def test_authority_import_audit_rejects_adversarial_import_forms() -> None:
     )
 
     for source in prohibited_sources:
-        assert _authority_import_violations(source), source
+        assert _authority_source_violations(source), source
 
 
 def test_authority_import_audit_allows_public_research_imports() -> None:
@@ -144,34 +226,49 @@ def test_authority_import_audit_allows_public_research_imports() -> None:
     )
 
     for source in benign_sources:
-        assert _authority_import_violations(source) == (), source
+        assert _authority_source_violations(source) == (), source
+
+
+def test_authority_import_audit_scopes_economics_execution_to_full_module_path() -> None:
+    allowed_sources = (
+        "import polytrading.carry.economics_execution",
+        "import polytrading.carry.economics_execution as economics_execution",
+        "from polytrading.carry.economics_execution import PairedBookObservation",
+    )
+    prohibited_sources = (
+        "import polytrading.venues.economics_execution",
+        "import polytrading.venues.economics_execution as economics_execution",
+        "import another_package.economics_execution",
+    )
+
+    for source in allowed_sources:
+        assert _authority_source_violations(source) == (), source
+    for source in prohibited_sources:
+        assert _authority_source_violations(source), source
+
+
+def test_authority_source_audit_rejects_private_client_symbols() -> None:
+    source = """
+import polytrading.venues.public as venue
+
+client = venue.DydxPrivateClient
+
+def load_credentials():
+    return client
+"""
+
+    assert _authority_source_violations(source)
 
 
 def test_every_public_trial_module_imports_without_authority_surfaces() -> None:
     module_names = _trial_module_names()
     assert module_names
-    forbidden_symbols = {
-        "cancel_order",
-        "create_order",
-        "load_credentials",
-        "place_order",
-        "private_client",
-        "sign_order",
-        "withdraw",
-    }
 
     for module_name in module_names:
         module = importlib.import_module(module_name)
         source_path = Path(module.__file__ or "")
         source = source_path.read_text(encoding="utf-8")
-        assert _authority_import_violations(source) == (), module_name
-        tree = ast.parse(source, filename=str(source_path))
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Name, ast.Attribute, ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbol = getattr(node, "id", None) or getattr(node, "attr", None) or node.name
-                assert symbol.lower() not in forbidden_symbols, (
-                    f"{module_name} exposes authority symbol {symbol}"
-                )
+        assert _authority_source_violations(source) == (), module_name
 
 
 def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
