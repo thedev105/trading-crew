@@ -184,7 +184,7 @@ def test_readme_documents_prospective_trial_operations_contract() -> None:
 
 def test_readme_rollout_contract_rejects_ordering_health_path_and_cron_mutations() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
-    mutations = {
+    prose_mutations = {
         "ordering": readme.replace("Before configuring", "After configuring", 1),
         "health": readme.replace(" and inspect `trial health`", "", 1),
         "database path": readme.replace(
@@ -192,15 +192,27 @@ def test_readme_rollout_contract_rejects_ordering_health_path_and_cron_mutations
             "a shared database path",
             1,
         ),
-        "minute 1": readme.replace(
-            _TRIAL_CRON_LINES[0],
-            _TRIAL_CRON_LINES[0].replace("1 *", "11 *"),
-        ),
     }
 
-    for label, mutated_readme in mutations.items():
+    for label, mutated_readme in prose_mutations.items():
         assert mutated_readme != readme, label
         assert _readme_rollout_violations(mutated_readme), label
+
+    for cron_line in _TRIAL_CRON_LINES:
+        minute, remainder = cron_line.split(" ", maxsplit=1)
+        line_mutations = {
+            "minute": f"{int(minute) + 1} {remainder}",
+            "command": cron_line.replace(".venv/bin/polytrading", ".venv/bin/not-polytrading", 1),
+            "database path": cron_line.replace(
+                "var/lighter-dydx-trial.duckdb", "var/wrong-trial.duckdb", 1
+            ),
+        }
+        for label, mutated_line in line_mutations.items():
+            mutated_readme = readme.replace(cron_line, mutated_line, 1)
+            case = f"minute {minute}: {label}"
+            assert mutated_line != cron_line, case
+            assert mutated_readme != readme, case
+            assert _readme_rollout_violations(mutated_readme) == (cron_line,), case
 
 
 def test_trial_module_audit_includes_package_initializer() -> None:
@@ -247,17 +259,37 @@ def test_authority_import_audit_scopes_economics_execution_to_full_module_path()
         assert _authority_source_violations(source), source
 
 
-def test_authority_source_audit_rejects_private_client_symbols() -> None:
-    source = """
-import polytrading.venues.public as venue
+def test_authority_source_audit_checks_each_symbol_node_without_masking() -> None:
+    prohibited_fixtures = (
+        ("Name", "DydxPrivateClient\n", "DydxPrivateClient"),
+        (
+            "Attribute",
+            "import polytrading.venues.public as venue\nvenue.DydxPrivateClient\n",
+            "DydxPrivateClient",
+        ),
+        ("FunctionDef", "def load_credentials():\n    return None\n", "load_credentials"),
+        (
+            "AsyncFunctionDef",
+            "async def load_credentials():\n    return None\n",
+            "load_credentials",
+        ),
+        ("ClassDef", "class DydxPrivateClient:\n    pass\n", "DydxPrivateClient"),
+    )
+    benign_fixtures = (
+        ("Name", "PublicVenueAdapter\n"),
+        (
+            "Attribute",
+            "import polytrading.venues.public as venue\nvenue.PublicVenueAdapter\n",
+        ),
+        ("FunctionDef", "def load_public_books():\n    return None\n"),
+        ("AsyncFunctionDef", "async def load_public_books():\n    return None\n"),
+        ("ClassDef", "class PublicVenueAdapter:\n    pass\n"),
+    )
 
-client = venue.DydxPrivateClient
-
-def load_credentials():
-    return client
-"""
-
-    assert _authority_source_violations(source)
+    for node_kind, source, expected_identifier in prohibited_fixtures:
+        assert _authority_source_violations(source) == (expected_identifier,), node_kind
+    for node_kind, source in benign_fixtures:
+        assert _authority_source_violations(source) == (), node_kind
 
 
 def test_every_public_trial_module_imports_without_authority_surfaces() -> None:
