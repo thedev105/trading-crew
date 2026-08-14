@@ -753,8 +753,9 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
     if end - start > timedelta(days=7):
         raise CliUsageError("public funding collection is limited to seven days")
     observed_at = _utc_now()
-    store = DuckDBStore(arguments.db)
-    try:
+    with owned_resource_cleanup() as cleanup:
+        store = DuckDBStore(arguments.db)
+        cleanup.add(store.close)
         recorder = PublicRecorder(store)
         async with public_adapter_session(store, venues) as adapters:
             for adapter in adapters:
@@ -778,8 +779,6 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
                         recorder,
                         await adapter.fetch_funding_history(asset, start, end, observed_at),
                     )
-    finally:
-        store.close()
     print(
         f"completed public collection for {len(assets)} assets across {len(venues)} venues; "
         "see warnings for skipped evidence"
@@ -1075,8 +1074,9 @@ async def _collect_books(arguments: argparse.Namespace) -> int:
         raise CliUsageError("duration seconds must be a finite positive number")
     if not math.isfinite(arguments.interval_seconds) or arguments.interval_seconds <= 0:
         raise CliUsageError("interval seconds must be a finite positive number")
-    store = DuckDBStore(arguments.db)
-    try:
+    with owned_resource_cleanup() as cleanup:
+        store = DuckDBStore(arguments.db)
+        cleanup.add(store.close)
         async with public_adapter_session(store, venues) as adapters:
             await collect_book_cycles(
                 adapters,
@@ -1086,8 +1086,6 @@ async def _collect_books(arguments: argparse.Namespace) -> int:
                 interval_seconds=arguments.interval_seconds,
                 wall_clock=_utc_now,
             )
-    finally:
-        store.close()
     print("completed synchronized public book collection")
     return 0
 

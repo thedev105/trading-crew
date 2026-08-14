@@ -295,3 +295,208 @@ The generated final coverage file was moved into the retained wheel artifact dir
 egg-info, coverage, or cache artifact remains in the worktree. No blocker or unresolved correctness
 concern remains. The required commit author is `thedev105 <tkim3182@gmail.com>`; the exact final
 commit hash is reported in the controller handoff.
+
+## Corrective addendum — outer generic collection stores
+
+Date: 2026-08-14
+Correction base: `1f56a95443cbdc5abb9a8f88658150d3cc7ce4db`
+
+### Corrected audit conclusion
+
+A targeted follow-up review found that the original audit table was too narrow when it classified
+the outer collect-public/books stores as unrelated pre-existing lifecycles. Those stores directly
+surrounded the named generic `public_adapter_session()` lifecycle. Their raw `finally:
+store.close()` blocks could therefore replace the exact active body/cancellation or the inner
+client cleanup marker after the shared async helper had already selected the correct outcome.
+
+This addendum preserves the original audit trail and supersedes only that one scope decision. The
+end-to-end ownership correction is implemented in a separate commit from the original round-5
+fix.
+
+### Corrective RED
+
+Production remained at the exact clean correction base while twelve parameterized end-to-end
+cases were added for both `_collect_public` and `_collect_books`:
+
+- exact body `CancelledError`, client cleanup `CancelledError`, and store cleanup
+  `KeyboardInterrupt`;
+- successful body, client cleanup `CancelledError`, and store cleanup `KeyboardInterrupt`;
+- ordinary body failure plus client/store `BaseException` cleanup;
+- store-only `CancelledError` and `KeyboardInterrupt`; and
+- the ordinary store-only OSError regression.
+
+The pre-correction run recorded:
+
+```text
+.venv/bin/python -m pytest -q tests/test_cli.py \
+  -k 'generic_collection_exact_body_cancellation_wins_over_all_cleanup or \
+      generic_collection_client_cleanup_marker_wins_over_store_cleanup or \
+      generic_collection_body_failure_stays_primary_and_operator_stable or \
+      generic_collection_store_cleanup_only_uses_fixed_sanitized_marker'
+12 failed, 146 deselected in 2.29s
+```
+
+The failures reproduced every reported mode. A later store `KeyboardInterrupt` replaced the exact
+body cancellation and the inner client marker; client and store cleanup still ran in order. Store
+cleanup `CancelledError`/`KeyboardInterrupt` escaped `main()`. Store-only OSError exposed the
+hostile injected detail and returned exit 2 instead of the shared-marker exit 1.
+
+### Corrective implementation
+
+Only the two mandated production functions changed. `_collect_public` and `_collect_books` now
+construct their caller-owned `DuckDBStore` inside `owned_resource_cleanup`, register `store.close`
+immediately, and keep the complete nested `public_adapter_session()` plus collection body inside
+that outer ownership context.
+
+Lexical unwinding is deliberately nested rather than combining stores and clients in one registry:
+
+1. the inner async session attempts every client cleanup and selects its first cause;
+2. the outer sync lifecycle then attempts store cleanup;
+3. an exact body primary or inner cleanup marker remains the active primary and suppresses the
+   later store failure; and
+4. store-only failure becomes `OwnedResourceCleanupError("OWNED_RESOURCE_CLEANUP_ERROR")`.
+
+Success output remains after the outer context, so failed cleanup cannot print a false success.
+No command body catches `BaseException`; genuine task cancellation still escapes unchanged.
+
+### Complete `public_adapter_session()` call-site audit
+
+The correction audit found three production call sites and three direct pre-existing test call
+sites.
+
+- `_collect_public`: caller-owned store now follows the shared outer ownership contract.
+- `_collect_funding_cycle`: already constructed and immediately registered its store with
+  `owned_resource_cleanup`; no correction was needed.
+- `_collect_books`: caller-owned store now follows the shared outer ownership contract.
+- The route-selection unit test uses a real test-fixture store and manually closes it after its
+  intentionally successful session. It has no command/operator boundary and is not a production
+  owner.
+- The direct active-cancellation and cleanup-only session tests pass inert `object()` stores; they
+  own no surrounding closeable resource.
+
+No other production caller exists. The correction therefore changes no directly or transitively
+unrelated lifecycle.
+
+### Corrective GREEN and final-tree evidence
+
+Focused correction matrix:
+
+```text
+12 passed, 146 deselected in 1.44s
+```
+
+Complete CLI/lifecycle matrix:
+
+```text
+.venv/bin/python -m pytest -q tests/test_lifecycle.py tests/test_cli.py
+167 passed in 6.18s
+```
+
+Integrated lifecycle/CLI/server/trial/funding/synchronization matrix:
+
+```text
+.venv/bin/python -m pytest -q \
+  tests/test_lifecycle.py tests/test_cli.py tests/web/test_server.py \
+  tests/trial/test_books.py tests/trial/test_writer_lease.py \
+  tests/venues/test_funding_cycle.py tests/venues/test_synchronized.py
+287 passed in 13.06s
+```
+
+Corrected-tree broad preservation matrix:
+
+```text
+.venv/bin/python -m pytest -q \
+  tests/test_lifecycle.py tests/trial tests/venues/test_synchronized.py \
+  tests/carry/test_economics_assembler.py tests/storage/test_store.py \
+  tests/test_cli.py tests/web
+519 passed in 461.15s (0:07:41)
+```
+
+Definitive corrected-tree full suite and coverage:
+
+```text
+.venv/bin/python -m pytest --cov=polytrading --cov-report=term-missing \
+  --cov-fail-under=90 -q
+TOTAL 11474 statements, 813 missed, 93% displayed
+Required test coverage of 90% reached. Total coverage: 92.91%
+1356 passed in 591.23s (0:09:51)
+src/polytrading/lifecycle.py: 68 statements, 0 missed, 100%
+```
+
+Browser/server regression suite:
+
+```text
+.venv/bin/python -m pytest -q tests/web
+72 passed in 4.02s
+```
+
+Web production code and assets did not change. The original round-5 real-browser desktop, narrow,
+real `DATABASE_BUSY`, recovery, zero-console-error, Ctrl-C, and `PORT_RELEASED` smoke above remains
+applicable under the corrective brief's explicit citation allowance.
+
+Final static, formatting, diff, and package/authority gates:
+
+```text
+.venv/bin/python -m ruff check .
+All checks passed!
+
+.venv/bin/python -m ruff format --check .
+172 files already formatted
+
+git diff --check
+exit 0, no output
+
+.venv/bin/python -m pytest -q tests/test_package.py
+10 passed in 2.44s
+```
+
+### Corrected-tree installed-wheel smoke
+
+The source-frozen corrected tree was copied without `.git`, `.venv`, caches, coverage, build,
+dist, or egg-info artifacts and built under:
+
+```text
+/private/tmp/polytrading-round5-correction-wheel.46zWxj
+polytrading-0.1.0-py3-none-any.whl
+size=262911 bytes
+sha256=4a59d93ba00ee038044fb965c9e97fe76a2fd870095282aeb6515f189808afa6
+```
+
+The wheel installed with no dependencies into a fresh venv. Dependency-only `PYTHONPATH`
+supplied the locked dependencies without processing the worktree editable `.pth`. Import-origin
+proof was:
+
+```text
+polytrading /private/tmp/polytrading-round5-correction-wheel.46zWxj/venv/lib/python3.14/site-packages/polytrading/__init__.py
+cli /private/tmp/polytrading-round5-correction-wheel.46zWxj/venv/lib/python3.14/site-packages/polytrading/cli.py
+duckdb 1.5.4
+httpx 0.28.1
+pydantic 2.13.4
+sklearn 1.9.0
+worktree_src_on_sys_path False
+```
+
+The wheel contains `cli.py`, `lifecycle.py`, and `web/server.py`. Every required installed command
+exited zero:
+
+```text
+polytrading --help
+polytrading collect funding-cycle --help
+polytrading trial funding --help
+polytrading trial books --help
+polytrading trial health --help
+polytrading dashboard --help
+```
+
+### Corrective review and preserved boundaries
+
+The independent corrective review ran a fresh focused matrix (`13 passed, 145 deselected in
+1.77s`) and complete CLI/lifecycle matrix (`167 passed in 6.09s`), plus Ruff, formatting, and diff
+checks. It found no Critical, Important, or Minor issue and declared the correction ready.
+
+No network/adapters/assets/range behavior, client construction, UTC/cutoff/no-lookahead rule,
+evidence transaction, selector, health/economics rule, UI asset, schema, credential use, or trading
+authority changed. The only production diff is the two outer generic collection ownership blocks.
+The generated corrected-tree coverage file was archived with the retained correction wheel; no
+coverage, build, dist, egg-info, or cache artifact remains in the worktree. The separate corrective
+commit uses `thedev105 <tkim3182@gmail.com>`; its exact hash is reported in the controller handoff.

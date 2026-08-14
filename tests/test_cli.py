@@ -3693,6 +3693,223 @@ def test_generic_public_client_cleanup_cancellation_uses_fixed_sanitized_marker(
     assert events == ["store-open", "collect", "client-close", "store-close"]
 
 
+def _install_generic_collection_cleanup_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+    *,
+    body_error: BaseException | None,
+    client_error: BaseException | None,
+    store_error: BaseException | None,
+) -> None:
+    class Store:
+        def __init__(self, _path: Path) -> None:
+            events.append("store-open")
+
+        def close(self) -> None:
+            events.append("store-close")
+            if store_error is not None:
+                raise store_error
+
+    class Client:
+        async def aclose(self) -> None:
+            events.append("client-close")
+            if client_error is not None:
+                raise client_error
+
+    async def exercise_body() -> AdapterBatch:
+        events.append("body")
+        if body_error is not None:
+            raise body_error
+        return AdapterBatch(raw=(), normalized=())
+
+    class Adapter:
+        venue = Venue.HYPERLIQUID
+
+        def __init__(self, _client: object, *_args: object) -> None:
+            pass
+
+        async def fetch_instruments(self, *_args: object) -> AdapterBatch:
+            return await exercise_body()
+
+        async def fetch_market_snapshots(self, *_args: object) -> AdapterBatch:
+            return AdapterBatch(raw=(), normalized=())
+
+        async def fetch_funding_history(self, *_args: object) -> AdapterBatch:
+            return AdapterBatch(raw=(), normalized=())
+
+    async def collect(*_args: object, **_kwargs: object) -> None:
+        await exercise_body()
+
+    monkeypatch.setattr(cli, "DuckDBStore", Store)
+    monkeypatch.setattr(cli, "make_public_http_client", Client)
+    monkeypatch.setattr(cli, "HyperliquidPublicAdapter", Adapter)
+    monkeypatch.setattr(cli, "collect_book_cycles", collect)
+    monkeypatch.setattr(cli, "_record_public_batch", lambda *_args: None)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+
+def _generic_collection_arguments(command: str, database: Path) -> SimpleNamespace:
+    if command == "public":
+        return SimpleNamespace(
+            assets="BTC",
+            venue="hyperliquid",
+            start=None,
+            end=None,
+            db=database,
+        )
+    return SimpleNamespace(
+        assets="BTC",
+        venue="hyperliquid",
+        once=True,
+        duration_seconds=60.0,
+        interval_seconds=1.0,
+        db=database,
+    )
+
+
+def _generic_collection_command(command: str, database: Path) -> list[str]:
+    arguments = [
+        "collect",
+        command,
+        "--venue",
+        "hyperliquid",
+        "--assets",
+        "BTC",
+        "--db",
+        str(database),
+    ]
+    if command == "books":
+        arguments.append("--once")
+    return arguments
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+def test_generic_collection_exact_body_cancellation_wins_over_all_cleanup(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = asyncio.CancelledError("body cancellation token=primary")
+    client_cleanup = asyncio.CancelledError("client cleanup token=hidden")
+    store_cleanup = KeyboardInterrupt("store cleanup /private/store?token=hidden")
+    events: list[str] = []
+    _install_generic_collection_cleanup_scenario(
+        monkeypatch,
+        events,
+        body_error=primary,
+        client_error=client_cleanup,
+        store_error=store_cleanup,
+    )
+
+    operation = cli._collect_public if command == "public" else cli._collect_books
+    with pytest.raises(BaseException) as captured:
+        asyncio.run(operation(_generic_collection_arguments(command, tmp_path / "primary.duckdb")))
+
+    assert captured.value is primary
+    assert events == ["store-open", "body", "client-close", "store-close"]
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+def test_generic_collection_client_cleanup_marker_wins_over_store_cleanup(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_cleanup = asyncio.CancelledError("first client cleanup token=hidden")
+    store_cleanup = KeyboardInterrupt("later store cleanup /private/store?token=hidden")
+    events: list[str] = []
+    _install_generic_collection_cleanup_scenario(
+        monkeypatch,
+        events,
+        body_error=None,
+        client_error=client_cleanup,
+        store_error=store_cleanup,
+    )
+
+    operation = cli._collect_public if command == "public" else cli._collect_books
+    with pytest.raises(BaseException) as captured:
+        asyncio.run(operation(_generic_collection_arguments(command, tmp_path / "client.duckdb")))
+
+    assert type(captured.value).__name__ == "OwnedResourceCleanupError"
+    assert captured.value.__cause__ is client_cleanup
+    assert events == ["store-open", "body", "client-close", "store-close"]
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+def test_generic_collection_body_failure_stays_primary_and_operator_stable(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_error = RuntimeError("GENERIC_COLLECTION_BODY_ERROR")
+    client_secret = "client cleanup https://private.test?token=hidden"
+    store_secret = "store cleanup /private/store.duckdb lock-owner=hidden"
+    events: list[str] = []
+    _install_generic_collection_cleanup_scenario(
+        monkeypatch,
+        events,
+        body_error=body_error,
+        client_error=asyncio.CancelledError(client_secret),
+        store_error=KeyboardInterrupt(store_secret),
+    )
+
+    result: int | None = None
+    escaped: BaseException | None = None
+    try:
+        result = main(_generic_collection_command(command, tmp_path / "body.duckdb"))
+    except BaseException as error:
+        escaped = error
+
+    assert escaped is None
+    assert result == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: GENERIC_COLLECTION_BODY_ERROR\n"
+    assert client_secret not in captured.err
+    assert store_secret not in captured.err
+    assert events == ["store-open", "body", "client-close", "store-close"]
+
+
+@pytest.mark.parametrize("command", ["public", "books"])
+@pytest.mark.parametrize("error_type", [asyncio.CancelledError, KeyboardInterrupt, OSError])
+def test_generic_collection_store_cleanup_only_uses_fixed_sanitized_marker(
+    command: str,
+    error_type: type[BaseException],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = (
+        "store cleanup /private/store.duckdb?token=hidden "
+        "https://private.test response-body=hidden lock-owner=hidden"
+    )
+    events: list[str] = []
+    _install_generic_collection_cleanup_scenario(
+        monkeypatch,
+        events,
+        body_error=None,
+        client_error=None,
+        store_error=error_type(secret),
+    )
+
+    result: int | None = None
+    escaped: BaseException | None = None
+    try:
+        result = main(_generic_collection_command(command, tmp_path / "cleanup.duckdb"))
+    except BaseException as error:
+        escaped = error
+
+    assert escaped is None
+    assert result == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "polytrading: collection failed: OWNED_RESOURCE_CLEANUP_ERROR\n"
+    assert secret not in captured.err
+    assert "Traceback" not in captured.err
+    assert events == ["store-open", "body", "client-close", "store-close"]
+
+
 @pytest.mark.parametrize("command", ["public", "books"])
 def test_generic_collection_parsers_accept_dydx(command: str, tmp_path: Path) -> None:
     # Catches a venue implemented in code but unreachable through the public CLI contract.
