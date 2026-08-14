@@ -467,6 +467,12 @@ mkdir -p var
   --db var/lighter-dydx-trial.duckdb --port 8787
 ```
 
+Before configuring unattended scheduling, complete several successful manual funding and book
+cycles and inspect `trial health`. Treat that as a binding rollout checkpoint: verify host clock
+synchronization, writable and free disk capacity, scheduler log paths and monitoring, the exact
+shared database path used by every command, and loopback dashboard access from the operator host.
+Resolve every failed check before scheduling. Prospective timing failures cannot be repaired later.
+
 The funding command validates whole-hour UTC timing. From the boundary through minute 5 inclusive,
 it may request public venue data; after that cutoff it makes no venue request and persists a `late`
 diagnostic. Every invocation receives a new cycle UUID, including two attempts for the same hourly
@@ -487,8 +493,9 @@ Exit codes are intended for external monitoring:
 These four portable cron entries use the same database and keep the one-minute book burst separate
 from the funding attempts. They are documentation only. Replace `/absolute/path/poly-trading` with
 the absolute path to the checkout; the project does not install or modify cron or any other
-scheduler. UTC boundary math is internal, so cron's configured timezone does not define the funding
-boundary.
+scheduler. The scheduler trigger timezone must be UTC for the minute fields below. Alternatively,
+explicitly translate all four minute fields to UTC-aligned wall time while preserving their UTC
+minute 1, 4, 6, and 58 relationship.
 
 ```cron
 1 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial funding --current --db var/lighter-dydx-trial.duckdb --format json >> var/trial-funding.log 2>&1
@@ -496,6 +503,12 @@ boundary.
 6 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial health --recent-hours 24 --db var/lighter-dydx-trial.duckdb --format json >> var/trial-health.log 2>&1
 58 * * * * cd /absolute/path/poly-trading && .venv/bin/polytrading trial books --duration-seconds 60 --interval-seconds 5 --db var/lighter-dydx-trial.duckdb >> var/trial-books.log 2>&1
 ```
+
+`--current` computes the funding boundary from an aware UTC clock, but it cannot change when cron
+starts the process. Local `:01` and `:04` on a whole-hour UTC offset remain aligned; on a half-hour
+or quarter-hour offset they occur at different UTC minutes and can fall outside the boundary's
+five-minute collection window. Configure cron with UTC triggers or perform and verify the explicit
+wall-time translation before enabling the schedule.
 
 Do not point unrelated legacy writer commands at this trial database while scheduled collection is
 active. The local writer lease reduces brief write collisions; it is not a distributed lock and it
