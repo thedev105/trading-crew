@@ -118,6 +118,34 @@ def test_hourly_book_selection_never_looks_after_boundary(tmp_path: Path) -> Non
     store.close()
 
 
+def test_hourly_book_selection_uses_completion_time_not_old_source_effective_time(
+    tmp_path: Path,
+) -> None:
+    completed_at = BOUNDARY - timedelta(seconds=1)
+    store = DuckDBStore(tmp_path / "books.duckdb")
+    append_pair(
+        store,
+        1,
+        completed_at,
+        snapshot_effective_at=BOUNDARY - timedelta(hours=2),
+    )
+
+    selected = select_hourly_trial_books(
+        store,
+        Asset.BTC,
+        BOUNDARY - timedelta(hours=1),
+        BOUNDARY,
+        BOUNDARY + timedelta(minutes=5),
+        maximum_age_seconds=Decimal("300"),
+        maximum_skew_ms=Decimal("1000"),
+    )
+
+    assert len(selected) == 1
+    assert selected[0].cycle.request_completed_at == completed_at
+    assert selected[0].pair.dydx.effective_at == BOUNDARY - timedelta(hours=2)
+    store.close()
+
+
 @pytest.mark.parametrize(
     ("age", "expected"),
     ((timedelta(minutes=5), 1), (timedelta(minutes=5, microseconds=1), 0)),

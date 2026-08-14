@@ -11,8 +11,8 @@ from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
 from polytrading.trial.book_evidence import (
     EligibleTrialBookPair,
+    _select_hourly_trial_books_from_eligible,
     eligible_lighter_dydx_book_pair,
-    select_hourly_trial_books,
 )
 from polytrading.trial.funding_lineage import select_prospective_funding
 from polytrading.trial.funding_models import LighterDydxFundingCycle, TrialFundingCycleStatus
@@ -251,29 +251,14 @@ class LighterDydxTrialHealthAuditor:
             for venue in (Venue.DYDX, Venue.LIGHTER):
                 source_hashes.add(funding_hashes[venue][boundary])
 
-        hourly = (
-            ()
-            if trial_started_at is None
-            else tuple(
-                item
-                for item in select_hourly_trial_books(
-                    self._store,
-                    asset,
-                    selection_start,
-                    total_boundaries[-1],
-                    as_of,
-                    _MAXIMUM_HOURLY_BOOK_AGE_SECONDS,
-                    _MAXIMUM_BOOK_SKEW_MS,
-                )
-                if item.pair.effective_at >= trial_started_at
-            )
-        )
-        hourly_by_boundary = {item.pair.effective_at: item for item in hourly}
-
         all_book_cycles = (
             ()
             if trial_started_at is None
-            else self._store.book_collection_cycles_between(_UNIX_EPOCH, as_of, as_of)
+            else self._store.book_collection_cycles_completed_between(
+                trial_started_at,
+                as_of,
+                as_of,
+            )
         )
         all_eligible = tuple(
             item
@@ -285,17 +270,18 @@ class LighterDydxTrialHealthAuditor:
             )
             is not None
         )
-        prospective_cutoff = (
-            None
-            if trial_started_at is None
-            else trial_started_at - timedelta(seconds=int(_MAXIMUM_HOURLY_BOOK_AGE_SECONDS))
-        )
         prospective_eligible = tuple(
             item
             for item in all_eligible
-            if prospective_cutoff is not None
-            and item.cycle.request_completed_at >= prospective_cutoff
+            if trial_started_at is not None and item.cycle.request_completed_at >= trial_started_at
         )
+        hourly = _select_hourly_trial_books_from_eligible(
+            prospective_eligible,
+            selection_start,
+            total_boundaries[-1],
+            _MAXIMUM_HOURLY_BOOK_AGE_SECONDS,
+        )
+        hourly_by_boundary = {item.pair.effective_at: item for item in hourly}
         evaluation_start = windows.evaluation_books[0] - _HOUR
         dense = tuple(
             sorted(

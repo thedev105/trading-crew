@@ -384,7 +384,7 @@ class TrialAssetCoverage(_ValidatedCopyRecord):
         if self.consecutive_dense_sample_count > self.dense_book_pair_count:
             raise ValueError("consecutive dense samples must not exceed dense book pairs")
 
-        self._require_missing_boundaries_in_windows()
+        self._require_latest_funding_boundary_aligned()
         expected_fresh = (
             self.latest_book_completed_at is not None
             and self.latest_book_age_seconds is not None
@@ -418,7 +418,7 @@ class TrialAssetCoverage(_ValidatedCopyRecord):
             raise ValueError("reason codes do not match coverage evidence")
         return self
 
-    def _require_missing_boundaries_in_windows(self) -> None:
+    def _require_latest_funding_boundary_aligned(self) -> None:
         if self.latest_funding_boundary is None:
             return
         if any(
@@ -429,24 +429,6 @@ class TrialAssetCoverage(_ValidatedCopyRecord):
             )
         ):
             raise ValueError("latest funding boundary must align to a whole UTC hour")
-        windows = trial_window_boundaries(self.latest_funding_boundary)
-        required_windows = (
-            (
-                "training funding",
-                self.missing_training_funding_boundaries,
-                windows.training_funding,
-            ),
-            (
-                "evaluation funding",
-                self.missing_evaluation_funding_boundaries,
-                windows.evaluation_funding,
-            ),
-            ("book", self.missing_book_boundaries, windows.evaluation_books),
-            ("current funding", self.missing_current_funding_boundaries, windows.current_funding),
-        )
-        for name, missing, allowed in required_windows:
-            if not set(missing).issubset(allowed):
-                raise ValueError(f"missing {name} boundaries must belong to its fixed window")
 
 
 class LighterDydxTrialHealthReport(_ValidatedCopyRecord):

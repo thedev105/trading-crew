@@ -431,29 +431,16 @@ def test_asset_coverage_requires_exact_current_window_and_derived_booleans() -> 
         TrialAssetCoverage(**invalid)
 
 
-def test_missing_boundary_containment_is_fail_closed_for_direct_and_copy() -> None:
+def test_report_owns_missing_boundary_containment_anchor() -> None:
     values = coverage_values(training=712, books=1426)
     outside = trial_window_boundaries(at(17)).total_funding[0] - timedelta(hours=1)
     invalid_missing = (outside, *values["missing_training_funding_boundaries"][1:])
     values["missing_training_funding_boundaries"] = invalid_missing
 
-    with pytest.raises(ValidationError, match="fixed window"):
-        TrialAssetCoverage(**values)
-    with pytest.raises(ValidationError, match="fixed window"):
-        coverage(Asset.BTC).model_copy(
-            update={
-                "paired_training_funding_hours": 712,
-                "training_funding_coverage": Decimal(712) / Decimal(720),
-                "paired_total_funding_hours": 2_152,
-                "total_funding_coverage": Decimal(2_152) / Decimal(2_160),
-                "missing_training_funding_boundaries": invalid_missing,
-                "historical_windows_mature": False,
-                "reason_codes": (
-                    "FUNDING_COVERAGE_INSUFFICIENT",
-                    "FUNDING_TRAINING_COVERAGE_INSUFFICIENT",
-                ),
-            }
-        )
+    asset = TrialAssetCoverage(**values)
+    assets = tuple(asset.model_copy(update={"asset": item}) for item in Asset)
+    with pytest.raises(ValidationError, match="current study window"):
+        report(status=TrialCollectionStatus.COLLECTING, assets=assets)
 
 
 def test_report_requires_exact_statuses_ordering_and_elapsed_inclusive_count() -> None:

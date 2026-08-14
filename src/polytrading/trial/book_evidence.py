@@ -53,6 +53,45 @@ def _limit_timedelta(value: Decimal) -> timedelta:
         raise ValueError("book evidence limit is outside the supported datetime range") from error
 
 
+def _select_hourly_trial_books_from_eligible(
+    eligible: tuple[EligibleTrialBookPair, ...],
+    start: datetime,
+    end: datetime,
+    maximum_age_seconds: Decimal,
+) -> tuple[EligibleTrialBookPair, ...]:
+    ordered = tuple(
+        sorted(eligible, key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
+    )
+    selected: list[EligibleTrialBookPair] = []
+    boundary = start + _HOUR
+    while boundary <= end:
+        representative = next(
+            (
+                item
+                for item in reversed(ordered)
+                if item.cycle.request_completed_at <= boundary
+                and _duration_seconds(boundary - item.cycle.request_completed_at)
+                <= maximum_age_seconds
+                and item.pair.dydx.observed_at <= boundary
+                and item.pair.lighter.observed_at <= boundary
+            ),
+            None,
+        )
+        if representative is not None:
+            selected.append(
+                EligibleTrialBookPair(
+                    cycle=representative.cycle,
+                    pair=PairedBookObservation(
+                        effective_at=boundary,
+                        lighter=representative.pair.lighter,
+                        dydx=representative.pair.dydx,
+                    ),
+                )
+            )
+        boundary += _HOUR
+    return tuple(selected)
+
+
 def eligible_lighter_dydx_book_pair(
     store: DuckDBStore,
     cycle: BookCollectionCycle,
@@ -134,7 +173,11 @@ def select_hourly_trial_books(
         _UNIX_EPOCH,
         normalized_start - _limit_timedelta(age_limit) - _limit_timedelta(skew_limit / 1_000),
     )
-    cycles = store.book_collection_cycles_between(earliest_query, normalized_end, normalized_cutoff)
+    cycles = store.book_collection_cycles_completed_between(
+        earliest_query,
+        normalized_end,
+        normalized_cutoff,
+    )
     eligible = tuple(
         item
         for cycle in cycles
@@ -145,34 +188,9 @@ def select_hourly_trial_books(
         )
         is not None
     )
-    ordered = tuple(
-        sorted(eligible, key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
+    return _select_hourly_trial_books_from_eligible(
+        eligible,
+        normalized_start,
+        normalized_end,
+        age_limit,
     )
-
-    selected: list[EligibleTrialBookPair] = []
-    boundary = normalized_start + _HOUR
-    while boundary <= normalized_end:
-        representative = next(
-            (
-                item
-                for item in reversed(ordered)
-                if item.cycle.request_completed_at <= boundary
-                and _duration_seconds(boundary - item.cycle.request_completed_at) <= age_limit
-                and item.pair.dydx.observed_at <= boundary
-                and item.pair.lighter.observed_at <= boundary
-            ),
-            None,
-        )
-        if representative is not None:
-            selected.append(
-                EligibleTrialBookPair(
-                    cycle=representative.cycle,
-                    pair=PairedBookObservation(
-                        effective_at=boundary,
-                        lighter=representative.pair.lighter,
-                        dydx=representative.pair.dydx,
-                    ),
-                )
-            )
-        boundary += _HOUR
-    return tuple(selected)

@@ -582,6 +582,32 @@ class DuckDBStore:
             and cycle.effective_timestamps[0] <= normalized_end
         )
 
+    def book_collection_cycles_completed_between(
+        self,
+        start: datetime,
+        end: datetime,
+        known_as_of: datetime,
+    ) -> tuple[BookCollectionCycle, ...]:
+        normalized_start = normalize_utc_timestamp(start)
+        normalized_end = normalize_utc_timestamp(end)
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if normalized_start > normalized_end:
+            raise ValueError("start must be less than or equal to end")
+        if normalized_known_as_of < normalized_end:
+            raise ValueError("knowledge cutoff must be greater than or equal to end")
+        rows = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM book_collection_cycles
+            WHERE request_completed_at >= ?
+              AND request_completed_at <= ?
+              AND request_completed_at <= ?
+            ORDER BY request_completed_at, cycle_id
+            """,
+            [normalized_start, normalized_end, normalized_known_as_of],
+        ).fetchall()
+        return tuple(BookCollectionCycle.model_validate_json(row[0]) for row in rows)
+
     def books_for_cycle(self, cycle_id: UUID) -> tuple[Level2BookSnapshot, ...]:
         rows = self._connection.execute(
             """

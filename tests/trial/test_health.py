@@ -16,7 +16,7 @@ from polytrading.trial.health import (
 )
 from polytrading.trial.health_models import TrialCollectionStatus, TrialEvidenceStatus
 from tests.trial.funding_helpers import trial_funding_cycle
-from tests.trial.test_book_evidence import append_pair
+from tests.trial.test_book_evidence import DYDX_HASH, LIGHTER_HASH, append_pair
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 AS_OF = datetime(2026, 8, 14, 7, 6, tzinfo=UTC)
@@ -137,7 +137,7 @@ def seed_complete_trial_hours(
                 append_pair(
                     store,
                     10_000 + index * 10 + offset,
-                    boundary - timedelta(seconds=1),
+                    boundary,
                     asset=asset,
                 )
     return store
@@ -205,6 +205,38 @@ def test_started_trial_counts_only_book_boundaries_at_or_after_start(tmp_path: P
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("completion_offset", "expected_count"),
+    ((timedelta(seconds=-1), 0), (timedelta(0), 1)),
+)
+def test_trial_book_evidence_requires_completion_at_or_after_prospective_start(
+    tmp_path: Path,
+    completion_offset: timedelta,
+    expected_count: int,
+) -> None:
+    store = DuckDBStore(tmp_path / "trial.duckdb")
+    with store.transaction():
+        append_complete_funding_boundary(store, AS_OF_HOUR, 1)
+        for offset, asset in enumerate(Asset, start=1):
+            append_pair(
+                store,
+                76_000 + offset,
+                AS_OF_HOUR + completion_offset,
+                asset=asset,
+            )
+
+    report = LighterDydxTrialHealthAuditor(store).audit(AS_OF, 1)
+
+    assert report.trial_started_at == AS_OF_HOUR
+    assert all(item.paired_book_hours == expected_count for item in report.assets)
+    assert all(item.dense_book_pair_count == expected_count for item in report.assets)
+    expected_latest = AS_OF_HOUR if expected_count else None
+    assert all(item.latest_book_completed_at == expected_latest for item in report.assets)
+    assert (DYDX_HASH in report.source_hashes) is bool(expected_count)
+    assert (LIGHTER_HASH in report.source_hashes) is bool(expected_count)
+    store.close()
+
+
 def test_calendar_immaturity_is_collecting_not_degraded(tmp_path: Path) -> None:
     store = seed_complete_trial_hours(tmp_path, hours=24)
     report = LighterDydxTrialHealthAuditor(store).audit(AS_OF, 24)
@@ -222,6 +254,31 @@ def test_recent_missing_book_makes_health_degraded(tmp_path: Path) -> None:
     assert "BOOK_BTC_MISSING" in report.recent_boundaries[-1].reason_codes
     assert report.recent_boundaries[-1].assets[1].funding_status is TrialEvidenceStatus.COMPLETE
     assert report.recent_boundaries[-1].assets[1].book_status is TrialEvidenceStatus.COMPLETE
+    store.close()
+
+
+def test_missing_newest_funding_after_earlier_evidence_returns_degraded_report(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "trial.duckdb")
+    first = AS_OF_HOUR - timedelta(hours=1)
+    with store.transaction():
+        append_complete_funding_boundary(store, first, 1)
+        for index, boundary in enumerate((first, AS_OF_HOUR)):
+            for offset, asset in enumerate(Asset, start=1):
+                append_pair(
+                    store,
+                    80_000 + index * 10 + offset,
+                    boundary,
+                    asset=asset,
+                )
+
+    report = LighterDydxTrialHealthAuditor(store).audit(AS_OF, 2)
+
+    assert report.status is TrialCollectionStatus.DEGRADED
+    assert report.assets[0].latest_funding_boundary == first
+    assert AS_OF_HOUR in report.assets[0].missing_current_funding_boundaries
+    assert report.recent_boundaries[-1].assets[0].funding_status is TrialEvidenceStatus.MISSING
     store.close()
 
 
