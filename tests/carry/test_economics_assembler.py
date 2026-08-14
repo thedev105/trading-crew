@@ -1,5 +1,5 @@
 import shutil
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -9,14 +9,17 @@ import pytest
 
 from polytrading.carry.dossier_models import DossierStatus
 from polytrading.carry.economics_assembler import EconomicsEvidenceAssembler
+from polytrading.carry.economics_models import EconomicsPolicy
 from polytrading.domain.models import Asset, FeeSchedule, FundingObservation, Venue
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.funding_models import LighterDydxFundingCycle
 from tests.carry.test_economics_models import KNOWN_AS_OF, STUDY_END, policy
 from tests.domain.factories import (
     book_collection_cycle,
     book_snapshot,
     instrument_spec,
 )
+from tests.trial.funding_helpers import trial_funding_cycle
 
 DYDX_FUNDING_HASH = "1" * 64
 LIGHTER_FUNDING_HASH = "2" * 64
@@ -24,9 +27,10 @@ DYDX_BOOK_HASH = "3" * 64
 LIGHTER_BOOK_HASH = "4" * 64
 DYDX_INSTRUMENT_HASH = "5" * 64
 LIGHTER_INSTRUMENT_HASH = "6" * 64
+CONFLICT_FUNDING_HASH = "7" * 64
 
 
-def seed_complete_database(path: Path) -> None:
+def seed_complete_database(path: Path, *, link_trial_funding: bool = True) -> None:
     item = policy()
     store = DuckDBStore(path)
     training_start = item.study_end - timedelta(days=90)
@@ -101,38 +105,117 @@ def seed_complete_database(path: Path) -> None:
         for hour in range(1, 90 * 24 + 1):
             effective_at = training_start + timedelta(hours=hour)
             observed_at = effective_at + timedelta(minutes=1)
-            store.append_funding(
-                FundingObservation(
-                    schema_version=1,
-                    venue=Venue.DYDX,
-                    symbol="BTC-USD",
-                    asset=Asset.BTC,
-                    rate=Decimal("0.0001"),
-                    interval_hours=Decimal("1"),
-                    effective_at=effective_at,
-                    observed_at=observed_at,
-                    source_hash=DYDX_FUNDING_HASH,
-                )
+            dydx_funding = FundingObservation(
+                schema_version=1,
+                venue=Venue.DYDX,
+                symbol="BTC-USD",
+                asset=Asset.BTC,
+                rate=Decimal("0.0001"),
+                interval_hours=Decimal("1"),
+                effective_at=effective_at,
+                observed_at=observed_at,
+                source_hash=DYDX_FUNDING_HASH,
             )
-            store.append_funding(
-                FundingObservation(
-                    schema_version=1,
-                    venue=Venue.LIGHTER,
-                    symbol="BTC",
-                    asset=Asset.BTC,
-                    rate=Decimal("0.0002"),
-                    interval_hours=Decimal("1"),
-                    effective_at=effective_at,
-                    observed_at=observed_at,
-                    source_hash=LIGHTER_FUNDING_HASH,
-                )
+            lighter_funding = FundingObservation(
+                schema_version=1,
+                venue=Venue.LIGHTER,
+                symbol="BTC",
+                asset=Asset.BTC,
+                rate=Decimal("0.0002"),
+                interval_hours=Decimal("1"),
+                effective_at=effective_at,
+                observed_at=observed_at,
+                source_hash=LIGHTER_FUNDING_HASH,
             )
+            store.append_funding(dydx_funding)
+            store.append_funding(lighter_funding)
+            if link_trial_funding:
+                append_trial_funding_cycle(
+                    store,
+                    cycle_id=UUID(int=100_000 + hour),
+                    dydx=dydx_funding,
+                    lighter=lighter_funding,
+                )
         for hour in range(1, 60 * 24 + 1):
             boundary = evaluation_start + timedelta(hours=hour)
             append_book_pair(store, 10_000 + hour, boundary - timedelta(minutes=1))
         append_book_pair(store, 20_001, KNOWN_AS_OF - timedelta(seconds=10))
         append_book_pair(store, 20_002, KNOWN_AS_OF - timedelta(seconds=5))
     store.close()
+
+
+def append_trial_funding_cycle(
+    store: DuckDBStore,
+    *,
+    cycle_id: UUID,
+    dydx: FundingObservation,
+    lighter: FundingObservation,
+) -> LighterDydxFundingCycle:
+    items = list(trial_funding_cycle(cycle_end=dydx.effective_at).items)
+    for observation in (dydx, lighter):
+        index = next(
+            index
+            for index, item in enumerate(items)
+            if item.venue is observation.venue and item.asset is observation.asset
+        )
+        items[index] = items[index].model_copy(
+            update={
+                "funding_observed_at": observation.observed_at,
+                "funding_source_hashes": (observation.source_hash,),
+            }
+        )
+    cycle = trial_funding_cycle(
+        cycle_id=cycle_id,
+        cycle_end=dydx.effective_at,
+        request_started_at=dydx.effective_at + timedelta(seconds=10),
+        request_completed_at=dydx.effective_at + timedelta(minutes=2),
+        items=tuple(items),
+    )
+    store.append_lighter_dydx_funding_cycle(cycle)
+    return cycle
+
+
+def append_conflicting_trial_revision(
+    store: DuckDBStore, asset: Asset, boundary: datetime
+) -> FundingObservation:
+    conflicting = FundingObservation(
+        schema_version=1,
+        venue=Venue.DYDX,
+        symbol=f"{asset.value}-USD",
+        asset=asset,
+        rate=Decimal("0.0003"),
+        interval_hours=Decimal("1"),
+        effective_at=boundary,
+        observed_at=boundary + timedelta(minutes=2),
+        source_hash=CONFLICT_FUNDING_HASH,
+    )
+    lighter = FundingObservation(
+        schema_version=1,
+        venue=Venue.LIGHTER,
+        symbol=asset.value,
+        asset=asset,
+        rate=Decimal("0.0002"),
+        interval_hours=Decimal("1"),
+        effective_at=boundary,
+        observed_at=boundary + timedelta(minutes=1),
+        source_hash=LIGHTER_FUNDING_HASH,
+    )
+    store.append_funding(conflicting)
+    append_trial_funding_cycle(
+        store,
+        cycle_id=UUID(int=500_000),
+        dydx=conflicting,
+        lighter=lighter,
+    )
+    return conflicting
+
+
+def seeded_economics_store(
+    tmp_path: Path, *, link_trial_funding: bool = True
+) -> tuple[DuckDBStore, EconomicsPolicy]:
+    path = tmp_path / "economics.duckdb"
+    seed_complete_database(path, link_trial_funding=link_trial_funding)
+    return DuckDBStore(path), policy()
 
 
 def append_book_pair(store: DuckDBStore, identity: int, completed_at) -> None:
@@ -185,6 +268,23 @@ def copied_database(tmp_path: Path, complete_database: Path) -> Path:
     path = tmp_path / "research.duckdb"
     shutil.copyfile(complete_database, path)
     return path
+
+
+def test_economics_ignores_complete_unlinked_historical_funding(tmp_path: Path) -> None:
+    store, policy = seeded_economics_store(tmp_path, link_trial_funding=False)
+    result = EconomicsEvidenceAssembler(store).assemble(policy)
+    assert result.bundle is None
+    assert "FUNDING_COVERAGE_INSUFFICIENT" in result.reason_codes
+    store.close()
+
+
+def test_economics_fails_closed_on_linked_revision_conflict(tmp_path: Path) -> None:
+    store, policy = seeded_economics_store(tmp_path)
+    append_conflicting_trial_revision(store, policy.asset, policy.study_end)
+    result = EconomicsEvidenceAssembler(store).assemble(policy)
+    assert result.bundle is None
+    assert "FUNDING_REVISION_CONFLICT" in result.reason_codes
+    store.close()
 
 
 def test_complete_assembly_uses_exact_windows_tiers_books_and_lineage(
@@ -356,7 +456,7 @@ def test_invalid_instrument_funding_and_hourly_book_evidence_accumulate_reasons(
 
     assert result.bundle is None
     assert "INSTRUMENT_DYDX_MISSING" in result.reason_codes
-    assert "FUNDING_INTERVAL_OR_IDENTITY_INVALID" in result.reason_codes
+    assert result.coverage.paired_evaluation_hours == 1439
     assert "BOOK_COVERAGE_INSUFFICIENT" in result.reason_codes
     assert result.coverage.paired_book_hours == 1425
     store.close()

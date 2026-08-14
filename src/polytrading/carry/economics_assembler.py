@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -19,6 +18,7 @@ from polytrading.domain.models import (
     Venue,
 )
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.funding_lineage import select_prospective_funding
 from polytrading.venues.synchronized import BookCollectionCycle
 
 _VENUES = (Venue.DYDX, Venue.LIGHTER)
@@ -265,31 +265,21 @@ class EconomicsEvidenceAssembler:
         selected: dict[Venue, dict[datetime, FundingObservation]] = {}
         for venue in _VENUES:
             symbol = _SYMBOLS[policy.asset][venue]
-            rows = self._store.funding_revisions_between(
+            selection = select_prospective_funding(
+                self._store,
                 venue,
                 symbol,
+                policy.asset,
                 training_start,
                 policy.study_end,
                 policy.known_as_of,
             )
-            grouped: dict[datetime, list[FundingObservation]] = defaultdict(list)
-            for item in rows:
-                grouped[item.effective_at].append(item)
-            venue_selected: dict[datetime, FundingObservation] = {}
-            for effective_at, revisions in grouped.items():
-                latest = max(revisions, key=lambda item: (item.observed_at, item.source_hash))
-                if (
-                    latest.venue is not venue
-                    or latest.symbol != symbol
-                    or latest.asset is not policy.asset
-                    or latest.interval_hours != 1
-                ):
-                    reasons.add("FUNDING_INTERVAL_OR_IDENTITY_INVALID")
-                    source_hashes.add(latest.source_hash)
-                    continue
-                venue_selected[effective_at] = latest
-                source_hashes.add(latest.source_hash)
-            selected[venue] = venue_selected
+            source_hashes.update(selection.source_hashes)
+            if selection.conflict_boundaries:
+                reasons.add("FUNDING_REVISION_CONFLICT")
+            selected[venue] = {
+                observation.effective_at: observation for observation in selection.observations
+            }
         expected = tuple(
             training_start + timedelta(hours=hour)
             for hour in range(1, (policy.training_days + policy.evaluation_days) * 24 + 1)
