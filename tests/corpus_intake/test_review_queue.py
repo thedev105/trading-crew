@@ -30,6 +30,7 @@ from polytrading.corpus_intake.source_policy import (
     SourceUseApproval,
     canonical_sha256,
 )
+from polytrading.predictions.domain import PredictionSource
 
 NOW = datetime(2026, 8, 12, 16, tzinfo=UTC)
 FIXTURE = Path("tests/fixtures/polymarket/markets_keyset_page_1.json")
@@ -38,7 +39,7 @@ FIXTURE = Path("tests/fixtures/polymarket/markets_keyset_page_1.json")
 def scope() -> IntendedUseScope:
     return IntendedUseScope(
         schema_version=1,
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         maximum_records=1_000,
         local_retention=True,
         derived_semantic_labels=True,
@@ -91,7 +92,7 @@ def evidence_record(index: int) -> SourceEvidence:
     target = POLYMARKET_EVIDENCE_TARGETS[index]
     return SourceEvidence(
         schema_version=1,
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         url=target.url,
         retrieved_at=NOW,
         status_code=200,
@@ -118,7 +119,7 @@ def exact_approval(intake: Path, source_use: Path, **changes: object) -> SourceU
     verified = verify_source_use_run(source_use)
     values: dict[str, object] = {
         "schema_version": 1,
-        "source": "polymarket",
+        "source": PredictionSource.POLYMARKET,
         "approver_id": "human-legal-reviewer-001",
         "approver_role": "qualified_legal_review",
         "approval_reference": "synthetic-test-approval-only",

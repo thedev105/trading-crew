@@ -42,6 +42,7 @@ from polytrading.domain.models import (
     RawEnvelope,
     Venue,
 )
+from polytrading.predictions.domain import PredictionSource
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.trial.books import TrialBookRunSummary
@@ -827,7 +828,7 @@ def test_collect_source_use_writes_unresolved_hash_only_run(
         index = POLYMARKET_EVIDENCE_TARGETS.index(target) + 1
         return SourceEvidence(
             schema_version=1,
-            source="polymarket",
+            source=PredictionSource.POLYMARKET,
             url=target.url,
             retrieved_at=retrieved_at,
             status_code=200,
@@ -903,7 +904,7 @@ def test_collect_review_queue_reports_valid_blocked_outcome(
         index = POLYMARKET_EVIDENCE_TARGETS.index(target) + 1
         return SourceEvidence(
             schema_version=1,
-            source="polymarket",
+            source=PredictionSource.POLYMARKET,
             url=target.url,
             retrieved_at=retrieved_at,
             status_code=200,

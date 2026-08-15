@@ -51,6 +51,7 @@ from polytrading.lifecycle import (
     cleanup_error_cause,
     owned_resource_cleanup,
 )
+from polytrading.predictions.domain import PredictionSource
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
@@ -139,6 +140,9 @@ class RetryingTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._transport.aclose()
+
+
+_WRITER_LEASE_TIMEOUT_SECONDS = 30.0
 
 
 class CliUsageError(ValueError):
@@ -416,28 +420,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _replay(arguments: argparse.Namespace) -> int:
-    store = DuckDBStore(arguments.db)
-    try:
-        count = replay_file(arguments.input, store)
-    finally:
-        store.close()
+    with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+        store = DuckDBStore(arguments.db)
+        try:
+            count = replay_file(arguments.input, store)
+        finally:
+            store.close()
     print(f"replayed {count} public adapter batches")
     return 0
 
 
 def _carry_audit(arguments: argparse.Namespace) -> int:
     as_of = _parse_timestamp(arguments.as_of)
-    store = DuckDBStore(arguments.db)
-    try:
-        report = CarryAuditor(
-            store,
-            max_instrument_age=timedelta(days=7),
-            max_funding_age=timedelta(days=7),
-            max_book_age=timedelta(seconds=30),
-            max_book_cycle_skew=timedelta(seconds=1),
-        ).audit(as_of)
-    finally:
-        store.close()
+    with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+        store = DuckDBStore(arguments.db)
+        try:
+            report = CarryAuditor(
+                store,
+                max_instrument_age=timedelta(days=7),
+                max_funding_age=timedelta(days=7),
+                max_book_age=timedelta(seconds=30),
+                max_book_cycle_skew=timedelta(seconds=1),
+            ).audit(as_of)
+        finally:
+            store.close()
     renderer = render_json if arguments.format == "json" else render_text
     print(renderer(report))
     return 0
@@ -564,8 +570,9 @@ def _fees_import(arguments: argparse.Namespace) -> int:
     )
     store: DuckDBStore | None = None
     try:
-        store = DuckDBStore(arguments.db)
-        inserted = record_reviewed_fees(store, document)
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = DuckDBStore(arguments.db)
+            inserted = record_reviewed_fees(store, document)
     except (duckdb.Error, ConflictingRecordError, RuntimeError) as error:
         raise CliUsageError("reviewed fee import failed") from error
     finally:
@@ -588,14 +595,15 @@ def _carry_economics(arguments: argparse.Namespace) -> int:
         raise CliUsageError("economics database is unavailable or not current")
     store: DuckDBStore | None = None
     try:
-        store = DuckDBStore(arguments.db)
-        assembly = EconomicsEvidenceAssembler(store).assemble(loaded_policy)
-        report = CandidateEconomicsEvaluator().evaluate(
-            assembly,
-            evaluated_at=evaluated_at,
-            evaluation_id=evaluation_id,
-        )
-        store.append_economic_evaluation(report)
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = DuckDBStore(arguments.db)
+            assembly = EconomicsEvidenceAssembler(store).assemble(loaded_policy)
+            report = CandidateEconomicsEvaluator().evaluate(
+                assembly,
+                evaluated_at=evaluated_at,
+                evaluation_id=evaluation_id,
+            )
+            store.append_economic_evaluation(report)
     except ConflictingRecordError as error:
         raise CliUsageError("economics report persistence conflict") from error
     except (duckdb.Error, RuntimeError) as error:
@@ -753,7 +761,10 @@ async def _collect_public(arguments: argparse.Namespace) -> int:
     if end - start > timedelta(days=7):
         raise CliUsageError("public funding collection is limited to seven days")
     observed_at = _utc_now()
-    with owned_resource_cleanup() as cleanup:
+    with (
+        database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS),
+        owned_resource_cleanup() as cleanup,
+    ):
         store = DuckDBStore(arguments.db)
         cleanup.add(store.close)
         recorder = PublicRecorder(store)
@@ -797,7 +808,10 @@ async def _collect_funding_cycle(arguments: argparse.Namespace) -> int:
     _, _, is_late = validate_cycle_timing(cycle_end, now)
 
     try:
-        with owned_resource_cleanup() as cleanup:
+        with (
+            database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS),
+            owned_resource_cleanup() as cleanup,
+        ):
             store = DuckDBStore(arguments.db)
             cleanup.add(store.close)
             if is_late:
@@ -1001,7 +1015,7 @@ async def _collect_source_use(arguments: argparse.Namespace) -> int:
     )
     scope = IntendedUseScope(
         schema_version=1,
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         maximum_records=1_000,
         local_retention=True,
         derived_semantic_labels=True,
@@ -1074,7 +1088,10 @@ async def _collect_books(arguments: argparse.Namespace) -> int:
         raise CliUsageError("duration seconds must be a finite positive number")
     if not math.isfinite(arguments.interval_seconds) or arguments.interval_seconds <= 0:
         raise CliUsageError("interval seconds must be a finite positive number")
-    with owned_resource_cleanup() as cleanup:
+    with (
+        database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS),
+        owned_resource_cleanup() as cleanup,
+    ):
         store = DuckDBStore(arguments.db)
         cleanup.add(store.close)
         async with public_adapter_session(store, venues) as adapters:

@@ -22,6 +22,7 @@ from polytrading.corpus_intake.source_policy import (
     SourceEvidence,
     canonical_sha256,
 )
+from polytrading.predictions.domain import PredictionSource
 
 NOW = datetime(2026, 8, 12, 16, tzinfo=UTC)
 DOCS_HTML = b"""<!doctype html><html><body>
@@ -38,7 +39,7 @@ in consultation with Polymarket and ICE.</p>
 def scope() -> IntendedUseScope:
     return IntendedUseScope(
         schema_version=1,
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         maximum_records=1_000,
         local_retention=True,
         derived_semantic_labels=True,

@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from polytrading.domain.models import StrictRecord, normalize_utc_timestamp
+from polytrading.predictions.domain import PredictionSource
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -44,7 +45,7 @@ def canonical_sha256(value: object) -> str:
 
 class IntendedUseScope(StrictRecord):
     schema_version: Literal[1]
-    source: Literal["polymarket"]
+    source: PredictionSource
     maximum_records: int = Field(ge=1, le=5_000)
     local_retention: Literal[True]
     derived_semantic_labels: Literal[True]
@@ -56,7 +57,7 @@ class IntendedUseScope(StrictRecord):
 
 class SourceEvidence(StrictRecord):
     schema_version: Literal[1]
-    source: Literal["polymarket"]
+    source: PredictionSource
     url: NonEmptyString
     retrieved_at: datetime
     status_code: Literal[200]
@@ -86,7 +87,7 @@ class SourceEvidence(StrictRecord):
 
 class SourceUseAssessment(StrictRecord):
     schema_version: Literal[1]
-    source: Literal["polymarket"]
+    source: PredictionSource
     assessed_at: datetime
     status: Literal["requires_external_confirmation", "rejected"]
     reason_code: Literal["source_consultation_notice", "human_rejected"]
@@ -120,7 +121,7 @@ class SourceUseAssessment(StrictRecord):
 
 class SourceUseApproval(StrictRecord):
     schema_version: Literal[1]
-    source: Literal["polymarket"]
+    source: PredictionSource
     approver_id: NonEmptyString
     approver_role: Literal["source_owner_authorization", "qualified_legal_review"]
     approval_reference: NonEmptyString

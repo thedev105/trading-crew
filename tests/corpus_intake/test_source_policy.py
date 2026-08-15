@@ -13,6 +13,7 @@ from polytrading.corpus_intake.source_policy import (
     canonical_sha256,
     evaluate_source_gate,
 )
+from polytrading.predictions.domain import PredictionSource
 
 NOW = datetime(2026, 8, 12, 16, tzinfo=UTC)
 HASH_A = "a" * 64
@@ -23,7 +24,7 @@ HASH_C = "c" * 64
 def scope(**changes: object) -> IntendedUseScope:
     values: dict[str, object] = {
         "schema_version": 1,
-        "source": "polymarket",
+        "source": PredictionSource.POLYMARKET,
         "maximum_records": 1_000,
         "local_retention": True,
         "derived_semantic_labels": True,
@@ -40,7 +41,7 @@ def assessment(**changes: object) -> SourceUseAssessment:
     intended_use = scope()
     values: dict[str, object] = {
         "schema_version": 1,
-        "source": "polymarket",
+        "source": PredictionSource.POLYMARKET,
         "assessed_at": NOW,
         "status": "requires_external_confirmation",
         "reason_code": "source_consultation_notice",
@@ -55,7 +56,7 @@ def assessment(**changes: object) -> SourceUseAssessment:
 def approval(**changes: object) -> SourceUseApproval:
     values: dict[str, object] = {
         "schema_version": 1,
-        "source": "polymarket",
+        "source": PredictionSource.POLYMARKET,
         "approver_id": "human-legal-reviewer-001",
         "approver_role": "qualified_legal_review",
         "approval_reference": "internal-matter-2026-001",
@@ -68,6 +69,23 @@ def approval(**changes: object) -> SourceUseApproval:
     }
     values.update(changes)
     return SourceUseApproval(**values)
+
+
+def test_source_use_scope_accepts_kalshi_and_polymarket() -> None:
+    for source in (PredictionSource.POLYMARKET, PredictionSource.KALSHI):
+        assert scope(source=source).source is source
+
+
+def test_source_use_scope_rejects_a_bare_string_literal() -> None:
+    with pytest.raises(ValidationError):
+        scope(source="polymarket")
+
+
+def test_existing_polymarket_string_fixtures_still_parse() -> None:
+    fixture_json = scope().model_dump_json()
+    restored = IntendedUseScope.model_validate_json(fixture_json)
+    assert restored.source is PredictionSource.POLYMARKET
+    assert '"polymarket"' in fixture_json
 
 
 def test_automated_assessment_cannot_claim_approval() -> None:
@@ -88,7 +106,7 @@ def test_scope_is_narrow_and_bounded() -> None:
 def test_evidence_rejects_long_or_hash_mismatched_excerpt() -> None:
     common = {
         "schema_version": 1,
-        "source": "polymarket",
+        "source": PredictionSource.POLYMARKET,
         "url": "https://institutional.polymarket.com/",
         "retrieved_at": NOW,
         "status_code": 200,

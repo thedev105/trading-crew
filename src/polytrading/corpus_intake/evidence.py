@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
@@ -19,13 +19,14 @@ from polytrading.corpus_intake.source_policy import (
     canonical_sha256,
 )
 from polytrading.domain.models import normalize_utc_timestamp
+from polytrading.predictions.domain import PredictionSource
 
 SOURCE_USE_SCHEMA_VERSION = "source-use-v1"
 
 
 @dataclass(frozen=True)
 class EvidenceTarget:
-    source: Literal["polymarket"]
+    source: PredictionSource
     url: str
     locator: str
     excerpt: str
@@ -33,7 +34,7 @@ class EvidenceTarget:
 
 POLYMARKET_EVIDENCE_TARGETS = (
     EvidenceTarget(
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         url="https://docs.polymarket.com/api-reference/predictions/overview",
         locator="Gamma API",
         excerpt=(
@@ -41,7 +42,7 @@ POLYMARKET_EVIDENCE_TARGETS = (
         ),
     ),
     EvidenceTarget(
-        source="polymarket",
+        source=PredictionSource.POLYMARKET,
         url="https://institutional.polymarket.com/",
         locator="in consultation with Polymarket and ICE",
         excerpt=(
