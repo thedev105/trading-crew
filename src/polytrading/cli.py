@@ -45,12 +45,15 @@ from polytrading.corpus_intake.polymarket import acquire_polymarket
 from polytrading.corpus_intake.review_queue import prepare_review_queue
 from polytrading.corpus_intake.source_policy import IntendedUseScope, SourceUseApproval
 from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
+from polytrading.http_client import RetryingTransport as RetryingTransport
+from polytrading.http_client import make_public_http_client
 from polytrading.lifecycle import (
     OwnedResourceCleanupError,
     async_owned_resource_cleanup,
     cleanup_error_cause,
     owned_resource_cleanup,
 )
+from polytrading.predictions.cli import add_predictions_subcommands, run_predictions_command
 from polytrading.predictions.domain import PredictionSource
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
@@ -107,40 +110,6 @@ from polytrading.venues.public import AdapterBatch, AdapterWarning, PublicVenueA
 from polytrading.venues.recorder import PublicRecorder
 from polytrading.venues.synchronized import SynchronizedBookCollector
 from polytrading.web.server import serve_dashboard, validate_dashboard_database
-
-_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
-
-
-class RetryingTransport(httpx.AsyncBaseTransport):
-    """Retry a bounded set of public HTTP statuses with deterministic backoff."""
-
-    def __init__(
-        self,
-        transport: httpx.AsyncBaseTransport,
-        *,
-        max_attempts: int = 3,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
-        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
-            raise TypeError("max_attempts must be an integer")
-        if max_attempts <= 0:
-            raise ValueError("max_attempts must be positive")
-        self._transport = transport
-        self._max_attempts = max_attempts
-        self._sleep = sleep
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        for attempt in range(1, self._max_attempts + 1):
-            response = await self._transport.handle_async_request(request)
-            if response.status_code not in _RETRYABLE_STATUSES or attempt == self._max_attempts:
-                return response
-            await response.aclose()
-            await self._sleep(0.25 * 2 ** (attempt - 1))
-        raise AssertionError("positive retry budget must return a response")
-
-    async def aclose(self) -> None:
-        await self._transport.aclose()
-
 
 _WRITER_LEASE_TIMEOUT_SECONDS = 30.0
 
@@ -363,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_queue.add_argument("--reviewer-a")
     review_queue.add_argument("--reviewer-b")
     add_ai_subcommands(commands)
+    add_predictions_subcommands(commands)
     return parser
 
 
@@ -397,6 +367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _trial_health(arguments)
         if arguments.command == "ai":
             return run_ai_command(arguments)
+        if arguments.command == "predictions":
+            return run_predictions_command(arguments)
         if arguments.collect_command == "public":
             return asyncio.run(_collect_public(arguments))
         if arguments.collect_command == "funding-cycle":
@@ -667,20 +639,6 @@ def _parse_venues(value: str) -> tuple[Venue, ...]:
     if value == "all":
         return (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
     return (Venue(value),)
-
-
-def make_public_http_client(
-    *, transport: httpx.AsyncBaseTransport | None = None
-) -> httpx.AsyncClient:
-    base_transport = transport or httpx.AsyncHTTPTransport()
-    return httpx.AsyncClient(
-        headers={
-            "Accept-Encoding": "identity",
-            "User-Agent": "polytrading/0.1 public-market-research",
-        },
-        timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0),
-        transport=RetryingTransport(base_transport),
-    )
 
 
 @asynccontextmanager
