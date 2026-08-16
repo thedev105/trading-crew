@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>polytrading predictions dashboard</title>
+<link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+<main>
+  <h1>Prediction-market evidence (research only)</h1>
+  <p class="warning">
+    Research only. No structural-opportunity proof, economics, or trading authority exists in
+    this increment. This page has no collection or execution controls.
+  </p>
+  <p id="as-of">Loading&hellip;</p>
+
+  <section>
+    <h2>Venue health</h2>
+    <table id="venues">
+      <thead>
+        <tr>
+          <th>Venue</th>
+          <th>Status</th>
+          <th>Collection allowed</th>
+          <th>Markets</th>
+          <th>Latest book age (s)</th>
+          <th>Reasons</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Markets</h2>
+    <table id="markets">
+      <thead>
+        <tr>
+          <th>Venue</th>
+          <th>Market</th>
+          <th>Question</th>
+          <th>Active</th>
+          <th>Closed</th>
+          <th>Retrieved at</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Evidence counts</h2>
+    <pre id="evidence-counts"></pre>
+  </section>
+
+  <section>
+    <h2>Recipes (copy only, never executed)</h2>
+    <ul id="recipes"></ul>
+  </section>
+
+  <p id="stale-notice" hidden>Showing the last successful snapshot; refresh failed.</p>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

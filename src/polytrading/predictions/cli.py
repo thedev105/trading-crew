@@ -10,6 +10,10 @@ from pathlib import Path
 
 from polytrading.http_client import make_public_http_client
 from polytrading.predictions.adapter import PredictionCollectionGateError
+from polytrading.predictions.dashboard_server import (
+    serve_prediction_dashboard,
+    validate_prediction_dashboard_database,
+)
 from polytrading.predictions.domain import MarketRecord, PredictionVenue, RuleVersion
 from polytrading.predictions.health import PredictionHealthAuditor, VenueEvidenceStatus
 from polytrading.predictions.health_report import (
@@ -70,12 +74,22 @@ def add_predictions_subcommands(
     health.add_argument("--as-of")
     health.add_argument("--format", choices=("text", "json"), default="text")
 
+    dashboard = predictions_commands.add_parser(
+        "dashboard", help="serve the loopback-only prediction-market evidence console"
+    )
+    dashboard.add_argument("--db", required=True, type=Path)
+    dashboard.add_argument("--port", required=True, type=int)
+
 
 def run_predictions_command(arguments: argparse.Namespace) -> int:
     if arguments.predictions_command == "venues":
         return _run_venues_status(arguments)
     if arguments.predictions_command == "collect":
         return asyncio.run(_run_collect(arguments))
+    if arguments.predictions_command == "dashboard":
+        validate_prediction_dashboard_database(arguments.db)
+        serve_prediction_dashboard(arguments.db, arguments.port)
+        return 0
     return _run_health(arguments)
 
 
