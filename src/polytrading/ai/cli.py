@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -34,7 +35,7 @@ from polytrading.ai.evaluate import (
 from polytrading.ai.extraction import RegexRuleExtractor, build_regex_model_card
 from polytrading.ai.metrics import MutationCaseResult, RelationshipMetricCase
 from polytrading.ai.model_registry import ModelRegistry
-from polytrading.ai.models import CriticalField, RuleExtractionArtifact
+from polytrading.ai.models import CriticalField, GoldContractLabel, RuleExtractionArtifact
 from polytrading.ai.prompt_packets import build_prompt_packet
 from polytrading.ai.report import (
     build_semantic_report,
@@ -48,7 +49,7 @@ from polytrading.ai.retrieval import (
 )
 from polytrading.ai.review import CorpusReviewAssignment, ReviewRecord
 from polytrading.ai.security import find_untrusted_text_markers
-from polytrading.ai.spans import SourceSpanValidationError, validate_rule_fields
+from polytrading.ai.spans import SourceSpanValidationError, validate_span
 from polytrading.research.models import EvaluationWindow, ExperimentRecord, SuccessCriterion
 from polytrading.storage.store import DuckDBStore
 
@@ -322,18 +323,17 @@ def _run_import_artifacts(arguments: argparse.Namespace) -> int:
         raise ValueError("artifact input contains no JSONL rows")
     equity = Decimal(arguments.equity_usd)
     spent = Decimal(arguments.spent_usd)
-    explicit_imported_at = (
-        _parse_timestamp(arguments.imported_at) if arguments.imported_at else None
+    imported_at = (
+        _parse_timestamp(arguments.imported_at) if arguments.imported_at else datetime.now(UTC)
     )
     store = DuckDBStore(arguments.db)
     try:
         importer = ArtifactImporter(ModelRegistry(store), corpus.manifest, corpus.contracts)
         accepted = 0
         for line in lines:
-            envelope = ArtifactEnvelope.model_validate_json(line)
             result = importer.import_json(
                 line,
-                imported_at=explicit_imported_at or envelope.artifact.created_at,
+                imported_at=imported_at,
                 equity_usd=equity,
                 spent_usd=spent,
             )
@@ -437,14 +437,20 @@ def _evaluation_request(
         for relationship in relationships
     )
     extractor = RegexRuleExtractor()
+    gold_fields = {
+        label.contract_id: label.fields
+        for label in corpus.labels
+        if isinstance(label, GoldContractLabel)
+    }
     field_cases = tuple(
         FieldEvaluationCase(
             contract_id=contract.contract_id,
             canonical_text=contract.canonical_text,
-            expected_fields=(fields := extractor.extract(contract.canonical_text).fields),
-            actual_fields=fields,
+            expected_fields=gold_fields[contract.contract_id],
+            actual_fields=extractor.extract(contract.canonical_text).fields,
         )
         for contract in _contracts_for_split(corpus, split)
+        if contract.contract_id in gold_fields
     )
     hostile_cases = [
         BooleanCaseResult(
@@ -538,12 +544,26 @@ def _mutation_case_results(split: Split) -> tuple[MutationCaseResult, ...]:
     )
     results: list[MutationCaseResult] = []
     for group, old, new in changes:
-        try:
-            validate_rule_fields(fields, text.replace(old, new, 1))
-        except SourceSpanValidationError:
-            invalidated = True
-        else:
-            invalidated = False
+        mutated_text = text.replace(old, new, 1)
+        # Re-stamp each span's whole-document hash to the mutated text before checking.
+        # validate_span's document-hash gate would otherwise short-circuit every span on
+        # every mutation, so this isolates its position/exact-text check and lets it prove
+        # whether span-boundary tracking actually notices the field-scoped mutation, rather
+        # than reporting invalidated=True unconditionally regardless of span precision.
+        mutated_hash = hashlib.sha256(mutated_text.encode("utf-8")).hexdigest()
+        rehashed_spans = tuple(
+            span.model_copy(update={"canonical_text_hash": mutated_hash})
+            for _, field in fields
+            if field.status == "known"
+            for span in field.supporting_spans
+        )
+        invalidated = False
+        for span in rehashed_spans:
+            try:
+                validate_span(span, mutated_text)
+            except SourceSpanValidationError:
+                invalidated = True
+                break
         results.append(
             MutationCaseResult(
                 case_id=f"{split}:{group}",

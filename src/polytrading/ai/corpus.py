@@ -446,6 +446,7 @@ class FrozenCorpus(StrictRecord):
     manifest: CorpusManifest
     contracts: tuple[CorpusContract, ...]
     relationships: tuple[GoldRelationship, ...]
+    labels: tuple[GoldContractLabel | GoldRelationshipLabel, ...]
 
 
 def load_frozen_corpus(directory: Path) -> FrozenCorpus:
@@ -533,6 +534,7 @@ def load_frozen_corpus(directory: Path) -> FrozenCorpus:
         manifest=manifest,
         contracts=contracts,
         relationships=relationships,
+        labels=labels,
     )
 
 
@@ -555,6 +557,13 @@ def freeze_manifest(
     review_rows = _read_jsonl(paths["reviews"])
     contracts = tuple(_validate_json_record(CorpusContract, row) for row in contract_rows)
     relationships = tuple(_validate_json_record(GoldRelationship, row) for row in relationship_rows)
+    labels = tuple(
+        _validate_json_record(
+            GoldContractLabel if "contract_id" in row else GoldRelationshipLabel,
+            row,
+        )
+        for row in label_rows
+    )
     reviews = tuple(_validate_json_record(ReviewRecord, row) for row in review_rows)
     validate_split_integrity(contracts, relationships)
     completion = _review_completion(contracts, relationships, reviews)
@@ -572,13 +581,11 @@ def freeze_manifest(
     counts = {
         "contracts": len(contracts),
         "relationships": len(relationships),
-        "labels": len(label_rows),
+        "labels": len(labels),
         "reviews": len(reviews),
     }
     rule_templates = Counter(contract.rule_template for contract in contracts)
-    adversarial_tags = Counter(
-        tag for label in label_rows for tag in label.get("adversarial_tags", [])
-    )
+    adversarial_tags = Counter(tag for label in labels for tag in label.adversarial_tags)
     cutoff = max(
         (contract.information_cutoff for contract in contracts),
         default=_policy_cutoff(directory),

@@ -23,7 +23,7 @@ from polytrading.ai.corpus import (
     validate_split_integrity,
     write_imported_contracts,
 )
-from polytrading.ai.models import GoldRelationship
+from polytrading.ai.models import CriticalField, GoldContractLabel, GoldRelationship, RuleFieldSet
 from polytrading.ai.review import (
     CorpusReviewAssignment,
     ReviewRecord,
@@ -57,6 +57,20 @@ def contract(contract_id: str, split: str, **overrides: object) -> CorpusContrac
     }
     values.update(overrides)
     return CorpusContract(**values)
+
+
+def contract_label(contract_id: str, *, label_version: int = 1) -> GoldContractLabel:
+    unknown = CriticalField(status="unknown", value=None, supporting_spans=())
+    return GoldContractLabel(
+        schema_version=1,
+        contract_id=contract_id,
+        rule_template="binary_threshold",
+        fields=RuleFieldSet(**{field: unknown for field in RuleFieldSet.model_fields}),
+        label_version=label_version,
+        adversarial_tags=(),
+        review_ids=(),
+        adjudication_id=None,
+    )
 
 
 def review(
@@ -564,7 +578,9 @@ def test_freeze_is_content_addressed_atomic_and_never_mutates_a_frozen_manifest(
     rows = [contract("a", "train").model_dump(mode="json")]
     write_jsonl(gold / "contracts.jsonl", rows)
     write_jsonl(gold / "relationships.jsonl", [])
-    write_jsonl(gold / "labels.jsonl", [{"item_id": "a", "label_version": 1}])
+    write_jsonl(
+        gold / "labels.jsonl", [contract_label("a", label_version=1).model_dump(mode="json")]
+    )
     write_jsonl(gold / "reviews.jsonl", [])
 
     first = freeze_manifest(gold, created_at=NOW, require_reviews=False)
@@ -574,7 +590,9 @@ def test_freeze_is_content_addressed_atomic_and_never_mutates_a_frozen_manifest(
     assert not list(gold.rglob("*.tmp"))
     assert freeze_manifest(gold, created_at=NOW.replace(hour=13), require_reviews=False) == first
 
-    write_jsonl(gold / "labels.jsonl", [{"item_id": "a", "label_version": 2}])
+    write_jsonl(
+        gold / "labels.jsonl", [contract_label("a", label_version=2).model_dump(mode="json")]
+    )
     second = freeze_manifest(gold, created_at=NOW, require_reviews=False)
 
     assert second.dataset_id != first.dataset_id
