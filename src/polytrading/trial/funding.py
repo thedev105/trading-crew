@@ -492,16 +492,19 @@ def _item_source_hashes(items: tuple[LighterDydxFundingItem, ...]) -> tuple[str,
 
 def _validate_prepared_conservation(prepared: PreparedLighterDydxFundingCycle) -> None:
     raw_lineage = {(raw.venue, raw.source_hash, raw.observed_at) for raw in prepared.raw}
-    raw_hash_lineage = {(raw.venue, raw.source_hash) for raw in prepared.raw}
     raw_hashes = {raw.source_hash for raw in prepared.raw}
     if len({raw.event_id for raw in prepared.raw}) != len(prepared.raw):
         raise ValueError("prepared raw identities are not conserved uniquely")
     if raw_hashes != set(prepared.cycle.source_hashes):
         raise ValueError("prepared raw hashes are not conserved by cycle evidence")
     if any(
-        (item.venue, source_hash) not in raw_hash_lineage
+        (item.venue, source_hash, item.instrument_observed_at) not in raw_lineage
         for item in prepared.cycle.items
-        for source_hash in (*item.instrument_source_hashes, *item.funding_source_hashes)
+        for source_hash in item.instrument_source_hashes
+    ) or any(
+        (item.venue, source_hash, item.funding_observed_at) not in raw_lineage
+        for item in prepared.cycle.items
+        for source_hash in item.funding_source_hashes
     ):
         raise ValueError("prepared raw lineage is not conserved by cycle items")
     normalized = (*prepared.instruments, *prepared.funding)
