@@ -352,6 +352,25 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
             "polytrading/storage/schema/004_economic_evaluations.sql",
             "polytrading/storage/schema/005_lighter_dydx_trial_operations.sql",
         ]
+        prediction_migration_members = [
+            name
+            for name in archive.namelist()
+            if name.startswith("polytrading/predictions/storage/schema/") and name.endswith(".sql")
+        ]
+        assert prediction_migration_members == [
+            "polytrading/predictions/storage/schema/001_prediction_core.sql",
+        ]
+        prediction_web_asset_members = {
+            name
+            for name in archive.namelist()
+            if name.startswith("polytrading/predictions/web_assets/")
+            and name.endswith((".html", ".css", ".js"))
+        }
+        assert prediction_web_asset_members == {
+            "polytrading/predictions/web_assets/index.html",
+            "polytrading/predictions/web_assets/app.css",
+            "polytrading/predictions/web_assets/app.js",
+        }
         dossiers = tuple(
             ContractCompatibilityDossier.model_validate_json(archive.read(member))
             for member in members

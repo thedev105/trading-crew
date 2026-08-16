@@ -800,3 +800,84 @@ If a future provider runner is separately approved, its monthly inference budget
 smaller of USD 25 and 0.3125% of supplied equity. Prompt packets themselves enable no tools or
 browsing. Imported artifacts can never contain eligibility, order, size, leverage, risk-limit,
 credential, wallet, tool-call, or trade-proposal authority fields.
+
+## 17. Multi-venue prediction-market evidence (increment 1)
+
+This is a separate, parallel research system for Polymarket and Kalshi prediction markets,
+implementing increment 1 of
+`docs/superpowers/specs/2026-08-14-multi-venue-prediction-market-structural-opportunity-system-design.md`:
+venue manifests, committed public adapters, an immutable market/rule registry, per-venue continuity
+health, and a loopback-only dashboard. It shares no domain types, storage schema, or database file
+with the perpetual-futures/carry system described in the rest of this README. A prediction-market
+database (for example `var/prediction-markets.duckdb`) is never the same file as `var/forward.duckdb`
+or any other existing database, and opening one system's database with the other's tooling fails
+closed rather than silently misreading it.
+
+Later increments — the Limitless conditional adapter, semantic candidate discovery, deterministic
+equivalence and payoff proofs, conservative economics, replay and forward shadow execution, and any
+execution adapter — are not implemented yet. This increment is public-data collection and read-only
+presentation only; it has no candidate, proof, economics, or shadow-execution surface, and no
+credential, account, order, or trading authority of any kind.
+
+### Venue manifests and the collection gate
+
+Every collection or CLI command first checks a stored venue manifest through the exact same gate:
+`WATCHLIST` and a missing manifest both fail closed before any network request. Neither Polymarket
+nor Kalshi ships a bundled "already approved" manifest in this increment, so on a fresh database
+`predictions collect` exits `2` until an operator has explicitly recorded a manifest with
+`implementation_state` of `READ_ONLY` or later. This is the same fail-closed posture as the rest of
+this project: recording a manifest is a deliberate, auditable step, never an implicit default.
+
+The corpus-intake source-use gate (`polytrading.corpus_intake.source_policy`) is generalized to the
+same `PredictionSource` vocabulary rather than duplicated; it remains the separate review path for
+semantic-scout corpus text provenance and is not itself a venue-level collection gate.
+
+### Collecting public evidence
+
+```bash
+mkdir -p var
+.venv/bin/polytrading predictions venues status --db var/prediction-markets.duckdb --format json
+.venv/bin/polytrading predictions collect polymarket --db var/prediction-markets.duckdb
+.venv/bin/polytrading predictions collect kalshi --db var/prediction-markets.duckdb
+.venv/bin/polytrading predictions health --db var/prediction-markets.duckdb --format text
+```
+
+`predictions collect polymarket` pages Polymarket's public Gamma `/markets` endpoint, decodes its
+stringified-JSON `outcomes`/`outcomePrices`/`clobTokenIds` fields exactly once, and stores one
+immutable market and rule version per condition. `predictions collect kalshi` pages Kalshi's public
+`/markets` endpoint by cursor and normalizes every binary market to the fixed `("yes", "no")`
+outcome pair; Kalshi's own multivariate/event-group mechanics are retained in the raw record but not
+further interpreted in this increment. Both adapters persist raw responses before normalized
+records and never substitute a missing venue field with a value from the other venue.
+
+Executable book and trade collection use the same adapters' `fetch_book_snapshot`/`fetch_trades`
+methods directly; a dedicated `predictions collect books`/`predictions collect trades` CLI surface
+is deferred to a later plan, consistent with keeping this increment's scope to what the spec commits
+to. Kalshi's public order book exposes only resting bids on each side (`yes_dollars`/`no_dollars`);
+the adapter derives the opposite side's asks as `1 - price` from the other side's bids, since a bid
+to buy one outcome at price `p` is equivalent to an offer to sell the other outcome at `1 - p`.
+Kalshi's live and historical trade partitions are joined at the exact cutoff from its own
+`/historical/cutoff` endpoint, never duplicating or dropping a boundary-adjacent trade. Kalshi has no
+documented live public fee-rate endpoint; `fetch_fee_rate` therefore records no fee evidence and
+emits a structured `KALSHI_FEE_RATE_ENDPOINT_UNAVAILABLE` warning rather than fabricate a rate.
+Polymarket's `/fee-rate` endpoint returns a flat basis-point reference value, not the
+price-dependent curve Polymarket's own documentation says it actually applies; the adapter records
+the flat value with a `POLYMARKET_FEE_RATE_IS_FLAT_REFERENCE_NOT_APPLIED_CURVE` warning so it is
+never mistaken for the exact applied fee.
+
+### Health and the dashboard
+
+```bash
+.venv/bin/polytrading predictions dashboard --db var/prediction-markets.duckdb --port 8787
+```
+
+Then open `http://127.0.0.1:8787`. The page shows per-venue collection health (gate status, market
+count, latest book age), the most recently retrieved markets, evidence counts, and copyable CLI
+recipes, all from one captured `as_of` cutoff, exactly like the existing perpetual-futures dashboard.
+It is GET-only, loopback-only, and has no collection or mutation control. `predictions health` and
+the dashboard classify a venue as `NOT_COLLECTED` both when its manifest gate rejects collection and
+when no evidence has been collected yet under a permitted gate; either way, the operator has
+something to investigate. Book staleness thresholds (`STALE` after 5 minutes, `DEGRADED` after 1
+hour) are a deliberately conservative starting point for this increment and are independent of the
+perpetual-futures system's own staleness constants, since this system's real collection cadence has
+not yet been established through operation.
