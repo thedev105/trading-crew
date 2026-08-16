@@ -40,11 +40,25 @@ class CorpusRunWriter:
         request: AcquisitionRequest,
     ) -> None:
         self.output = _validated_output_path(output, project_root)
-        if self.output.exists() and any(self.output.iterdir()):
-            raise CorpusIntakeError("corpus intake output directory must not be non-empty")
         self.output.mkdir(parents=True, exist_ok=True)
-        self.request = request
         self._raw_path = self.output / "raw_pages.jsonl"
+        # Exclusively creating raw_pages.jsonl here (rather than lazily on the first
+        # append) closes the check-then-act race between the emptiness check below and a
+        # concurrent writer targeting the same output directory: only one process can win
+        # this atomic create, so a second concurrent run fails here instead of interleaving
+        # appends into the same file.
+        try:
+            claim_fd = os.open(str(self._raw_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as error:
+            raise CorpusIntakeError(
+                "corpus intake output directory is already claimed by a concurrent or "
+                "unfinished run"
+            ) from error
+        os.close(claim_fd)
+        if any(path != self._raw_path for path in self.output.iterdir()):
+            self._raw_path.unlink()
+            raise CorpusIntakeError("corpus intake output directory must not be non-empty")
+        self.request = request
         self._raw_hashes: set[str] = set()
         self._raw_page_count = 0
         self._completed = False
