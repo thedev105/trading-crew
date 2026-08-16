@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from polytrading.predictions.domain import MarketRecord, PredictionRecord
+from polytrading.predictions.domain import (
+    MarketRecord,
+    PredictionBookSnapshot,
+    PredictionRecord,
+)
 from polytrading.predictions.health import PredictionHealthReport
 
 
@@ -22,5 +26,6 @@ class PredictionDashboardSnapshot(PredictionRecord):
     as_of: datetime
     health: PredictionHealthReport
     markets: tuple[MarketRecord, ...]
+    books: tuple[PredictionBookSnapshot, ...]
     evidence_counts: PredictionEvidenceCounts
     recipes: PredictionOperationRecipes
