@@ -220,7 +220,7 @@ reviewable, independently tested commit.
     `source_hash: Sha256`.
 - Consumers: every later task in this plan.
 
-- [ ] **Step 1: Write failing strict-base and enum tests**
+- [x] **Step 1: Write failing strict-base and enum tests**
 
 Prove the local strict base rejects extra fields and mutation, and requires aware UTC:
 
@@ -245,7 +245,7 @@ def test_prediction_venue_and_source_share_exact_two_values() -> None:
     assert {member.value for member in PredictionSource} == {"polymarket", "kalshi"}
 ```
 
-- [ ] **Step 2: Run the focused test and observe the missing module**
+- [x] **Step 2: Run the focused test and observe the missing module**
 
 Run:
 
@@ -255,13 +255,13 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.domain` does not exist.
 
-- [ ] **Step 3: Implement the strict base and enums**
+- [x] **Step 3: Implement the strict base and enums**
 
 Do not import `polytrading.domain.models`; this package must have zero dependency on the
 perpetual-futures domain so the two systems can never accidentally share a type. Copy the UTC and
 SHA-256 validator *pattern*, not the class.
 
-- [ ] **Step 4: Write failing model construction and invariant tests**
+- [x] **Step 4: Write failing model construction and invariant tests**
 
 Cover, at minimum:
 
@@ -295,20 +295,20 @@ Add `tests/predictions/domain_helpers.py` factories (`market_record`, `rule_vers
 deterministic-default-plus-`**overrides` shape used by
 `tests/ai/test_corpus.py::contract` and the trial-plan's `trial_funding_item` helper.
 
-- [ ] **Step 5: Implement the Kalshi-specific `negative_risk` invariant and book/price validators**
+- [x] **Step 5: Implement the Kalshi-specific `negative_risk` invariant and book/price validators**
 
 `MarketRecord` requires `negative_risk is None` whenever `venue is PredictionVenue.KALSHI` (per
 spec section 6.2's revision — the flag is Polymarket/Limitless-specific only). `TradeRecord` and
 `PredictionBookLevel` require `0 < price < 1` since these are outcome-share probability prices, not
 generic asset prices; reject exactly at the boundaries.
 
-- [ ] **Step 6: Add Hypothesis property coverage for canonical round-tripping**
+- [x] **Step 6: Add Hypothesis property coverage for canonical round-tripping**
 
 Prove that every accepted `MarketRecord`, `RuleVersion`, `TradeRecord`, and `PredictionBookSnapshot`
 round-trips through `model_dump(mode="json")` / `model_validate` unchanged, and that a naive
 datetime is rejected for every timestamp field across randomized field combinations.
 
-- [ ] **Step 7: Verify and commit Task 1**
+- [x] **Step 7: Verify and commit Task 1**
 
 Run:
 
@@ -366,7 +366,7 @@ Expected: focused domain tests and static checks pass.
 - Consumers: Tasks 6, 7 (adapters gate on `evaluate_collection_gate` before opening any client),
   Task 10 (CLI `venues status`), Task 11 (dashboard venue capability panel).
 
-- [ ] **Step 1: Write failing gate-decision tests**
+- [x] **Step 1: Write failing gate-decision tests**
 
 ```python
 def test_watchlist_venue_never_permits_collection() -> None:
@@ -404,7 +404,7 @@ the execution gate, canonical (sorted, unique) `source_hashes`, non-empty `offic
 that `manifest_source_hashes` on the decision always equals the manifest's own hashes (or empty
 when no manifest exists) so a decision can be audited without re-deriving it.
 
-- [ ] **Step 2: Run manifest tests and observe the missing module**
+- [x] **Step 2: Run manifest tests and observe the missing module**
 
 Run:
 
@@ -414,12 +414,12 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.manifest` does not exist.
 
-- [ ] **Step 3: Implement `VenueManifest`, gate reasons, and both gate functions**
+- [x] **Step 3: Implement `VenueManifest`, gate reasons, and both gate functions**
 
 Both gate functions are pure and take no I/O; a manifest is always loaded and passed in by the
 caller (Task 4/8's storage read, or a bundled fixture at CLI/test time), never fetched internally.
 
-- [ ] **Step 4: Verify and commit Task 2**
+- [x] **Step 4: Verify and commit Task 2**
 
 Run:
 
@@ -461,7 +461,7 @@ Expected: gate-decision tests pass, including the fail-closed missing-manifest a
   two, per that same revision. `polytrading.corpus_intake` modules that already depend on this file
   are the only direct consumers.
 
-- [ ] **Step 1: Write failing widened-type tests**
+- [x] **Step 1: Write failing widened-type tests**
 
 ```python
 def test_source_use_scope_accepts_kalshi_and_polymarket() -> None:
@@ -486,7 +486,7 @@ def test_existing_polymarket_string_fixtures_still_parse() -> None:
     assert scope.source is PredictionSource.POLYMARKET
 ```
 
-- [ ] **Step 2: Run source-policy tests and observe the failure**
+- [x] **Step 2: Run source-policy tests and observe the failure**
 
 Run:
 
@@ -497,19 +497,19 @@ Run:
 Expected: FAIL because `source_policy.py` still hardcodes `Literal["polymarket"]` and rejects
 `PredictionSource.KALSHI`.
 
-- [ ] **Step 3: Widen the four `source` fields and their cross-checks**
+- [x] **Step 3: Widen the four `source` fields and their cross-checks**
 
 Change `source: Literal["polymarket"]` to `source: PredictionSource` on all four classes. The
 existing cross-field checks (`assessment.source == scope.source`, `approval.source == scope.source`)
 are unchanged since they already compare by equality, not by literal identity.
 
-- [ ] **Step 4: Update every existing call site to the enum member**
+- [x] **Step 4: Update every existing call site to the enum member**
 
 Grep `corpus_intake/*.py` and `tests/corpus_intake/*.py` for `"polymarket"` used as a `source=`
 argument and replace each with `PredictionSource.POLYMARKET`. Do not touch unrelated string uses
 (e.g. URLs containing the word "polymarket").
 
-- [ ] **Step 5: Verify the complete corpus-intake suite and commit Task 3**
+- [x] **Step 5: Verify the complete corpus-intake suite and commit Task 3**
 
 Run:
 
@@ -568,7 +568,7 @@ plus new Kalshi-acceptance coverage.
     evidence-count convention for dashboard/health consumption).
 - Consumers: Tasks 6-11.
 
-- [ ] **Step 1: Write failing schema and round-trip tests**
+- [x] **Step 1: Write failing schema and round-trip tests**
 
 ```python
 def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
@@ -597,7 +597,7 @@ installed (mirroring the existing store's `_verify_current_schema` test); a fres
 perpetual-futures migrations, proving the two systems are structurally disjoint even if opened via
 the same DuckDB engine.
 
-- [ ] **Step 2: Run storage tests and observe the missing module**
+- [x] **Step 2: Run storage tests and observe the missing module**
 
 Run:
 
@@ -607,7 +607,7 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.storage.store` does not exist.
 
-- [ ] **Step 3: Add migration 001 and the store's connect/migrate/transaction scaffold**
+- [x] **Step 3: Add migration 001 and the store's connect/migrate/transaction scaffold**
 
 Copy the exact `DuckDBStore.__init__`/`.close()`/`.transaction()`/`._apply_migrations()`/
 `._verify_current_schema()`/`._migration_entries()`/`._applied_migration_versions()` structure from
@@ -697,7 +697,7 @@ raise `ConflictingRecordError` on divergent content for the same key, otherwise 
 than exploding every field into its own column, since these records are read back whole far more
 often than queried by an inner field.
 
-- [ ] **Step 4: Write failing cutoff-safe read tests**
+- [x] **Step 4: Write failing cutoff-safe read tests**
 
 ```python
 def test_markets_as_of_never_leaks_a_later_rule_version(tmp_path: Path) -> None:
@@ -717,13 +717,13 @@ matching the existing store's revision-safety convention; `latest_book_as_of` an
 `latest_fee_rate_as_of` reject a future-observed row; `evidence_counts_as_of` sums exactly the
 seven table counts as of the cutoff.
 
-- [ ] **Step 5: Implement the cutoff-safe readers**
+- [x] **Step 5: Implement the cutoff-safe readers**
 
 Use the same `WHERE ... <= ?` cutoff-filtering and `ORDER BY ... DESC LIMIT 1`-per-key pattern
 already used throughout `polytrading.storage.store`'s readers (e.g. `latest_instrument_as_of`,
 `reviewed_fee_schedules_as_of`).
 
-- [ ] **Step 6: Verify and commit Task 4**
+- [x] **Step 6: Verify and commit Task 4**
 
 Run:
 
@@ -779,7 +779,7 @@ name appears in a fresh prediction-market database.
   - `PredictionCollectionGateError(RuntimeError)`.
 - Consumers: Tasks 6, 7 implement this Protocol; Tasks 9, 10 consume it generically.
 
-- [ ] **Step 1: Write failing lineage-validation tests**
+- [x] **Step 1: Write failing lineage-validation tests**
 
 Mirror the existing venue-public test shape exactly, substituting prediction types:
 
@@ -800,7 +800,7 @@ def test_validate_prediction_adapter_batch_rejects_orphaned_normalized_lineage()
         )
 ```
 
-- [ ] **Step 2: Run adapter tests and observe the missing module**
+- [x] **Step 2: Run adapter tests and observe the missing module**
 
 Run:
 
@@ -810,7 +810,7 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.adapter` does not exist.
 
-- [ ] **Step 3: Choose and pin the Polymarket CLOB WebSocket dependency**
+- [x] **Step 3: Choose and pin the Polymarket CLOB WebSocket dependency**
 
 The existing project has no WebSocket client dependency (its perpetual-futures adapters are
 REST-only). Polymarket's CLOB market channel (spec section 19.1) requires one for continuity
@@ -820,13 +820,13 @@ asyncio-native client already common in this ecosystem. Do not add a heavier ful
 project's existing adapters are all hand-rolled against raw REST/WebSocket endpoints and this
 should follow the same convention. Record the exact chosen version in the commit message.
 
-- [ ] **Step 4: Implement the batch, warning, integrity validator, and Protocol**
+- [x] **Step 4: Implement the batch, warning, integrity validator, and Protocol**
 
 Reuse the existing `polytrading.venues.public` validator's exact two-check structure (raw hash
 self-consistency, then normalized-to-raw lineage), rewritten against
 `PredictionNormalizedRecord`'s five-member union instead of the perpetual-futures four-member union.
 
-- [ ] **Step 5: Verify and commit Task 5**
+- [x] **Step 5: Verify and commit Task 5**
 
 Run:
 
@@ -869,7 +869,7 @@ below are grounded in Polymarket's public documentation and known integrations a
 writing, but a live check before the first fixture is committed is mandatory, since third-party API
 documentation drifts.
 
-- [ ] **Step 1: Write failing markets/rule-version parsing tests against a recorded fixture**
+- [x] **Step 1: Write failing markets/rule-version parsing tests against a recorded fixture**
 
 Record one real Gamma `/markets` page (redact nothing but authentication, since this is a public
 endpoint) as `gamma_markets_page_1.json`. Test:
@@ -900,7 +900,7 @@ the live docs) with the same stalled-pagination guard already used by
 `BybitPublicAdapter.fetch_instruments`; a market missing `conditionId` or with duplicate
 `conditionId` values on one page fails closed with a named error, never silently deduplicated.
 
-- [ ] **Step 2: Run and observe the missing module**
+- [x] **Step 2: Run and observe the missing module**
 
 Run:
 
@@ -910,7 +910,7 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.polymarket` does not exist.
 
-- [ ] **Step 3: Implement `fetch_markets`**
+- [x] **Step 3: Implement `fetch_markets`**
 
 Gate on `evaluate_collection_gate` first (Task 2); construct no client if disallowed. Page through
 Gamma `/markets`, parse the two inner stringified-JSON arrays exactly once each, construct one
@@ -919,15 +919,15 @@ Gamma `/markets`, parse the two inner stringified-JSON arrays exactly once each,
 convention already used in `src/polytrading/ai/cli.py`), and set `negative_risk` from `negRisk`/
 `neg_risk` (confirm exact key name against the live response — sources disagree on casing).
 
-- [ ] **Step 4: Write failing CLOB REST book-snapshot tests**
+- [x] **Step 4: Write failing CLOB REST book-snapshot tests**
 
 Record one real `GET /book?token_id=<id>` response. Test exact bid/ask ordering, non-crossed-book
 validation reuse from Task 1, and that a market lacking `enableOrderBook` is never requested for a
 book snapshot (the adapter must check this itself, not merely trust the caller).
 
-- [ ] **Step 5: Implement `fetch_book_snapshot` (REST path)**
+- [x] **Step 5: Implement `fetch_book_snapshot` (REST path)**
 
-- [ ] **Step 6: Write failing CLOB WebSocket continuity tests**
+- [x] **Step 6: Write failing CLOB WebSocket continuity tests**
 
 Using the `websockets` dependency from Task 5, test: a `book` channel message updates the maintained
 in-memory book; a heartbeat/ping timeout or unexpected close forces a fresh REST snapshot rather
@@ -935,21 +935,21 @@ than silently continuing a stale book (spec section 6.3's WebSocket-vs-REST reco
 out-of-order or gapped sequence invalidates the affected interval rather than being carried forward,
 mirroring the existing Bybit/Hyperliquid book-continuity tests' structure.
 
-- [ ] **Step 7: Implement WebSocket continuity reconciliation**
+- [x] **Step 7: Implement WebSocket continuity reconciliation**
 
-- [ ] **Step 8: Write failing fee-rate tests and implement `fetch_fee_rate`**
+- [x] **Step 8: Write failing fee-rate tests and implement `fetch_fee_rate`**
 
 Record one real fee-rate response; test that a per-token fee is stored with `market_id` set and a
 venue-wide fallback (if the documented endpoint returns one) is stored with `market_id=None`.
 
-- [ ] **Step 9: Add gate-rejection and collection-context tests**
+- [x] **Step 9: Add gate-rejection and collection-context tests**
 
 Assert `fetch_markets`/`fetch_book_snapshot`/`fetch_trades`/`fetch_fee_rate` each raise
 `PredictionCollectionGateError` and open no `httpx`/`websockets` connection when the manifest's
 `evaluate_collection_gate` disallows collection (e.g. `WATCHLIST`), matching the existing
 adapters' collection-context guard pattern.
 
-- [ ] **Step 10: Verify and commit Task 6**
+- [x] **Step 10: Verify and commit Task 6**
 
 Run:
 
@@ -995,14 +995,14 @@ data behind `GET /historical/cutoff`, which returns per-resource cutoff timestam
 the single most safety-critical piece of this adapter (spec section 6.3: "Kalshi live and
 historical partitions are joined at the official cutoff without duplicating or dropping records").
 
-- [ ] **Step 1: Write failing markets tests against a recorded fixture**
+- [x] **Step 1: Write failing markets tests against a recorded fixture**
 
 Record one real public markets-list response. Test market/rule-version normalization analogous to
 Task 6 Step 1, using Kalshi's own field names (`ticker`, `event_ticker`, `series_ticker`, `title`,
 `status`, `yes_bid`/`yes_ask` or the exact documented current-price field names, `open_time`,
 `close_time`, `expiration_time`). Assert `negative_risk` is always `None`.
 
-- [ ] **Step 2: Run and observe the missing module**
+- [x] **Step 2: Run and observe the missing module**
 
 Run:
 
@@ -1012,9 +1012,9 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.kalshi` does not exist.
 
-- [ ] **Step 3: Implement `fetch_markets` against the live-data endpoint**
+- [x] **Step 3: Implement `fetch_markets` against the live-data endpoint**
 
-- [ ] **Step 4: Write failing historical-partition join tests**
+- [x] **Step 4: Write failing historical-partition join tests**
 
 This is the core safety property of this adapter:
 
@@ -1046,7 +1046,7 @@ and this choice must be a single named constant, not duplicated logic in two pla
 falling back to live-only data, since silently narrowing scope after previously routing wider would
 itself create a duplicate/drop risk on the next run.
 
-- [ ] **Step 5: Implement the cutoff-routed join**
+- [x] **Step 5: Implement the cutoff-routed join**
 
 Fetch `GET /historical/cutoff` first on every `fetch_markets`/`fetch_trades` call (no internal
 caching across calls, so a moved cutoff is always honored); route each requested time range to
@@ -1056,7 +1056,7 @@ routed, should not produce overlapping records — if it does, fail closed with 
 than silently deduplicating, since a real duplicate is exactly the kind of integrity problem this
 system must surface, not hide).
 
-- [ ] **Step 6: Write failing order-book tests and implement `fetch_book_snapshot`**
+- [x] **Step 6: Write failing order-book tests and implement `fetch_book_snapshot`**
 
 Kalshi's public order book is REST-only (no documented public WebSocket for market data as of this
 plan's writing — confirm this before implementation, since it changes whether Task 9's continuity
@@ -1065,7 +1065,7 @@ reuse from Task 1, and that Kalshi's own two-sided (YES/NO) book representation 
 this system's single `bids`/`asks` shape per outcome token without inventing a synthetic price the
 venue did not provide.
 
-- [ ] **Step 7: Write failing trades and fee tests, implement `fetch_trades`/`fetch_fee_rate`**
+- [x] **Step 7: Write failing trades and fee tests, implement `fetch_trades`/`fetch_fee_rate`**
 
 Kalshi publishes maker/taker fee schedules in its documentation rather than a live per-market fee
 endpoint in all cases — confirm the exact documented mechanism at implementation time and adjust
@@ -1075,9 +1075,9 @@ live endpoint exists, this method may return an empty batch with a structured
 adapters emit structured warnings for fields their APIs do not expose (e.g.
 `DYDX_MARK_PRICE_UNAVAILABLE`).
 
-- [ ] **Step 8: Add gate-rejection tests matching Task 6 Step 9**
+- [x] **Step 8: Add gate-rejection tests matching Task 6 Step 9**
 
-- [ ] **Step 9: Verify and commit Task 7**
+- [x] **Step 9: Verify and commit Task 7**
 
 Run:
 
@@ -1121,7 +1121,7 @@ particular must demonstrably never duplicate or drop a boundary-adjacent record.
     scout increment.
 - Consumers: Task 9 (health cross-checks rule continuity), Task 11 (dashboard market/rule panel).
 
-- [ ] **Step 1: Write failing point-in-time and invalidation tests**
+- [x] **Step 1: Write failing point-in-time and invalidation tests**
 
 ```python
 def test_rule_history_never_includes_a_version_effective_after_the_cutoff(...) -> None:
@@ -1138,7 +1138,7 @@ def test_has_rule_changed_since_is_true_only_for_a_genuinely_new_version(...) ->
     ) is False
 ```
 
-- [ ] **Step 2: Run and observe the missing module**
+- [x] **Step 2: Run and observe the missing module**
 
 Run:
 
@@ -1148,13 +1148,13 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.registry` does not exist.
 
-- [ ] **Step 3: Implement the registry as a thin typed layer over Task 4's readers**
+- [x] **Step 3: Implement the registry as a thin typed layer over Task 4's readers**
 
 No new SQL beyond what Task 4 already exposes; this class composes those readers into the exact
 named queries above and adds no caching, since every call must reflect the current `as_of` cutoff
 precisely.
 
-- [ ] **Step 4: Verify and commit Task 8**
+- [x] **Step 4: Verify and commit Task 8**
 
 Run:
 
@@ -1202,7 +1202,7 @@ Expected: point-in-time and invalidation-primitive tests pass.
   - `render_prediction_health_text(report) -> str`, `render_prediction_health_json(report) -> str`.
 - Consumers: Task 10 (CLI `predictions health`), Task 11 (dashboard venue-health panel).
 
-- [ ] **Step 1: Write failing status-classification tests**
+- [x] **Step 1: Write failing status-classification tests**
 
 ```python
 def test_venue_with_no_evidence_is_not_collected() -> None:
@@ -1230,7 +1230,7 @@ is `STALE`, over a larger fixed number is `DEGRADED`) as named constants, matchi
 convention of never leaving a threshold implicit; do not reuse the perpetual-futures 30-second/
 five-minute constants without re-justifying them for prediction-market book collection cadence.
 
-- [ ] **Step 2: Run and observe the missing module**
+- [x] **Step 2: Run and observe the missing module**
 
 Run:
 
@@ -1240,7 +1240,7 @@ Run:
 
 Expected: collection fails because `polytrading.predictions.health` does not exist.
 
-- [ ] **Step 3: Implement the auditor**
+- [x] **Step 3: Implement the auditor**
 
 For each of the two venues, load the latest manifest and gate decision, count markets and latest
 book/market timestamps as of the cutoff, and classify status conservatively: a manifest gate
@@ -1248,15 +1248,15 @@ rejection is never conflated with a data gap (different reason vocabulary, per t
 above); genuinely missing evidence beneath a permitted gate is `NOT_COLLECTED`; present but stale
 evidence is `STALE`/`DEGRADED` by the named thresholds; otherwise `CURRENT`.
 
-- [ ] **Step 4: Write failing renderer tests**
+- [x] **Step 4: Write failing renderer tests**
 
 Assert canonical two-space sorted JSON, RFC 3339 `Z` timestamps, stable venue order, and the exact
 three warnings; assert neither renderer contains an uppercase `APPROVED`, `LIVE_ELIGIBLE`, or a
 return/profit claim, matching the existing report renderers' forbidden-string tests.
 
-- [ ] **Step 5: Implement the renderers**
+- [x] **Step 5: Implement the renderers**
 
-- [ ] **Step 6: Verify and commit Task 9**
+- [x] **Step 6: Verify and commit Task 9**
 
 Run:
 
@@ -1307,7 +1307,7 @@ Expected: classification and renderer tests pass.
 - Consumers: the operator; Task 11's dashboard does not go through this CLI layer (it calls the
   same underlying store/health/registry APIs directly, exactly as the existing dashboard does).
 
-- [ ] **Step 1: Write failing parser-shape tests**
+- [x] **Step 1: Write failing parser-shape tests**
 
 ```python
 def test_predictions_collect_is_a_subcommand_tree_not_a_venue_flag() -> None:
@@ -1327,7 +1327,7 @@ def test_predictions_command_does_not_collide_with_existing_top_level_names() ->
     assert "predictions" not in existing
 ```
 
-- [ ] **Step 2: Run and observe the missing parser branch**
+- [x] **Step 2: Run and observe the missing parser branch**
 
 Run:
 
@@ -1337,9 +1337,9 @@ Run:
 
 Expected: FAIL because `predictions` is not a registered subcommand.
 
-- [ ] **Step 3: Register the `predictions` subparser tree in `build_parser()`**
+- [x] **Step 3: Register the `predictions` subparser tree in `build_parser()`**
 
-- [ ] **Step 4: Write failing gate-rejection and exit-code tests**
+- [x] **Step 4: Write failing gate-rejection and exit-code tests**
 
 ```python
 def test_collect_polymarket_exits_two_before_any_network_call_when_watchlisted(
@@ -1360,9 +1360,9 @@ health` follows the existing `--as-of`-omitted-captures-one-clock-value conventi
 locked by a concurrent writer surfaces as a sanitized, non-zero exit rather than a raw DuckDB
 traceback, matching the existing CLI's error-sanitization convention.
 
-- [ ] **Step 5: Implement dispatch, writer-lease acquisition, and gate-checked collection**
+- [x] **Step 5: Implement dispatch, writer-lease acquisition, and gate-checked collection**
 
-- [ ] **Step 6: Verify and commit Task 10**
+- [x] **Step 6: Verify and commit Task 10**
 
 Run:
 
@@ -1423,7 +1423,7 @@ Expected: parser-shape, gate-rejection, and exit-code tests pass; no existing CL
   - CLI: `polytrading predictions dashboard --db var/prediction-markets.duckdb --port 8787`.
 - Consumers: the operator only; no other task consumes this dashboard's output.
 
-- [ ] **Step 1: Write failing snapshot-builder tests**
+- [x] **Step 1: Write failing snapshot-builder tests**
 
 ```python
 def test_snapshot_never_shows_a_market_retrieved_after_its_own_cutoff() -> None:
@@ -1437,7 +1437,7 @@ def test_snapshot_recipes_are_copy_only_text() -> None:
     assert all(isinstance(recipe, str) for recipe in snapshot.recipes)
 ```
 
-- [ ] **Step 2: Run and observe the missing module**
+- [x] **Step 2: Run and observe the missing module**
 
 Run:
 
@@ -1447,9 +1447,9 @@ Run:
 
 Expected: collection fails because the new modules do not exist.
 
-- [ ] **Step 3: Implement the snapshot models and builder**
+- [x] **Step 3: Implement the snapshot models and builder**
 
-- [ ] **Step 4: Write failing schema-lock and loopback-only server tests**
+- [x] **Step 4: Write failing schema-lock and loopback-only server tests**
 
 ```python
 def test_prediction_dashboard_rejects_a_perpetual_futures_database(tmp_path: Path) -> None:
@@ -1468,24 +1468,24 @@ Add a companion test asserting the *existing* `validate_dashboard_database` equa
 `PredictionMarketStore` database, proving the two schema-lock functions are symmetric and neither
 system can silently misread the other's database file.
 
-- [ ] **Step 5: Implement `validate_prediction_dashboard_database` and `serve_prediction_dashboard`**
+- [x] **Step 5: Implement `validate_prediction_dashboard_database` and `serve_prediction_dashboard`**
 
-- [ ] **Step 6: Write failing markup/asset tests**
+- [x] **Step 6: Write failing markup/asset tests**
 
 Mirror the existing dashboard's browser-rendering test structure (empty, collecting, watchlisted-
 venue, and stale states) at the level this codebase's existing web tests already operate (DOM
 structure and content assertions via the existing test harness, not a real browser, matching
 `tests/web/test_dashboard.py`'s and the local-dashboard companion spec's existing conventions).
 
-- [ ] **Step 7: Implement the markup, styling, and client script**
+- [x] **Step 7: Implement the markup, styling, and client script**
 
-- [ ] **Step 8: Register the CLI command**
+- [x] **Step 8: Register the CLI command**
 
 Add `predictions dashboard --db <path> --port <port>` to `predictions.cli`, calling
 `validate_prediction_dashboard_database` then `serve_prediction_dashboard`, mirroring the existing
 `dashboard` command's exact two-call structure in `cli.py`'s `main()`.
 
-- [ ] **Step 9: Verify and commit Task 11**
+- [x] **Step 9: Verify and commit Task 11**
 
 Run:
 
@@ -1512,7 +1512,7 @@ the other system's database file.
 
 **Interfaces:** none new; this task verifies and documents everything Tasks 1-11 produced.
 
-- [ ] **Step 1: Write the README section**
+- [x] **Step 1: Write the README section**
 
 Add a new top-level section (after the existing Lighter-dYdX trial section, before "Explicit
 read-only boundary") titled to match this codebase's numbered-section convention, covering: the
@@ -1527,7 +1527,7 @@ disclaimers already used throughout the existing README sections; and a note tha
 (Limitless, candidate discovery, proofs, economics, replay/shadow, execution) are not yet
 implemented.
 
-- [ ] **Step 2: Run the complete test suite**
+- [x] **Step 2: Run the complete test suite**
 
 Run:
 
@@ -1540,7 +1540,7 @@ Expected: the complete existing suite plus every new `tests/predictions` and mod
 `tests/corpus_intake`/`tests/test_cli.py` test passes; zero regressions in the perpetual-futures
 suite.
 
-- [ ] **Step 3: Run static checks and coverage**
+- [x] **Step 3: Run static checks and coverage**
 
 Run:
 
@@ -1552,7 +1552,7 @@ Run:
 
 Confirm total coverage has not regressed below the existing repository bar.
 
-- [ ] **Step 4: Build and smoke-test the wheel**
+- [x] **Step 4: Build and smoke-test the wheel**
 
 Run the same wheel-build-and-import smoke the existing `tests/test_package.py` already performs, or
 extend it, to confirm `polytrading.predictions` and its two new package-data globs are present in
@@ -1564,7 +1564,7 @@ the built wheel and importable from a clean install:
 python -c "from polytrading.predictions.cli import build_predictions_parser"
 ```
 
-- [ ] **Step 5: Manual browser smoke of `predictions dashboard`**
+- [x] **Step 5: Manual browser smoke of `predictions dashboard`**
 
 Following this codebase's existing manual-verification convention (not a CI gate): collect a small
 amount of fixture-replayed or live public evidence into a fresh `var/prediction-markets.duckdb`,
@@ -1572,7 +1572,7 @@ start `polytrading predictions dashboard --db var/prediction-markets.duckdb --po
 visually confirm venue health, market/rule counts, and the watchlisted-Kalshi state render without
 a mutation control anywhere on the page.
 
-- [ ] **Step 6: Final commit**
+- [x] **Step 6: Final commit**
 
 Run:
 
