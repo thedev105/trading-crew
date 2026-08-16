@@ -1,8 +1,11 @@
 .worktrees/
 .venv/
 *.duckdb
+*.writer.lock
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
+.coverage
 __pycache__/
 dist/
 *.egg-info/
