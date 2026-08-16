@@ -329,8 +329,11 @@ def _select_universe(
             asset = Asset(name)
         except ValueError:
             continue
-        if asset in assets:
-            selected.append((entry, contexts[index], asset))
+        if asset not in assets:
+            continue
+        if _optional_boolean(entry, "isDelisted", "metadata universe entry"):
+            continue
+        selected.append((entry, contexts[index], asset))
     return selected
 
 
@@ -453,6 +456,15 @@ def _require_integer(mapping: Mapping[str, object], key: str, label: str) -> int
     value = _require_key(mapping, key, label)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{label} key {key!r} must be an integer")
+    return value
+
+
+def _optional_boolean(mapping: Mapping[str, object], key: str, label: str) -> bool:
+    if key not in mapping:
+        return False
+    value = mapping[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} key {key!r} must be a boolean")
     return value
 
 
