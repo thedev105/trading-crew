@@ -160,6 +160,13 @@ class LighterPublicAdapter:
             direction = _require_string(row, "direction", "funding row")
             if direction not in {"long", "short"}:
                 raise ValueError("funding direction must be long or short")
+            # Sign convention is derived solely from this unsigned "rate" plus "direction"
+            # string; Lighter's /api/v1/fundings response documents no other signed field to
+            # cross-check against (https://apidocs.lighter.xyz/reference/fundings). A "long"
+            # direction is treated as longs paying shorts (positive, matching the standard
+            # perpetual-funding convention used across the other three venue adapters); a
+            # future API change to this convention would silently invert every Lighter
+            # cashflow unless this assumption is re-verified against Lighter's documentation.
             signed_rate = Decimal(0) if rate == 0 else rate if direction == "long" else -rate
             previous = signed_rates.get(effective_at)
             if previous is not None:
