@@ -14,6 +14,7 @@ from polytrading.predictions.domain import (
 )
 from tests.predictions.domain_helpers import (
     NOW,
+    RAW_PAYLOAD_HASH,
     fee_rate,
     level,
     market_record,
@@ -57,7 +58,7 @@ def test_prediction_venue_and_source_share_exact_two_values() -> None:
 def test_raw_envelope_requires_sha256_source_hash() -> None:
     with pytest.raises(ValidationError):
         raw_envelope(source_hash="not-a-hash")
-    assert raw_envelope().source_hash == "a" * 64
+    assert raw_envelope().source_hash == RAW_PAYLOAD_HASH
 
 
 def test_market_record_negative_risk_is_none_for_kalshi() -> None:

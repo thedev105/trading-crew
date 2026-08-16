@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from typing import Any
 from uuid import UUID
 
@@ -7,6 +8,8 @@ from polytrading.predictions.domain import PredictionRawEnvelope, PredictionVenu
 
 NOW = datetime(2026, 8, 15, 12, tzinfo=UTC)
 SOURCE_HASH = "a" * 64
+RAW_PAYLOAD_JSON = "{}"
+RAW_PAYLOAD_HASH = sha256(RAW_PAYLOAD_JSON.encode()).hexdigest()
 
 
 def raw_envelope(**overrides: Any) -> PredictionRawEnvelope:
@@ -20,8 +23,8 @@ def raw_envelope(**overrides: Any) -> PredictionRawEnvelope:
         "received_monotonic_ns": 1,
         "request_latency_ms": Decimal("10"),
         "source_version": "gamma-v1",
-        "payload_json": "{}",
-        "source_hash": SOURCE_HASH,
+        "payload_json": RAW_PAYLOAD_JSON,
+        "source_hash": RAW_PAYLOAD_HASH,
     }
     values.update(overrides)
     return PredictionRawEnvelope(**values)
