@@ -14,7 +14,8 @@ _MARKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("active_markup", re.compile(r"<\s*script\b|\bon[a-z]+\s*=", re.IGNORECASE)),
     ("unicode_control", re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069]")),
-    ("unicode_confusable", re.compile(r"[\u0400-\u04ff]")),
+    # Mirrors corpus.canonicalize_rule_text's confusable-letter check (Cyrillic and Greek).
+    ("unicode_confusable", re.compile(r"[\u0400-\u04ff\u0370-\u03ff\u1f00-\u1fff]")),
     ("non_http_url", re.compile(r"\b(?:javascript|data|file):", re.IGNORECASE)),
     ("code_fence", re.compile(r"```")),
     (
