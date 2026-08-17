@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -33,9 +34,19 @@ _ORDERBOOK_ENDPOINT_TEMPLATE = "/markets/{ticker}/orderbook"
 _TRADES_ENDPOINT = "/markets/trades"
 _HISTORICAL_TRADES_ENDPOINT = "/historical/trades"
 _SOURCE_VERSION = "trade-api-v2"
-_PAGE_LIMIT = 200
+_PAGE_LIMIT = 1000  # Kalshi's documented maximum for GET /markets.
 _MAX_PAGES = 1000
-_CLOSED_STATUSES = frozenset({"closed", "finalized"})
+# Unpaced back-to-back large-page (limit=1000) requests against Kalshi's live public
+# API were observed (2026-08-16) to progressively stall into read timeouts partway
+# through an ~80-page sweep, consistent with server-side rate-limiting; this pause is a
+# deliberate courtesy between successful page fetches, not a workaround for an error.
+_PAGE_PAUSE_SECONDS = 0.5
+# Kalshi's status *filter* values (unopened/open/paused/closed/settled, per its API
+# reference) differ from the literal strings its /markets response body actually returns
+# for the "status" field (initialized/active/inactive/determined/finalized, confirmed
+# against the live API on 2026-08-16); "closed" and "settled" map to "determined" and
+# "finalized" respectively, and neither response literal is ever the string "closed".
+_CLOSED_STATUSES = frozenset({"determined", "finalized"})
 
 
 class PaginationStalledError(RuntimeError):
@@ -137,6 +148,8 @@ class KalshiAdapter:
         monotonic_ns: Callable[[], int],
         *,
         max_pages: int = _MAX_PAGES,
+        page_pause_seconds: float = _PAGE_PAUSE_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if isinstance(max_pages, bool) or not isinstance(max_pages, int):
             raise TypeError("max_pages must be an integer")
@@ -146,6 +159,8 @@ class KalshiAdapter:
         self._wall_clock = wall_clock
         self._monotonic_ns = monotonic_ns
         self._max_pages = max_pages
+        self._page_pause_seconds = page_pause_seconds
+        self._sleep = sleep
 
     async def fetch_manifest_gated(self, manifest: VenueManifest) -> None:
         decision = evaluate_collection_gate(manifest, venue=self.venue)
@@ -187,8 +202,25 @@ class KalshiAdapter:
         normalized: list[MarketRecord | RuleVersion] = []
         seen_tickers: set[str] = set()
         cursor = ""
-        for _page_number in range(self._max_pages):
-            params: dict[str, object] = {"limit": _PAGE_LIMIT}
+        for page_number in range(self._max_pages):
+            if page_number > 0:
+                await self._sleep(self._page_pause_seconds)
+            # Kalshi's /markets with no status filter returns every market ever listed
+            # (its entire history, including short-lived recurring markets), which is far
+            # larger than _max_pages * _PAGE_LIMIT and would always stall pagination.
+            # Scope each collection run to the currently open/tradeable universe; a
+            # historical backfill of closed/settled markets is a separate, deliberate
+            # operation, not this method's default. mve_filter=exclude drops
+            # auto-generated combinatorial multivariate-event (parlay) markets
+            # server-side: confirmed 2026-08-16 that these otherwise dominate the open
+            # universe by several orders of magnitude (~300k+ open items vs. ~83k
+            # non-combinatorial) and have no analog on other venues this system
+            # compares against.
+            params: dict[str, object] = {
+                "limit": _PAGE_LIMIT,
+                "status": "open",
+                "mve_filter": "exclude",
+            }
             if cursor:
                 params["cursor"] = cursor
             received = await self._get(_MARKETS_ENDPOINT, params)
@@ -198,6 +230,12 @@ class KalshiAdapter:
             rows = _require_list(document.get("markets"), "markets response markets")
             for value in rows:
                 row = _require_mapping(value, "market row")
+                if row.get("mve_collection_ticker"):
+                    # Belt-and-suspenders against the mve_filter=exclude request param
+                    # above, in case that server-side filter is ever incomplete. The
+                    # raw page is still persisted above either way; only normalization
+                    # is scoped to non-combinatorial markets.
+                    continue
                 ticker = _require_string(row, "ticker", "market row")
                 if ticker in seen_tickers:
                     raise ValueError("markets page contains a duplicate ticker")
@@ -316,7 +354,11 @@ def _parse_market_row(
     row: Mapping[str, object], *, information_cutoff: datetime, raw: PredictionRawEnvelope
 ) -> tuple[MarketRecord, RuleVersion]:
     ticker = _require_string(row, "ticker", "market row")
-    title = _require_string(row, "title", "market row")
+    # A minority of markets grouped under a multi-candidate event (e.g. "which model
+    # will be top-ranked") carry the human-readable question on the event, not the
+    # per-market row, leaving "title" null; "subtitle" carries the market-specific
+    # candidate text in that case (confirmed 2026-08-16: 1 of ~79.8k open markets).
+    title = _optional_string(row, "title") or _require_string(row, "subtitle", "market row")
     status = _require_string(row, "status", "market row")
     active = status == "active"
     closed = status in _CLOSED_STATUSES

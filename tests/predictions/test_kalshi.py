@@ -45,6 +45,10 @@ def response(payload: bytes, status_code: int = 200) -> httpx.Response:
     )
 
 
+async def _no_pause(_seconds: float) -> None:
+    return None
+
+
 def make_adapter(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
@@ -57,6 +61,7 @@ def make_adapter(
         wall_clock=SequenceClock(wall_times or [NOW] * 40),
         monotonic_ns=SequenceClock(monotonic_times or list(range(100, 40_000, 100))),
         max_pages=max_pages,
+        sleep=_no_pause,
     )
 
 
@@ -108,6 +113,24 @@ def test_fetch_markets_status_maps_to_active_and_closed_flags() -> None:
     assert market.closed is True
 
 
+def test_fetch_markets_falls_back_to_subtitle_when_title_is_null() -> None:
+    document = json.loads(fixture_bytes("markets_page_1.json"))
+    document["markets"][0]["title"] = None
+    document["markets"][0]["subtitle"] = "Kimi:: Moonshot"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(json.dumps(document).encode())
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+    market = next(
+        item
+        for item in batch.normalized
+        if isinstance(item, MarketRecord) and item.market_id == document["markets"][0]["ticker"]
+    )
+    assert market.question == "Kimi:: Moonshot"
+
+
 def test_fetch_markets_paginates_via_cursor_and_stops_on_empty_cursor() -> None:
     page_one = json.loads(fixture_bytes("markets_page_1.json"))
     page_one["cursor"] = "next-page-token"
@@ -124,6 +147,61 @@ def test_fetch_markets_paginates_via_cursor_and_stops_on_empty_cursor() -> None:
 
     assert len(requests) == 2
     assert requests[1]["cursor"] == "next-page-token"
+
+
+def test_fetch_markets_requests_open_status_and_excludes_multivariate_events() -> None:
+    requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.url.params))
+        return response(fixture_bytes("markets_page_1.json"))
+
+    adapter = make_adapter(handler)
+    asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    assert requests[0]["status"] == "open"
+    assert requests[0]["mve_filter"] == "exclude"
+
+
+def test_fetch_markets_skips_combinatorial_rows_but_keeps_the_raw_page() -> None:
+    document = json.loads(fixture_bytes("markets_page_1.json"))
+    document["markets"][0]["mve_collection_ticker"] = "KXMVECROSSCATEGORY-SHARD1-R"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(json.dumps(document).encode())
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    market_ids = {item.market_id for item in batch.normalized if isinstance(item, MarketRecord)}
+    assert document["markets"][0]["ticker"] not in market_ids
+    assert document["markets"][1]["ticker"] in market_ids
+    assert len(batch.raw) == 1
+    assert document["markets"][0]["ticker"] in batch.raw[0].payload_json
+
+
+def test_fetch_markets_pauses_between_pages() -> None:
+    page_one = json.loads(fixture_bytes("markets_page_1.json"))
+    page_one["cursor"] = "next-page-token"
+    pauses: list[float] = []
+
+    async def recording_pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "cursor" not in request.url.params:
+            return response(json.dumps(page_one).encode())
+        return response(b'{"cursor": "", "markets": []}')
+
+    adapter = KalshiAdapter(
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        wall_clock=SequenceClock([NOW] * 40),
+        monotonic_ns=SequenceClock(list(range(100, 40_000, 100))),
+        sleep=recording_pause,
+    )
+    asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    assert pauses == [adapter._page_pause_seconds]
 
 
 def test_fetch_markets_rejects_duplicate_tickers() -> None:
