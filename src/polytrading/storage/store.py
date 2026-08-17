@@ -1193,6 +1193,8 @@ class DuckDBStore:
         identity_sql: str,
         parameters: list[Any],
     ) -> bool:
+        # table/identity_sql are hardcoded literals from internal callers, never
+        # externally-influenced identifiers — this is not safe if that changes.
         existing = self._connection.execute(
             f"SELECT record_hash FROM {table} WHERE {identity_sql}", parameters
         ).fetchone()

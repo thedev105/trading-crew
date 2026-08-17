@@ -24,6 +24,13 @@ from polytrading.ai.models import (
 from polytrading.ai.review import CorpusReviewAssignment, ReviewRecord, resolve_reviews
 from polytrading.domain.models import StrictRecord, normalize_utc_timestamp
 
+# `directory`/`path` arguments throughout this module come directly from
+# operator-supplied CLI flags (e.g. --corpus, --output), not from any
+# network-facing or automated caller, so no root-containment check is
+# applied here (contrast corpus_intake/artifacts.py, which quarantines
+# writes from an automated pipeline beneath a fixed project root). If a
+# less-trusted caller ever reaches these, add the same containment check.
+
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 Split = Literal["train", "validation", "test"]
 WarningKind = Literal[

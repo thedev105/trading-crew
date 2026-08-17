@@ -8,7 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -124,7 +124,8 @@ def serve_prediction_dashboard(
     application = PredictionDashboardApplication(database_path, clock=clock or _utc_now)
     try:
         with owned_resource_cleanup() as cleanup:
-            server = HTTPServer(("127.0.0.1", port), _handler_for(application))
+            server = ThreadingHTTPServer(("127.0.0.1", port), _handler_for(application))
+            server.daemon_threads = True
             cleanup.add(server.server_close)
             print(f"polytrading predictions dashboard: http://127.0.0.1:{server.server_port}")
             with suppress(KeyboardInterrupt):
@@ -140,6 +141,7 @@ def _handler_for(
 ) -> type[BaseHTTPRequestHandler]:
     class PredictionDashboardRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 30
 
         def do_GET(self) -> None:
             self._write_response("GET")

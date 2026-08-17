@@ -77,7 +77,7 @@ def test_serve_prediction_dashboard_stops_cleanly_on_keyboard_interrupt(
         def server_close(self) -> None:
             closed.append(True)
 
-    monkeypatch.setattr(prediction_dashboard_server, "HTTPServer", StubServer)
+    monkeypatch.setattr(prediction_dashboard_server, "ThreadingHTTPServer", StubServer)
     serve_prediction_dashboard(database, 8787, clock=lambda: NOW)
     assert closed == [True]
 
@@ -101,7 +101,7 @@ def test_serve_prediction_dashboard_sanitizes_a_server_failure(
         def server_close(self) -> None:
             pass
 
-    monkeypatch.setattr(prediction_dashboard_server, "HTTPServer", FailingServer)
+    monkeypatch.setattr(prediction_dashboard_server, "ThreadingHTTPServer", FailingServer)
 
     with pytest.raises(PredictionDashboardLifecycleError, match="DASHBOARD_SERVER_ERROR") as caught:
         serve_prediction_dashboard(database, 8787, clock=lambda: NOW)

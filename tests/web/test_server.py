@@ -579,7 +579,7 @@ def test_dashboard_server_sanitizes_close_and_preserves_primary_failure(
         def server_close(self) -> None:
             raise close_secret
 
-    monkeypatch.setattr(web_server, "HTTPServer", FailingServer)
+    monkeypatch.setattr(web_server, "ThreadingHTTPServer", FailingServer)
 
     with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
         web_server.serve_dashboard(database_path, 8787)
@@ -614,7 +614,7 @@ def test_dashboard_server_body_failure_wins_over_cleanup_base_exception(
             events.append("close")
             raise close_secret
 
-    monkeypatch.setattr(web_server, "HTTPServer", Server)
+    monkeypatch.setattr(web_server, "ThreadingHTTPServer", Server)
 
     with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
         web_server.serve_dashboard(database_path, 8787)
@@ -647,7 +647,7 @@ def test_dashboard_server_active_cancellation_wins_over_cleanup_cancellation(
             events.append("close")
             raise cleanup
 
-    monkeypatch.setattr(web_server, "HTTPServer", Server)
+    monkeypatch.setattr(web_server, "ThreadingHTTPServer", Server)
 
     with pytest.raises(BaseException) as captured:
         web_server.serve_dashboard(database_path, 8787)
@@ -677,7 +677,7 @@ def test_dashboard_server_cleanup_keyboard_interrupt_is_stably_sanitized(
             events.append("close")
             raise secret
 
-    monkeypatch.setattr(web_server, "HTTPServer", Server)
+    monkeypatch.setattr(web_server, "ThreadingHTTPServer", Server)
 
     with pytest.raises(RuntimeError, match=r"^DASHBOARD_SERVER_ERROR$") as captured:
         web_server.serve_dashboard(database_path, 8787)
@@ -696,7 +696,7 @@ def test_dashboard_server_preserves_constructor_cancellation(
         def __init__(self, _address: tuple[str, int], _handler: object) -> None:
             raise primary
 
-    monkeypatch.setattr(web_server, "HTTPServer", Server)
+    monkeypatch.setattr(web_server, "ThreadingHTTPServer", Server)
 
     with pytest.raises(BaseException) as captured:
         web_server.serve_dashboard(database_path, 8787)

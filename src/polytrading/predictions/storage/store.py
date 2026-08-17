@@ -249,6 +249,8 @@ class PredictionMarketStore:
         insert_columns: str,
         insert_params: list[Any],
     ) -> bool:
+        # table/where/insert_columns are hardcoded literals from internal callers,
+        # never externally-influenced identifiers — this is not safe if that changes.
         existing = self._connection.execute(
             f"SELECT record_hash FROM {table} WHERE {where}", key_params
         ).fetchone()
@@ -399,6 +401,8 @@ class PredictionMarketStore:
         }
         result: dict[str, int] = {}
         for name, (table, cutoff_column) in counts.items():
+            # table/cutoff_column come from the hardcoded `counts` mapping above,
+            # never externally-influenced identifiers — this is not safe if that changes.
             result[name] = self._connection.execute(
                 f"SELECT count(*) FROM {table} WHERE {cutoff_column} <= ?", [as_of]
             ).fetchone()[0]

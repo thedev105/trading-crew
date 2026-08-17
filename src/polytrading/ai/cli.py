@@ -52,10 +52,12 @@ from polytrading.ai.security import find_untrusted_text_markers
 from polytrading.ai.spans import SourceSpanValidationError, validate_span
 from polytrading.research.models import EvaluationWindow, ExperimentRecord, SuccessCriterion
 from polytrading.storage.store import DuckDBStore
+from polytrading.trial.writer_lease import database_writer_lease
 
 _DEFAULT_CODE_REVISION = "offline-ai-cli-v1"
 _DEFAULT_PROMPT_VERSION = "rule-extraction-v1"
 _DEFAULT_TRIAL_FAMILY = "semantic-scout-synthetic-v1"
+_WRITER_LEASE_TIMEOUT_SECONDS = 30.0
 
 
 class AIInputError(ValueError):
@@ -326,21 +328,22 @@ def _run_import_artifacts(arguments: argparse.Namespace) -> int:
     imported_at = (
         _parse_timestamp(arguments.imported_at) if arguments.imported_at else datetime.now(UTC)
     )
-    store = DuckDBStore(arguments.db)
-    try:
-        importer = ArtifactImporter(ModelRegistry(store), corpus.manifest, corpus.contracts)
-        accepted = 0
-        for line in lines:
-            result = importer.import_json(
-                line,
-                imported_at=imported_at,
-                equity_usd=equity,
-                spent_usd=spent,
-            )
-            accepted += result.disposition == "accepted"
-            spent = result.cumulative_cost_usd
-    finally:
-        store.close()
+    with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+        store = DuckDBStore(arguments.db)
+        try:
+            importer = ArtifactImporter(ModelRegistry(store), corpus.manifest, corpus.contracts)
+            accepted = 0
+            for line in lines:
+                result = importer.import_json(
+                    line,
+                    imported_at=imported_at,
+                    equity_usd=equity,
+                    spent_usd=spent,
+                )
+                accepted += result.disposition == "accepted"
+                spent = result.cumulative_cost_usd
+        finally:
+            store.close()
     print(f"accepted {accepted} immutable artifacts; cumulative inference cost USD {spent}")
     return 0
 
