@@ -280,20 +280,27 @@ class PredictionMarketStore:
         return None if row is None else VenueManifest.model_validate_json(row[0])
 
     def markets_as_of(self, venue: PredictionVenue, as_of: datetime) -> tuple[MarketRecord, ...]:
+        # A correlated subquery evaluated once per candidate row does not scale to a
+        # real market catalog (confirmed 2026-08-16: ~70s against ~79k Kalshi markets).
+        # A single windowed pass over the venue's rows is equivalent -- each market_id's
+        # rows are its distinct rule_version_id revisions, so the newest retrieved_at at
+        # or before the cutoff is exactly the same row the prior per-row subquery picked.
         rows = self._connection.execute(
             """
-            SELECT record_json FROM markets m
-            WHERE venue = ? AND retrieved_at <= ?
-              AND rule_version_id = (
-                  SELECT rule_version_id FROM markets inner_m
-                  WHERE inner_m.venue = m.venue AND inner_m.market_id = m.market_id
-                    AND inner_m.retrieved_at <= ?
-                  ORDER BY inner_m.retrieved_at DESC
-                  LIMIT 1
-              )
+            SELECT record_json FROM (
+                SELECT
+                    market_id,
+                    record_json,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id ORDER BY retrieved_at DESC
+                    ) AS rank
+                FROM markets
+                WHERE venue = ? AND retrieved_at <= ?
+            )
+            WHERE rank = 1
             ORDER BY market_id
             """,
-            [venue.value, as_of, as_of],
+            [venue.value, as_of],
         ).fetchall()
         return tuple(MarketRecord.model_validate_json(row[0]) for row in rows)
 
@@ -327,6 +334,24 @@ class PredictionMarketStore:
             [venue.value, market_id, outcome_token_id, as_of],
         ).fetchone()
         return None if row is None else PredictionBookSnapshot.model_validate_json(row[0])
+
+    def latest_book_observed_at_for_venue(
+        self, venue: PredictionVenue, as_of: datetime
+    ) -> datetime | None:
+        # Cast to VARCHAR rather than fetching TIMESTAMPTZ directly: duckdb's Python
+        # binding requires the optional pytz package to convert a native TIMESTAMPTZ
+        # result column, which this project does not depend on -- every other reader
+        # in this store avoids this by only ever fetching JSON text columns.
+        row = self._connection.execute(
+            """
+            SELECT CAST(observed_at AS VARCHAR) FROM prediction_books
+            WHERE venue = ? AND observed_at <= ?
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            [venue.value, as_of],
+        ).fetchone()
+        return None if row is None else datetime.fromisoformat(row[0]).astimezone(UTC)
 
     def trades_between(
         self,

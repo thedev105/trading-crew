@@ -76,16 +76,11 @@ class PredictionHealthAuditor:
         markets = self._store.markets_as_of(venue, as_of)
         latest_market_retrieved_at = max((market.retrieved_at for market in markets), default=None)
 
-        latest_book_observed_at: datetime | None = None
         latest_book_age_seconds: Decimal | None = None
-        for market in markets:
-            token_ids = market.outcome_token_ids or (None,)
-            for token_id in token_ids:
-                book = self._store.latest_book_as_of(venue, market.market_id, token_id, as_of)
-                if book is not None and (
-                    latest_book_observed_at is None or book.observed_at > latest_book_observed_at
-                ):
-                    latest_book_observed_at = book.observed_at
+        # A per-market, per-token latest_book_as_of loop does not scale to a real
+        # market catalog (confirmed 2026-08-16: ~66s across ~79k Kalshi markets, one
+        # query per market). This is a single aggregate query across the whole venue.
+        latest_book_observed_at = self._store.latest_book_observed_at_for_venue(venue, as_of)
 
         if latest_book_observed_at is not None:
             latest_book_age_seconds = Decimal((as_of - latest_book_observed_at).total_seconds())

@@ -199,6 +199,22 @@ def test_latest_book_as_of_rejects_a_future_observation(tmp_path: Path) -> None:
     )
 
 
+def test_latest_book_observed_at_for_venue_ignores_future_and_other_venues(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    older = prediction_book_snapshot(cycle_id=UUID(int=1), observed_at=NOW - timedelta(hours=1))
+    newer = prediction_book_snapshot(cycle_id=UUID(int=2), observed_at=NOW)
+    store.append_book_snapshot(older)
+    store.append_book_snapshot(newer)
+
+    assert store.latest_book_observed_at_for_venue(PredictionVenue.POLYMARKET, NOW) == NOW
+    assert store.latest_book_observed_at_for_venue(
+        PredictionVenue.POLYMARKET, NOW - timedelta(hours=1)
+    ) == NOW - timedelta(hours=1)
+    assert store.latest_book_observed_at_for_venue(PredictionVenue.KALSHI, NOW) is None
+
+
 def test_latest_fee_rate_as_of_handles_a_venue_wide_null_market_id(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     rate = fee_rate(market_id=None)
