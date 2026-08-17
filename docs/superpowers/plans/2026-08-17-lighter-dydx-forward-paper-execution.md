@@ -126,7 +126,7 @@ def test_paper_position_closure_rejects_nonpositive_exit_notional() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/trial/test_paper_models.py -v`
+Run: `.venv/bin/python -m pytest tests/trial/test_paper_models.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'polytrading.trial.paper_models'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -228,7 +228,7 @@ Note: `Decimal38x18` (from `domain/models.py`) forbids non-finite values but all
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/trial/test_paper_models.py -v`
+Run: `.venv/bin/python -m pytest tests/trial/test_paper_models.py -v`
 Expected: PASS (8 tests)
 
 - [ ] **Step 5: Commit**
@@ -353,7 +353,7 @@ def test_closing_a_position_removes_it_from_open_lookup(tmp_path: Path) -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/storage/test_store_paper_positions.py -v`
+Run: `.venv/bin/python -m pytest tests/storage/test_store_paper_positions.py -v`
 Expected: FAIL — `duckdb.CatalogException: Table with name paper_positions does not exist`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -490,7 +490,7 @@ Add `PaperPosition, PaperPositionClosure` to the existing `if TYPE_CHECKING:` im
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/storage/test_store_paper_positions.py -v`
+Run: `.venv/bin/python -m pytest tests/storage/test_store_paper_positions.py -v`
 Expected: PASS (3 tests)
 
 - [ ] **Step 5: Commit**
@@ -855,7 +855,7 @@ def test_open_accrue_close_cycle_reconciles_via_journal_trial_balance(tmp_path) 
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/trial/test_paper_execution.py -v`
+Run: `.venv/bin/python -m pytest tests/trial/test_paper_execution.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'polytrading.trial.paper_execution'`. (If `tests/carry/test_economics_models.py` has no importable `_report` helper, first add one there — a small frozen-default factory returning a valid `CandidateEconomicsReport` with keyword overrides, matching the pattern already used by `tests/carry/test_economics.py`'s own report-building test helpers.)
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1158,7 +1158,7 @@ Each leg's own postings balance independently (open: debit X / credit X; close: 
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/trial/test_paper_execution.py -v`
+Run: `.venv/bin/python -m pytest tests/trial/test_paper_execution.py -v`
 Expected: PASS (10 tests)
 
 - [ ] **Step 5: Commit**
@@ -1231,7 +1231,7 @@ def test_paper_open_rejects_missing_evaluation(tmp_path: Path, capsys) -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_cli_paper.py -v`
+Run: `.venv/bin/python -m pytest tests/test_cli_paper.py -v`
 Expected: FAIL — `argparse` error, unrecognized `trial paper` subcommand.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1429,7 +1429,7 @@ def _trial_paper_close(arguments: argparse.Namespace) -> int:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/test_cli_paper.py -v`
+Run: `.venv/bin/python -m pytest tests/test_cli_paper.py -v`
 Expected: PASS (2 tests)
 
 - [ ] **Step 5: Commit**
@@ -1472,7 +1472,7 @@ def test_monitor_with_no_open_positions_exits_zero(tmp_path: Path, capsys) -> No
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_cli_paper_monitor.py -v`
+Run: `.venv/bin/python -m pytest tests/test_cli_paper_monitor.py -v`
 Expected: FAIL — `NameError`/`AttributeError` from the not-yet-implemented `_trial_paper_monitor`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1611,7 +1611,7 @@ def _trial_paper_monitor(arguments: argparse.Namespace) -> int:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/test_cli_paper_monitor.py -v`
+Run: `.venv/bin/python -m pytest tests/test_cli_paper_monitor.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1658,7 +1658,7 @@ def test_dashboard_snapshot_includes_empty_paper_positions(tmp_path: Path) -> No
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/web/test_dashboard_paper_positions.py -v`
+Run: `.venv/bin/python -m pytest tests/web/test_dashboard_paper_positions.py -v`
 Expected: FAIL — `AttributeError: 'DashboardSnapshot' object has no attribute 'paper_position_rows'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1711,7 +1711,7 @@ In `src/polytrading/web/dashboard.py`, add a `_paper_position_rows(self, as_of: 
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/web/test_dashboard_paper_positions.py -v`
+Run: `.venv/bin/python -m pytest tests/web/test_dashboard_paper_positions.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1747,7 +1747,7 @@ def test_dashboard_html_declares_paper_positions_section() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/web/test_dashboard_render.py -v`
+Run: `.venv/bin/python -m pytest tests/web/test_dashboard_render.py -v`
 Expected: FAIL
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1850,7 +1850,7 @@ Call `renderPaperPositions(snapshot)` from wherever the existing `render*` funct
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/web/test_dashboard_render.py -v`
+Run: `.venv/bin/python -m pytest tests/web/test_dashboard_render.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Manually verify in a browser**
@@ -1874,7 +1874,7 @@ git commit -m "feat(web): render paper positions stat tiles, badges, and P&L spa
 
 - [ ] **Step 1: Run the complete test suite**
 
-Run: `.venv/bin/pytest`
+Run: `.venv/bin/python -m pytest`
 Expected: all tests pass, including every test added in Tasks 1–8.
 
 - [ ] **Step 2: Run lint**
