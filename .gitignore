@@ -13,3 +13,4 @@ var/corpus-intake/
 var/source-use/
 var/review-queue/
 graphify-out/
+.superpowers/
