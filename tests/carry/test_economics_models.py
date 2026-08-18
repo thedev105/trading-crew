@@ -282,6 +282,33 @@ def report(**overrides: object) -> CandidateEconomicsReport:
     return CandidateEconomicsReport(**values)
 
 
+def _report(**overrides: object) -> CandidateEconomicsReport:
+    """Shared report factory for tests outside this module (e.g. tests/trial).
+
+    Supports two call shapes on top of `report()`'s SHADOW_CANDIDATE defaults:
+    - `direction=None`: builds a valid directionless REJECTED report (the
+      TRAINING_FUNDING_MEDIAN_ZERO state), defaulting `short_venue`,
+      `long_venue`, `economics`, and `reason_codes` accordingly unless the
+      caller overrides them too.
+    - `base_quantity=...`: routed into `complete_economics(base_quantity=...)`
+      and passed as `economics=`, since `base_quantity` is not a top-level
+      field of `CandidateEconomicsReport`.
+    """
+    if "direction" in overrides and overrides["direction"] is None:
+        rejected_defaults: dict[str, object] = {
+            "short_venue": None,
+            "long_venue": None,
+            "economics": None,
+            "reason_codes": ("TRAINING_FUNDING_MEDIAN_ZERO",),
+        }
+        rejected_defaults.update(overrides)
+        return report(**rejected_defaults)
+    base_quantity = overrides.pop("base_quantity", None)
+    if base_quantity is not None:
+        overrides["economics"] = complete_economics(base_quantity=base_quantity)
+    return report(**overrides)
+
+
 def legacy_report_json(item: CandidateEconomicsReport | None = None) -> str:
     payload = (item or report()).model_dump(mode="json")
     payload["schema_version"] = 1
