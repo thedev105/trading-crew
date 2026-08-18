@@ -207,3 +207,54 @@ def test_paper_position_realized_funding_sums_only_matching_accrual_postings(
         assert store.paper_position_realized_funding(position.position_id) == expected
     finally:
         store.close()
+
+
+def test_paper_position_realized_funding_does_not_leak_across_sequential_positions(
+    tmp_path: Path,
+) -> None:
+    """A later position on the same asset must not inherit an earlier,
+    already-closed position's funding accruals.
+
+    Concurrently open positions on the same asset are forbidden, but
+    sequential open/close cycles on the same asset are expected normal
+    usage (see `open_paper_position_for_asset`). The realized-funding query
+    previously scoped only by `asset`, so a fresh position with zero
+    accruals of its own would incorrectly inherit an unrelated, earlier
+    position's leftover funding.
+    """
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position_a = _position()
+        store.append_paper_position(position_a)
+
+        accrual_a = funding_accrual_transaction(
+            position=position_a,
+            effective_at=position_a.opened_at + timedelta(hours=1),
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        assert accrual_a is not None
+        store.append_journal_transaction(accrual_a)
+
+        accrued_a = Decimal(0)
+        for posting in accrual_a.postings:
+            if posting.account == "paper:cash":
+                accrued_a += posting.debit - posting.credit
+        assert accrued_a != Decimal(0)
+        assert store.paper_position_realized_funding(position_a.position_id) == accrued_a
+
+        store.append_paper_position_closure(_closure(position_a.position_id))
+
+        # Position B opens later on the *same* asset, with zero accruals of
+        # its own.
+        position_b = _position(
+            position_id=uuid4(),
+            opened_at=position_a.opened_at + timedelta(days=1),
+        )
+        store.append_paper_position(position_b)
+
+        assert store.paper_position_realized_funding(position_b.position_id) == Decimal(0)
+        # And position A's own total must be unaffected.
+        assert store.paper_position_realized_funding(position_a.position_id) == accrued_a
+    finally:
+        store.close()

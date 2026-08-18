@@ -776,9 +776,13 @@ class DuckDBStore:
         """Sum realized funding cash postings accrued for one paper position.
 
         There is no direct `position_id` column on `journal_transactions`, so
-        this filters by the stable `"paper funding accrual {asset} "`
-        description prefix that `funding_accrual_transaction` writes, scoped
-        to the position's own asset.
+        this filters by the position's identity embedded in `evidence_ids`.
+        `funding_accrual_transaction` stores a single-element evidence_ids
+        tuple of `f"{position.position_id}:{normalized_effective_at.isoformat()}"`,
+        which `_append_journal_transaction` persists as a JSON array. Matching
+        against the asset alone is insufficient: sequential open/close cycles
+        on the same asset are expected, and an asset-only filter would sum in
+        an earlier, unrelated (and already-closed) position's accruals.
         """
         position = self.paper_position(position_id)
         if position is None:
@@ -791,8 +795,9 @@ class DuckDBStore:
               ON transaction.transaction_id = posting.transaction_id
             WHERE posting.account = 'paper:cash'
               AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+              AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
             """,
-            [position.asset.value],
+            [position.asset.value, str(position_id)],
         ).fetchone()
         total = row[0] if row is not None else None
         return Decimal(0) if total is None else Decimal(total)
