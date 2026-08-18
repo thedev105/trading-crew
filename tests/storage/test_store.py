@@ -400,14 +400,14 @@ def test_migration_version_is_recorded_exactly_once_across_reopens(tmp_path: Pat
     with duckdb.connect(str(path), read_only=True) as connection:
         assert connection.execute(
             "SELECT version, count(*) FROM schema_migrations GROUP BY version"
-        ).fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+        ).fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
 
 
 def test_unknown_applied_migration_gap_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [6, NOW])
+        connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [7, NOW])
 
     with pytest.raises(RuntimeError, match="not a known prefix"):
         open_store(path)
@@ -417,7 +417,7 @@ def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> No
     path = tmp_path / "research.duckdb"
     open_store(path).close()
     with duckdb.connect(str(path)) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
 
     with pytest.raises(RuntimeError, match="read-only store requires current schema"):
         DuckDBStore(path, read_only=True)
@@ -487,7 +487,7 @@ def test_existing_version_three_database_migrates_without_rewriting_prior_rows(
         ).fetchone() == (1, "9" * 64)
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
 
 
 def test_funding_collection_cycle_round_trips_and_exact_retry_is_idempotent(

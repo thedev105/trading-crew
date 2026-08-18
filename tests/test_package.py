@@ -351,6 +351,7 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
             "polytrading/storage/schema/003_forward_funding_cycles.sql",
             "polytrading/storage/schema/004_economic_evaluations.sql",
             "polytrading/storage/schema/005_lighter_dydx_trial_operations.sql",
+            "polytrading/storage/schema/006_paper_positions.sql",
         ]
         prediction_migration_members = [
             name
