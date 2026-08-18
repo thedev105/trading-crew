@@ -282,14 +282,24 @@ def report(**overrides: object) -> CandidateEconomicsReport:
     return CandidateEconomicsReport(**values)
 
 
+_DIRECTION_VENUES: dict[FundingDirection, tuple[Venue, Venue]] = {
+    FundingDirection.SHORT_LIGHTER_LONG_DYDX: (Venue.LIGHTER, Venue.DYDX),
+    FundingDirection.SHORT_DYDX_LONG_LIGHTER: (Venue.DYDX, Venue.LIGHTER),
+}
+
+
 def _report(**overrides: object) -> CandidateEconomicsReport:
     """Shared report factory for tests outside this module (e.g. tests/trial).
 
-    Supports two call shapes on top of `report()`'s SHADOW_CANDIDATE defaults:
+    Supports these call shapes on top of `report()`'s SHADOW_CANDIDATE defaults:
     - `direction=None`: builds a valid directionless REJECTED report (the
       TRAINING_FUNDING_MEDIAN_ZERO state), defaulting `short_venue`,
       `long_venue`, `economics`, and `reason_codes` accordingly unless the
       caller overrides them too.
+    - `direction=FundingDirection.SHORT_DYDX_LONG_LIGHTER` (or the default
+      SHORT_LIGHTER_LONG_DYDX): defaults `short_venue`/`long_venue` to match
+      the given direction, per `CandidateEconomicsReport.require_coherent_report`'s
+      direction-venue mapping, unless the caller overrides them too.
     - `base_quantity=...`: routed into `complete_economics(base_quantity=...)`
       and passed as `economics=`, since `base_quantity` is not a top-level
       field of `CandidateEconomicsReport`.
@@ -303,6 +313,12 @@ def _report(**overrides: object) -> CandidateEconomicsReport:
         }
         rejected_defaults.update(overrides)
         return report(**rejected_defaults)
+    direction = overrides.get("direction")
+    if direction in _DIRECTION_VENUES:
+        short_venue, long_venue = _DIRECTION_VENUES[direction]
+        venue_defaults: dict[str, object] = {"short_venue": short_venue, "long_venue": long_venue}
+        venue_defaults.update(overrides)
+        overrides = venue_defaults
     base_quantity = overrides.pop("base_quantity", None)
     if base_quantity is not None:
         overrides["economics"] = complete_economics(base_quantity=base_quantity)

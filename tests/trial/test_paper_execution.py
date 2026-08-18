@@ -178,6 +178,106 @@ def test_funding_accrual_transaction_is_balanced() -> None:
     assert sum(p.debit for p in transaction.postings) == sum(p.credit for p in transaction.postings)
 
 
+def test_funding_accrual_transaction_matches_established_sign_convention() -> None:
+    # Established convention (src/polytrading/carry/economics.py's
+    # _funding_cashflows): a short-Lighter leg *receives* funding when
+    # lighter_rate > 0 (positive funding means longs pay shorts), so for
+    # SHORT_LIGHTER_LONG_DYDX the true net funding P&L is
+    # +lighter_entry_notional*lighter_rate - dydx_entry_notional*dydx_rate.
+    # Using two distinct positive rates here means a sign flip on either leg
+    # produces a different, distinguishable net value.
+    report = _report(
+        decision=EconomicsDecision.SHADOW_CANDIDATE,
+        direction=FundingDirection.SHORT_LIGHTER_LONG_DYDX,
+        base_quantity=Decimal("1"),
+    )
+    cycle_id = uuid4()
+    books = PairedBookObservation(
+        effective_at=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+        lighter=_book(Venue.LIGHTER, "60000", "60010", cycle_id),
+        dydx=_book(Venue.DYDX, "60005", "60015", cycle_id),
+    )
+    position, _ = open_paper_position(
+        report=report,
+        current_books=books,
+        lighter_instrument=_instrument(Venue.LIGHTER),
+        dydx_instrument=_instrument(Venue.DYDX),
+        position_id=uuid4(),
+        opening_book_cycle_id=cycle_id,
+        opened_at=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+    )
+    lighter_rate = Decimal("0.0002")
+    dydx_rate = Decimal("0.0001")
+    transaction = funding_accrual_transaction(
+        position=position,
+        effective_at=datetime(2026, 8, 17, 13, 0, tzinfo=UTC),
+        lighter_rate=lighter_rate,
+        dydx_rate=dydx_rate,
+    )
+    assert transaction is not None
+    expected_net = (
+        position.lighter_entry_notional_usd * lighter_rate
+        - position.dydx_entry_notional_usd * dydx_rate
+    )
+    funding_posting = next(p for p in transaction.postings if p.account == "paper:pnl:funding")
+    # debit/credit on paper:pnl:funding is the mirror of the cash posting (see
+    # test_open_accrue_close_cycle_reconciles_via_journal_trial_balance's comment),
+    # so credit - debit recovers the true signed net funding P&L.
+    assert funding_posting.credit - funding_posting.debit == expected_net
+
+
+def test_funding_accrual_transaction_sign_convention_reversed_direction() -> None:
+    # Same assertion as above, but for the SHORT_DYDX_LONG_LIGHTER direction,
+    # which none of the other tests in this module exercise. For this
+    # direction the true net funding P&L is
+    # +dydx_entry_notional*dydx_rate - lighter_entry_notional*lighter_rate.
+    report = _report(
+        decision=EconomicsDecision.SHADOW_CANDIDATE,
+        direction=FundingDirection.SHORT_DYDX_LONG_LIGHTER,
+        base_quantity=Decimal("1"),
+    )
+    cycle_id = uuid4()
+    # SHORT_DYDX_LONG_LIGHTER entry uses the Lighter ask and the dYdX bid.
+    books = PairedBookObservation(
+        effective_at=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+        lighter=_book(Venue.LIGHTER, "60000", "60010", cycle_id),
+        dydx=_book(Venue.DYDX, "60005", "60015", cycle_id),
+    )
+    position, open_transaction = open_paper_position(
+        report=report,
+        current_books=books,
+        lighter_instrument=_instrument(Venue.LIGHTER),
+        dydx_instrument=_instrument(Venue.DYDX),
+        position_id=uuid4(),
+        opening_book_cycle_id=cycle_id,
+        opened_at=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+    )
+    assert position.direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER
+    # long Lighter buys from Lighter asks (60010), short dYdX sells into dYdX bids (60005).
+    assert position.lighter_entry_price == Decimal("60010")
+    assert position.dydx_entry_price == Decimal("60005")
+    assert sum(p.debit for p in open_transaction.postings) == sum(
+        p.credit for p in open_transaction.postings
+    )
+
+    lighter_rate = Decimal("0.0002")
+    dydx_rate = Decimal("0.0001")
+    transaction = funding_accrual_transaction(
+        position=position,
+        effective_at=datetime(2026, 8, 17, 13, 0, tzinfo=UTC),
+        lighter_rate=lighter_rate,
+        dydx_rate=dydx_rate,
+    )
+    assert transaction is not None
+    assert sum(p.debit for p in transaction.postings) == sum(p.credit for p in transaction.postings)
+    expected_net = (
+        position.dydx_entry_notional_usd * dydx_rate
+        - position.lighter_entry_notional_usd * lighter_rate
+    )
+    funding_posting = next(p for p in transaction.postings if p.account == "paper:pnl:funding")
+    assert funding_posting.credit - funding_posting.debit == expected_net
+
+
 def test_funding_accrual_transaction_is_none_when_net_is_exactly_zero() -> None:
     report = _report(
         decision=EconomicsDecision.SHADOW_CANDIDATE,

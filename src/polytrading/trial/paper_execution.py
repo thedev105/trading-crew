@@ -29,6 +29,14 @@ PAPER_RESEARCH_WARNING = (
     "Research only — simulated paper position, not a live fill or trading authorization."
 )
 
+# Every JournalPosting this module produces carries a USD-denominated notional
+# or funding figure (never a crypto quantity), so the ledger's per-asset
+# account code is always "USD" here, independent of the position's underlying
+# `Asset` (e.g. BTC). Using `position.asset`/`report.asset` instead would
+# silently violate JournalTransaction.require_balanced_assets the moment
+# anything else posts a real crypto-denominated amount into this account space.
+LEDGER_ASSET_CODE = "USD"
+
 
 class PaperOpenRejected(ValueError):
     """Raised when a paper position cannot be opened from the given report/book."""
@@ -121,7 +129,7 @@ def open_paper_position(
             postings.append(
                 JournalPosting(
                     account=account,
-                    asset=report.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=notional,
                     credit=Decimal(0),
                 )
@@ -129,7 +137,7 @@ def open_paper_position(
             postings.append(
                 JournalPosting(
                     account="paper:cash",
-                    asset=report.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=Decimal(0),
                     credit=notional,
                 )
@@ -138,7 +146,7 @@ def open_paper_position(
             postings.append(
                 JournalPosting(
                     account="paper:cash",
-                    asset=report.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=notional,
                     credit=Decimal(0),
                 )
@@ -146,7 +154,7 @@ def open_paper_position(
             postings.append(
                 JournalPosting(
                     account=account,
-                    asset=report.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=Decimal(0),
                     credit=notional,
                 )
@@ -203,7 +211,7 @@ def close_paper_position(
             postings.append(
                 JournalPosting(
                     account="paper:cash",
-                    asset=position.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=exit_notional,
                     credit=Decimal(0),
                 )
@@ -211,7 +219,7 @@ def close_paper_position(
             postings.append(
                 JournalPosting(
                     account=account,
-                    asset=position.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=Decimal(0),
                     credit=entry_notional,
                 )
@@ -220,7 +228,7 @@ def close_paper_position(
             postings.append(
                 JournalPosting(
                     account=account,
-                    asset=position.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=entry_notional,
                     credit=Decimal(0),
                 )
@@ -228,7 +236,7 @@ def close_paper_position(
             postings.append(
                 JournalPosting(
                     account="paper:cash",
-                    asset=position.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=Decimal(0),
                     credit=exit_notional,
                 )
@@ -239,7 +247,7 @@ def close_paper_position(
             postings.append(
                 JournalPosting(
                     account="paper:pnl:trading",
-                    asset=position.asset.value,
+                    asset=LEDGER_ASSET_CODE,
                     debit=pnl_debit,
                     credit=pnl_credit,
                 )
@@ -284,12 +292,16 @@ def funding_accrual_transaction(
     lighter_rate: Decimal,
     dydx_rate: Decimal,
 ) -> JournalTransaction | None:
-    if position.direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX:
-        lighter_funding_usd = -position.lighter_entry_notional_usd * lighter_rate
-        dydx_funding_usd = position.dydx_entry_notional_usd * dydx_rate
-    else:
-        lighter_funding_usd = position.lighter_entry_notional_usd * lighter_rate
-        dydx_funding_usd = -position.dydx_entry_notional_usd * dydx_rate
+    # Sign convention must match the established one in economics.py's
+    # _funding_cashflows: a short-Lighter leg *receives* funding when
+    # lighter_rate > 0 (positive funding means longs pay shorts), so
+    # SHORT_LIGHTER_LONG_DYDX gets lighter_sign=+1, dydx_sign=-1 (and the
+    # reverse direction flips both).
+    is_short_lighter = position.direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX
+    lighter_sign = Decimal(1) if is_short_lighter else Decimal(-1)
+    dydx_sign = -lighter_sign
+    lighter_funding_usd = position.lighter_entry_notional_usd * lighter_rate * lighter_sign
+    dydx_funding_usd = position.dydx_entry_notional_usd * dydx_rate * dydx_sign
     net = lighter_funding_usd + dydx_funding_usd
     if net == 0:
         # a zero-value posting is not a valid JournalPosting; there is simply no
@@ -310,13 +322,13 @@ def funding_accrual_transaction(
         postings=(
             JournalPosting(
                 account="paper:cash",
-                asset=position.asset.value,
+                asset=LEDGER_ASSET_CODE,
                 debit=cash_debit,
                 credit=cash_credit,
             ),
             JournalPosting(
                 account="paper:pnl:funding",
-                asset=position.asset.value,
+                asset=LEDGER_ASSET_CODE,
                 debit=cash_credit,
                 credit=cash_debit,
             ),
