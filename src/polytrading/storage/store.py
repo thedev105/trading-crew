@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         CandidateEconomicsReport,
         LegacyEconomicEvaluationSummary,
     )
+    from polytrading.trial.paper_models import PaperPosition, PaperPositionClosure
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -325,6 +326,60 @@ class DuckDBStore:
             return self._append_economic_evaluation(record)
         with self.transaction():
             return self._append_economic_evaluation(record)
+
+    def append_paper_position(self, record: PaperPosition) -> bool:
+        if self._in_transaction:
+            return self._append_paper_position(record)
+        with self.transaction():
+            return self._append_paper_position(record)
+
+    def append_paper_position_closure(self, record: PaperPositionClosure) -> bool:
+        if self._in_transaction:
+            return self._append_paper_position_closure(record)
+        with self.transaction():
+            return self._append_paper_position_closure(record)
+
+    def open_paper_position_for_asset(self, asset: Asset) -> PaperPosition | None:
+        row = self._connection.execute(
+            """
+            SELECT CAST(position.record_json AS VARCHAR)
+            FROM paper_positions AS position
+            LEFT JOIN paper_position_closures AS closure
+              ON closure.position_id = position.position_id
+            WHERE position.asset = ? AND closure.position_id IS NULL
+            """,
+            [asset.value],
+        ).fetchone()
+        if row is None:
+            return None
+        from polytrading.trial.paper_models import PaperPosition
+
+        return PaperPosition.model_validate_json(row[0])
+
+    def paper_position(self, position_id: UUID) -> PaperPosition | None:
+        row = self._connection.execute(
+            "SELECT CAST(record_json AS VARCHAR) FROM paper_positions WHERE position_id = ?",
+            [position_id],
+        ).fetchone()
+        if row is None:
+            return None
+        from polytrading.trial.paper_models import PaperPosition
+
+        return PaperPosition.model_validate_json(row[0])
+
+    def paper_position_closure(self, position_id: UUID) -> PaperPositionClosure | None:
+        row = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR) FROM paper_position_closures
+            WHERE position_id = ?
+            """,
+            [position_id],
+        ).fetchone()
+        if row is None:
+            return None
+        from polytrading.trial.paper_models import PaperPositionClosure
+
+        return PaperPositionClosure.model_validate_json(row[0])
 
     def append_experiment(self, record: ExperimentRecord) -> bool:
         if self._normalized_retry(
@@ -1071,6 +1126,51 @@ class DuckDBStore:
                 record.decision.value,
                 None if record.direction is None else record.direction.value,
                 record.policy_hash,
+                _canonical_json(record),
+                record.schema_version,
+                _record_hash(record),
+            ],
+        )
+        return True
+
+    def _append_paper_position(self, record: PaperPosition) -> bool:
+        if self._normalized_retry(
+            "paper position",
+            record,
+            "paper_positions",
+            "position_id = ?",
+            [record.position_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO paper_positions VALUES (?, ?, ?, ?, ?::JSON, ?, ?)",
+            [
+                record.position_id,
+                record.source_evaluation_id,
+                record.asset.value,
+                record.opened_at,
+                _canonical_json(record),
+                record.schema_version,
+                _record_hash(record),
+            ],
+        )
+        return True
+
+    def _append_paper_position_closure(self, record: PaperPositionClosure) -> bool:
+        if self._normalized_retry(
+            "paper position closure",
+            record,
+            "paper_position_closures",
+            "position_id = ?",
+            [record.position_id],
+        ):
+            return False
+        self._connection.execute(
+            "INSERT INTO paper_position_closures VALUES (?, ?, ?, ?::JSON, ?, ?)",
+            [
+                record.position_id,
+                record.closed_at,
+                record.close_reason.value,
                 _canonical_json(record),
                 record.schema_version,
                 _record_hash(record),
