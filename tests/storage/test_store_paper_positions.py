@@ -258,3 +258,56 @@ def test_paper_position_realized_funding_does_not_leak_across_sequential_positio
         assert store.paper_position_realized_funding(position_a.position_id) == accrued_a
     finally:
         store.close()
+
+
+def test_paper_position_funding_accrued_reflects_posted_transactions(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+        effective_at = position.opened_at + timedelta(hours=1)
+
+        assert store.paper_position_funding_accrued(position.position_id, effective_at) is False
+
+        accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=effective_at,
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        assert accrual is not None
+        store.append_journal_transaction(accrual)
+
+        assert store.paper_position_funding_accrued(position.position_id, effective_at) is True
+        # A different hour for the same position is a distinct, unposted accrual.
+        assert (
+            store.paper_position_funding_accrued(
+                position.position_id, effective_at + timedelta(hours=1)
+            )
+            is False
+        )
+    finally:
+        store.close()
+
+
+def test_paper_position_funding_accrued_false_when_net_funding_is_zero(tmp_path: Path) -> None:
+    """When funding nets to exactly zero, `funding_accrual_transaction` returns
+    `None` and nothing is ever posted for that hour — the existence check must
+    reflect that rather than assuming a transaction always follows.
+    """
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+        effective_at = position.opened_at + timedelta(hours=1)
+
+        accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=effective_at,
+            lighter_rate=Decimal("0"),
+            dydx_rate=Decimal("0"),
+        )
+        assert accrual is None
+        assert store.paper_position_funding_accrued(position.position_id, effective_at) is False
+    finally:
+        store.close()

@@ -11,7 +11,7 @@ from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import duckdb
 from pydantic import BaseModel
@@ -801,6 +801,23 @@ class DuckDBStore:
         ).fetchone()
         total = row[0] if row is not None else None
         return Decimal(0) if total is None else Decimal(total)
+
+    def paper_position_funding_accrued(self, position_id: UUID, effective_at: datetime) -> bool:
+        """True when the hourly funding accrual for this position/hour is already posted.
+
+        `funding_accrual_transaction` derives its `transaction_id` deterministically
+        as `uuid5(position.position_id, normalize_utc_timestamp(effective_at).isoformat())`
+        (and returns `None`, posting nothing, when net funding for the hour is exactly
+        zero). Recomputing that same identity here makes this a straight existence
+        lookup rather than a new tracking column.
+        """
+        normalized_effective_at = normalize_utc_timestamp(effective_at)
+        transaction_id = uuid5(position_id, normalized_effective_at.isoformat())
+        row = self._connection.execute(
+            "SELECT 1 FROM journal_transactions WHERE transaction_id = ?",
+            [transaction_id],
+        ).fetchone()
+        return row is not None
 
     def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
         normalized_as_of = normalize_utc_timestamp(as_of)
