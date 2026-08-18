@@ -9,8 +9,9 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import duckdb
 import httpx
@@ -261,6 +262,21 @@ def build_parser() -> argparse.ArgumentParser:
     trial_health.add_argument("--recent-hours", type=_trial_recent_hours, default=24)
     trial_health.add_argument("--as-of")
     trial_health.add_argument("--format", choices=("text", "json"), default="text")
+    trial_paper = trial_commands.add_parser("paper", help="simulated forward paper execution")
+    trial_paper_commands = trial_paper.add_subparsers(dest="trial_paper_command", required=True)
+    trial_paper_open = trial_paper_commands.add_parser("open", help="open a paper position")
+    trial_paper_open.add_argument("--evaluation-id", required=True)
+    trial_paper_open.add_argument("--db", required=True, type=Path)
+    trial_paper_open.add_argument("--confirm", action="store_true")
+    trial_paper_close = trial_paper_commands.add_parser("close", help="close a paper position")
+    trial_paper_close.add_argument("--position-id", required=True)
+    trial_paper_close.add_argument("--db", required=True, type=Path)
+    trial_paper_close.add_argument("--confirm", action="store_true")
+    trial_paper_monitor = trial_paper_commands.add_parser(
+        "monitor", help="close-eligible positions and accrue hourly funding"
+    )
+    trial_paper_monitor.add_argument("--db", required=True, type=Path)
+    trial_paper_monitor.add_argument("--as-of")
 
     collect = commands.add_parser("collect", help="collect public market evidence")
     collect_commands = collect.add_subparsers(dest="collect_command", required=True)
@@ -364,7 +380,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return asyncio.run(_trial_funding(arguments))
             if arguments.trial_command == "books":
                 return asyncio.run(_trial_books(arguments))
-            return _trial_health(arguments)
+            if arguments.trial_command == "health":
+                return _trial_health(arguments)
+            if arguments.trial_paper_command == "open":
+                return _trial_paper_open(arguments)
+            if arguments.trial_paper_command == "close":
+                return _trial_paper_close(arguments)
+            return _trial_paper_monitor(arguments)
         if arguments.command == "ai":
             return run_ai_command(arguments)
         if arguments.command == "predictions":
@@ -912,6 +934,169 @@ def _trial_health(arguments: argparse.Namespace) -> int:
         )
         else 1
     )
+
+
+def _trial_paper_open(arguments: argparse.Namespace) -> int:
+    if not arguments.confirm:
+        print(
+            "polytrading: dry run — pass --confirm to open a paper position",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        evaluation_id = UUID(arguments.evaluation_id)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise CliUsageError("invalid evaluation UUID") from error
+    if not arguments.db.is_file():
+        raise CliUsageError("paper execution database is unavailable or not current")
+
+    from polytrading.carry.economics_models import EconomicsDecision
+    from polytrading.trial.book_evidence import eligible_lighter_dydx_book_pair
+    from polytrading.trial.paper_execution import PaperOpenRejected, open_paper_position
+
+    store: DuckDBStore | None = None
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = DuckDBStore(arguments.db)
+            report = store.get_economic_evaluation(evaluation_id)
+            if report is None or report.decision is not EconomicsDecision.SHADOW_CANDIDATE:
+                raise CliUsageError("evaluation not found or not a SHADOW_CANDIDATE")
+            if store.open_paper_position_for_asset(report.asset) is not None:
+                raise CliUsageError(f"a paper position is already open for {report.asset.value}")
+            now = _utc_now()
+            if now - report.evaluated_at > timedelta(hours=24):
+                raise CliUsageError("SHADOW_CANDIDATE report is stale; re-run carry economics")
+            cycles = store.book_collection_cycles_between(now - timedelta(minutes=5), now, now)
+            eligible = next(
+                (
+                    item
+                    for cycle in sorted(cycles, key=lambda c: c.request_completed_at, reverse=True)
+                    if (
+                        item := eligible_lighter_dydx_book_pair(
+                            store, cycle, report.asset, now, Decimal("1000")
+                        )
+                    )
+                    is not None
+                ),
+                None,
+            )
+            if eligible is None:
+                raise CliUsageError("no eligible current book cycle to open against")
+            lighter_instrument = store.latest_instrument_as_of(
+                Venue.LIGHTER, eligible.pair.lighter.symbol, now
+            )
+            dydx_instrument = store.latest_instrument_as_of(
+                Venue.DYDX, eligible.pair.dydx.symbol, now
+            )
+            if lighter_instrument is None or dydx_instrument is None:
+                raise CliUsageError("current instrument specification is unavailable")
+            try:
+                position, transaction = open_paper_position(
+                    report=report,
+                    current_books=eligible.pair,
+                    lighter_instrument=lighter_instrument,
+                    dydx_instrument=dydx_instrument,
+                    position_id=uuid4(),
+                    opening_book_cycle_id=eligible.cycle.cycle_id,
+                    opened_at=now,
+                )
+            except PaperOpenRejected as error:
+                raise CliUsageError(str(error)) from error
+            with store.transaction():
+                store.append_paper_position(position)
+                store.append_journal_transaction(transaction)
+    except ConflictingRecordError as error:
+        raise CliUsageError("paper position persistence conflict") from error
+    finally:
+        if store is not None:
+            store.close()
+    print(f"opened paper position {position.position_id} for {position.asset.value}")
+    return 0
+
+
+def _trial_paper_close(arguments: argparse.Namespace) -> int:
+    if not arguments.confirm:
+        print(
+            "polytrading: dry run — pass --confirm to close a paper position",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        position_id = UUID(arguments.position_id)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise CliUsageError("invalid position UUID") from error
+    if not arguments.db.is_file():
+        raise CliUsageError("paper execution database is unavailable or not current")
+
+    from polytrading.trial.book_evidence import eligible_lighter_dydx_book_pair
+    from polytrading.trial.paper_execution import PaperOpenRejected, close_paper_position
+    from polytrading.trial.paper_models import PaperCloseReason
+
+    store: DuckDBStore | None = None
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = DuckDBStore(arguments.db)
+            position = store.paper_position(position_id)
+            if position is None or store.paper_position_closure(position_id) is not None:
+                raise CliUsageError("position not found or already closed")
+            now = _utc_now()
+            cycles = store.book_collection_cycles_between(now - timedelta(minutes=5), now, now)
+            eligible = next(
+                (
+                    item
+                    for cycle in sorted(cycles, key=lambda c: c.request_completed_at, reverse=True)
+                    if (
+                        item := eligible_lighter_dydx_book_pair(
+                            store, cycle, position.asset, now, Decimal("1000")
+                        )
+                    )
+                    is not None
+                ),
+                None,
+            )
+            if eligible is None:
+                raise CliUsageError("no eligible current book cycle to close against")
+            lighter_instrument = store.latest_instrument_as_of(
+                Venue.LIGHTER, eligible.pair.lighter.symbol, now
+            )
+            dydx_instrument = store.latest_instrument_as_of(
+                Venue.DYDX, eligible.pair.dydx.symbol, now
+            )
+            if lighter_instrument is None or dydx_instrument is None:
+                raise CliUsageError("current instrument specification is unavailable")
+            realized_funding = store.paper_position_realized_funding(position_id)
+            try:
+                closure, transaction = close_paper_position(
+                    position=position,
+                    current_books=eligible.pair,
+                    lighter_instrument=lighter_instrument,
+                    dydx_instrument=dydx_instrument,
+                    closing_book_cycle_id=eligible.cycle.cycle_id,
+                    closed_at=now,
+                    close_reason=PaperCloseReason.OPERATOR_CLOSED,
+                    realized_funding_usd=realized_funding,
+                )
+            except PaperOpenRejected as error:
+                raise CliUsageError(str(error)) from error
+            with store.transaction():
+                store.append_paper_position_closure(closure)
+                store.append_journal_transaction(transaction)
+    except ConflictingRecordError as error:
+        raise CliUsageError("paper position closure persistence conflict") from error
+    finally:
+        if store is not None:
+            store.close()
+    print(f"closed paper position {position_id}: realized pnl {closure.realized_pnl_usd}")
+    return 0
+
+
+def _trial_paper_monitor(arguments: argparse.Namespace) -> int:
+    # Placeholder for the scheduled close-eligible/funding-accrual monitor loop
+    # (introduced by a later task in this plan). The `trial paper monitor`
+    # subcommand is wired into the parser now so `open`/`close` can share the
+    # `trial paper` subparser tree, but the monitor logic itself is not yet
+    # implemented.
+    raise CliUsageError("trial paper monitor is not yet implemented")
 
 
 def _funding_health(arguments: argparse.Namespace) -> int:

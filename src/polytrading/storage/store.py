@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from importlib import resources
 from pathlib import Path
@@ -752,6 +753,49 @@ class DuckDBStore:
         if row[1] == 1:
             return LegacyEconomicEvaluationSummary.from_report_json(row[0])
         raise ValueError(f"unsupported economic evaluation schema version: {row[1]}")
+
+    def get_economic_evaluation(self, evaluation_id: UUID) -> CandidateEconomicsReport | None:
+        """Look up a single evaluation by primary key, current-schema only.
+
+        Unlike `latest_economic_evaluation_as_of`, this never parses legacy
+        schema_version=1 payloads — a stale schema-1 report was never a valid
+        SHADOW_CANDIDATE payload, so it is treated as "not found" here.
+        """
+        row = self._connection.execute(
+            "SELECT CAST(report_json AS VARCHAR), schema_version FROM economic_evaluations "
+            "WHERE evaluation_id = ?",
+            [evaluation_id],
+        ).fetchone()
+        if row is None or row[1] != 2:
+            return None
+        from polytrading.carry.economics_models import CandidateEconomicsReport
+
+        return CandidateEconomicsReport.model_validate_json(row[0])
+
+    def paper_position_realized_funding(self, position_id: UUID) -> Decimal:
+        """Sum realized funding cash postings accrued for one paper position.
+
+        There is no direct `position_id` column on `journal_transactions`, so
+        this filters by the stable `"paper funding accrual {asset} "`
+        description prefix that `funding_accrual_transaction` writes, scoped
+        to the position's own asset.
+        """
+        position = self.paper_position(position_id)
+        if position is None:
+            return Decimal(0)
+        row = self._connection.execute(
+            """
+            SELECT SUM(posting.debit - posting.credit)
+            FROM journal_postings AS posting
+            JOIN journal_transactions AS transaction
+              ON transaction.transaction_id = posting.transaction_id
+            WHERE posting.account = 'paper:cash'
+              AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+            """,
+            [position.asset.value],
+        ).fetchone()
+        total = row[0] if row is not None else None
+        return Decimal(0) if total is None else Decimal(total)
 
     def latest_book_cycle_as_of(self, as_of: datetime) -> BookCollectionCycle | None:
         normalized_as_of = normalize_utc_timestamp(as_of)

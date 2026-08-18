@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -7,13 +7,16 @@ import pytest
 
 from polytrading.carry.economics_models import FundingDirection
 from polytrading.domain.models import Asset
+from polytrading.ledger.models import JournalPosting, JournalTransaction
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
+from polytrading.trial.paper_execution import funding_accrual_transaction
 from polytrading.trial.paper_models import (
     PAPER_RESEARCH_WARNING,
     PaperCloseReason,
     PaperPosition,
     PaperPositionClosure,
 )
+from tests.carry.test_economics_models import legacy_report_json, report
 
 
 def _position(**overrides: object) -> PaperPosition:
@@ -90,5 +93,117 @@ def test_closing_a_position_removes_it_from_open_lookup(tmp_path: Path) -> None:
         assert store.append_paper_position_closure(closure) is True
         assert store.open_paper_position_for_asset(Asset.BTC) is None
         assert store.paper_position_closure(position.position_id) == closure
+    finally:
+        store.close()
+
+
+def test_get_economic_evaluation_returns_stored_shadow_candidate(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        item = report()
+        store.append_economic_evaluation(item)
+        assert store.get_economic_evaluation(item.evaluation_id) == item
+        assert store.get_economic_evaluation(uuid4()) is None
+    finally:
+        store.close()
+
+
+def test_get_economic_evaluation_treats_legacy_schema_as_not_found(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        current_shape = report()
+        payload = legacy_report_json(current_shape)
+        store._connection.execute(
+            """
+            INSERT INTO economic_evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?::JSON, ?, ?)
+            """,
+            [
+                current_shape.evaluation_id,
+                current_shape.asset.value,
+                current_shape.known_as_of,
+                current_shape.evaluated_at,
+                current_shape.decision.value,
+                current_shape.direction.value,
+                current_shape.policy_hash,
+                payload,
+                1,
+                "9" * 64,
+            ],
+        )
+
+        assert store.get_economic_evaluation(current_shape.evaluation_id) is None
+    finally:
+        store.close()
+
+
+def test_paper_position_realized_funding_returns_zero_with_no_accruals(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+        assert store.paper_position_realized_funding(position.position_id) == Decimal(0)
+        assert store.paper_position_realized_funding(uuid4()) == Decimal(0)
+    finally:
+        store.close()
+
+
+def test_paper_position_realized_funding_sums_only_matching_accrual_postings(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+
+        # An unrelated transaction that also posts to paper:cash (e.g. the
+        # position's own open transaction) must not be counted — only
+        # transactions whose description marks them as funding accruals for
+        # this position's asset should contribute.
+        unrelated = JournalTransaction(
+            schema_version=1,
+            transaction_id=uuid4(),
+            occurred_at=position.opened_at,
+            observed_at=position.opened_at,
+            description=f"paper open {position.asset.value} {position.direction.value}",
+            postings=(
+                JournalPosting(
+                    account="paper:cash", asset="USD", debit=Decimal(0), credit=Decimal("100")
+                ),
+                JournalPosting(
+                    account="paper:position:lighter",
+                    asset="USD",
+                    debit=Decimal("100"),
+                    credit=Decimal(0),
+                ),
+            ),
+            evidence_ids=("unrelated",),
+        )
+        store.append_journal_transaction(unrelated)
+
+        first_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=1),
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        second_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=2),
+            lighter_rate=Decimal("-0.0002"),
+            dydx_rate=Decimal("0.0001"),
+        )
+        assert first_accrual is not None
+        assert second_accrual is not None
+        store.append_journal_transaction(first_accrual)
+        store.append_journal_transaction(second_accrual)
+
+        expected = Decimal(0)
+        for transaction in (first_accrual, second_accrual):
+            for posting in transaction.postings:
+                if posting.account == "paper:cash":
+                    expected += posting.debit - posting.credit
+
+        assert expected != Decimal(0)
+        assert store.paper_position_realized_funding(position.position_id) == expected
     finally:
         store.close()
