@@ -35,6 +35,7 @@
     <a href="#markets">Markets</a>
     <a href="#compatibility">Discovery</a>
     <a href="#economics">Economics</a>
+    <a href="#paper-positions">Paper positions</a>
     <a href="#research">Research gate</a>
     <a href="#evidence">Evidence</a>
     <a href="#operations">Operations</a>
@@ -152,9 +153,19 @@
       </div>
     </section>
 
+    <section id="paper-positions" class="dashboard-section" aria-labelledby="paper-positions-title">
+      <div class="section-heading">
+        <div><p class="section-index">06 / FORWARD PAPER EXECUTION</p><h2 id="paper-positions-title">Paper positions</h2></div>
+        <p>Simulated Lighter ↔ dYdX positions only. Read-only research evidence — no order is ever placed.</p>
+      </div>
+      <dl id="paper-stat-tiles" class="count-grid"></dl>
+      <div class="boundary-heading"><h3>Open and closed positions</h3><p>Cumulative P&amp;L sparkline per position</p></div>
+      <div id="paper-position-cards" class="carry-grid"></div>
+    </section>
+
     <section id="research" class="dashboard-section" aria-labelledby="research-title">
       <div class="section-heading">
-        <div><p class="section-index">06 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
+        <div><p class="section-index">07 / LEGACY PAIR</p><h2 id="research-title">Carry research gate</h2></div>
         <p>Bybit ↔ Hyperliquid diagnostics only. No dYdX compatibility is inferred.</p>
       </div>
       <div id="carry-rows" class="carry-grid"></div>
@@ -162,7 +173,7 @@
 
     <section id="evidence" class="dashboard-section" aria-labelledby="evidence-title">
       <div class="section-heading">
-        <div><p class="section-index">07 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
+        <div><p class="section-index">08 / INVENTORY</p><h2 id="evidence-title">Evidence on disk</h2></div>
         <p>Records known at this snapshot cutoff, not unfiltered table totals.</p>
       </div>
       <dl id="evidence-counts" class="count-grid"></dl>
@@ -170,7 +181,7 @@
 
     <section id="operations" class="dashboard-section" aria-labelledby="operations-title">
       <div class="section-heading">
-        <div><p class="section-index">08 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
+        <div><p class="section-index">09 / SAFE NEXT ACTIONS</p><h2 id="operations-title">Operator recipes</h2></div>
         <p>Copy-only commands. This page never starts a collector or executes a process.</p>
       </div>
       <div id="recipe-list" class="recipe-list"></div>

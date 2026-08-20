@@ -27,6 +27,8 @@ const nodes = {
   dossierLeftHeading: document.querySelector("#dossier-left-heading"),
   dossierRightHeading: document.querySelector("#dossier-right-heading"),
   economicsRows: document.querySelector("#economics-rows"),
+  paperStatTiles: document.querySelector("#paper-stat-tiles"),
+  paperPositionCards: document.querySelector("#paper-position-cards"),
   carryRows: document.querySelector("#carry-rows"),
   evidenceCounts: document.querySelector("#evidence-counts"),
   recipeList: document.querySelector("#recipe-list"),
@@ -430,6 +432,110 @@ function renderDiscovery(snapshot) {
   nodes.dossierRows.replaceChildren(...rows);
 }
 
+const paperStatusTones = {
+  OPEN: "paper_open",
+  CLOSED_REGIME_REVERSED: "paper_regime_reversed",
+  CLOSED_MAX_HORIZON_REACHED: "paper_max_horizon",
+  CLOSED_OPERATOR_CLOSED: "paper_operator_closed",
+};
+
+function renderSparkline(points, currentValue) {
+  const width = 280;
+  const height = 40;
+  const svgNs = "http:" + "//www.w3.org/2000/svg";
+  const values = points.map(([, value]) => Number(value));
+  const max = Math.max(0, currentValue, ...values);
+  const min = Math.min(0, currentValue, ...values);
+  const span = max - min || 1;
+  const toY = (value) => height - ((value - min) / span) * height;
+
+  const svg = document.createElementNS(svgNs, "svg");
+  svg.setAttribute("class", "paper-sparkline");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `Cumulative P&L, currently ${currentValue.toFixed(2)} USD`);
+
+  const baseline = document.createElementNS(svgNs, "line");
+  baseline.setAttribute("class", "baseline");
+  baseline.setAttribute("x1", "0");
+  baseline.setAttribute("y1", String(toY(0)));
+  baseline.setAttribute("x2", String(width));
+  baseline.setAttribute("y2", String(toY(0)));
+  svg.append(baseline);
+
+  if (points.length) {
+    const trend = document.createElementNS(svgNs, "path");
+    trend.setAttribute("class", "trend");
+    const pathData = points
+      .map(([, value], index) => {
+        const x = (index / Math.max(1, points.length - 1)) * width;
+        const y = toY(Number(value));
+        return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+    trend.setAttribute("d", pathData);
+    svg.append(trend);
+  }
+
+  const endpointX = width;
+  const endpointY = toY(currentValue);
+  const endpoint = document.createElementNS(svgNs, "circle");
+  endpoint.setAttribute("class", currentValue >= 0 ? "endpoint-good" : "endpoint-bad");
+  endpoint.setAttribute("cx", String(endpointX));
+  endpoint.setAttribute("cy", String(endpointY));
+  endpoint.setAttribute("r", "4");
+  svg.append(endpoint);
+
+  const label = document.createElementNS(svgNs, "text");
+  label.setAttribute("x", String(endpointX - 6));
+  label.setAttribute("y", String(endpointY - 8));
+  label.setAttribute("text-anchor", "end");
+  label.textContent = currentValue.toFixed(2);
+  svg.append(label);
+
+  return svg;
+}
+
+function renderPaperPositions(snapshot) {
+  const rows = snapshot.paper_position_rows;
+  const openRows = rows.filter((row) => row.status === "OPEN");
+  const regimeReversedRows = rows.filter((row) => row.status === "CLOSED_REGIME_REVERSED");
+  const maxHorizonRows = rows.filter((row) => row.status === "CLOSED_MAX_HORIZON_REACHED");
+  const operatorClosedRows = rows.filter((row) => row.status === "CLOSED_OPERATOR_CLOSED");
+  const aggregateOpenPnl = openRows.reduce((sum, row) => sum + Number(row.current_pnl_usd), 0);
+
+  const tiles = [
+    ["Open positions", openRows.length],
+    ["Closed — regime reversed", regimeReversedRows.length],
+    ["Closed — max horizon", maxHorizonRows.length],
+    ["Closed — operator closed", operatorClosedRows.length],
+    ["Aggregate open P&L (USD)", aggregateOpenPnl.toFixed(2)],
+  ].map(([label, value]) => {
+    const card = element("div", "count-card");
+    card.append(element("dt", "", label), element("dd", "", String(value)));
+    return card;
+  });
+  nodes.paperStatTiles.replaceChildren(...tiles);
+
+  if (!rows.length) {
+    nodes.paperPositionCards.replaceChildren(
+      element("p", "unavailable", "Unavailable · no paper positions recorded at this snapshot cutoff"),
+    );
+    return;
+  }
+
+  const cards = rows.map((row) => {
+    const card = element("article", "carry-card");
+    const header = document.createElement("header");
+    const pill = element("span", "status-pill", row.status);
+    pill.dataset.tone = paperStatusTones[row.status] || "missing";
+    header.append(element("h3", "", `${row.asset} · ${row.direction}`), pill);
+    card.append(header, renderSparkline(row.hourly_pnl_points, Number(row.current_pnl_usd)));
+    return card;
+  });
+  nodes.paperPositionCards.replaceChildren(...cards);
+}
+
 function renderCarry(snapshot) {
   const cards = snapshot.carry_rows.map((item) => {
     const card = element("article", "carry-card");
@@ -553,6 +659,7 @@ function render(snapshot) {
   renderMarkets(snapshot);
   renderDiscovery(snapshot);
   renderEconomics(snapshot);
+  renderPaperPositions(snapshot);
   renderCarry(snapshot);
   renderCounts(snapshot);
   renderRecipes(snapshot);
@@ -579,6 +686,9 @@ function validateSnapshot(snapshot) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!Array.isArray(snapshot.economics_rows) || snapshot.economics_rows.length !== 3) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (!Array.isArray(snapshot.paper_position_rows)) {
     throw new Error("INVALID_SNAPSHOT");
   }
   if (!Object.prototype.hasOwnProperty.call(snapshot, "compatibility_dossier")) {
