@@ -1115,111 +1115,139 @@ def _trial_paper_monitor(arguments: argparse.Namespace) -> int:
         with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
             store = DuckDBStore(arguments.db)
             for asset in (Asset.BTC, Asset.ETH, Asset.SOL):
-                position = store.open_paper_position_for_asset(asset)
-                if position is None:
-                    continue
-                window_start = as_of - timedelta(hours=168)
-                lighter_selection = select_prospective_funding(
-                    store,
-                    Venue.LIGHTER,
-                    symbols[Venue.LIGHTER][asset],
-                    asset,
-                    window_start,
-                    as_of,
-                    as_of,
-                )
-                dydx_selection = select_prospective_funding(
-                    store,
-                    Venue.DYDX,
-                    symbols[Venue.DYDX][asset],
-                    asset,
-                    window_start,
-                    as_of,
-                    as_of,
-                )
-                lighter_by_hour = {o.effective_at: o for o in lighter_selection.observations}
-                dydx_by_hour = {o.effective_at: o for o in dydx_selection.observations}
-                paired_hours = sorted(set(lighter_by_hour) & set(dydx_by_hour))
-                differentials = tuple(
-                    lighter_by_hour[hour].rate - dydx_by_hour[hour].rate for hour in paired_hours
-                )
-                if len(differentials) < 168:
-                    lines.append(f"{asset.value}: held (insufficient regime evidence this cycle)")
-                    continue
-                oriented = orient_funding(differentials[-168:], position.direction)
-                reversed_regime = current_regime_reversed(oriented)
-                age = as_of - position.opened_at
-                should_close = reversed_regime or age >= timedelta(days=28)
-                if should_close:
-                    reason = (
-                        PaperCloseReason.REGIME_REVERSED
-                        if reversed_regime
-                        else PaperCloseReason.MAX_HORIZON_REACHED
+                try:
+                    position = store.open_paper_position_for_asset(asset)
+                    if position is None:
+                        continue
+                    window_start = as_of - timedelta(hours=168)
+                    lighter_selection = select_prospective_funding(
+                        store,
+                        Venue.LIGHTER,
+                        symbols[Venue.LIGHTER][asset],
+                        asset,
+                        window_start,
+                        as_of,
+                        as_of,
                     )
-                    cycles = store.book_collection_cycles_between(
-                        as_of - timedelta(minutes=5), as_of, as_of
+                    dydx_selection = select_prospective_funding(
+                        store,
+                        Venue.DYDX,
+                        symbols[Venue.DYDX][asset],
+                        asset,
+                        window_start,
+                        as_of,
+                        as_of,
                     )
-                    eligible = next(
-                        (
-                            item
-                            for cycle in sorted(
-                                cycles, key=lambda c: c.request_completed_at, reverse=True
-                            )
-                            if (
-                                item := eligible_lighter_dydx_book_pair(
-                                    store, cycle, asset, as_of, Decimal("1000")
+                    lighter_by_hour = {o.effective_at: o for o in lighter_selection.observations}
+                    dydx_by_hour = {o.effective_at: o for o in dydx_selection.observations}
+                    paired_hours = sorted(set(lighter_by_hour) & set(dydx_by_hour))
+                    differentials = tuple(
+                        lighter_by_hour[hour].rate - dydx_by_hour[hour].rate
+                        for hour in paired_hours
+                    )
+                    # The 28-day max-horizon close needs no funding evidence at all, so
+                    # it must be evaluated independently of (and before) the funding
+                    # coverage gate below — otherwise a single missing funding hour
+                    # anywhere in the trailing week would silently disable the hard
+                    # horizon close too, letting a position run indefinitely past its
+                    # stated maximum horizon. Only the regime-reversal check and the
+                    # funding-accrual step are gated on coverage.
+                    age = as_of - position.opened_at
+                    horizon_reached = age >= timedelta(days=28)
+                    insufficient_coverage = len(differentials) < 168
+                    reversed_regime = False
+                    if not insufficient_coverage:
+                        oriented = orient_funding(differentials[-168:], position.direction)
+                        reversed_regime = current_regime_reversed(oriented)
+                    should_close = reversed_regime or horizon_reached
+                    if should_close:
+                        reason = (
+                            PaperCloseReason.REGIME_REVERSED
+                            if reversed_regime
+                            else PaperCloseReason.MAX_HORIZON_REACHED
+                        )
+                        cycles = store.book_collection_cycles_between(
+                            as_of - timedelta(minutes=5), as_of, as_of
+                        )
+                        eligible = next(
+                            (
+                                item
+                                for cycle in sorted(
+                                    cycles, key=lambda c: c.request_completed_at, reverse=True
                                 )
+                                if (
+                                    item := eligible_lighter_dydx_book_pair(
+                                        store, cycle, asset, as_of, Decimal("1000")
+                                    )
+                                )
+                                is not None
+                            ),
+                            None,
+                        )
+                        if eligible is None:
+                            lines.append(
+                                f"{asset.value}: held (no eligible book to close against yet)"
                             )
-                            is not None
-                        ),
-                        None,
-                    )
-                    if eligible is None:
-                        lines.append(f"{asset.value}: held (no eligible book to close against yet)")
+                            continue
+                        lighter_instrument = store.latest_instrument_as_of(
+                            Venue.LIGHTER, eligible.pair.lighter.symbol, as_of
+                        )
+                        dydx_instrument = store.latest_instrument_as_of(
+                            Venue.DYDX, eligible.pair.dydx.symbol, as_of
+                        )
+                        if lighter_instrument is None or dydx_instrument is None:
+                            lines.append(
+                                f"{asset.value}: held (instrument specification unavailable)"
+                            )
+                            continue
+                        realized_funding = store.paper_position_realized_funding(
+                            position.position_id
+                        )
+                        closure, transaction = close_paper_position(
+                            position=position,
+                            current_books=eligible.pair,
+                            lighter_instrument=lighter_instrument,
+                            dydx_instrument=dydx_instrument,
+                            closing_book_cycle_id=eligible.cycle.cycle_id,
+                            closed_at=as_of,
+                            close_reason=reason,
+                            realized_funding_usd=realized_funding,
+                        )
+                        with store.transaction():
+                            store.append_paper_position_closure(closure)
+                            store.append_journal_transaction(transaction)
+                        lines.append(
+                            f"{asset.value}: closed:{reason.value} pnl={closure.realized_pnl_usd}"
+                        )
                         continue
-                    lighter_instrument = store.latest_instrument_as_of(
-                        Venue.LIGHTER, eligible.pair.lighter.symbol, as_of
-                    )
-                    dydx_instrument = store.latest_instrument_as_of(
-                        Venue.DYDX, eligible.pair.dydx.symbol, as_of
-                    )
-                    if lighter_instrument is None or dydx_instrument is None:
-                        lines.append(f"{asset.value}: held (instrument specification unavailable)")
+                    if insufficient_coverage:
+                        lines.append(
+                            f"{asset.value}: held (insufficient regime evidence this cycle)"
+                        )
                         continue
-                    realized_funding = store.paper_position_realized_funding(position.position_id)
-                    closure, transaction = close_paper_position(
-                        position=position,
-                        current_books=eligible.pair,
-                        lighter_instrument=lighter_instrument,
-                        dydx_instrument=dydx_instrument,
-                        closing_book_cycle_id=eligible.cycle.cycle_id,
-                        closed_at=as_of,
-                        close_reason=reason,
-                        realized_funding_usd=realized_funding,
-                    )
-                    with store.transaction():
-                        store.append_paper_position_closure(closure)
-                        store.append_journal_transaction(transaction)
-                    lines.append(
-                        f"{asset.value}: closed:{reason.value} pnl={closure.realized_pnl_usd}"
-                    )
-                    continue
-                latest_hour = paired_hours[-1]
-                accrual = None
-                if latest_hour > position.opened_at and not store.paper_position_funding_accrued(
-                    position.position_id, latest_hour
-                ):
-                    accrual = funding_accrual_transaction(
-                        position=position,
-                        effective_at=latest_hour,
-                        lighter_rate=lighter_by_hour[latest_hour].rate,
-                        dydx_rate=dydx_by_hour[latest_hour].rate,
-                    )
-                if accrual is not None:
-                    store.append_journal_transaction(accrual)
-                    lines.append(f"{asset.value}: accrued funding for {latest_hour.isoformat()}")
-                else:
-                    lines.append(f"{asset.value}: held")
+                    latest_hour = paired_hours[-1]
+                    accrual = None
+                    if (
+                        latest_hour > position.opened_at
+                        and not store.paper_position_funding_accrued(
+                            position.position_id, latest_hour
+                        )
+                    ):
+                        accrual = funding_accrual_transaction(
+                            position=position,
+                            effective_at=latest_hour,
+                            lighter_rate=lighter_by_hour[latest_hour].rate,
+                            dydx_rate=dydx_by_hour[latest_hour].rate,
+                        )
+                    if accrual is not None:
+                        store.append_journal_transaction(accrual)
+                        lines.append(
+                            f"{asset.value}: accrued funding for {latest_hour.isoformat()}"
+                        )
+                    else:
+                        lines.append(f"{asset.value}: held")
+                except Exception as error:  # isolate one asset's failure from the others
+                    lines.append(f"{asset.value}: error ({error})")
     finally:
         if store is not None:
             store.close()
