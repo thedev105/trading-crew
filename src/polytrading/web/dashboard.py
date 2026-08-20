@@ -249,11 +249,11 @@ class DashboardBuilder:
     def _paper_position_rows(self, as_of: datetime) -> tuple[PaperPositionRow, ...]:
         rows = []
         for position in self._store.paper_positions_as_of(as_of):
-            closure = self._store.paper_position_closure(position.position_id)
+            closure = self._store.paper_position_closure(position.position_id, as_of=as_of)
             running_total = Decimal(0)
             hourly_pnl_points: list[tuple[datetime, Decimal]] = []
             for occurred_at, delta in self._store.paper_position_hourly_funding(
-                position.position_id
+                position.position_id, as_of=as_of
             ):
                 running_total += delta
                 hourly_pnl_points.append((occurred_at, running_total))
@@ -261,7 +261,9 @@ class DashboardBuilder:
             if closure is None:
                 status = "OPEN"
                 closed_at = None
-                current_pnl_usd = self._store.paper_position_realized_funding(position.position_id)
+                current_pnl_usd = self._store.paper_position_realized_funding(
+                    position.position_id, as_of=as_of
+                )
             else:
                 status = f"CLOSED_{closure.close_reason.value}"
                 closed_at = closure.closed_at

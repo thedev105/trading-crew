@@ -161,3 +161,67 @@ def test_sequential_positions_on_same_asset_do_not_leak_pnl_or_points(
         assert row_a.status == "CLOSED_MAX_HORIZON_REACHED"
     finally:
         store.close()
+
+
+def test_snapshot_as_of_before_close_renders_open_and_excludes_later_accruals(
+    tmp_path: Path,
+) -> None:
+    """Reproduces Fix 1: as_of between open and close must render OPEN.
+
+    Without threading `as_of` through to `paper_position_closure` /
+    `paper_position_hourly_funding` / `paper_position_realized_funding`,
+    building a snapshot strictly between a position's open and close time
+    either raises (evidence must not follow as-of) or leaks post-as_of
+    funding accruals into the open-position figures.
+    """
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+
+        first_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=1),
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        second_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=2),
+            lighter_rate=Decimal("-0.0002"),
+            dydx_rate=Decimal("0.0001"),
+        )
+        assert first_accrual is not None
+        assert second_accrual is not None
+        store.append_journal_transaction(first_accrual)
+        store.append_journal_transaction(second_accrual)
+
+        closure = _closure(
+            position.position_id,
+            closed_at=position.opened_at + timedelta(hours=3),
+        )
+        store.append_paper_position_closure(closure)
+
+        as_of = position.opened_at + timedelta(hours=1, minutes=30)
+        snapshot = DashboardBuilder(store, tmp_path / "test.duckdb").build(as_of)
+
+        assert len(snapshot.paper_position_rows) == 1
+        row = snapshot.paper_position_rows[0]
+        # Renders OPEN, not CLOSED, because the closure's closed_at (+3h) is
+        # after as_of (+1.5h).
+        assert row.status == "OPEN"
+        assert row.closed_at is None
+
+        # Only the +1h accrual point should appear, not the +2h one.
+        assert len(row.hourly_pnl_points) == 1
+        first_delta = next(
+            posting.debit - posting.credit
+            for posting in first_accrual.postings
+            if posting.account == "paper:cash"
+        )
+        assert row.hourly_pnl_points[0][1] == first_delta
+
+        # current_pnl_usd must only reflect the +1h accrual.
+        assert row.current_pnl_usd == first_delta
+    finally:
+        store.close()

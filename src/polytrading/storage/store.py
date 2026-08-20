@@ -383,14 +383,33 @@ class DuckDBStore:
 
         return PaperPosition.model_validate_json(row[0])
 
-    def paper_position_closure(self, position_id: UUID) -> PaperPositionClosure | None:
-        row = self._connection.execute(
-            """
-            SELECT CAST(record_json AS VARCHAR) FROM paper_position_closures
-            WHERE position_id = ?
-            """,
-            [position_id],
-        ).fetchone()
+    def paper_position_closure(
+        self, position_id: UUID, as_of: datetime | None = None
+    ) -> PaperPositionClosure | None:
+        """The position's closure record, or `None` if it isn't closed yet.
+
+        When `as_of` is given, a closure whose `closed_at` is strictly after
+        `as_of` is treated as not having happened yet (returns `None`), so a
+        caller reconstructing state at a past `as_of` sees the position as
+        still open rather than raising on a closure timestamp from the future.
+        """
+        if as_of is None:
+            row = self._connection.execute(
+                """
+                SELECT CAST(record_json AS VARCHAR) FROM paper_position_closures
+                WHERE position_id = ?
+                """,
+                [position_id],
+            ).fetchone()
+        else:
+            normalized_as_of = normalize_utc_timestamp(as_of)
+            row = self._connection.execute(
+                """
+                SELECT CAST(record_json AS VARCHAR) FROM paper_position_closures
+                WHERE position_id = ? AND closed_at <= ?
+                """,
+                [position_id, normalized_as_of],
+            ).fetchone()
         if row is None:
             return None
         from polytrading.trial.paper_models import PaperPositionClosure
@@ -787,7 +806,9 @@ class DuckDBStore:
 
         return CandidateEconomicsReport.model_validate_json(row[0])
 
-    def paper_position_realized_funding(self, position_id: UUID) -> Decimal:
+    def paper_position_realized_funding(
+        self, position_id: UUID, as_of: datetime | None = None
+    ) -> Decimal:
         """Sum realized funding cash postings accrued for one paper position.
 
         There is no direct `position_id` column on `journal_transactions`, so
@@ -798,27 +819,50 @@ class DuckDBStore:
         against the asset alone is insufficient: sequential open/close cycles
         on the same asset are expected, and an asset-only filter would sum in
         an earlier, unrelated (and already-closed) position's accruals.
+
+        `as_of`, when given, excludes any accrual whose `occurred_at` is after
+        it — callers reconstructing state as of a past moment should not see
+        funding postings dated later than that moment. Existing callers that
+        want the full, current, no-cutoff realized funding (e.g. the CLI's
+        `close`/`monitor` commands at the moment of a real close) should leave
+        this `None`.
         """
         position = self.paper_position(position_id)
         if position is None:
             return Decimal(0)
-        row = self._connection.execute(
-            """
-            SELECT SUM(posting.debit - posting.credit)
-            FROM journal_postings AS posting
-            JOIN journal_transactions AS transaction
-              ON transaction.transaction_id = posting.transaction_id
-            WHERE posting.account = 'paper:cash'
-              AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
-              AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
-            """,
-            [position.asset.value, str(position_id)],
-        ).fetchone()
+        if as_of is None:
+            row = self._connection.execute(
+                """
+                SELECT SUM(posting.debit - posting.credit)
+                FROM journal_postings AS posting
+                JOIN journal_transactions AS transaction
+                  ON transaction.transaction_id = posting.transaction_id
+                WHERE posting.account = 'paper:cash'
+                  AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+                  AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
+                """,
+                [position.asset.value, str(position_id)],
+            ).fetchone()
+        else:
+            normalized_as_of = normalize_utc_timestamp(as_of)
+            row = self._connection.execute(
+                """
+                SELECT SUM(posting.debit - posting.credit)
+                FROM journal_postings AS posting
+                JOIN journal_transactions AS transaction
+                  ON transaction.transaction_id = posting.transaction_id
+                WHERE posting.account = 'paper:cash'
+                  AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+                  AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
+                  AND transaction.occurred_at <= ?
+                """,
+                [position.asset.value, str(position_id), normalized_as_of],
+            ).fetchone()
         total = row[0] if row is not None else None
         return Decimal(0) if total is None else Decimal(total)
 
     def paper_position_hourly_funding(
-        self, position_id: UUID
+        self, position_id: UUID, as_of: datetime | None = None
     ) -> tuple[tuple[datetime, Decimal], ...]:
         """Per-hour signed funding P&L deltas for one paper position, ordered by hour.
 
@@ -831,24 +875,46 @@ class DuckDBStore:
         `credit - debit` on `paper:pnl:funding` yields the same signed value
         (net funding received, positive is profit) as `debit - credit` on
         `paper:cash`.
+
+        `as_of`, when given, excludes any accrual point dated after it — see
+        `paper_position_realized_funding` for why. Leave `None` for the full,
+        current, no-cutoff history.
         """
         position = self.paper_position(position_id)
         if position is None:
             return ()
-        rows = self._connection.execute(
-            """
-            SELECT epoch_us(transaction.occurred_at), SUM(posting.credit - posting.debit)
-            FROM journal_postings AS posting
-            JOIN journal_transactions AS transaction
-              ON transaction.transaction_id = posting.transaction_id
-            WHERE posting.account = 'paper:pnl:funding'
-              AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
-              AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
-            GROUP BY transaction.occurred_at
-            ORDER BY transaction.occurred_at
-            """,
-            [position.asset.value, str(position_id)],
-        ).fetchall()
+        if as_of is None:
+            rows = self._connection.execute(
+                """
+                SELECT epoch_us(transaction.occurred_at), SUM(posting.credit - posting.debit)
+                FROM journal_postings AS posting
+                JOIN journal_transactions AS transaction
+                  ON transaction.transaction_id = posting.transaction_id
+                WHERE posting.account = 'paper:pnl:funding'
+                  AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+                  AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
+                GROUP BY transaction.occurred_at
+                ORDER BY transaction.occurred_at
+                """,
+                [position.asset.value, str(position_id)],
+            ).fetchall()
+        else:
+            normalized_as_of = normalize_utc_timestamp(as_of)
+            rows = self._connection.execute(
+                """
+                SELECT epoch_us(transaction.occurred_at), SUM(posting.credit - posting.debit)
+                FROM journal_postings AS posting
+                JOIN journal_transactions AS transaction
+                  ON transaction.transaction_id = posting.transaction_id
+                WHERE posting.account = 'paper:pnl:funding'
+                  AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+                  AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
+                  AND transaction.occurred_at <= ?
+                GROUP BY transaction.occurred_at
+                ORDER BY transaction.occurred_at
+                """,
+                [position.asset.value, str(position_id), normalized_as_of],
+            ).fetchall()
         return tuple(
             (_utc_from_epoch_us(row[0]), Decimal(row[1])) for row in rows if row[0] is not None
         )
