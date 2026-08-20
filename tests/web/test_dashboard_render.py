@@ -26,7 +26,13 @@ def test_dashboard_client_renders_paper_positions_with_status_badges_and_sparkli
     assert 'CLOSED_REGIME_REVERSED: "paper_regime_reversed"' in javascript
     assert 'CLOSED_MAX_HORIZON_REACHED: "paper_max_horizon"' in javascript
     assert 'CLOSED_OPERATOR_CLOSED: "paper_operator_closed"' in javascript
-    assert "function renderSparkline(points, currentValue)" in javascript
+    assert "function renderSparkline(points, currentValue, valueLabel)" in javascript
+    # Open positions' current_pnl_usd is accrued funding only (no trading/price
+    # P&L until close), so the UI must label it "accrued funding", not "P&L".
+    # Closed positions' realized_pnl_usd is the true total but is pre-fee.
+    assert '"Cumulative accrued funding"' in javascript
+    assert '"Realized P&L (pre-fee)"' in javascript
+    assert "Aggregate accrued funding, open positions (USD)" in javascript
     assert '"baseline"' in javascript
     assert '"trend"' in javascript
     assert "endpoint-good" in javascript

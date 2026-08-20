@@ -86,6 +86,11 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
     css = _asset("app.css")
     javascript = _asset("app.js")
     combined = "\n".join((html, css, javascript)).lower()
+    # The SVG namespace URI is a required identifier for
+    # `document.createElementNS` — it is never dereferenced as a network
+    # request — so it is allowlisted out of the generic "http://" guard below
+    # without weakening that guard against any other, real external URL.
+    combined_without_svg_ns = combined.replace("http://www.w3.org/2000/svg", "")
 
     assert "textContent" in javascript
     assert "AbortController" in javascript
@@ -124,7 +129,7 @@ def test_dashboard_assets_use_safe_dom_rendering_without_remote_or_mutation_surf
         'method: "patch"',
         'method: "delete"',
     ):
-        assert forbidden not in combined
+        assert forbidden not in combined_without_svg_ns
 
 
 def test_dashboard_client_accepts_the_canonical_twelve_market_rows() -> None:

@@ -439,10 +439,10 @@ const paperStatusTones = {
   CLOSED_OPERATOR_CLOSED: "paper_operator_closed",
 };
 
-function renderSparkline(points, currentValue) {
+function renderSparkline(points, currentValue, valueLabel) {
   const width = 280;
   const height = 40;
-  const svgNs = "http:" + "//www.w3.org/2000/svg";
+  const svgNs = "http://www.w3.org/2000/svg";
   const values = points.map(([, value]) => Number(value));
   const max = Math.max(0, currentValue, ...values);
   const min = Math.min(0, currentValue, ...values);
@@ -453,7 +453,7 @@ function renderSparkline(points, currentValue) {
   svg.setAttribute("class", "paper-sparkline");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", `Cumulative P&L, currently ${currentValue.toFixed(2)} USD`);
+  svg.setAttribute("aria-label", `${valueLabel}, currently ${currentValue.toFixed(2)} USD`);
 
   const baseline = document.createElementNS(svgNs, "line");
   baseline.setAttribute("class", "baseline");
@@ -502,14 +502,22 @@ function renderPaperPositions(snapshot) {
   const regimeReversedRows = rows.filter((row) => row.status === "CLOSED_REGIME_REVERSED");
   const maxHorizonRows = rows.filter((row) => row.status === "CLOSED_MAX_HORIZON_REACHED");
   const operatorClosedRows = rows.filter((row) => row.status === "CLOSED_OPERATOR_CLOSED");
-  const aggregateOpenPnl = openRows.reduce((sum, row) => sum + Number(row.current_pnl_usd), 0);
+  // Open positions' current_pnl_usd is accrued funding only — no trading/price
+  // P&L until close, per design — so this aggregate must not be labeled as
+  // full P&L. Closed positions' realized_pnl_usd is the true total (funding +
+  // trading P&L) but is itself pre-fee: it does not model trading fees or
+  // exit slippage costs (that modeling is deferred to a follow-up task).
+  const aggregateOpenAccruedFunding = openRows.reduce(
+    (sum, row) => sum + Number(row.current_pnl_usd),
+    0,
+  );
 
   const tiles = [
     ["Open positions", openRows.length],
     ["Closed — regime reversed", regimeReversedRows.length],
     ["Closed — max horizon", maxHorizonRows.length],
     ["Closed — operator closed", operatorClosedRows.length],
-    ["Aggregate open P&L (USD)", aggregateOpenPnl.toFixed(2)],
+    ["Aggregate accrued funding, open positions (USD)", aggregateOpenAccruedFunding.toFixed(2)],
   ].map(([label, value]) => {
     const card = element("div", "count-card");
     card.append(element("dt", "", label), element("dd", "", String(value)));
@@ -530,7 +538,15 @@ function renderPaperPositions(snapshot) {
     const pill = element("span", "status-pill", row.status);
     pill.dataset.tone = paperStatusTones[row.status] || "missing";
     header.append(element("h3", "", `${row.asset} · ${row.direction}`), pill);
-    card.append(header, renderSparkline(row.hourly_pnl_points, Number(row.current_pnl_usd)));
+    // Open positions have accrued funding only (no trading/price P&L until
+    // close); closed positions' realized_pnl_usd is the true total but is
+    // pre-fee (no trading fees or exit slippage costs modeled yet).
+    const valueLabel =
+      row.status === "OPEN" ? "Cumulative accrued funding" : "Realized P&L (pre-fee)";
+    card.append(
+      header,
+      renderSparkline(row.hourly_pnl_points, Number(row.current_pnl_usd), valueLabel),
+    );
     return card;
   });
   nodes.paperPositionCards.replaceChildren(...cards);
