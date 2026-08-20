@@ -130,6 +130,7 @@ def _snapshot_values() -> dict[str, object]:
         "markets": _market_rows(),
         "carry_rows": _carry_rows(),
         "economics_rows": _economics_rows(),
+        "paper_position_rows": (),
         "evidence_counts": EvidenceCounts(
             raw_envelopes=0,
             instrument_specs=0,

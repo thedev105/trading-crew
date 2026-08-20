@@ -206,6 +206,36 @@ class EconomicsSummaryRow(StrictRecord):
         return self
 
 
+class PaperPositionRow(StrictRecord):
+    schema_version: Literal[1]
+    position_id: UUID
+    asset: Asset
+    direction: FundingDirection
+    status: Literal[
+        "OPEN",
+        "CLOSED_REGIME_REVERSED",
+        "CLOSED_MAX_HORIZON_REACHED",
+        "CLOSED_OPERATOR_CLOSED",
+    ]
+    opened_at: datetime
+    closed_at: datetime | None
+    current_pnl_usd: Decimal
+    hourly_pnl_points: tuple[tuple[datetime, Decimal], ...]
+
+    @field_validator("opened_at", "closed_at")
+    @classmethod
+    def normalize_optional_timestamp(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def require_coherent_status(self) -> PaperPositionRow:
+        if self.status == "OPEN" and self.closed_at is not None:
+            raise ValueError("an OPEN row must not carry a closed_at")
+        if self.status != "OPEN" and self.closed_at is None:
+            raise ValueError("a closed row must carry closed_at")
+        return self
+
+
 class FundingCycleSummary(StrictRecord):
     schema_version: Literal[1]
     cycle_id: UUID
@@ -278,6 +308,7 @@ class DashboardSnapshot(StrictRecord):
     markets: tuple[MarketEvidenceRow, ...]
     carry_rows: tuple[CarryEvidenceRow, ...]
     economics_rows: tuple[EconomicsSummaryRow, ...]
+    paper_position_rows: tuple[PaperPositionRow, ...]
     evidence_counts: EvidenceCounts
     operation_recipes: OperationRecipes
 
@@ -387,4 +418,9 @@ class DashboardSnapshot(StrictRecord):
             for timestamp in (row.known_as_of, row.evaluated_at)
         ):
             raise ValueError("economics report must not follow dashboard as-of")
+        if any(
+            (row.closed_at is not None and row.closed_at > self.as_of) or row.opened_at > self.as_of
+            for row in self.paper_position_rows
+        ):
+            raise ValueError("paper position evidence must not follow dashboard as-of")
         return self

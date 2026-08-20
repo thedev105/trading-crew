@@ -75,9 +75,7 @@ def test_append_paper_position_conflict_raises(tmp_path: Path) -> None:
     try:
         position = _position()
         store.append_paper_position(position)
-        conflicting = _position(
-            position_id=position.position_id, base_quantity=Decimal("0.6")
-        )
+        conflicting = _position(position_id=position.position_id, base_quantity=Decimal("0.6"))
         with pytest.raises(ConflictingRecordError):
             store.append_paper_position(conflicting)
     finally:
@@ -286,6 +284,111 @@ def test_paper_position_funding_accrued_reflects_posted_transactions(tmp_path: P
             )
             is False
         )
+    finally:
+        store.close()
+
+
+def test_paper_positions_as_of_returns_positions_opened_on_or_before_as_of(
+    tmp_path: Path,
+) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        early = _position(opened_at=datetime(2026, 8, 1, tzinfo=UTC))
+        late = _position(
+            position_id=uuid4(),
+            asset=Asset.ETH,
+            opened_at=datetime(2026, 8, 10, tzinfo=UTC),
+        )
+        store.append_paper_position(early)
+        store.append_paper_position(late)
+
+        assert store.paper_positions_as_of(datetime(2026, 7, 31, tzinfo=UTC)) == ()
+        assert store.paper_positions_as_of(datetime(2026, 8, 1, tzinfo=UTC)) == (early,)
+        assert store.paper_positions_as_of(datetime(2026, 8, 31, tzinfo=UTC)) == (
+            early,
+            late,
+        )
+    finally:
+        store.close()
+
+
+def test_paper_position_hourly_funding_returns_empty_with_no_accruals(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+        assert store.paper_position_hourly_funding(position.position_id) == ()
+        assert store.paper_position_hourly_funding(uuid4()) == ()
+    finally:
+        store.close()
+
+
+def test_paper_position_hourly_funding_returns_signed_deltas_in_order(tmp_path: Path) -> None:
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position = _position()
+        store.append_paper_position(position)
+
+        first_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=1),
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        second_accrual = funding_accrual_transaction(
+            position=position,
+            effective_at=position.opened_at + timedelta(hours=2),
+            lighter_rate=Decimal("-0.0002"),
+            dydx_rate=Decimal("0.0001"),
+        )
+        assert first_accrual is not None
+        assert second_accrual is not None
+        store.append_journal_transaction(first_accrual)
+        store.append_journal_transaction(second_accrual)
+
+        expected = []
+        for transaction in (first_accrual, second_accrual):
+            for posting in transaction.postings:
+                if posting.account == "paper:cash":
+                    expected.append((transaction.occurred_at, posting.debit - posting.credit))
+
+        assert store.paper_position_hourly_funding(position.position_id) == tuple(expected)
+    finally:
+        store.close()
+
+
+def test_paper_position_hourly_funding_does_not_leak_across_sequential_positions(
+    tmp_path: Path,
+) -> None:
+    """Mirrors the leak scenario covered for `paper_position_realized_funding`:
+    a later position on the same asset must not inherit an earlier,
+    already-closed position's hourly funding accruals.
+    """
+    store = DuckDBStore(tmp_path / "test.duckdb")
+    try:
+        position_a = _position()
+        store.append_paper_position(position_a)
+
+        accrual_a = funding_accrual_transaction(
+            position=position_a,
+            effective_at=position_a.opened_at + timedelta(hours=1),
+            lighter_rate=Decimal("0.0001"),
+            dydx_rate=Decimal("0.00005"),
+        )
+        assert accrual_a is not None
+        store.append_journal_transaction(accrual_a)
+        assert store.paper_position_hourly_funding(position_a.position_id) != ()
+
+        store.append_paper_position_closure(_closure(position_a.position_id))
+
+        position_b = _position(
+            position_id=uuid4(),
+            opened_at=position_a.opened_at + timedelta(days=1),
+        )
+        store.append_paper_position(position_b)
+
+        assert store.paper_position_hourly_funding(position_b.position_id) == ()
+        assert store.paper_position_hourly_funding(position_a.position_id) != ()
     finally:
         store.close()
 

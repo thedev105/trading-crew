@@ -34,6 +34,7 @@ from polytrading.web.models import (
     FundingCycleSummary,
     MarketEvidenceRow,
     OperationRecipes,
+    PaperPositionRow,
 )
 
 _VENUES = (Venue.BYBIT, Venue.HYPERLIQUID, Venue.DYDX, Venue.LIGHTER)
@@ -140,6 +141,7 @@ class DashboardBuilder:
                 for row in carry.assets
             ),
             economics_rows=tuple(self._economics_row(asset, normalized_as_of) for asset in _ASSETS),
+            paper_position_rows=self._paper_position_rows(normalized_as_of),
             evidence_counts=EvidenceCounts(**self._store.evidence_counts_as_of(normalized_as_of)),
             operation_recipes=_operation_recipes(self._database_path),
         )
@@ -243,6 +245,42 @@ class DashboardBuilder:
             evaluated_at=report.evaluated_at,
             stress_pass=stress_pass,
         )
+
+    def _paper_position_rows(self, as_of: datetime) -> tuple[PaperPositionRow, ...]:
+        rows = []
+        for position in self._store.paper_positions_as_of(as_of):
+            closure = self._store.paper_position_closure(position.position_id)
+            running_total = Decimal(0)
+            hourly_pnl_points: list[tuple[datetime, Decimal]] = []
+            for occurred_at, delta in self._store.paper_position_hourly_funding(
+                position.position_id
+            ):
+                running_total += delta
+                hourly_pnl_points.append((occurred_at, running_total))
+
+            if closure is None:
+                status = "OPEN"
+                closed_at = None
+                current_pnl_usd = self._store.paper_position_realized_funding(position.position_id)
+            else:
+                status = f"CLOSED_{closure.close_reason.value}"
+                closed_at = closure.closed_at
+                current_pnl_usd = closure.realized_pnl_usd
+
+            rows.append(
+                PaperPositionRow(
+                    schema_version=1,
+                    position_id=position.position_id,
+                    asset=position.asset,
+                    direction=position.direction,
+                    status=status,
+                    opened_at=position.opened_at,
+                    closed_at=closed_at,
+                    current_pnl_usd=current_pnl_usd,
+                    hourly_pnl_points=tuple(hourly_pnl_points),
+                )
+            )
+        return tuple(rows)
 
 
 def _operation_recipes(database_path: Path) -> OperationRecipes:

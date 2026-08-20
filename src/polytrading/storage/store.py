@@ -357,6 +357,21 @@ class DuckDBStore:
 
         return PaperPosition.model_validate_json(row[0])
 
+    def paper_positions_as_of(self, as_of: datetime) -> tuple[PaperPosition, ...]:
+        normalized_as_of = normalize_utc_timestamp(as_of)
+        rows = self._connection.execute(
+            """
+            SELECT CAST(record_json AS VARCHAR)
+            FROM paper_positions
+            WHERE opened_at <= ?
+            ORDER BY opened_at, position_id
+            """,
+            [normalized_as_of],
+        ).fetchall()
+        from polytrading.trial.paper_models import PaperPosition
+
+        return tuple(PaperPosition.model_validate_json(row[0]) for row in rows)
+
     def paper_position(self, position_id: UUID) -> PaperPosition | None:
         row = self._connection.execute(
             "SELECT CAST(record_json AS VARCHAR) FROM paper_positions WHERE position_id = ?",
@@ -801,6 +816,42 @@ class DuckDBStore:
         ).fetchone()
         total = row[0] if row is not None else None
         return Decimal(0) if total is None else Decimal(total)
+
+    def paper_position_hourly_funding(
+        self, position_id: UUID
+    ) -> tuple[tuple[datetime, Decimal], ...]:
+        """Per-hour signed funding P&L deltas for one paper position, ordered by hour.
+
+        Scoped identically to `paper_position_realized_funding` (matching on
+        the `paper:pnl:funding` account, the accrual description prefix for
+        this position's asset, and the position's identity embedded in
+        `evidence_ids`) to avoid the same cross-position leak that method's
+        docstring describes. Each accrual transaction posts mirrored
+        debit/credit amounts to `paper:cash` and `paper:pnl:funding`, so
+        `credit - debit` on `paper:pnl:funding` yields the same signed value
+        (net funding received, positive is profit) as `debit - credit` on
+        `paper:cash`.
+        """
+        position = self.paper_position(position_id)
+        if position is None:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT epoch_us(transaction.occurred_at), SUM(posting.credit - posting.debit)
+            FROM journal_postings AS posting
+            JOIN journal_transactions AS transaction
+              ON transaction.transaction_id = posting.transaction_id
+            WHERE posting.account = 'paper:pnl:funding'
+              AND transaction.description LIKE 'paper funding accrual ' || ? || ' %'
+              AND json_extract_string(transaction.evidence_ids, '$[0]') LIKE ? || ':%'
+            GROUP BY transaction.occurred_at
+            ORDER BY transaction.occurred_at
+            """,
+            [position.asset.value, str(position_id)],
+        ).fetchall()
+        return tuple(
+            (_utc_from_epoch_us(row[0]), Decimal(row[1])) for row in rows if row[0] is not None
+        )
 
     def paper_position_funding_accrued(self, position_id: UUID, effective_at: datetime) -> bool:
         """True when the hourly funding accrual for this position/hour is already posted.
