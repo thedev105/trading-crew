@@ -28,6 +28,10 @@ from polytrading.trial.paper_models import PaperCloseReason, PaperPosition, Pape
 PAPER_RESEARCH_WARNING = (
     "Research only — simulated paper position, not a live fill or trading authorization."
 )
+# Note (not part of the frozen warning string above, which is a Literal type other
+# code depends on): the forward paper track record does not yet model trading fees
+# or exit slippage costs — see close_paper_position's realized_pnl_usd docstring
+# note below. Fee/slippage modeling is deferred to a follow-up task.
 
 # Every JournalPosting this module produces carries a USD-denominated notional
 # or funding figure (never a crypto quantity), so the ledger's per-asset
@@ -52,7 +56,9 @@ def _entry_levels(
 ) -> tuple[tuple, tuple]:
     if direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX:
         return lighter_book.bids[:20], dydx_book.asks[:20]
-    return lighter_book.asks[:20], dydx_book.bids[:20]
+    if direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER:
+        return lighter_book.asks[:20], dydx_book.bids[:20]
+    raise ValueError("unsupported funding direction")
 
 
 def _exit_levels(
@@ -60,7 +66,9 @@ def _exit_levels(
 ) -> tuple[tuple, tuple]:
     if direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX:
         return lighter_book.asks[:20], dydx_book.bids[:20]
-    return lighter_book.bids[:20], dydx_book.asks[:20]
+    if direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER:
+        return lighter_book.bids[:20], dydx_book.asks[:20]
+    raise ValueError("unsupported funding direction")
 
 
 def _walk_base(levels: tuple, base_quantity: Decimal, instrument: InstrumentSpec) -> WalkedQuote:
@@ -75,7 +83,9 @@ def _walk_base(levels: tuple, base_quantity: Decimal, instrument: InstrumentSpec
 def _leg_is_long(direction: FundingDirection, venue: Venue) -> bool:
     if direction is FundingDirection.SHORT_LIGHTER_LONG_DYDX:
         return venue is Venue.DYDX
-    return venue is Venue.LIGHTER
+    if direction is FundingDirection.SHORT_DYDX_LONG_LIGHTER:
+        return venue is Venue.LIGHTER
+    raise ValueError("unsupported funding direction")
 
 
 def open_paper_position(
@@ -182,6 +192,13 @@ def close_paper_position(
     close_reason: PaperCloseReason,
     realized_funding_usd: Decimal,
 ) -> tuple[PaperPositionClosure, JournalTransaction]:
+    """Close a paper position and compute its realized P&L.
+
+    Note: the returned closure's ``realized_pnl_usd`` is pre-fee — it sums
+    funding accrual and price movement (trading P&L) only. It does not model
+    trading fees or exit slippage costs, even though the ``SHADOW_CANDIDATE``
+    economics gate that authorizes the position does model those costs.
+    """
     lighter_levels, dydx_levels = _exit_levels(
         position.direction, current_books.lighter, current_books.dydx
     )
