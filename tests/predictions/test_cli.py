@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -33,12 +34,19 @@ def test_predictions_command_does_not_collide_with_existing_top_level_names() ->
     assert "predictions" not in existing
 
 
-def test_predictions_venues_status_reports_missing_manifests(tmp_path: Path) -> None:
+def test_predictions_venues_status_reports_missing_manifests(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     database = tmp_path / "predictions.duckdb"
     PredictionMarketStore(database).close()
 
     exit_code = main(["predictions", "venues", "status", "--db", str(database), "--format", "json"])
     assert exit_code == 0
+
+    output = json.loads(capsys.readouterr().out)
+    limitless_row = next(row for row in output["venues"] if row["venue"] == "limitless")
+    assert limitless_row["collection_allowed"] is False
+    assert limitless_row["reason"] == "MANIFEST_NOT_FOUND"
 
 
 def test_predictions_venues_status_rejects_a_missing_database(tmp_path: Path) -> None:

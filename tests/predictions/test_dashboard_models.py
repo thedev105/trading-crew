@@ -23,7 +23,7 @@ def test_snapshot_recipes_are_copy_only_text(tmp_path: Path) -> None:
     assert len(snapshot.recipes.recipes) > 0
 
 
-def test_snapshot_includes_health_for_both_venues(tmp_path: Path) -> None:
+def test_snapshot_includes_health_for_all_venues(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     store.append_venue_manifest(
         venue_manifest(
@@ -35,6 +35,7 @@ def test_snapshot_includes_health_for_both_venues(tmp_path: Path) -> None:
     assert {venue.venue for venue in snapshot.health.venues} == {
         PredictionVenue.POLYMARKET,
         PredictionVenue.KALSHI,
+        PredictionVenue.LIMITLESS,
     }
 
 

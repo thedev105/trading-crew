@@ -59,10 +59,7 @@ class PredictionHealthAuditor:
         self._store = store
 
     def audit(self, as_of: datetime) -> PredictionHealthReport:
-        venues = tuple(
-            self._venue_health(venue, as_of)
-            for venue in (PredictionVenue.POLYMARKET, PredictionVenue.KALSHI)
-        )
+        venues = tuple(self._venue_health(venue, as_of) for venue in PredictionVenue)
         return PredictionHealthReport(
             schema_version=1,
             as_of=as_of,

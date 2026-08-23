@@ -31,7 +31,7 @@ class PredictionDashboardBuilder:
     def build(self, as_of: datetime) -> PredictionDashboardSnapshot:
         health = PredictionHealthAuditor(self._store).audit(as_of)
         markets: list[MarketRecord] = []
-        for venue in (PredictionVenue.POLYMARKET, PredictionVenue.KALSHI):
+        for venue in PredictionVenue:
             markets.extend(self._store.markets_as_of(venue, as_of))
         markets.sort(key=lambda market: market.retrieved_at, reverse=True)
         shown_markets = tuple(markets[:_MAX_MARKETS_SHOWN])

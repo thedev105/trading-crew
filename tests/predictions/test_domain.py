@@ -50,9 +50,24 @@ def test_prediction_record_normalizes_non_utc_aware_timestamps() -> None:
     assert probe.observed_at.utcoffset() == timedelta(0)
 
 
-def test_prediction_venue_and_source_share_exact_two_values() -> None:
-    assert {member.value for member in PredictionVenue} == {"polymarket", "kalshi"}
-    assert {member.value for member in PredictionSource} == {"polymarket", "kalshi"}
+def test_prediction_venue_and_source_share_exact_three_values() -> None:
+    assert {member.value for member in PredictionVenue} == {"polymarket", "kalshi", "limitless"}
+    assert {member.value for member in PredictionSource} == {"polymarket", "kalshi", "limitless"}
+
+
+def test_limitless_is_a_prediction_venue_and_source() -> None:
+    assert PredictionVenue("limitless") is PredictionVenue.LIMITLESS
+    assert PredictionSource("limitless") is PredictionSource.LIMITLESS
+
+
+def test_limitless_market_may_carry_negative_risk() -> None:
+    market = market_record(venue=PredictionVenue.LIMITLESS, negative_risk=True)
+    assert market.negative_risk is True
+
+
+def test_kalshi_market_still_rejects_negative_risk() -> None:
+    with pytest.raises(ValidationError, match="negative_risk"):
+        market_record(venue=PredictionVenue.KALSHI, negative_risk=False)
 
 
 def test_raw_envelope_requires_sha256_source_hash() -> None:

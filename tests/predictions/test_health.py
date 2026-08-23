@@ -13,7 +13,7 @@ def test_venue_with_no_evidence_is_not_collected(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     report = PredictionHealthAuditor(store).audit(NOW)
 
-    assert len(report.venues) == 2
+    assert len(report.venues) == 3
     assert all(venue.status is VenueEvidenceStatus.NOT_COLLECTED for venue in report.venues)
     assert all(venue.collection_gate.allowed is False for venue in report.venues)
 

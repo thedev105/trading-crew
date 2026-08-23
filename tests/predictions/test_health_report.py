@@ -31,7 +31,11 @@ def test_json_renderer_is_canonical_sorted_and_byte_stable(tmp_path: Path) -> No
     assert first == second
     parsed = json.loads(first)
     assert parsed["as_of"] == "2026-08-15T12:00:00Z"
-    assert {venue["venue"] for venue in parsed["venues"]} == {"polymarket", "kalshi"}
+    assert {venue["venue"] for venue in parsed["venues"]} == {
+        "polymarket",
+        "kalshi",
+        "limitless",
+    }
 
 
 def test_text_renderer_includes_every_venue_and_all_warnings(tmp_path: Path) -> None:
@@ -39,6 +43,7 @@ def test_text_renderer_includes_every_venue_and_all_warnings(tmp_path: Path) -> 
     text = render_prediction_health_text(report)
     assert "polymarket" in text
     assert "kalshi" in text
+    assert "limitless" in text
     for warning in report.warnings:
         assert warning in text
 

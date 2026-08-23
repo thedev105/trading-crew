@@ -63,11 +63,13 @@ class PredictionRecord(BaseModel):
 class PredictionVenue(StrEnum):
     POLYMARKET = "polymarket"
     KALSHI = "kalshi"
+    LIMITLESS = "limitless"
 
 
 class PredictionSource(StrEnum):
     POLYMARKET = "polymarket"
     KALSHI = "kalshi"
+    LIMITLESS = "limitless"
 
 
 class PredictionRawEnvelope(PredictionRecord):
@@ -118,6 +120,11 @@ class MarketRecord(PredictionRecord):
 
     @model_validator(mode="after")
     def _require_matching_token_count(self) -> MarketRecord:
+        """Validate outcome/token alignment and the venue-specific negative_risk contract.
+
+        ``negative_risk`` is Polymarket/Limitless-specific (both use conditional-token
+        markets); Kalshi has no such concept, so a Kalshi record must leave it unset.
+        """
         if self.outcome_token_ids is not None and len(self.outcome_token_ids) != len(self.outcomes):
             raise ValueError("outcome token IDs must align one-to-one with outcomes")
         if self.venue is PredictionVenue.KALSHI and self.negative_risk is not None:

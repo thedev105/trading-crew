@@ -19,7 +19,11 @@ def test_dashboard_serves_the_snapshot_at_the_json_endpoint(tmp_path: Path) -> N
     assert response.status == HTTPStatus.OK
     document = json.loads(response.body)
     assert document["as_of"] == "2026-08-16T12:00:00Z"
-    assert {venue["venue"] for venue in document["health"]["venues"]} == {"polymarket", "kalshi"}
+    assert {venue["venue"] for venue in document["health"]["venues"]} == {
+        "polymarket",
+        "kalshi",
+        "limitless",
+    }
 
 
 def test_dashboard_rejects_a_non_loopback_host(tmp_path: Path) -> None:

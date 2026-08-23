@@ -102,7 +102,7 @@ def _run_venues_status(arguments: argparse.Namespace) -> int:
     try:
         as_of = _utc_now()
         rows = []
-        for venue in (PredictionVenue.POLYMARKET, PredictionVenue.KALSHI):
+        for venue in PredictionVenue:
             manifest = store.latest_venue_manifest_as_of(venue, as_of)
             gate = evaluate_collection_gate(manifest, venue=venue)
             rows.append(
