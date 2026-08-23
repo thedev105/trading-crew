@@ -21,6 +21,7 @@ from polytrading.predictions.health_report import (
     render_prediction_health_text,
 )
 from polytrading.predictions.kalshi import KalshiAdapter
+from polytrading.predictions.limitless import LimitlessAdapter
 from polytrading.predictions.manifest import evaluate_collection_gate
 from polytrading.predictions.polymarket import PolymarketAdapter
 from polytrading.predictions.storage.store import PredictionMarketStore
@@ -30,6 +31,7 @@ _WRITER_LEASE_TIMEOUT_SECONDS = 30.0
 _ADAPTER_BY_VENUE = {
     PredictionVenue.POLYMARKET: PolymarketAdapter,
     PredictionVenue.KALSHI: KalshiAdapter,
+    PredictionVenue.LIMITLESS: LimitlessAdapter,
 }
 
 
@@ -63,7 +65,7 @@ def add_predictions_subcommands(
         "collect", help="collect committed venue public evidence"
     )
     collect_commands = collect.add_subparsers(dest="predictions_collect_command", required=True)
-    for name in ("polymarket", "kalshi"):
+    for name in ("polymarket", "kalshi", "limitless"):
         collector = collect_commands.add_parser(name, help=f"collect {name} public evidence")
         collector.add_argument("--db", required=True, type=Path)
 

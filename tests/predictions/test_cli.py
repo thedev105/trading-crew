@@ -15,6 +15,7 @@ from tests.predictions.domain_helpers import NOW
 from tests.predictions.manifest_helpers import venue_manifest
 
 MARKETS_FIXTURE = Path("tests/fixtures/predictions/polymarket/gamma_markets_page_1.json")
+LIMITLESS_MARKETS_FIXTURE = Path("tests/fixtures/predictions/limitless/markets_active_page_1.json")
 
 
 def test_predictions_collect_is_a_subcommand_tree_not_a_venue_flag() -> None:
@@ -74,6 +75,62 @@ def test_collect_polymarket_exits_two_before_any_network_call_when_watchlisted(
 
     exit_code = main(["predictions", "collect", "polymarket", "--db", str(database)])
     assert exit_code == 2
+
+
+def test_collect_limitless_fails_closed_without_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def reject_network(*_a: object, **_k: object) -> httpx.AsyncClient:
+        raise AssertionError("collect must not open a network client when gate-rejected")
+
+    monkeypatch.setattr(predictions_cli, "make_public_http_client", reject_network)
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()  # migrated, empty
+
+    exit_code = main(["predictions", "collect", "limitless", "--db", str(database)])
+    assert exit_code == 2
+    assert "MANIFEST_NOT_FOUND" in capsys.readouterr().err
+
+
+def test_collect_limitless_with_permitting_manifest_stores_markets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets/active":
+            return httpx.Response(
+                200,
+                content=LIMITLESS_MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"content-type": "application/json"})
+
+    def fake_client(**_kwargs: object) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(predictions_cli, "make_public_http_client", fake_client)
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.LIMITLESS,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(["predictions", "collect", "limitless", "--db", str(database)])
+    assert exit_code == 0
+    assert "collected 3 limitless markets" in capsys.readouterr().out
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        markets = verify_store.markets_as_of(
+            PredictionVenue.LIMITLESS, datetime.now(UTC) + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert len(markets) == 3
 
 
 def test_predictions_health_exits_zero_when_current(
