@@ -1,0 +1,51 @@
+{
+  "data": [
+    {
+      "id": 7495,
+      "address": "0x76d3e2098Be66Aa7E15138F467390f0Eb7349B9b",
+      "conditionId": "clob-market-1",
+      "title": "$DOGE above $0.21652 on Sep 1, 12:00 UTC?",
+      "description": "This market will resolve to \"YES\" if the price of $DOGE is above $0.21652 at the deadline.",
+      "status": "FUNDED",
+      "expired": false,
+      "expirationDate": "Sep 1, 2025",
+      "expirationTimestamp": 1756728000000,
+      "tradeType": "clob",
+      "marketType": "single",
+      "slug": "dollardoge-above-dollar021652-on-sep-1-1200-utc",
+      "tokens": {
+        "yes": "78695809706775235377718830617502491971378663350108823320552375535762230401980",
+        "no": "8642544735724967665477930445154251213223700833624811358896571351781151616445"
+      },
+      "negRiskRequestId": "negrisk-group-42"
+    },
+    {
+      "id": 7497,
+      "address": "0x0000000000000000000000000000000000000001",
+      "conditionId": "amm-market-1",
+      "title": "Will the AMM market resolve YES?",
+      "description": "An automated-market-maker prediction market.",
+      "status": "FUNDED",
+      "expired": false,
+      "expirationDate": "Sep 1, 2025",
+      "expirationTimestamp": 1756728000000,
+      "tradeType": "amm",
+      "marketType": "single",
+      "slug": "will-the-amm-market-resolve-yes",
+      "positionIds": [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222"
+      ]
+    },
+    {
+      "id": 7498,
+      "description": "A row with no usable identifier and no title.",
+      "status": "FUNDED",
+      "expired": false,
+      "expirationTimestamp": 1756728000000,
+      "tradeType": "clob",
+      "marketType": "single"
+    }
+  ],
+  "totalMarketsCount": 3
+}
