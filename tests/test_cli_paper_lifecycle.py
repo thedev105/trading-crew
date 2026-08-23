@@ -8,7 +8,7 @@ per-command tests in `tests/test_cli_paper.py` and
 `tests/test_cli_paper_monitor.py` exercise together.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
