@@ -99,7 +99,7 @@ class MarketRecord(PredictionRecord):
     negative_risk: bool | None
     active: bool
     closed: bool
-    restricted: bool
+    restricted: bool | None
     order_book_enabled: bool
     start_at: datetime | None
     end_at: datetime | None

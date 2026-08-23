@@ -358,6 +358,24 @@ def _parse_market_row(
     if negative_risk_warning is not None:
         warnings.append(negative_risk_warning)
 
+    # Limitless's public markets API does not publish a per-market jurisdictional
+    # restriction flag (unlike Polymarket's Gamma `restricted`); see
+    # https://docs.limitless.exchange/api-reference/markets/get-market. Per spec
+    # section 6.2, an unsupported venue field stays unknown rather than being
+    # defaulted, so this is left None with a structured warning, never guessed.
+    warnings.append(
+        PredictionAdapterWarning(
+            code="limitless_restricted_unknown",
+            venue=PredictionVenue.LIMITLESS,
+            endpoint=_MARKETS_ENDPOINT,
+            market_id=identifier,
+            message=(
+                "Limitless does not expose a per-market jurisdictional-restriction "
+                "field; restricted is unknown, not defaulted"
+            ),
+        )
+    )
+
     end_at = _optional_datetime_from_ms(row.get("expirationTimestamp"))
     slug = row.get("slug")
 
@@ -375,12 +393,7 @@ def _parse_market_row(
         negative_risk=negative_risk,
         active=active,
         closed=closed,
-        # Limitless's public markets API does not publish a per-market jurisdictional
-        # restriction flag (unlike Polymarket's Gamma `restricted`); see
-        # https://docs.limitless.exchange/api-reference/markets/get-market. There is
-        # no venue signal to read here, so this is a documented absence rather than a
-        # per-record guess.
-        restricted=False,
+        restricted=None,
         order_book_enabled=order_book_enabled,
         start_at=None,
         end_at=end_at,

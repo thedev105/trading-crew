@@ -98,7 +98,26 @@ def test_clob_market_is_order_book_enabled_and_negative_risk_round_trips() -> No
     assert len(clob.outcome_token_ids) == 2
     assert clob.negative_risk is True
     assert clob.event_id == "negrisk-group-42"
-    assert not any(warning.market_id == "clob-market-1" for warning in batch.warnings)
+    assert clob.restricted is None
+    clob_warning_codes = {w.code for w in batch.warnings if w.market_id == "clob-market-1"}
+    assert clob_warning_codes == {"limitless_restricted_unknown"}
+
+
+def test_restricted_is_unknown_not_defaulted_and_warns_for_every_market() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(fixture_bytes("markets_active_page_1.json"))
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    markets = [item for item in batch.normalized if isinstance(item, MarketRecord)]
+    assert markets
+    assert all(market.restricted is None for market in markets)
+    for market in markets:
+        assert any(
+            w.code == "limitless_restricted_unknown" and w.market_id == market.market_id
+            for w in batch.warnings
+        )
 
 
 def test_amm_market_is_not_order_book_enabled_and_warns() -> None:
