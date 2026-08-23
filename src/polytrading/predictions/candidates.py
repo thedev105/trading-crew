@@ -50,6 +50,26 @@ def _leg_or_none(
     )
 
 
+def _all_legs_or_none(
+    registry: PredictionRegistry,
+    markets: list[MarketRecord],
+    as_of: datetime,
+) -> tuple[CandidateLeg, ...] | None:
+    """Build a leg for every market in ``markets``, or ``None`` if any single one can't.
+
+    A partial leg list for an outcome-set group would misrepresent the venue's actual
+    event-group membership -- worse than skipping -- so this is all-or-nothing for the
+    whole group, not per-member: one unresolvable member fails the entire group closed.
+    """
+    legs: list[CandidateLeg] = []
+    for market in markets:
+        leg = _leg_or_none(registry, market, as_of, None)
+        if leg is None:
+            return None
+        legs.append(leg)
+    return tuple(legs)
+
+
 def _outcome_membership_propositions(
     legs: tuple[CandidateLeg, ...],
 ) -> tuple[TypedProposition, ...]:
@@ -167,17 +187,9 @@ def propose_venue_native_outcome_sets(
             continue
 
         members = sorted(members, key=lambda member: member.market_id)
-        legs: list[CandidateLeg] = []
-        for member in members:
-            leg = _leg_or_none(registry, member, as_of, None)
-            if leg is None:
-                legs = []
-                break
-            legs.append(leg)
-        if not legs:
+        legs_tuple = _all_legs_or_none(registry, members, as_of)
+        if legs_tuple is None:
             continue
-
-        legs_tuple = tuple(legs)
         candidates.append(
             CandidateRelationship(
                 schema_version=1,

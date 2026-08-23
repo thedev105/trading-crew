@@ -226,6 +226,58 @@ def test_market_without_event_id_is_never_grouped(tmp_path: Path) -> None:
     assert candidates == ()
 
 
+def test_group_with_one_unresolvable_member_is_skipped_but_sibling_group_survives(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+
+    # Broken group: three members, one of which references a rule version that never
+    # got appended to the registry.
+    broken_1 = market_record(
+        market_id="broken-market-1",
+        event_id="event-broken",
+        negative_risk=True,
+        rule_version_id=RULE_A,
+    )
+    broken_2 = market_record(
+        market_id="broken-market-2",
+        event_id="event-broken",
+        negative_risk=True,
+        rule_version_id=RULE_B,
+    )
+    broken_3_missing_rule = market_record(
+        market_id="broken-market-3",
+        event_id="event-broken",
+        negative_risk=True,
+        rule_version_id=UUID("00000000-0000-0000-0000-000000005999"),
+    )
+    _seed(store, broken_1, rule_version(rule_version_id=RULE_A, market_id=broken_1.market_id))
+    _seed(store, broken_2, rule_version(rule_version_id=RULE_B, market_id=broken_2.market_id))
+    store.append_market(broken_3_missing_rule)  # no matching rule_version appended
+
+    # Sibling, fully-resolvable group in the same venue/call. Rule versions are keyed only
+    # by rule_version_id in the store, so this group needs its own distinct IDs.
+    rule_ok_1 = UUID("00000000-0000-0000-0000-000000005101")
+    rule_ok_2 = UUID("00000000-0000-0000-0000-000000005102")
+    ok_1 = market_record(
+        market_id="ok-market-1", event_id="event-ok", negative_risk=True, rule_version_id=rule_ok_1
+    )
+    ok_2 = market_record(
+        market_id="ok-market-2", event_id="event-ok", negative_risk=True, rule_version_id=rule_ok_2
+    )
+    _seed(store, ok_1, rule_version(rule_version_id=rule_ok_1, market_id=ok_1.market_id))
+    _seed(store, ok_2, rule_version(rule_version_id=rule_ok_2, market_id=ok_2.market_id))
+
+    registry = PredictionRegistry(store)
+
+    candidates = propose_venue_native_outcome_sets(
+        registry, PredictionVenue.POLYMARKET, AS_OF, trial_family_id="tf-1", code_revision="abc"
+    )
+
+    (candidate,) = candidates
+    assert {leg.market_id for leg in candidate.legs} == {"ok-market-1", "ok-market-2"}
+
+
 def test_regeneration_is_identity_stable(tmp_path: Path) -> None:
     store = _store(tmp_path)
     market = market_record(rule_version_id=RULE_A)
