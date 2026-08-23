@@ -76,8 +76,8 @@ def test_fetch_markets_persists_raw_before_normalized_lineage() -> None:
     assert all(record.venue is PredictionVenue.LIMITLESS for record in batch.raw)
     markets = [item for item in batch.normalized if isinstance(item, MarketRecord)]
     rule_versions = [item for item in batch.normalized if isinstance(item, RuleVersion)]
-    assert len(markets) == 2
-    assert len(rule_versions) == 2
+    assert len(markets) == 3
+    assert len(rule_versions) == 3
 
 
 def test_clob_market_is_order_book_enabled_and_negative_risk_round_trips() -> None:
@@ -134,6 +134,51 @@ def test_amm_market_is_not_order_book_enabled_and_warns() -> None:
     assert any(
         w.code == "limitless_amm_market" and w.market_id == "amm-market-1" for w in batch.warnings
     )
+    # amm-market-1's fixture row has no negRiskRequestId key at all (unlike a CLOB row,
+    # where it is documented as always present, nullable) -- negative_risk must stay
+    # unknown, not be defaulted to False, and the omission must be flagged.
+    assert amm.negative_risk is None
+    assert any(
+        w.code == "limitless_negative_risk_unknown" and w.market_id == "amm-market-1"
+        for w in batch.warnings
+    )
+
+
+def test_market_with_missing_tokens_leaves_outcome_token_ids_unknown_and_warns() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(fixture_bytes("markets_active_page_1.json"))
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    market = next(
+        item
+        for item in batch.normalized
+        if isinstance(item, MarketRecord) and item.market_id == "clob-market-missing-tokens"
+    )
+    assert market.outcome_token_ids is None
+    assert market.outcomes == ("Yes", "No")
+    assert any(
+        w.code == "limitless_outcome_tokens_unavailable"
+        and w.market_id == "clob-market-missing-tokens"
+        for w in batch.warnings
+    )
+
+
+def test_group_market_type_is_skipped_with_warning_and_not_normalized() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(fixture_bytes("markets_active_page_1.json"))
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+
+    group_slug = "norway-vs-england-team-to-advance"
+    market_ids = {item.market_id for item in batch.normalized if isinstance(item, MarketRecord)}
+    assert group_slug not in market_ids
+    assert any(
+        w.code == "limitless_market_incomplete" and w.market_id == group_slug
+        for w in batch.warnings
+    )
 
 
 def test_incomplete_market_is_skipped_with_warning_not_defaulted() -> None:
@@ -144,8 +189,9 @@ def test_incomplete_market_is_skipped_with_warning_not_defaulted() -> None:
     batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
 
     market_ids = {item.market_id for item in batch.normalized if isinstance(item, MarketRecord)}
-    assert len(market_ids) == 2
-    assert any(w.code == "limitless_market_incomplete" for w in batch.warnings)
+    assert len(market_ids) == 3
+    incomplete_warnings = [w for w in batch.warnings if w.code == "limitless_market_incomplete"]
+    assert len(incomplete_warnings) == 2
 
 
 def test_book_trade_fee_endpoints_are_explicitly_not_collected() -> None:

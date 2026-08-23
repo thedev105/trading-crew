@@ -45,7 +45,32 @@
       "expirationTimestamp": 1756728000000,
       "tradeType": "clob",
       "marketType": "single"
+    },
+    {
+      "id": 7499,
+      "address": "0x0000000000000000000000000000000000000002",
+      "conditionId": "clob-market-missing-tokens",
+      "title": "A clob market with no tokens object?",
+      "description": "A CLOB row missing its tokens.yes/tokens.no pair.",
+      "status": "FUNDED",
+      "expired": false,
+      "expirationTimestamp": 1756728000000,
+      "tradeType": "clob",
+      "marketType": "single",
+      "slug": "a-clob-market-with-no-tokens-object"
+    },
+    {
+      "id": 10000078,
+      "slug": "norway-vs-england-team-to-advance",
+      "title": "Norway vs England: team to advance?",
+      "description": "A NegRisk group bundling one submarket per outcome.",
+      "status": "FUNDED",
+      "expired": false,
+      "expirationTimestamp": 1756728000000,
+      "tradeType": "group",
+      "marketType": "group",
+      "outcomeTokens": ["Norway", "England"]
     }
   ],
-  "totalMarketsCount": 3
+  "totalMarketsCount": 5
 }
