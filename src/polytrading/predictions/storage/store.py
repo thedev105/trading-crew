@@ -13,6 +13,7 @@ from typing import Any
 import duckdb
 from pydantic import BaseModel
 
+from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.domain import (
     MarketRecord,
     PredictionBookSnapshot,
@@ -238,6 +239,26 @@ class PredictionMarketStore:
             insert_params=[record.venue.value, record.market_id, record.observed_at],
         )
 
+    def append_candidate_relationship(self, record: CandidateRelationship) -> bool:
+        return self._append_keyed(
+            table="candidate_relationships",
+            record=record,
+            label="candidate relationship",
+            where="candidate_id = ?",
+            key_params=[record.candidate_id],
+            insert_columns=(
+                "candidate_id, relationship_type, trial_family_id, observed_at, "
+                "information_cutoff, record_json, record_hash"
+            ),
+            insert_params=[
+                record.candidate_id,
+                record.relationship_type.value,
+                record.trial_family_id,
+                record.observed_at,
+                record.information_cutoff,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -388,6 +409,17 @@ class PredictionMarketStore:
             [venue.value, market_id, as_of],
         ).fetchone()
         return None if row is None else PredictionFeeRate.model_validate_json(row[0])
+
+    def candidate_relationships_as_of(self, as_of: datetime) -> tuple[CandidateRelationship, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM candidate_relationships
+            WHERE observed_at <= ?
+            ORDER BY observed_at, candidate_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(CandidateRelationship.model_validate_json(row[0]) for row in rows)
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {

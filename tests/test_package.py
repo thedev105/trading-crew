@@ -360,6 +360,7 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
         ]
         assert prediction_migration_members == [
             "polytrading/predictions/storage/schema/001_prediction_core.sql",
+            "polytrading/predictions/storage/schema/002_candidate_relationships.sql",
         ]
         prediction_web_asset_members = {
             name

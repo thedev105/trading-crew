@@ -7,6 +7,7 @@ import pytest
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
+from tests.predictions.candidate_helpers import candidate_relationship
 from tests.predictions.domain_helpers import (
     NOW,
     fee_rate,
@@ -31,6 +32,7 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "trades",
         "prediction_books",
         "prediction_fee_rates",
+        "candidate_relationships",
         "schema_migrations",
     } <= tables
     perpetual_futures_tables = {
@@ -244,3 +246,37 @@ def test_evidence_counts_as_of_sums_every_table(tmp_path: Path) -> None:
         "prediction_books": 1,
         "prediction_fee_rates": 1,
     }
+
+
+def test_candidate_relationship_round_trip_is_idempotent_and_conflict_safe(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    candidate = candidate_relationship()
+
+    assert store.append_candidate_relationship(candidate) is True
+    assert store.append_candidate_relationship(candidate) is False
+    with pytest.raises(ConflictingRecordError):
+        store.append_candidate_relationship(
+            candidate.model_copy(update={"trial_family_id": "different-family"})
+        )
+
+
+def test_candidate_relationships_as_of_respects_the_cutoff(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = candidate_relationship(
+        candidate_id=UUID("00000000-0000-0000-0000-000000004001"),
+        observed_at=NOW - timedelta(hours=1),
+        information_cutoff=NOW - timedelta(hours=1),
+    )
+    late = candidate_relationship(
+        candidate_id=UUID("00000000-0000-0000-0000-000000004002"),
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    store.append_candidate_relationship(early)
+    store.append_candidate_relationship(late)
+
+    assert store.candidate_relationships_as_of(NOW - timedelta(minutes=30)) == (early,)
+    assert store.candidate_relationships_as_of(NOW) == (early, late)
+    assert store.candidate_relationships_as_of(NOW - timedelta(hours=2)) == ()
