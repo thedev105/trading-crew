@@ -136,7 +136,8 @@ def test_dashboard_client_renders_candidates_labeled_by_disposition_with_ai_badg
     assert "renderCandidates(snapshot);" in javascript
     assert "snapshot.candidates" in javascript
     assert "cell(candidate.disposition)" in javascript
-    assert '"AI-nominated — quarantined"' in javascript
+    assert '"AI-nominated"' in javascript
+    assert '"AI-nominated — quarantined"' not in javascript
     assert 'candidate.provenance_kind === "ai"' in javascript
 
 
@@ -151,7 +152,7 @@ def test_dashboard_candidates_panel_never_uses_forbidden_words() -> None:
         assert forbidden not in css
 
 
-def test_dashboard_ai_provenance_candidate_shows_quarantined_badge_in_snapshot(
+def test_dashboard_ai_provenance_candidate_carries_its_own_disposition_in_snapshot(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "predictions.duckdb"
@@ -169,3 +170,26 @@ def test_dashboard_ai_provenance_candidate_shows_quarantined_badge_in_snapshot(
     document = json.loads(response.body)
     assert document["candidates"]["latest"][0]["provenance_kind"] == "ai"
     assert document["candidates"]["latest"][0]["disposition"] == "quarantined"
+
+
+def test_dashboard_ai_provenance_candidate_disposition_is_not_forced_to_quarantined(
+    tmp_path: Path,
+) -> None:
+    # An AI-provenance candidate may be rejected as well as quarantined; the JSON
+    # snapshot's disposition field must reflect the candidate's actual disposition,
+    # not the badge text the client happens to render alongside it.
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(
+        candidate_relationship(
+            disposition=CandidateDisposition.REJECTED, provenance=ai_provenance()
+        )
+    )
+    store.close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+
+    document = json.loads(response.body)
+    assert document["candidates"]["latest"][0]["provenance_kind"] == "ai"
+    assert document["candidates"]["latest"][0]["disposition"] == "rejected"

@@ -116,7 +116,7 @@ function renderCandidates(snapshot) {
     if (candidate.provenance_kind === "ai") {
       const badge = document.createElement("span");
       badge.className = "candidate-badge";
-      badge.textContent = "AI-nominated — quarantined";
+      badge.textContent = "AI-nominated";
       provenanceCell.append(" ", badge);
     }
     row.append(
