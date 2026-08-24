@@ -99,7 +99,10 @@ class PredictionDashboardBuilder:
             f"polytrading predictions venues status --db {db} --format json",
             f"polytrading predictions collect polymarket --db {db}",
             f"polytrading predictions collect kalshi --db {db}",
+            f"polytrading predictions collect limitless --db {db}",
             f"polytrading predictions health --db {db} --format json",
+            f"polytrading predictions candidates --db {db} "
+            "--venues polymarket,kalshi,limitless --format json",
         )
 
 
