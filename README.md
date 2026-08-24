@@ -888,8 +888,11 @@ All candidate relationships this increment produces are quarantined research art
 trading opportunities. They record that two or more market legs might describe the same or
 complementary real-world outcomes, in the same append-only, disposition-labeled, review-gated way
 this project already treats every other unproven observation. Deterministic equivalence proof, a
-payoff compiler, and economics remain future increments; nothing here approves a candidate, sizes a
-position, or authorizes execution.
+payoff compiler, and conservative economics were future increments as of this section; section 19
+covers what increment 3 built on top of them. Nothing `predictions candidates` itself produces
+approves a candidate, sizes a position, or authorizes execution — only an operator-authored
+attestation followed by `predictions prove` and `predictions scan` (section 19) can ever move a
+candidate past `quarantined`.
 
 ### Limitless as a third, conditionally-gated venue
 
@@ -987,3 +990,188 @@ cross-venue nomination is disabled as described above. The panel's own labels ne
 "risk-free," "guaranteed," or "approved": `quarantined` is the only disposition a generator or the
 scout bridge can currently produce, and only a separate, explicit human review can ever move a
 candidate to `proof_ready`.
+
+## 19. Rule attestations, deterministic proofs, and the conservative scan (increment 3)
+
+This increment adds the layer between a quarantined candidate relationship (section 18) and a
+research-only shadow finding: operator-authored typed rule facts, four deterministic payoff
+proof templates compiled from those facts, and a conservative depth-aware economics scan.
+Nothing here approves a candidate, sizes a position, or authorizes execution. A
+`SHADOW_CANDIDATE` scan decision is a research finding for further human review, never an
+opportunity or an instruction to trade — and a stable rejection across repeated scans is just as
+valid a result as a `SHADOW_CANDIDATE`, not a failure to find one.
+
+### Rule-relevant rule-version identity
+
+A market's `rule_version_id` is now derived from only its rule-relevant fields — venue,
+`market_id`, question, description, resolution source, outcomes, and end time — rather than the
+raw collected page's hash. An unrelated byte change elsewhere on a collected page (page layout,
+an unrelated field, whitespace) no longer mints a new rule version for a market whose actual
+rule content hasn't changed, since a new id would otherwise churn every downstream candidate and
+attestation identity that folds in `rule_version_id`. This is a one-time, non-retroactive
+transition: only markets normalized after this change get a rule-relevant id, and previously
+persisted rule-version rows keep whatever id they were minted with.
+
+### Executable book and fee collection (`--books`)
+
+```bash
+.venv/bin/polytrading predictions collect polymarket --db var/prediction-markets.duckdb --books 5
+.venv/bin/polytrading predictions collect kalshi --db var/prediction-markets.duckdb --books 5
+```
+
+`--books N` (default `0`, markets/rules only) additionally collects executable order-book
+snapshots and a fee-rate record for up to `N` order-book-enabled, active, open markets from that
+same collection run, selected deterministically by ascending `market_id`. This is the CLI
+surface increment 1 deferred (section 17): the same `fetch_book_snapshot`/`fetch_fee_rate`
+adapter methods, now reachable without hand-calling them. A single market's book/fee collection
+failure is isolated and logged as a warning rather than aborting the whole run or the markets
+already collected.
+
+Kalshi exposes no public live fee-rate endpoint, so `--books` collection against Kalshi records
+no fee evidence for any market — this is by design, not a gap the adapter tries to paper over.
+`predictions scan` (below) therefore cannot evaluate economics for a Kalshi leg until an operator
+supplies fee evidence some other way: it stays `INSUFFICIENT_EVIDENCE` with reason `MISSING_FEE`.
+Limitless has no book/fee collection at all in this increment (section 18); passing `--books`
+greater than zero for `limitless` is rejected outright rather than silently collecting nothing.
+
+### Operator-authored rule attestations
+
+```bash
+.venv/bin/polytrading predictions attest \
+  --db var/prediction-markets.duckdb \
+  --input attestation.json
+```
+
+`attestation.json` is an operator-authored JSON array of rule attestations — the *only* bridge
+from a market's natural-language rule text to the typed payout facts a proof compiler consumes.
+There is deliberately no code path that generates an attestation's content; a human reviewer
+reads the rule text and records it. Each attestation is hash-bound to one exact
+`rule_version_id`/`rule_source_hash` pair and must cite at least one supporting span indexed into
+that exact rule text. One entry looks like:
+
+```json
+[
+  {
+    "schema_version": 1,
+    "attestation_id": "8f14e45f-ceea-4d6f-a5c5-f7c1a52b8b2e",
+    "venue": "polymarket",
+    "market_id": "0xcondition",
+    "rule_version_id": "b1946ac9-2f8e-4d0a-9a5b-2e6f5e8c9a1b",
+    "rule_source_hash": "a1b2c3...64 hex chars",
+    "payout_unit": "usdc_1_per_share",
+    "winner_payout_per_share": "1",
+    "loser_payout_per_share": "0",
+    "outcome_set_exhaustive": true,
+    "void_or_invalid_possible": false,
+    "void_behavior": "unknown",
+    "tie_possible": false,
+    "tie_behavior": null,
+    "resolution_source_attested": "https://example.test/rules",
+    "deadline_utc": null,
+    "threshold_text": null,
+    "threshold_inclusive": null,
+    "supporting_spans": [
+      {"start_char": 0, "end_char": 12, "exact_text": "resolves YES", "rule_source_hash": "a1b2c3...64 hex chars"}
+    ],
+    "review_identity": "reviewer@example.test",
+    "reviewed_at": "2026-08-15T12:00:00Z"
+  }
+]
+```
+
+`predictions attest` cross-checks every attestation against the immutable rule-version registry
+before appending any of them: an unknown `rule_version_id`, a `rule_source_hash` mismatch, or a
+venue/`market_id` mismatch against the stored rule version fails the *entire* import as a usage
+error rather than partially persisting a batch. Import is append-only and idempotent — re-running
+the same input reports `already_known` rather than duplicating.
+
+### Deterministic proof templates (`predictions prove`)
+
+```bash
+.venv/bin/polytrading predictions prove \
+  --db var/prediction-markets.duckdb \
+  --candidate-id <candidate-id> \
+  --format json
+```
+
+`predictions prove` compiles one candidate's attested facts into a `ProofArtifact`: either
+`proof_ready` (a fully bounded basket payout with cited terminal states) or `rejected`/
+`insufficient_evidence` (a typed reason, no payout bounds) — never a partial mix of the two.
+Four templates exist, one per `RelationshipType`:
+
+- **`binary_complement@1`** — a market's two outcomes as one basket; requires an attestation
+  affirming the pair is exhaustive.
+- **`exhaustive_outcome_set@1`** — every member of a venue-native event group as one basket;
+  requires an independent attestation from *every* member affirming group exhaustiveness.
+- **`logical_implication@1`** — NO(A) + YES(B) across two distinct markets, where a
+  deterministically verified implication A ⇒ B (compared over typed `threshold`/`deadline`
+  propositions, never inferred from prose) excludes the one impossible combination.
+- **`cross_venue_equivalence@1`** — an 8-dimension equivalence matrix comparing two legs' attested
+  rule facts field-by-field across two venues, reusing the exact dimension names increment 2's
+  scout bridge left unresolved.
+
+Every template is fail-closed and rejects rather than infers whenever an attested fact is
+missing, contradictory, or unmodeled — reported through one of a fixed set of typed reasons:
+`MISSING_ATTESTATION` (no attestation for a leg), `OUTCOME_SET_NOT_EXHAUSTIVE`,
+`VOID_BEHAVIOR_UNKNOWN` (a possible void whose settlement the attestation doesn't pin down),
+`TIE_UNMODELED`, `IMPLICATION_INVALID` (the implication doesn't deterministically hold, or the
+two propositions aren't comparable), `RULE_VERSION_CHANGED` (a leg's attested rule version has
+since been superseded), `PROPOSITIONS_NOT_EXTRACTED`, and `EQUIVALENCE_DIMENSION_UNKNOWN`/
+`EQUIVALENCE_DIMENSION_INCOMPATIBLE` for cross-venue equivalence specifically.
+
+`cross_venue_equivalence@1` cannot reach `proof_ready` in this increment, and that is deliberate,
+not a bug: two of its eight dimensions — `settlement_finality_timing` and
+`venue_access_custody_rules` — have no attested basis anywhere in the current `RuleAttestation`
+model, so they are unconditionally `unknown`, and every compiled artifact rejects at minimum on
+those two dimensions (`EQUIVALENCE_DIMENSION_UNKNOWN`, or `EQUIVALENCE_DIMENSION_INCOMPATIBLE`
+whenever another dimension also diverges — a proven divergence takes precedence in the reported
+reason). Cross-venue equivalence across two independent venues is a strong claim; this increment
+simply doesn't yet attest enough to support it, and fails closed rather than softening the bar.
+The six gold hard-negative pairs checked in for the semantic scout (section 18) double as this
+template's own fixtures: every pair — markets whose titles a retriever would plausibly conflate,
+but whose rules diverge on exactly one dimension — reject through `cross_venue_equivalence@1`
+with that pair's own divergent dimension, never a false pass.
+
+### The conservative scan (`predictions scan`)
+
+```bash
+.venv/bin/polytrading predictions scan --db var/prediction-markets.duckdb --format json
+```
+
+`predictions scan` re-evaluates every candidate against its latest proof and the freshest
+available books/fees, under the frozen `DEFAULT_RESEARCH_POLICY` (policy id `research-v1`), and
+persists exactly one append-only `ScanReport` per candidate per run. A scan never compiles a new
+proof itself — it only reads what `predictions prove` has already established. Every candidate's
+outcome is exactly one of three states:
+
+- **`SHADOW_CANDIDATE`** — the candidate has a `proof_ready` proof, and the depth-walked
+  conservative economics evaluation is positive at current book depth. This is a research shadow
+  finding for further review, not a trading signal, position size, or execution instruction.
+- **`REJECTED`** — a proof rejected the candidate, or the economics evaluation came out
+  non-positive. A stable, repeated `REJECTED` result is a valid, useful outcome, not a dead end.
+- **`INSUFFICIENT_EVIDENCE`** — no proof exists yet, the proof itself was insufficient evidence,
+  or the economics evaluation couldn't run: `MISSING_BOOK`, `STALE_BOOK` (older than the policy's
+  5-second freshness gate), `CROSSED_BOOK`, `MISSING_FEE` (this is where a Kalshi leg lands absent
+  the fee endpoint above), or `ZERO_EXECUTABLE_DEPTH`.
+
+The economics evaluation itself (spec section 7) walks each leg's live ask ladder to the basket's
+bottleneck fillable quantity, then charges every named friction against that depth-walked
+acquisition cost before calling anything a surplus: a gas/conversion/redemption reserve, a
+currency-basis reserve, a flat transfer cost, a capital-lockup charge over an assumed lock
+period, an ordinary operational cost, and four failure reserves (partial-fill/unwind, latency,
+dispute delay, venue/custody divergence) — all deliberately small-but-nonzero, conservative
+research-mode defaults, never tuned to make a particular candidate look attractive. It also
+reports a `doubled_cost_surplus_usd` stress figure — the same surplus recomputed with every cost
+component doubled — so a `SHADOW_CANDIDATE` finding that only survives at the policy's exact,
+undoubled cost assumptions is visibly fragile rather than hidden behind a single pass/fail
+number. `predictions scan` is idempotent at a fixed `--as-of`: re-running it over unchanged
+evidence reproduces the same `ScanReport` ids rather than appending duplicates.
+
+### Dashboard and recipes
+
+The dashboard (`predictions dashboard`, section 17) now also shows a proofs panel (status and
+template counts, the most recently compiled proofs) and a scans panel (decision counts, the most
+recent `SHADOW_CANDIDATE` findings with their conservative surplus and capacity), and its copyable
+recipes list now includes `--books`, `attest`, `prove`, and `scan`. Both panels are read-only,
+loopback-only, and present exactly what is already persisted — the dashboard compiles nothing and
+scans nothing itself.
