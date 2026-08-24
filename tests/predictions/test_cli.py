@@ -991,6 +991,79 @@ def test_attest_command_rejects_a_rule_source_hash_mismatch(
     assert stored is None
 
 
+def test_attest_command_rejects_a_venue_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation(venue=PredictionVenue.POLYMARKET)
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=attestation.rule_version_id,
+            source_hash=attestation.rule_source_hash,
+            venue=PredictionVenue.KALSHI,
+            market_id=attestation.market_id,
+        )
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert str(attestation.attestation_id) in captured.err
+    assert "venue" in captured.err
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        stored = verify_store.latest_attestation_for_rule_version(
+            attestation.rule_version_id, NOW + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert stored is None
+
+
+def test_attest_command_rejects_a_market_id_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation()
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=attestation.rule_version_id,
+            source_hash=attestation.rule_source_hash,
+            market_id="a-different-market",
+        )
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert str(attestation.attestation_id) in captured.err
+    assert "market_id" in captured.err
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        stored = verify_store.latest_attestation_for_rule_version(
+            attestation.rule_version_id, NOW + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert stored is None
+
+
 def test_attest_command_rejects_an_unknown_rule_version_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

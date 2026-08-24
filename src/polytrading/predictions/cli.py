@@ -477,6 +477,20 @@ def _run_attest(arguments: argparse.Namespace) -> int:
                             f"rule_source_hash mismatch for rule_version_id "
                             f"{attestation.rule_version_id}"
                         )
+                    if stored_rule_version.venue != attestation.venue:
+                        raise PredictionsUsageError(
+                            f"attestation {attestation.attestation_id} venue mismatch: "
+                            f"rule_version_id {attestation.rule_version_id} is bound to "
+                            f"venue {stored_rule_version.venue.value!r}, attestation "
+                            f"declares {attestation.venue.value!r}"
+                        )
+                    if stored_rule_version.market_id != attestation.market_id:
+                        raise PredictionsUsageError(
+                            f"attestation {attestation.attestation_id} market_id mismatch: "
+                            f"rule_version_id {attestation.rule_version_id} is bound to "
+                            f"market_id {stored_rule_version.market_id!r}, attestation "
+                            f"declares {attestation.market_id!r}"
+                        )
                 with store.transaction() as transaction:
                     for attestation in attestations:
                         if transaction.append_rule_attestation(attestation):
