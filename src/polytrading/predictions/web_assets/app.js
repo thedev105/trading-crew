@@ -21,6 +21,13 @@ function validateSnapshot(snapshot) {
   if (!Array.isArray(snapshot.markets) || !Array.isArray(snapshot.recipes?.recipes)) {
     throw new Error("INVALID_SNAPSHOT");
   }
+  if (
+    typeof snapshot.candidates !== "object" ||
+    snapshot.candidates === null ||
+    !Array.isArray(snapshot.candidates.latest)
+  ) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
   return snapshot;
 }
 
@@ -83,6 +90,45 @@ function render(snapshot) {
     const item = document.createElement("li");
     item.textContent = recipe;
     recipesList.append(item);
+  }
+
+  renderCandidates(snapshot);
+}
+
+function renderCandidates(snapshot) {
+  const summary = snapshot.candidates;
+  el("candidates-summary").textContent =
+    `Total: ${summary.total} | by disposition: ${JSON.stringify(summary.by_disposition)} | ` +
+    `by relationship type: ${JSON.stringify(summary.by_relationship_type)} | ` +
+    `by provenance: ${JSON.stringify(summary.by_provenance_kind)}`;
+
+  const candidatesBody = el("candidates").querySelector("tbody");
+  candidatesBody.replaceChildren();
+
+  const hasCandidates = summary.latest.length > 0;
+  el("candidates").hidden = !hasCandidates;
+  el("candidates-empty").hidden = hasCandidates;
+
+  for (const candidate of summary.latest) {
+    const row = document.createElement("tr");
+    const provenanceCell = document.createElement("td");
+    provenanceCell.textContent = candidate.provenance_kind;
+    if (candidate.provenance_kind === "ai") {
+      const badge = document.createElement("span");
+      badge.className = "candidate-badge";
+      badge.textContent = "AI-nominated — quarantined";
+      provenanceCell.append(" ", badge);
+    }
+    row.append(
+      cell(candidate.candidate_id),
+      cell(candidate.relationship_type),
+      cell(candidate.venues.join(", ")),
+      cell(candidate.disposition),
+      provenanceCell,
+      cell(String(candidate.unresolved_field_count)),
+      cell(candidate.observed_at),
+    );
+    candidatesBody.append(row);
   }
 }
 

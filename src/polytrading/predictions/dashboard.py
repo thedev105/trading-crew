@@ -10,7 +10,10 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.dashboard_models import (
+    CandidateListing,
+    CandidateSummary,
     PredictionDashboardSnapshot,
     PredictionEvidenceCounts,
     PredictionOperationRecipes,
@@ -21,6 +24,7 @@ from polytrading.predictions.storage.store import PredictionMarketStore
 
 _MAX_MARKETS_SHOWN = 200
 _MAX_BOOKS_SHOWN = 24
+_MAX_CANDIDATES_SHOWN = 20
 
 
 class PredictionDashboardBuilder:
@@ -45,6 +49,7 @@ class PredictionDashboardBuilder:
                 schema_version=1, counts=self._store.evidence_counts_as_of(as_of)
             ),
             recipes=PredictionOperationRecipes(schema_version=1, recipes=self._recipes()),
+            candidates=self._candidate_summary(as_of),
         )
 
     def _latest_books(
@@ -64,6 +69,30 @@ class PredictionDashboardBuilder:
                     break
         return tuple(books)
 
+    def _candidate_summary(self, as_of: datetime) -> CandidateSummary:
+        candidates = self._store.candidate_relationships_as_of(as_of)
+        by_relationship_type: dict[str, int] = {}
+        by_disposition: dict[str, int] = {}
+        by_provenance_kind: dict[str, int] = {}
+        for candidate in candidates:
+            _increment(by_relationship_type, candidate.relationship_type.value)
+            _increment(by_disposition, candidate.disposition.value)
+            _increment(by_provenance_kind, candidate.provenance.kind)
+
+        # `candidates` is ordered oldest-first (Task 5's store contract); the panel wants
+        # the most recently observed candidates first, capped at _MAX_CANDIDATES_SHOWN.
+        newest_first = tuple(reversed(candidates[-_MAX_CANDIDATES_SHOWN:]))
+        latest = tuple(_candidate_listing(candidate) for candidate in newest_first)
+
+        return CandidateSummary(
+            schema_version=1,
+            total=len(candidates),
+            by_relationship_type=by_relationship_type,
+            by_disposition=by_disposition,
+            by_provenance_kind=by_provenance_kind,
+            latest=latest,
+        )
+
     def _recipes(self) -> tuple[str, ...]:
         db = self._database_path
         return (
@@ -72,6 +101,23 @@ class PredictionDashboardBuilder:
             f"polytrading predictions collect kalshi --db {db}",
             f"polytrading predictions health --db {db} --format json",
         )
+
+
+def _increment(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _candidate_listing(candidate: CandidateRelationship) -> CandidateListing:
+    return CandidateListing(
+        schema_version=1,
+        candidate_id=candidate.candidate_id,
+        relationship_type=candidate.relationship_type,
+        venues=tuple(dict.fromkeys(leg.venue for leg in candidate.legs)),
+        disposition=candidate.disposition,
+        provenance_kind=candidate.provenance.kind,
+        unresolved_field_count=len(candidate.unresolved_fields),
+        observed_at=candidate.observed_at,
+    )
 
 
 def render_prediction_dashboard_json(snapshot: PredictionDashboardSnapshot) -> bytes:
