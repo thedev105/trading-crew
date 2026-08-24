@@ -19,6 +19,12 @@ MARKETS_FIXTURE = Path("tests/fixtures/predictions/polymarket/gamma_markets_page
 LIMITLESS_MARKETS_FIXTURE = Path("tests/fixtures/predictions/limitless/markets_active_page_1.json")
 CLOB_BOOK_FIXTURE = Path("tests/fixtures/predictions/polymarket/clob_book.json")
 FEE_RATE_FIXTURE = Path("tests/fixtures/predictions/polymarket/fee_rate.json")
+KALSHI_MARKETS_FIXTURE = Path("tests/fixtures/predictions/kalshi/markets_page_1.json")
+KALSHI_ORDERBOOK_FIXTURE = Path("tests/fixtures/predictions/kalshi/orderbook.json")
+
+# Sorted ascending by market_id -- "KXHIGHNY-26AUG16-T78" < "KXHIGHNY-26AUG16-T85".
+_KALSHI_LOWER_MARKET_ID = "KXHIGHNY-26AUG16-T78"
+_KALSHI_HIGHER_MARKET_ID = "KXHIGHNY-26AUG16-T85"
 
 # Sorted ascending by market_id (condition_id) -- "0x0f49..." < "0xa467...".
 _LOWER_MARKET_ID = "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75"
@@ -801,3 +807,80 @@ def test_collect_limitless_default_books_is_unaffected(
     exit_code = main(["predictions", "collect", "limitless", "--db", str(database)])
     assert exit_code == 0
     assert "collected 3 limitless markets" in capsys.readouterr().out
+
+
+def test_collect_kalshi_with_books_falls_back_to_yes_no_outcome_tokens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Kalshi markets always have outcome_token_ids=None; --books must fall back to the
+    market's own outcomes ("yes"/"no") as the per-outcome token identifiers passed to
+    fetch_book_snapshot, since that adapter rejects any other outcome_token_id value.
+    This exercises `cli.py`'s `outcome_token_ids is None -> market.outcomes` branch
+    end-to-end, which otherwise has no coverage anywhere and fires on every real Kalshi
+    --books>0 run.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/markets"):
+            return httpx.Response(
+                200,
+                content=KALSHI_MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path.endswith("/orderbook"):
+            return httpx.Response(
+                200,
+                content=KALSHI_ORDERBOOK_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(
+        predictions_cli, "make_public_http_client", _polymarket_client_factory(handler)
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.KALSHI,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(["predictions", "collect", "kalshi", "--db", str(database), "--books", "1"])
+    assert exit_code == 0
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        far_future = datetime.now(UTC) + timedelta(days=1)
+        # --books 1 selects the deterministically-lowest market_id.
+        for outcome_token_id in ("yes", "no"):
+            book = verify_store.latest_book_as_of(
+                PredictionVenue.KALSHI, _KALSHI_LOWER_MARKET_ID, outcome_token_id, far_future
+            )
+            assert book is not None
+            assert book.outcome_token_id == outcome_token_id
+
+        # Kalshi's fetch_fee_rate never returns a normalized fee record -- it documents a
+        # published per-category schedule instead of a live public fee-rate endpoint -- so
+        # no fee evidence is ever persisted for Kalshi, but the fee fetch was still attempted
+        # (and its structured warning surfaced) rather than silently skipped.
+        assert (
+            verify_store.latest_fee_rate_as_of(
+                PredictionVenue.KALSHI, _KALSHI_LOWER_MARKET_ID, far_future
+            )
+            is None
+        )
+        assert "KALSHI_FEE_RATE_ENDPOINT_UNAVAILABLE" in capsys.readouterr().err
+
+        # The higher-sorted market was not selected -- no evidence collected for it.
+        assert (
+            verify_store.latest_book_as_of(
+                PredictionVenue.KALSHI, _KALSHI_HIGHER_MARKET_ID, "yes", far_future
+            )
+            is None
+        )
+    finally:
+        verify_store.close()
