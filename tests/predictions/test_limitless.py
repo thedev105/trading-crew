@@ -80,6 +80,45 @@ def test_fetch_markets_persists_raw_before_normalized_lineage() -> None:
     assert len(rule_versions) == 3
 
 
+def _rule_version_for(document: dict[str, Any], market_id: str) -> RuleVersion:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(json.dumps(document).encode())
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+    return next(
+        item
+        for item in batch.normalized
+        if isinstance(item, RuleVersion) and item.market_id == market_id
+    )
+
+
+def test_rule_version_id_is_stable_across_unrelated_page_byte_changes() -> None:
+    """A byte change to a different market on the same page must not mint a new id."""
+    market_id = "clob-market-1"
+    document_a = fixture_document()
+    document_b = fixture_document()
+    document_b["data"][1]["description"] = "A completely different AMM market description."
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.source_hash != rule_version_b.source_hash
+    assert rule_version_a.rule_version_id == rule_version_b.rule_version_id
+
+
+def test_rule_version_id_changes_when_description_changes() -> None:
+    market_id = "clob-market-1"
+    document_a = fixture_document()
+    document_b = fixture_document()
+    document_b["data"][0]["description"] = "A materially different resolution description."
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.rule_version_id != rule_version_b.rule_version_id
+
+
 def test_clob_market_is_order_book_enabled_and_negative_risk_round_trips() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return response(fixture_bytes("markets_active_page_1.json"))

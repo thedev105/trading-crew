@@ -24,6 +24,7 @@ from polytrading.predictions.domain import (
     PredictionVenue,
     RuleVersion,
     TradeRecord,
+    rule_relevant_version_id,
 )
 from polytrading.predictions.manifest import VenueManifest, evaluate_collection_gate
 
@@ -363,7 +364,16 @@ def _parse_market_row(
     active = status == "active"
     closed = status in _CLOSED_STATUSES
     outcomes = ("yes", "no")
-    rule_version_id = uuid5(NAMESPACE_URL, f"kalshi:{ticker}:{raw.source_hash}")
+    end_at = _optional_datetime(row.get("close_time"))
+    description_parts = [
+        part
+        for part in (row.get("rules_primary"), row.get("rules_secondary"))
+        if isinstance(part, str) and part
+    ]
+    description = "\n\n".join(description_parts)
+    rule_version_id = rule_relevant_version_id(
+        PredictionVenue.KALSHI, ticker, title, description, None, outcomes, end_at
+    )
 
     market = MarketRecord(
         schema_version=1,
@@ -381,7 +391,7 @@ def _parse_market_row(
         restricted=False,
         order_book_enabled=True,
         start_at=_optional_datetime(row.get("open_time")),
-        end_at=_optional_datetime(row.get("close_time")),
+        end_at=end_at,
         resolution_source=None,
         rule_version_id=rule_version_id,
         information_cutoff=information_cutoff,
@@ -390,18 +400,13 @@ def _parse_market_row(
         raw_hash=raw.source_hash,
         normalized_hash=raw.source_hash,
     )
-    description_parts = [
-        part
-        for part in (row.get("rules_primary"), row.get("rules_secondary"))
-        if isinstance(part, str) and part
-    ]
     rule_version = RuleVersion(
         schema_version=1,
         rule_version_id=rule_version_id,
         market_id=ticker,
         venue=PredictionVenue.KALSHI,
         question=title,
-        description="\n\n".join(description_parts),
+        description=description,
         resolution_source=None,
         outcomes=outcomes,
         superseded_rule_version_id=None,

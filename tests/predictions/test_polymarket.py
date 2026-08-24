@@ -99,6 +99,47 @@ def test_fetch_markets_normalizes_gamma_page_into_market_and_rule_version() -> N
     assert rule_version.outcomes == market.outcomes
 
 
+def _rule_version_for(document: list[Any], market_id: str) -> RuleVersion:
+    pages = iter([json.dumps(document).encode(), b"[]"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(next(pages))
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+    return next(
+        item
+        for item in batch.normalized
+        if isinstance(item, RuleVersion) and item.market_id == market_id
+    )
+
+
+def test_rule_version_id_is_stable_across_unrelated_page_byte_changes() -> None:
+    """A byte change to a different market on the same page must not mint a new id."""
+    market_id = "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7"
+    document_a = json.loads(fixture_bytes("gamma_markets_page_1.json"))
+    document_b = json.loads(fixture_bytes("gamma_markets_page_1.json"))
+    document_b[1]["liquidity"] = "999999.99999"
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.source_hash != rule_version_b.source_hash
+    assert rule_version_a.rule_version_id == rule_version_b.rule_version_id
+
+
+def test_rule_version_id_changes_when_resolution_source_changes() -> None:
+    market_id = "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7"
+    document_a = json.loads(fixture_bytes("gamma_markets_page_1.json"))
+    document_b = json.loads(fixture_bytes("gamma_markets_page_1.json"))
+    document_b[0]["resolutionSource"] = "https://example.com/oracle"
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.rule_version_id != rule_version_b.rule_version_id
+
+
 def test_fetch_markets_stops_pagination_on_a_short_page() -> None:
     pages = iter([fixture_bytes("gamma_markets_page_1.json")])
     requests: list[dict[str, str]] = []

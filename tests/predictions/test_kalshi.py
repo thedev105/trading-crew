@@ -95,6 +95,45 @@ def test_fetch_markets_normalizes_market_row_into_market_and_rule_version() -> N
     assert "New York City" in rule_version.description
 
 
+def _rule_version_for(document: dict[str, Any], market_id: str) -> RuleVersion:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(json.dumps(document).encode())
+
+    adapter = make_adapter(handler)
+    batch = asyncio.run(adapter.fetch_markets(information_cutoff=NOW))
+    return next(
+        item
+        for item in batch.normalized
+        if isinstance(item, RuleVersion) and item.market_id == market_id
+    )
+
+
+def test_rule_version_id_is_stable_across_unrelated_page_byte_changes() -> None:
+    """A byte change to a different market on the same page must not mint a new id."""
+    market_id = "KXHIGHNY-26AUG16-T85"
+    document_a = json.loads(fixture_bytes("markets_page_1.json"))
+    document_b = json.loads(fixture_bytes("markets_page_1.json"))
+    document_b["markets"][1]["liquidity_dollars"] = "999999.9999"
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.source_hash != rule_version_b.source_hash
+    assert rule_version_a.rule_version_id == rule_version_b.rule_version_id
+
+
+def test_rule_version_id_changes_when_question_changes() -> None:
+    market_id = "KXHIGHNY-26AUG16-T85"
+    document_a = json.loads(fixture_bytes("markets_page_1.json"))
+    document_b = json.loads(fixture_bytes("markets_page_1.json"))
+    document_b["markets"][0]["title"] = "Will the maximum temperature be >90° on Aug 16, 2026?"
+
+    rule_version_a = _rule_version_for(document_a, market_id)
+    rule_version_b = _rule_version_for(document_b, market_id)
+
+    assert rule_version_a.rule_version_id != rule_version_b.rule_version_id
+
+
 def test_fetch_markets_status_maps_to_active_and_closed_flags() -> None:
     document = json.loads(fixture_bytes("markets_page_1.json"))
     document["markets"][0]["status"] = "finalized"

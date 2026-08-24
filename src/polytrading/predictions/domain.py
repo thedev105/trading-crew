@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -64,6 +66,53 @@ class PredictionVenue(StrEnum):
     POLYMARKET = "polymarket"
     KALSHI = "kalshi"
     LIMITLESS = "limitless"
+
+
+# Dedicated namespace for rule-relevant version identity, distinct from the generic
+# ``uuid5(NAMESPACE_URL, ...)`` namespace adapters use elsewhere (e.g. raw-envelope
+# ``event_id``), so this identity space can never collide with an unrelated uuid5 use.
+_RULE_VERSION_NAMESPACE = uuid5(NAMESPACE_URL, "polytrading.predictions.rule_version")
+
+
+def rule_relevant_version_id(
+    venue: PredictionVenue,
+    market_id: str,
+    question: str,
+    description: str,
+    resolution_source: str | None,
+    outcomes: Sequence[str],
+    end_at: datetime | None,
+) -> UUID:
+    """Derive a rule-version identity from only the rule-relevant fields of a market.
+
+    Deliberately independent of the raw page hash (``RuleVersion.source_hash``, which
+    stays exactly as-is -- the raw lineage hash of the collected page): an unrelated byte
+    change elsewhere on a collected page must not mint a new rule version for a market
+    whose actual rule content is unchanged, since a new id here churns every downstream
+    candidate identity that folds in ``rule_version_id`` (see
+    ``candidates_models.deterministic_candidate_id``). A shared helper here is what keeps
+    the three venue adapters from drifting into their own derivations.
+
+    One-time id transition (controller ruling, binding): this replaces each adapter's
+    previous ``uuid5(NAMESPACE_URL, f"{venue}:{market_id}:{page_source_hash}")``
+    derivation. Previously persisted rule-version rows are never rewritten to the new
+    id -- only markets normalized after this change get a rule-relevant id; existing
+    history keeps whatever id it was minted with.
+    """
+    canonical = json.dumps(
+        [
+            venue.value,
+            market_id,
+            question,
+            description,
+            resolution_source,
+            list(outcomes),
+            end_at.isoformat() if end_at is not None else None,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return uuid5(_RULE_VERSION_NAMESPACE, canonical)
 
 
 class PredictionSource(StrEnum):

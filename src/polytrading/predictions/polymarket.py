@@ -25,6 +25,7 @@ from polytrading.predictions.domain import (
     PredictionVenue,
     RuleVersion,
     TradeRecord,
+    rule_relevant_version_id,
 )
 from polytrading.predictions.manifest import VenueManifest, evaluate_collection_gate
 
@@ -314,10 +315,17 @@ def _parse_market_row(
     end_at = _optional_datetime(row.get("endDate"))
     resolution_source_raw = row.get("resolutionSource")
     resolution_source = resolution_source_raw or None
+    description_raw = row.get("description")
+    description = description_raw if isinstance(description_raw, str) else ""
 
-    rule_version_id = uuid5(
-        NAMESPACE_URL,
-        f"polymarket:{condition_id}:{raw.source_hash}",
+    rule_version_id = rule_relevant_version_id(
+        PredictionVenue.POLYMARKET,
+        condition_id,
+        question,
+        description,
+        resolution_source,
+        outcomes,
+        end_at,
     )
     market = MarketRecord(
         schema_version=1,
@@ -344,14 +352,13 @@ def _parse_market_row(
         raw_hash=raw.source_hash,
         normalized_hash=raw.source_hash,
     )
-    description = row.get("description")
     rule_version = RuleVersion(
         schema_version=1,
         rule_version_id=rule_version_id,
         market_id=condition_id,
         venue=PredictionVenue.POLYMARKET,
         question=question,
-        description=description if isinstance(description, str) else "",
+        description=description,
         resolution_source=resolution_source,
         outcomes=outcomes,
         superseded_rule_version_id=None,
