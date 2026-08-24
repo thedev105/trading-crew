@@ -813,11 +813,11 @@ database (for example `var/prediction-markets.duckdb`) is never the same file as
 or any other existing database, and opening one system's database with the other's tooling fails
 closed rather than silently misreading it.
 
-Later increments — the Limitless conditional adapter, semantic candidate discovery, deterministic
-equivalence and payoff proofs, conservative economics, replay and forward shadow execution, and any
-execution adapter — are not implemented yet. This increment is public-data collection and read-only
-presentation only; it has no candidate, proof, economics, or shadow-execution surface, and no
-credential, account, order, or trading authority of any kind.
+This increment is public-data collection and read-only presentation only; it has no proof,
+economics, or shadow-execution surface, and no credential, account, order, or trading authority of
+any kind. The Limitless conditional adapter and deterministic candidate discovery are covered in
+section 18. Deterministic equivalence and payoff proofs, conservative economics, replay and forward
+shadow execution, and any execution adapter remain unimplemented and are increments 3–5.
 
 ### Venue manifests and the collection gate
 
@@ -881,3 +881,108 @@ something to investigate. Book staleness thresholds (`STALE` after 5 minutes, `D
 hour) are a deliberately conservative starting point for this increment and are independent of the
 perpetual-futures system's own staleness constants, since this system's real collection cadence has
 not yet been established through operation.
+
+## 18. Conditional Limitless collection and candidate discovery (increment 2)
+
+All candidate relationships this increment produces are quarantined research artifacts, not
+trading opportunities. They record that two or more market legs might describe the same or
+complementary real-world outcomes, in the same append-only, disposition-labeled, review-gated way
+this project already treats every other unproven observation. Deterministic equivalence proof, a
+payoff compiler, and economics remain future increments; nothing here approves a candidate, sizes a
+position, or authorizes execution.
+
+### Limitless as a third, conditionally-gated venue
+
+Limitless is registered as a third `PredictionVenue`, but it ships with no bundled manifest, so it
+is unreachable until an operator explicitly appends one. `predictions collect limitless` runs the
+same `evaluate_collection_gate` check as Polymarket and Kalshi (section 17): a missing manifest
+fails closed with the typed reason `MANIFEST_NOT_FOUND` before any network request, and only an
+operator-recorded manifest whose `implementation_state` is `READ_ONLY` or later and whose
+`automated_use_status` is `permitted` opens the gate:
+
+```bash
+.venv/bin/polytrading predictions venues status --db var/prediction-markets.duckdb --format text
+.venv/bin/polytrading predictions collect limitless --db var/prediction-markets.duckdb
+```
+
+On a fresh database the second command exits `2` with that gate reason; it starts succeeding only
+after the affirmative manifest step below, exactly like the Polymarket and Kalshi gates it reuses.
+
+The Limitless adapter is read-only and markets/rules only. It pages Limitless's public
+`/markets/active` endpoint, keeps only `single`-type markets in the documented `clob`/`amm`
+trade types, and stores one immutable market and rule version per market. Book-snapshot,
+trade, and fee-rate collection are not implemented for Limitless in this increment; calling those
+adapter methods raises a `limitless_endpoint_not_collected` error rather than returning
+approximate or synthesized evidence. A negative-risk (event-group) flag, outcome-set membership,
+or other field the listing endpoint does not document is recorded `unknown` with a structured
+warning rather than guessed. Extending Limitless past markets/rules is a separate, later,
+manifest-gated step.
+
+### Deterministic candidate discovery
+
+`predictions candidates` runs two deterministic generators over one or more already-collected,
+already-gated venues and persists their output as append-only `CandidateRelationship` records:
+
+```bash
+.venv/bin/polytrading predictions candidates \
+  --db var/prediction-markets.duckdb \
+  --venues polymarket,kalshi,limitless \
+  --format text
+```
+
+`binary_complement` proposes one candidate per eligible two-outcome market, pairing its two legs
+as presumptive complements. `venue_native_outcome_set` proposes one candidate per eligible
+multi-market `event_id` group (Polymarket and Limitless groups additionally require every member's
+`negative_risk` to be `true`; Kalshi groups purely by `event_id`). Both generators are pure
+functions of the registry snapshot at `--as-of` (default: command start): no network access, no
+AI inference, and no non-deterministic input. Every emitted candidate carries an
+`unresolved_fields` entry (`terminal_partition_unproven` or `outcome_set_exhaustiveness_unproven`)
+and starts `review_status="unreviewed"` with `disposition="quarantined"` — a candidate is never
+disposed `proof_ready` by a generator. Candidate identity is a UUIDv5 derived deterministically from
+the relationship type and its sorted legs, so re-running `predictions candidates` against unchanged
+markets is idempotent: previously appended candidates report `already_known` rather than
+duplicating. `--trial-family` groups candidates for later evaluation batches and defaults to
+`increment-2-structural`; `--as-of` fixes the registry snapshot's information cutoff for a
+reproducible run.
+
+Every invocation of `predictions candidates` also prints one fixed line:
+
+```
+cross-venue nomination: abstained (SCOUT_GATE_UNMET: no adjudicated gold evaluation)
+```
+
+Cross-venue candidate nomination is implemented and tested (the semantic-scout bridge that would
+propose `cross_venue_equivalence` candidates from AI-assisted rule-text comparison), but it is not
+reachable from this CLI. It stays disabled — and every run reports that explicit abstention rather
+than silently doing nothing — until a genuine adjudicated gold evaluation clears the
+semantic-scout's critical-field gate.
+
+### The 99.5% scout gate and why it cannot pass yet
+
+The semantic-scout critical-field exact-match threshold (section 16) is `0.995`, raised from an
+earlier `0.95` as part of this increment's threshold-gap closure. The checked-in synthetic corpus
+under `tests/fixtures/ai/corpus` cannot pass this threshold and is not expected to: it exists only
+to exercise retrieval, extraction, and evaluation mechanics deterministically, exactly as section 16
+already states. Cross-venue AI nomination stays disabled until a real, two-independently-reviewed,
+adjudicated `data/gold` corpus (section 16) is evaluated and clears `0.995` — a bar the spec sets
+deliberately high because a false cross-venue equivalence is the failure mode this whole layer
+exists to prevent.
+
+`tests/fixtures/predictions/hard_negatives.json` checks in six gold hard-negative pairs: markets
+with near-identical titles that TF-IDF retrieval would plausibly nominate across venues, but whose
+rule text diverges on exactly one critical dimension (threshold inclusivity, deadline timezone,
+resolution-source authority, observation window, or scope). Each pair's two markets are
+deliberately separate events, so the deterministic generators above never relate them. These fixed
+pairs are the concrete cases increment 3's equivalence-compiler mutation tests and this increment's
+generator-determinism tests both reuse: a scout or compiler that cannot tell the two members of a
+hard-negative pair apart is not ready to nominate anything across venues.
+
+### Reading candidates on the dashboard
+
+The dashboard's candidates panel (`predictions dashboard`, section 17) lists the most recently
+observed candidates alongside their relationship type, participating venues, and disposition, and
+tags AI-provenance candidates with an explicit AI-nominated badge — currently unreachable, since
+cross-venue nomination is disabled as described above. The panel's own labels never use the words
+"risk-free," "guaranteed," or "approved": `quarantined` is the only disposition a generator or the
+scout bridge can currently produce, and only a separate, explicit human review can ever move a
+candidate to `proof_ready`.
