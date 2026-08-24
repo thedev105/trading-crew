@@ -675,6 +675,15 @@ def _scan_one_candidate(
     Read-only over already-persisted proofs (never calls ``compile_proof``): a scan
     reports on what ``predictions prove`` has already established, joined with
     current books/fees/economics -- it never mints new proof evidence itself.
+
+    Before running economics on a ``proof_ready`` proof, this re-validates rule-version
+    currency: if any candidate leg's ``rule_version_id`` is no longer its market's
+    presently-effective version as of ``as_of``, the decision is ``REJECTED`` /
+    ``RULE_VERSION_CHANGED`` and economics never runs. A proof is compiled once and
+    persisted append-only, so a rule version can be superseded after a proof went
+    ``proof_ready`` but before a later scan runs; without this re-check, that stale
+    proof would silently survive into a persisted ``SHADOW_CANDIDATE`` (spec §14),
+    even though the proof's own ``invalidation_conditions`` name exactly this case.
     """
     proof = store.latest_proof_for_candidate(candidate.candidate_id, as_of)
     economics: EconomicsResult | None = None
@@ -693,30 +702,40 @@ def _scan_one_candidate(
             assert proof.rejection_reason is not None  # ProofArtifact invariant
             decision, reason = "REJECTED", proof.rejection_reason
         else:  # proof_ready
-            books = {
-                i: store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, as_of)
-                for i, leg in enumerate(candidate.legs)
-            }
-            fees = {
-                i: store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
-                for i, leg in enumerate(candidate.legs)
-            }
-            economics = evaluate_basket_economics(
-                proof,
-                candidate,
-                books=books,
-                fees=fees,
-                policy=DEFAULT_RESEARCH_POLICY,
-                as_of=as_of,
-            )
-            if economics.status == "insufficient_evidence":
-                assert economics.insufficiency_reason is not None  # EconomicsResult invariant
-                decision, reason = "INSUFFICIENT_EVIDENCE", economics.insufficiency_reason
-            elif economics.conservative_surplus_usd > 0:
-                decision = "SHADOW_CANDIDATE"
-                reason = "conservative surplus positive at current depth"
+            current_rule_versions = _current_rule_versions_for_candidate(store, candidate, as_of)
+            if any(leg.rule_version_id not in current_rule_versions for leg in candidate.legs):
+                # A proof compiled against a since-superseded rule version must never
+                # silently survive into a persisted SHADOW_CANDIDATE (spec §14); a scan
+                # is read-only over the proof, so it re-validates currency here rather
+                # than trusting the proof's own now-possibly-stale rule_version_ids.
+                decision, reason = "REJECTED", "RULE_VERSION_CHANGED"
             else:
-                decision, reason = "REJECTED", "conservative surplus not positive"
+                books = {
+                    i: store.latest_book_as_of(
+                        leg.venue, leg.market_id, leg.outcome_token_id, as_of
+                    )
+                    for i, leg in enumerate(candidate.legs)
+                }
+                fees = {
+                    i: store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
+                    for i, leg in enumerate(candidate.legs)
+                }
+                economics = evaluate_basket_economics(
+                    proof,
+                    candidate,
+                    books=books,
+                    fees=fees,
+                    policy=DEFAULT_RESEARCH_POLICY,
+                    as_of=as_of,
+                )
+                if economics.status == "insufficient_evidence":
+                    assert economics.insufficiency_reason is not None  # EconomicsResult invariant
+                    decision, reason = "INSUFFICIENT_EVIDENCE", economics.insufficiency_reason
+                elif economics.conservative_surplus_usd > 0:
+                    decision = "SHADOW_CANDIDATE"
+                    reason = "conservative surplus positive at current depth"
+                else:
+                    decision, reason = "REJECTED", "conservative surplus not positive"
 
     report_id = deterministic_scan_report_id(
         candidate_id=candidate.candidate_id,

@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
@@ -1595,6 +1596,163 @@ def test_scan_command_rejects_a_proof_ready_candidate_with_non_positive_surplus(
     assert report.economics.status == "evaluated"
     assert report.economics.conservative_surplus_usd == Decimal("-4.69104")
     assert report.economics.capacity_usd_at_current_depth == Decimal("78.40")
+
+
+def test_scan_command_rejects_a_proof_compiled_against_a_superseded_rule_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A proof compiled while ``RULE_VERSION_ID`` was current must not silently survive
+    into a persisted ``SHADOW_CANDIDATE`` once a newer rule version supersedes it --
+    spec §14 and the proof's own ``invalidation_conditions`` both name this exact
+    case. The scan must re-check currency itself (never trust the proof's own
+    now-possibly-stale ``rule_version_ids``) and reject before running economics, even
+    though books/fees exist and would otherwise price out to a positive surplus.
+    """
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="111",
+            bids=(level("0.20", "10"),),
+            asks=(level("0.30", "100"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="222",
+            bids=(level("0.30", "10"),),
+            asks=(level("0.35", "80"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_fee_rate(fee_rate(market_id="0xcondition", taker_rate=Decimal("0.01")))
+    store.close()
+
+    prove_as_of = "2026-08-15T12:00:00Z"
+    prove_exit = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            prove_as_of,
+        ]
+    )
+    assert prove_exit == 0
+    capsys.readouterr()
+
+    # A newer rule version for the same market supersedes RULE_VERSION_ID, effective
+    # before the scan's as_of -- the candidate's legs (and the persisted proof) still
+    # carry the now-superseded RULE_VERSION_ID, since candidates/proofs are append-only.
+    newer_rule_version_id = UUID("00000000-0000-0000-0000-000000002099")
+    store = PredictionMarketStore(database)
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=newer_rule_version_id,
+            market_id="0xcondition",
+            effective_at=NOW + timedelta(minutes=30),
+            superseded_rule_version_id=RULE_VERSION_ID,
+        )
+    )
+    store.close()
+
+    scan_as_of = "2026-08-15T13:00:00Z"
+    scan_exit = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", scan_as_of, "--format", "json"]
+    )
+    assert scan_exit == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 1,
+        "INSUFFICIENT_EVIDENCE": 0,
+    }
+    assert output["shadow_candidates"] == []
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 13, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.decision == "REJECTED"
+    assert report.reason == "RULE_VERSION_CHANGED"
+    assert report.proof_id is not None
+    assert report.economics is None
+
+
+def test_scan_command_reports_insufficient_evidence_for_an_insufficient_evidence_proof(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A proof compiled with no attestation available is itself ``insufficient_evidence``
+    (``rejection_reason="MISSING_ATTESTATION"``), distinct from a ``rejected`` proof and
+    from no proof existing at all. The scan must pass that proof's own
+    ``rejection_reason`` through verbatim as the ``INSUFFICIENT_EVIDENCE`` reason.
+    """
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record(rule_version_id=RULE_VERSION_ID))
+    store.append_rule_version(rule_version(rule_version_id=RULE_VERSION_ID, effective_at=NOW))
+    # Deliberately no rule attestation appended.
+    store.append_candidate_relationship(candidate_relationship())
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    prove_exit = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    assert prove_exit == 0
+    capsys.readouterr()
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        proof = verify_store.latest_proof_for_candidate(
+            CANDIDATE_ID, datetime(2026, 8, 15, 12, tzinfo=UTC)
+        )
+    finally:
+        verify_store.close()
+    assert proof is not None
+    assert proof.status == "insufficient_evidence"
+    assert proof.rejection_reason == "MISSING_ATTESTATION"
+
+    scan_exit = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert scan_exit == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 0,
+        "INSUFFICIENT_EVIDENCE": 1,
+    }
+    assert output["shadow_candidates"] == []
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.decision == "INSUFFICIENT_EVIDENCE"
+    assert report.reason == "MISSING_ATTESTATION"
+    assert report.proof_id == proof.proof_id
+    assert report.economics is None
 
 
 def test_scan_command_is_idempotent_across_reruns(
