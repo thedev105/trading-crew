@@ -8,6 +8,7 @@ import pytest
 
 from polytrading.ai.corpus import CorpusManifest
 from polytrading.ai.evaluate import (
+    _THRESHOLDS,
     BooleanCaseResult,
     EvaluationRequest,
     FieldEvaluationCase,
@@ -175,6 +176,16 @@ def run_through_test(service: SemanticEvaluator, **test_overrides: object):
     service.run(request("train"))
     service.run(request("validation"))
     return service.run(request("test", **test_overrides))
+
+
+def test_critical_field_gate_requires_995_per_thousand() -> None:
+    assert _THRESHOLDS["critical_field_exact_match"] == Decimal("0.995")
+
+
+def test_synthetic_fixture_corpus_does_not_pass_the_raised_gate() -> None:
+    evaluation = run_through_test(evaluator())
+
+    assert evaluation.gate_status != "PASS"
 
 
 def test_test_gate_remains_blocked_when_all_measurable_metrics_pass_without_payoff() -> None:

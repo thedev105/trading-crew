@@ -33,7 +33,7 @@ GateStatus = Literal[
     "BLOCKED_BY_DEPENDENCY",
 ]
 _THRESHOLDS = {
-    "critical_field_exact_match": Decimal("0.95"),
+    "critical_field_exact_match": Decimal("0.995"),
     "candidate_recall": Decimal("0.90"),
     "span_validity": Decimal("1"),
     "malformed_fail_closed_rate": Decimal("1"),
