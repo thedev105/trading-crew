@@ -13,11 +13,12 @@ from polytrading.ai.evaluate import (
     EvaluationRequest,
     FieldEvaluationCase,
     ModelVersionRef,
+    PayoffCompilerResults,
     SemanticEvaluator,
 )
 from polytrading.ai.extraction import RegexRuleExtractor
 from polytrading.ai.metrics import MutationCaseResult, RelationshipMetricCase
-from polytrading.ai.models import ModelCard
+from polytrading.ai.models import CriticalField, ModelCard, RuleFieldSet, SourceSpan
 from polytrading.research.models import (
     EvaluationWindow,
     ExperimentRecord,
@@ -168,6 +169,44 @@ def request(split: str = "train", **overrides: object) -> EvaluationRequest:
     return EvaluationRequest(**values)
 
 
+def full_text_span(text: str) -> SourceSpan:
+    return SourceSpan(
+        start_char=0,
+        end_char=len(text),
+        exact_text=text,
+        canonical_text_hash=hashlib.sha256(text.encode()).hexdigest(),
+    )
+
+
+def known_field_set(prefix: str, span: SourceSpan) -> RuleFieldSet:
+    """Every field 'known', with a value derived from ``prefix`` so two field
+    sets built from different prefixes disagree on every field."""
+
+    values: dict[str, object] = {}
+    for field_name in RuleFieldSet.model_fields:
+        if field_name == "rule_hash":
+            value = hashlib.sha256(f"{prefix}-{field_name}".encode()).hexdigest()
+        else:
+            value = f"{prefix}-{field_name}"
+        values[field_name] = CriticalField(status="known", value=value, supporting_spans=(span,))
+    return RuleFieldSet(**values)
+
+
+def fully_mismatched_field_case(contract_id: str, text: str) -> FieldEvaluationCase:
+    """A field-evaluation case whose expected/actual fields disagree on every
+    one of RuleFieldSet's fields, while every actual field still carries a
+    source span that validates against ``text`` (so it does not trip the
+    separate span-validity / fail-closed-breach gate)."""
+
+    span = full_text_span(text)
+    return FieldEvaluationCase(
+        contract_id=contract_id,
+        canonical_text=text,
+        expected_fields=known_field_set("expected", span),
+        actual_fields=known_field_set("actual", span),
+    )
+
+
 def evaluator(card: ModelCard | None = None) -> SemanticEvaluator:
     return SemanticEvaluator((experiment(),), (card or model_card(),))
 
@@ -182,10 +221,36 @@ def test_critical_field_gate_requires_995_per_thousand() -> None:
     assert _THRESHOLDS["critical_field_exact_match"] == Decimal("0.995")
 
 
-def test_synthetic_fixture_corpus_does_not_pass_the_raised_gate() -> None:
-    evaluation = run_through_test(evaluator())
+def test_ratio_between_old_and_new_threshold_fails_the_raised_gate() -> None:
+    text = "BTC resolves above $100."
+    matching_fields = RegexRuleExtractor().extract(text).fields
+    matching_cases = tuple(
+        FieldEvaluationCase(
+            contract_id=f"match-{index}",
+            canonical_text=text,
+            expected_fields=matching_fields,
+            actual_fields=matching_fields,
+        )
+        for index in range(39)
+    )
+    field_cases = (*matching_cases, fully_mismatched_field_case("mismatch-0", text))
 
-    assert evaluation.gate_status != "PASS"
+    # 39 cases * 25 fields all match, 1 case * 25 fields all mismatch:
+    # (39 * 25) / (40 * 25) = 975 / 1000 = 0.975 -- strictly between the old
+    # (0.95) and raised (0.995) thresholds.
+    ratio = Decimal(39 * 25) / Decimal(40 * 25)
+    assert ratio == Decimal("0.975")
+    assert ratio > Decimal("0.95")  # would have PASSED the old gate
+
+    payoff = PayoffCompilerResults(
+        compiler_hash="a" * 64,
+        graph_hash="b" * 64,
+        all_cases_proved=True,
+    )
+    result = run_through_test(evaluator(), field_cases=field_cases, payoff_compiler_results=payoff)
+
+    assert result.metric("critical_field_exact_match").status == "FAIL"
+    assert result.gate_status == "FAIL"
 
 
 def test_test_gate_remains_blocked_when_all_measurable_metrics_pass_without_payoff() -> None:
