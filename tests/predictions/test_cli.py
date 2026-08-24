@@ -11,7 +11,7 @@ from polytrading.cli import build_parser, main
 from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
-from polytrading.predictions.storage.store import PredictionMarketStore
+from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.domain_helpers import NOW, market_record, rule_version
 from tests.predictions.manifest_helpers import venue_manifest
 
@@ -412,3 +412,35 @@ def test_candidates_command_defaults_trial_family_and_as_of(
         verify_store.close()
     assert len(candidates) == 1
     assert candidates[0].trial_family_id == "increment-2-structural"
+
+
+def test_candidates_command_sanitizes_a_persistence_conflict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record())
+    store.append_rule_version(rule_version())
+    store.close()
+
+    def raise_conflict(self: PredictionMarketStore, record: object) -> bool:
+        raise ConflictingRecordError("conflicting candidate relationship for immutable identity")
+
+    monkeypatch.setattr(PredictionMarketStore, "append_candidate_relationship", raise_conflict)
+
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+        ]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "candidate discovery failed to persist durably" in captured.err
+    assert "conflicting candidate relationship" not in captured.err

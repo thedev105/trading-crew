@@ -57,6 +57,10 @@ class PredictionCollectionError(RuntimeError):
     """A prediction-market collection failure, sanitized for CLI output."""
 
 
+class PredictionCandidatesError(RuntimeError):
+    """A prediction-market candidate-discovery failure, sanitized for CLI output."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -253,49 +257,54 @@ def _run_candidates(arguments: argparse.Namespace) -> int:
     trial_family_id = arguments.trial_family
 
     venue_counts: dict[PredictionVenue, dict[RelationshipType, dict[str, int]]] = {}
-    with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
-        store = PredictionMarketStore(arguments.db)
-        try:
-            registry = PredictionRegistry(store)
-            proposed: dict[PredictionVenue, tuple[CandidateRelationship, ...]] = {}
-            for venue in venues:
-                binary_complements = propose_binary_complements(
-                    registry,
-                    venue,
-                    as_of,
-                    trial_family_id=trial_family_id,
-                    code_revision=_CANDIDATES_CODE_REVISION,
-                )
-                outcome_sets = propose_venue_native_outcome_sets(
-                    registry,
-                    venue,
-                    as_of,
-                    trial_family_id=trial_family_id,
-                    code_revision=_CANDIDATES_CODE_REVISION,
-                )
-                proposed[venue] = binary_complements + outcome_sets
-
-            with store.transaction() as transaction:
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                registry = PredictionRegistry(store)
+                proposed: dict[PredictionVenue, tuple[CandidateRelationship, ...]] = {}
                 for venue in venues:
-                    counts: dict[RelationshipType, dict[str, int]] = {
-                        RelationshipType.BINARY_COMPLEMENT: {
-                            "newly_appended": 0,
-                            "already_known": 0,
-                        },
-                        RelationshipType.EXHAUSTIVE_OUTCOME_SET: {
-                            "newly_appended": 0,
-                            "already_known": 0,
-                        },
-                    }
-                    for candidate in proposed[venue]:
-                        bucket = counts[candidate.relationship_type]
-                        if transaction.append_candidate_relationship(candidate):
-                            bucket["newly_appended"] += 1
-                        else:
-                            bucket["already_known"] += 1
-                    venue_counts[venue] = counts
-        finally:
-            store.close()
+                    binary_complements = propose_binary_complements(
+                        registry,
+                        venue,
+                        as_of,
+                        trial_family_id=trial_family_id,
+                        code_revision=_CANDIDATES_CODE_REVISION,
+                    )
+                    outcome_sets = propose_venue_native_outcome_sets(
+                        registry,
+                        venue,
+                        as_of,
+                        trial_family_id=trial_family_id,
+                        code_revision=_CANDIDATES_CODE_REVISION,
+                    )
+                    proposed[venue] = binary_complements + outcome_sets
+
+                with store.transaction() as transaction:
+                    for venue in venues:
+                        counts: dict[RelationshipType, dict[str, int]] = {
+                            RelationshipType.BINARY_COMPLEMENT: {
+                                "newly_appended": 0,
+                                "already_known": 0,
+                            },
+                            RelationshipType.EXHAUSTIVE_OUTCOME_SET: {
+                                "newly_appended": 0,
+                                "already_known": 0,
+                            },
+                        }
+                        for candidate in proposed[venue]:
+                            bucket = counts[candidate.relationship_type]
+                            if transaction.append_candidate_relationship(candidate):
+                                bucket["newly_appended"] += 1
+                            else:
+                                bucket["already_known"] += 1
+                        venue_counts[venue] = counts
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionCandidatesError("candidate discovery failed to persist durably") from error
 
     if arguments.format == "json":
         print(
