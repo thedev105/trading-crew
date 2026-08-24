@@ -188,19 +188,22 @@ def test_scout_nominated_hard_negatives_remain_fully_unresolved_and_quarantined(
     tmp_path: Path,
 ) -> None:
     """Index the hard-negative pairs, run the bridge with a passing evaluation, and confirm
-    every nomination is QUARANTINED with all 8 equivalence dimensions unresolved -- title
-    similarity produces a nomination but never reduces the unresolved surface.
+    every fixture pair's two title-similar members are actually nominated together -- and that
+    THOSE nominations are QUARANTINED with all 8 equivalence dimensions unresolved. Title
+    similarity produces the nomination; nothing about it narrows the unresolved surface.
     """
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     pairs = _load_pairs()
 
     venue_pairs: set[tuple[PredictionVenue, PredictionVenue]] = set()
+    pair_market_ids: list[tuple[str, str]] = []
     for pair in pairs:
         market_a, rule_a = _build(pair["market_a"])
         market_b, rule_b = _build(pair["market_b"])
         _seed(store, market_a, rule_a)
         _seed(store, market_b, rule_b)
         venue_pairs.add((market_a.venue, market_b.venue))
+        pair_market_ids.append((market_a.market_id, market_b.market_id))
 
     registry = PredictionRegistry(store)
 
@@ -219,14 +222,26 @@ def test_scout_nominated_hard_negatives_remain_fully_unresolved_and_quarantined(
         )
         all_candidates.extend(result)
 
-    assert len(all_candidates) >= len(pairs)
-    for candidate in all_candidates:
-        assert candidate.relationship_type is RelationshipType.CROSS_VENUE_EQUIVALENCE
-        assert candidate.disposition is CandidateDisposition.QUARANTINED
-        assert candidate.provenance.kind == "ai"
-        assert candidate.provenance.gate_status == "PASS"
-        assert len(candidate.unresolved_fields) == 8
-        assert set(candidate.unresolved_fields) == _ENGINE_D_UNRESOLVED_FIELDS
+    # For every fixture pair, its two title-similar members must have actually been nominated
+    # together -- not merely that SOME cross-topic candidate exists somewhere in the batch.
+    for market_id_a, market_id_b in pair_market_ids:
+        expected_leg_ids = {market_id_a, market_id_b}
+        matches = [
+            candidate
+            for candidate in all_candidates
+            if {leg.market_id for leg in candidate.legs} == expected_leg_ids
+        ]
+        assert matches, (
+            f"expected a nomination pairing {market_id_a!r} with {market_id_b!r}, "
+            f"but retrieval never surfaced that pair together"
+        )
+        for candidate in matches:
+            assert candidate.relationship_type is RelationshipType.CROSS_VENUE_EQUIVALENCE
+            assert candidate.disposition is CandidateDisposition.QUARANTINED
+            assert candidate.provenance.kind == "ai"
+            assert candidate.provenance.gate_status == "PASS"
+            assert len(candidate.unresolved_fields) == 8
+            assert set(candidate.unresolved_fields) == _ENGINE_D_UNRESOLVED_FIELDS
 
 
 def test_same_underlying_exchange_frontend_pair_is_flagged_in_fixture() -> None:
