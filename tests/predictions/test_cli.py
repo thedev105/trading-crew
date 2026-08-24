@@ -1429,6 +1429,194 @@ def test_scan_command_reports_insufficient_evidence_without_books(
     assert reports[0].reason == "MISSING_BOOK"
 
 
+def test_scan_command_reports_insufficient_evidence_when_no_proof_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``predictions prove`` run has ever happened for this candidate: the store
+    has no proof_artifacts row at all, so ``latest_proof_for_candidate`` returns
+    ``None`` and the scan must fall back to the fixed "no proof compiled" reason
+    (distinct from an actually-compiled ``insufficient_evidence``/``rejected``
+    proof, which instead passes through that proof's own ``rejection_reason``).
+    """
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate_relationship())
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    exit_code = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 0,
+        "INSUFFICIENT_EVIDENCE": 1,
+    }
+    assert output["shadow_candidates"] == []
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    assert reports[0].decision == "INSUFFICIENT_EVIDENCE"
+    assert reports[0].proof_id is None
+    assert reports[0].reason == "no proof compiled"
+
+
+def test_scan_command_rejects_a_candidate_with_a_rejected_proof(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An attestation with ``tie_possible=True`` makes ``compile_proof`` emit a
+    ``rejected`` (not ``insufficient_evidence``) ``binary_complement@1`` artifact
+    with ``rejection_reason="TIE_UNMODELED"``. The scan must classify this as
+    ``REJECTED`` and pass that exact reason through verbatim -- proving the
+    "non-ready proof -> REJECTED with the proof's own rejection_reason" branch is
+    distinct from the "no proof at all" and "insufficient_evidence proof" branches.
+    """
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record(rule_version_id=RULE_VERSION_ID))
+    store.append_rule_version(rule_version(rule_version_id=RULE_VERSION_ID, effective_at=NOW))
+    store.append_rule_attestation(
+        rule_attestation(
+            rule_version_id=RULE_VERSION_ID,
+            reviewed_at=NOW,
+            tie_possible=True,
+            tie_behavior="split_at_par",
+        )
+    )
+    store.append_candidate_relationship(candidate_relationship())
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    prove_exit = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+            "--format",
+            "json",
+        ]
+    )
+    assert prove_exit == 0
+    prove_output = json.loads(capsys.readouterr().out)
+    assert prove_output["status"] == "rejected"
+    assert prove_output["rejection_reason"] == "TIE_UNMODELED"
+
+    exit_code = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 1,
+        "INSUFFICIENT_EVIDENCE": 0,
+    }
+    assert output["shadow_candidates"] == []
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    assert reports[0].decision == "REJECTED"
+    assert reports[0].reason == "TIE_UNMODELED"
+    assert reports[0].proof_id is not None
+    assert reports[0].economics is None
+
+
+def test_scan_command_rejects_a_proof_ready_candidate_with_non_positive_surplus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="111",
+            bids=(level("0.40", "10"),),
+            asks=(level("0.49", "100"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="222",
+            bids=(level("0.40", "10"),),
+            asks=(level("0.49", "80"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_fee_rate(fee_rate(market_id="0xcondition", taker_rate=Decimal("0.01")))
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    prove_exit = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    assert prove_exit == 0
+    capsys.readouterr()
+
+    scan_exit = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert scan_exit == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 1,
+        "INSUFFICIENT_EVIDENCE": 0,
+    }
+    assert output["shadow_candidates"] == []
+
+    # Hand-checked against DEFAULT_RESEARCH_POLICY (research-v1):
+    #   bottleneck quantity q = min(leg0 ask depth 100, leg1 ask depth 80) = 80
+    #   acquisition0 = 0.49 * 80 = 39.20; acquisition1 = 0.49 * 80 = 39.20
+    #   acquisition_total = 78.40
+    #   fee_total = 39.20*0.01 + 39.20*0.01 = 0.392 + 0.392 = 0.784
+    #   currency_basis_reserve = 78.40 * 0.0025 = 0.196
+    #   capital_lockup_reserve = 78.40 * 0.0002 * 3 = 0.04704
+    #   all_in_cost = 78.40 + 0.784 + 2.00(gas) + 0.196 + 1.00(transfer) + 0.04704 + 0.50(ops)
+    #               = 82.92704
+    #   failure_reserve = 78.40 * (0.01+0.005+0.005+0.0025) = 78.40 * 0.0225 = 1.764
+    #   proven_floor = q * minimum_basket_payout(1) = 80.00
+    #   surplus = 80.00 - 82.92704 - 1.764 = -4.69104  (negative -> REJECTED)
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.decision == "REJECTED"
+    assert report.reason == "conservative surplus not positive"
+    assert report.proof_id is not None
+    assert report.economics is not None
+    assert report.economics.status == "evaluated"
+    assert report.economics.conservative_surplus_usd == Decimal("-4.69104")
+    assert report.economics.capacity_usd_at_current_depth == Decimal("78.40")
+
+
 def test_scan_command_is_idempotent_across_reruns(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

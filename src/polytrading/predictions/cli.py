@@ -28,6 +28,7 @@ from polytrading.predictions.economics import evaluate_basket_economics
 from polytrading.predictions.economics_models import (
     DEFAULT_RESEARCH_POLICY,
     EconomicsResult,
+    ScanDecision,
     ScanReport,
     deterministic_scan_report_id,
 )
@@ -680,7 +681,7 @@ def _scan_one_candidate(
     proof = store.latest_proof_for_candidate(candidate.candidate_id, as_of)
     economics: EconomicsResult | None = None
     proof_id: UUID | None = None
-    decision: str
+    decision: ScanDecision
     reason: str
 
     if proof is None:
@@ -722,7 +723,7 @@ def _scan_one_candidate(
     report_id = deterministic_scan_report_id(
         candidate_id=candidate.candidate_id,
         proof_id=proof_id,
-        decision=decision,  # type: ignore[arg-type]
+        decision=decision,
         reason=reason,
         economics=economics,
         policy_id=DEFAULT_RESEARCH_POLICY.policy_id,
@@ -733,7 +734,7 @@ def _scan_one_candidate(
         report_id=report_id,
         candidate_id=candidate.candidate_id,
         proof_id=proof_id,
-        decision=decision,  # type: ignore[arg-type]
+        decision=decision,
         reason=reason,
         economics=economics,
         policy_id=DEFAULT_RESEARCH_POLICY.policy_id,
