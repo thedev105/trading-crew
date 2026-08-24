@@ -8,10 +8,12 @@ from polytrading.predictions.candidates_models import CandidateDisposition
 from polytrading.predictions.dashboard_server import PredictionDashboardApplication
 from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.candidate_helpers import ai_provenance, candidate_relationship
+from tests.predictions.proof_helpers import proof_artifact
+from tests.predictions.scan_helpers import scan_report
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
 
-_FORBIDDEN_WORDS = ("risk-free", "guaranteed", "approved")
+_FORBIDDEN_WORDS = ("risk-free", "guaranteed", "approved", "live eligible")
 
 
 def _asset(name: str) -> str:
@@ -193,3 +195,111 @@ def test_dashboard_ai_provenance_candidate_disposition_is_not_forced_to_quaranti
     document = json.loads(response.body)
     assert document["candidates"]["latest"][0]["provenance_kind"] == "ai"
     assert document["candidates"]["latest"][0]["disposition"] == "rejected"
+
+
+def test_dashboard_json_endpoint_includes_proof_summary(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_proof_artifact(proof_artifact(observed_at=NOW, information_cutoff=NOW))
+    store.close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+
+    document = json.loads(response.body)
+    assert document["proofs"]["total"] == 1
+    assert document["proofs"]["by_status"] == {"proof_ready": 1}
+    assert document["proofs"]["latest"][0]["status"] == "proof_ready"
+    assert document["proofs"]["latest"][0]["template"] == "binary_complement@1"
+
+
+def test_dashboard_json_endpoint_omits_proofs_when_none_seeded(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+
+    document = json.loads(response.body)
+    assert document["proofs"]["total"] == 0
+    assert document["proofs"]["latest"] == []
+
+
+def test_dashboard_json_endpoint_includes_scan_summary(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_scan_report(
+        scan_report(
+            decision="REJECTED",
+            reason="economics unfavorable",
+            economics=None,
+            proof_id=None,
+            as_of=NOW,
+            observed_at=NOW,
+        )
+    )
+    store.close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+
+    document = json.loads(response.body)
+    assert document["scans"]["total"] == 1
+    assert document["scans"]["by_decision"] == {"REJECTED": 1}
+    assert document["scans"]["latest"][0]["decision"] == "REJECTED"
+    assert document["scans"]["latest"][0]["surplus"] is None
+
+
+def test_dashboard_json_endpoint_omits_scans_when_none_seeded(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+
+    document = json.loads(response.body)
+    assert document["scans"]["total"] == 0
+    assert document["scans"]["latest"] == []
+
+
+def test_dashboard_html_declares_proof_and_scan_sections() -> None:
+    html = _asset("index.html")
+    assert 'id="proofs"' in html
+    assert 'id="proofs-summary"' in html
+    assert 'id="proofs-empty"' in html
+    assert "No proof artifacts observed" in html
+    assert 'id="scans"' in html
+    assert 'id="scans-summary"' in html
+    assert 'id="scans-empty"' in html
+    assert "No scan reports observed" in html
+
+
+def test_dashboard_client_renders_proofs_and_scans() -> None:
+    javascript = _asset("app.js")
+
+    assert "function renderProofs(snapshot)" in javascript
+    assert "renderProofs(snapshot);" in javascript
+    assert "snapshot.proofs" in javascript
+    assert "cell(proof.status)" in javascript
+
+    assert "function renderScans(snapshot)" in javascript
+    assert "renderScans(snapshot);" in javascript
+    assert "snapshot.scans" in javascript
+    assert "decisionCell.textContent = scan.decision;" in javascript
+
+
+def test_dashboard_scan_panel_labels_shadow_candidate_as_research_only() -> None:
+    javascript = _asset("app.js")
+    assert '"research decision — not an instruction to trade"' in javascript
+    assert 'scan.decision === "SHADOW_CANDIDATE"' in javascript
+
+
+def test_dashboard_proof_and_scan_panels_never_use_forbidden_words() -> None:
+    javascript = _asset("app.js").lower()
+    html = _asset("index.html").lower()
+    css = _asset("app.css").lower()
+
+    for forbidden in _FORBIDDEN_WORDS:
+        assert forbidden not in javascript
+        assert forbidden not in html
+        assert forbidden not in css

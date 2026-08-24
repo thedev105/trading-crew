@@ -54,3 +54,11 @@ pre {
   background: #e6e6e6;
   font-size: 0.8rem;
 }
+
+.scan-caption {
+  display: inline-block;
+  margin-left: 0.4rem;
+  font-size: 0.8rem;
+  font-style: italic;
+  color: #555;
+}

@@ -28,6 +28,20 @@ function validateSnapshot(snapshot) {
   ) {
     throw new Error("INVALID_SNAPSHOT");
   }
+  if (
+    typeof snapshot.proofs !== "object" ||
+    snapshot.proofs === null ||
+    !Array.isArray(snapshot.proofs.latest)
+  ) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
+  if (
+    typeof snapshot.scans !== "object" ||
+    snapshot.scans === null ||
+    !Array.isArray(snapshot.scans.latest)
+  ) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
   return snapshot;
 }
 
@@ -93,6 +107,8 @@ function render(snapshot) {
   }
 
   renderCandidates(snapshot);
+  renderProofs(snapshot);
+  renderScans(snapshot);
 }
 
 function renderCandidates(snapshot) {
@@ -129,6 +145,68 @@ function renderCandidates(snapshot) {
       cell(candidate.observed_at),
     );
     candidatesBody.append(row);
+  }
+}
+
+function renderProofs(snapshot) {
+  const summary = snapshot.proofs;
+  el("proofs-summary").textContent =
+    `Total: ${summary.total} | by status: ${JSON.stringify(summary.by_status)} | ` +
+    `by template: ${JSON.stringify(summary.by_template)}`;
+
+  const proofsBody = el("proofs").querySelector("tbody");
+  proofsBody.replaceChildren();
+
+  const hasProofs = summary.latest.length > 0;
+  el("proofs").hidden = !hasProofs;
+  el("proofs-empty").hidden = hasProofs;
+
+  for (const proof of summary.latest) {
+    const row = document.createElement("tr");
+    row.append(
+      cell(proof.proof_id),
+      cell(proof.candidate_id),
+      cell(proof.template),
+      cell(proof.status),
+      cell(proof.rejection_reason ?? "none"),
+      cell(proof.minimum_basket_payout ?? "none"),
+      cell(proof.observed_at),
+    );
+    proofsBody.append(row);
+  }
+}
+
+function renderScans(snapshot) {
+  const summary = snapshot.scans;
+  el("scans-summary").textContent =
+    `Total: ${summary.total} | by decision: ${JSON.stringify(summary.by_decision)}`;
+
+  const scansBody = el("scans").querySelector("tbody");
+  scansBody.replaceChildren();
+
+  const hasScans = summary.latest.length > 0;
+  el("scans").hidden = !hasScans;
+  el("scans-empty").hidden = hasScans;
+
+  for (const scan of summary.latest) {
+    const row = document.createElement("tr");
+    const decisionCell = document.createElement("td");
+    decisionCell.textContent = scan.decision;
+    if (scan.decision === "SHADOW_CANDIDATE") {
+      const caption = document.createElement("span");
+      caption.className = "scan-caption";
+      caption.textContent = "research decision — not an instruction to trade";
+      decisionCell.append(" ", caption);
+    }
+    row.append(
+      cell(scan.candidate_id),
+      decisionCell,
+      cell(scan.reason),
+      cell(scan.surplus ?? "none"),
+      cell(scan.capacity ?? "none"),
+      cell(scan.as_of),
+    );
+    scansBody.append(row);
   }
 }
 

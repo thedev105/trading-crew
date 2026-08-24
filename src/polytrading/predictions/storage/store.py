@@ -563,6 +563,17 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else ProofArtifact.model_validate_json(row[0])
 
+    def proof_artifacts_as_of(self, as_of: datetime) -> tuple[ProofArtifact, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM proof_artifacts
+            WHERE observed_at <= ?
+            ORDER BY observed_at, proof_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(ProofArtifact.model_validate_json(row[0]) for row in rows)
+
     def scan_reports_as_of(self, as_of: datetime) -> tuple[ScanReport, ...]:
         rows = self._connection.execute(
             """

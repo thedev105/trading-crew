@@ -17,14 +17,22 @@ from polytrading.predictions.dashboard_models import (
     PredictionDashboardSnapshot,
     PredictionEvidenceCounts,
     PredictionOperationRecipes,
+    ProofListing,
+    ProofSummary,
+    ScanListing,
+    ScanSummary,
 )
 from polytrading.predictions.domain import MarketRecord, PredictionBookSnapshot, PredictionVenue
+from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.health import PredictionHealthAuditor
+from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.storage.store import PredictionMarketStore
 
 _MAX_MARKETS_SHOWN = 200
 _MAX_BOOKS_SHOWN = 24
 _MAX_CANDIDATES_SHOWN = 20
+_MAX_PROOFS_SHOWN = 20
+_MAX_SCANS_SHOWN = 20
 
 
 class PredictionDashboardBuilder:
@@ -50,6 +58,8 @@ class PredictionDashboardBuilder:
             ),
             recipes=PredictionOperationRecipes(schema_version=1, recipes=self._recipes()),
             candidates=self._candidate_summary(as_of),
+            proofs=self._proof_summary(as_of),
+            scans=self._scan_summary(as_of),
         )
 
     def _latest_books(
@@ -93,6 +103,43 @@ class PredictionDashboardBuilder:
             latest=latest,
         )
 
+    def _proof_summary(self, as_of: datetime) -> ProofSummary:
+        proofs = self._store.proof_artifacts_as_of(as_of)
+        by_status: dict[str, int] = {}
+        by_template: dict[str, int] = {}
+        for proof in proofs:
+            _increment(by_status, proof.status)
+            _increment(by_template, proof.template)
+
+        # Same newest-first/cap-at-20 contract as `_candidate_summary` above: the
+        # store returns proofs oldest-first, so reverse the newest slice for display.
+        newest_first = tuple(reversed(proofs[-_MAX_PROOFS_SHOWN:]))
+        latest = tuple(_proof_listing(proof) for proof in newest_first)
+
+        return ProofSummary(
+            schema_version=1,
+            total=len(proofs),
+            by_status=by_status,
+            by_template=by_template,
+            latest=latest,
+        )
+
+    def _scan_summary(self, as_of: datetime) -> ScanSummary:
+        reports = self._store.scan_reports_as_of(as_of)
+        by_decision: dict[str, int] = {}
+        for report in reports:
+            _increment(by_decision, report.decision)
+
+        newest_first = tuple(reversed(reports[-_MAX_SCANS_SHOWN:]))
+        latest = tuple(_scan_listing(report) for report in newest_first)
+
+        return ScanSummary(
+            schema_version=1,
+            total=len(reports),
+            by_decision=by_decision,
+            latest=latest,
+        )
+
     def _recipes(self) -> tuple[str, ...]:
         db = self._database_path
         return (
@@ -100,9 +147,13 @@ class PredictionDashboardBuilder:
             f"polytrading predictions collect polymarket --db {db}",
             f"polytrading predictions collect kalshi --db {db}",
             f"polytrading predictions collect limitless --db {db}",
+            f"polytrading predictions collect polymarket --db {db} --books 5",
             f"polytrading predictions health --db {db} --format json",
             f"polytrading predictions candidates --db {db} "
             "--venues polymarket,kalshi,limitless --format json",
+            f"polytrading predictions attest --db {db} --input attestation.json",
+            f"polytrading predictions prove --db {db} --candidate-id <candidate-id> --format json",
+            f"polytrading predictions scan --db {db} --format json",
         )
 
 
@@ -120,6 +171,32 @@ def _candidate_listing(candidate: CandidateRelationship) -> CandidateListing:
         provenance_kind=candidate.provenance.kind,
         unresolved_field_count=len(candidate.unresolved_fields),
         observed_at=candidate.observed_at,
+    )
+
+
+def _proof_listing(proof: ProofArtifact) -> ProofListing:
+    return ProofListing(
+        schema_version=1,
+        proof_id=proof.proof_id,
+        candidate_id=proof.candidate_id,
+        template=proof.template,
+        status=proof.status,
+        rejection_reason=proof.rejection_reason,
+        minimum_basket_payout=proof.minimum_basket_payout,
+        observed_at=proof.observed_at,
+    )
+
+
+def _scan_listing(report: ScanReport) -> ScanListing:
+    economics = report.economics
+    return ScanListing(
+        schema_version=1,
+        candidate_id=report.candidate_id,
+        decision=report.decision,
+        reason=report.reason,
+        surplus=None if economics is None else economics.conservative_surplus_usd,
+        capacity=None if economics is None else economics.capacity_usd_at_current_depth,
+        as_of=report.as_of,
     )
 
 

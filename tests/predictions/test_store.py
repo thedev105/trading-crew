@@ -443,6 +443,28 @@ def _economics_result(
     )
 
 
+def test_proof_artifacts_as_of_respects_the_cutoff(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006401"),
+        candidate_id=UUID("00000000-0000-0000-0000-000000003401"),
+        observed_at=NOW - timedelta(hours=1),
+        information_cutoff=NOW - timedelta(hours=1),
+    )
+    late = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006402"),
+        candidate_id=UUID("00000000-0000-0000-0000-000000003402"),
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    store.append_proof_artifact(early)
+    store.append_proof_artifact(late)
+
+    assert store.proof_artifacts_as_of(NOW - timedelta(minutes=30)) == (early,)
+    assert store.proof_artifacts_as_of(NOW) == (early, late)
+    assert store.proof_artifacts_as_of(NOW - timedelta(hours=2)) == ()
+
+
 def test_scan_report_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     report = scan_report()
