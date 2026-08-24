@@ -349,6 +349,11 @@ def test_void_resolve_to_rules_price_adds_one_combined_void_terminal_state() -> 
     # Every leg -- not only the void-flagged member -- pays its own attestation's
     # loser_payout_per_share in the single combined void state.
     assert void_state.leg_payouts == (Decimal("0.1"), Decimal("0.2"), Decimal("0.3"))
+    # member_0_wins=(1,0.2,0.3)=1.5, member_1_wins=(0.1,1,0.3)=1.4,
+    # member_2_wins=(0.1,0.2,1)=1.3, void=(0.1,0.2,0.3)=0.6 -- min/max must be computed
+    # over all four states, including the void state appended after the member states.
+    assert artifact.minimum_basket_payout == Decimal("0.6")
+    assert artifact.maximum_basket_payout == Decimal("1.5")
     assert artifact.excluded_states == ()
 
 
