@@ -9,8 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from pydantic import TypeAdapter, ValidationError
+
 from polytrading.http_client import make_public_http_client
 from polytrading.predictions.adapter import PredictionCollectionGateError
+from polytrading.predictions.attestations import RuleAttestation
 from polytrading.predictions.candidates import (
     propose_binary_complements,
     propose_venue_native_outcome_sets,
@@ -48,6 +51,9 @@ _CANDIDATES_CODE_REVISION = "unversioned"
 _CROSS_VENUE_ABSTENTION_LINE = (
     "cross-venue nomination: abstained (SCOUT_GATE_UNMET: no adjudicated gold evaluation)"
 )
+_RULE_ATTESTATIONS_ADAPTER: TypeAdapter[list[RuleAttestation]] = TypeAdapter(
+    list[RuleAttestation]
+)
 
 
 class PredictionsUsageError(ValueError):
@@ -60,6 +66,10 @@ class PredictionCollectionError(RuntimeError):
 
 class PredictionCandidatesError(RuntimeError):
     """A prediction-market candidate-discovery failure, sanitized for CLI output."""
+
+
+class PredictionAttestError(RuntimeError):
+    """A prediction-market rule-attestation import failure, sanitized for CLI output."""
 
 
 def _utc_now() -> datetime:
@@ -113,6 +123,12 @@ def add_predictions_subcommands(
     candidates.add_argument("--trial-family", default=_DEFAULT_CANDIDATES_TRIAL_FAMILY_ID)
     candidates.add_argument("--format", choices=("text", "json"), default="text")
 
+    attest = predictions_commands.add_parser(
+        "attest", help="ingest an operator-authored rule attestation file"
+    )
+    attest.add_argument("--db", required=True, type=Path)
+    attest.add_argument("--input", required=True, type=Path)
+
     dashboard = predictions_commands.add_parser(
         "dashboard", help="serve the loopback-only prediction-market evidence console"
     )
@@ -127,6 +143,8 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
         return asyncio.run(_run_collect(arguments))
     if arguments.predictions_command == "candidates":
         return _run_candidates(arguments)
+    if arguments.predictions_command == "attest":
+        return _run_attest(arguments)
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
@@ -420,6 +438,59 @@ def _run_candidates(arguments: argparse.Namespace) -> int:
                     f"already_known={bucket['already_known']}"
                 )
         print(_CROSS_VENUE_ABSTENTION_LINE)
+    return 0
+
+
+def _run_attest(arguments: argparse.Namespace) -> int:
+    input_path: Path = arguments.input
+    try:
+        raw_text = input_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise PredictionsUsageError(
+            f"attestation input file is unavailable: {input_path}"
+        ) from error
+    try:
+        attestations = _RULE_ATTESTATIONS_ADAPTER.validate_json(raw_text)
+    except ValidationError as error:
+        raise PredictionsUsageError(
+            f"attestation input file {input_path} is not a valid JSON array of "
+            f"rule attestations: {error}"
+        ) from error
+
+    appended = 0
+    already_known = 0
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                # Verify every attestation against the immutable rule-version registry
+                # before appending any of them: a mismatch or unknown id anywhere in the
+                # batch must fail the whole import as a usage error, not partially persist.
+                for attestation in attestations:
+                    stored_rule_version = store.rule_version_by_id(attestation.rule_version_id)
+                    if stored_rule_version is None:
+                        raise PredictionsUsageError(
+                            f"unknown rule_version_id {attestation.rule_version_id}"
+                        )
+                    if stored_rule_version.source_hash != attestation.rule_source_hash:
+                        raise PredictionsUsageError(
+                            f"rule_source_hash mismatch for rule_version_id "
+                            f"{attestation.rule_version_id}"
+                        )
+                with store.transaction() as transaction:
+                    for attestation in attestations:
+                        if transaction.append_rule_attestation(attestation):
+                            appended += 1
+                        else:
+                            already_known += 1
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionAttestError("rule attestation import failed to persist durably") from error
+
+    print(f"appended {appended} attestations, already_known={already_known}")
     return 0
 
 

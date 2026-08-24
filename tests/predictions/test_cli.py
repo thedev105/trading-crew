@@ -12,6 +12,7 @@ from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
+from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.domain_helpers import NOW, market_record, rule_version
 from tests.predictions.manifest_helpers import venue_manifest
 
@@ -884,3 +885,189 @@ def test_collect_kalshi_with_books_falls_back_to_yes_no_outcome_tokens(
         )
     finally:
         verify_store.close()
+
+
+def _write_attestations(path: Path, *attestations: object) -> None:
+    payload = [
+        attestation.model_dump(mode="json") if hasattr(attestation, "model_dump") else attestation
+        for attestation in attestations
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_attest_command_appends_and_reports_counts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation()
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=attestation.rule_version_id,
+            source_hash=attestation.rule_source_hash,
+        )
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "appended 1" in output
+    assert "already_known=0" in output or "0 already known" in output
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        stored = verify_store.latest_attestation_for_rule_version(
+            attestation.rule_version_id, NOW + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert stored == attestation
+
+
+def test_attest_command_is_idempotent_across_reimport(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation()
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=attestation.rule_version_id,
+            source_hash=attestation.rule_source_hash,
+        )
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    first_exit = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    capsys.readouterr()
+    second_exit = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert first_exit == 0
+    assert second_exit == 0
+    output = capsys.readouterr().out
+    assert "appended 0" in output
+
+
+def test_attest_command_rejects_a_rule_source_hash_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation()
+    store.append_rule_version(
+        rule_version(rule_version_id=attestation.rule_version_id, source_hash="b" * 64)
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert str(attestation.rule_version_id) in captured.err
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        stored = verify_store.latest_attestation_for_rule_version(
+            attestation.rule_version_id, NOW + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert stored is None
+
+
+def test_attest_command_rejects_an_unknown_rule_version_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    attestation = rule_attestation()
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert str(attestation.rule_version_id) in captured.err
+
+
+def test_attest_command_rejects_a_non_array_json_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    input_path = tmp_path / "attestations.json"
+    input_path.write_text(json.dumps({"not": "an array"}), encoding="utf-8")
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+
+
+def test_attest_command_rejects_a_strictly_invalid_attestation_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    attestation = rule_attestation()
+    payload = attestation.model_dump(mode="json")
+    payload["extra_unexpected_field"] = "nope"
+    input_path = tmp_path / "attestations.json"
+    input_path.write_text(json.dumps([payload]), encoding="utf-8")
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 2
+
+
+def test_attest_command_sanitizes_a_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    attestation = rule_attestation()
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=attestation.rule_version_id,
+            source_hash=attestation.rule_source_hash,
+        )
+    )
+    store.close()
+
+    input_path = tmp_path / "attestations.json"
+    _write_attestations(input_path, attestation)
+
+    def raise_conflict(self: PredictionMarketStore, record: object) -> bool:
+        raise ConflictingRecordError("conflicting rule attestation for immutable identity")
+
+    monkeypatch.setattr(PredictionMarketStore, "append_rule_attestation", raise_conflict)
+
+    exit_code = main(
+        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "rule attestation" in captured.err
+    assert "conflicting rule attestation" not in captured.err

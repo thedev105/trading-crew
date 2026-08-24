@@ -14,6 +14,7 @@ from uuid import UUID
 import duckdb
 from pydantic import BaseModel
 
+from polytrading.predictions.attestations import RuleAttestation
 from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.domain import (
     MarketRecord,
@@ -260,6 +261,26 @@ class PredictionMarketStore:
             ],
         )
 
+    def append_rule_attestation(self, record: RuleAttestation) -> bool:
+        return self._append_keyed(
+            table="rule_attestations",
+            record=record,
+            label="rule attestation",
+            where="attestation_id = ?",
+            key_params=[record.attestation_id],
+            insert_columns=(
+                "attestation_id, venue, market_id, rule_version_id, reviewed_at, "
+                "record_json, record_hash"
+            ),
+            insert_params=[
+                record.attestation_id,
+                record.venue.value,
+                record.market_id,
+                record.rule_version_id,
+                record.reviewed_at,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -327,6 +348,13 @@ class PredictionMarketStore:
             [venue.value, as_of],
         ).fetchall()
         return tuple(MarketRecord.model_validate_json(row[0]) for row in rows)
+
+    def rule_version_by_id(self, rule_version_id: UUID) -> RuleVersion | None:
+        row = self._connection.execute(
+            "SELECT record_json FROM rule_versions WHERE rule_version_id = ?",
+            [rule_version_id],
+        ).fetchone()
+        return None if row is None else RuleVersion.model_validate_json(row[0])
 
     def rule_versions_for_market(self, market_id: str, as_of: datetime) -> tuple[RuleVersion, ...]:
         rows = self._connection.execute(
@@ -436,6 +464,20 @@ class PredictionMarketStore:
             [as_of],
         ).fetchall()
         return tuple(CandidateRelationship.model_validate_json(row[0]) for row in rows)
+
+    def latest_attestation_for_rule_version(
+        self, rule_version_id: UUID, as_of: datetime
+    ) -> RuleAttestation | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM rule_attestations
+            WHERE rule_version_id = ? AND reviewed_at <= ?
+            ORDER BY reviewed_at DESC
+            LIMIT 1
+            """,
+            [rule_version_id, as_of],
+        ).fetchone()
+        return None if row is None else RuleAttestation.model_validate_json(row[0])
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {

@@ -7,6 +7,7 @@ import pytest
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
+from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.candidate_helpers import candidate_relationship
 from tests.predictions.domain_helpers import (
     NOW,
@@ -33,6 +34,7 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "prediction_books",
         "prediction_fee_rates",
         "candidate_relationships",
+        "rule_attestations",
         "schema_migrations",
     } <= tables
     perpetual_futures_tables = {
@@ -280,3 +282,46 @@ def test_candidate_relationships_as_of_respects_the_cutoff(tmp_path: Path) -> No
     assert store.candidate_relationships_as_of(NOW - timedelta(minutes=30)) == (early,)
     assert store.candidate_relationships_as_of(NOW) == (early, late)
     assert store.candidate_relationships_as_of(NOW - timedelta(hours=2)) == ()
+
+
+def test_rule_version_by_id_returns_none_for_an_unknown_id(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_rule_version(rule_version())
+
+    assert store.rule_version_by_id(rule_version().rule_version_id) == rule_version()
+    assert store.rule_version_by_id(UUID("00000000-0000-0000-0000-000000009999")) is None
+
+
+def test_rule_attestation_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    attestation = rule_attestation()
+
+    assert store.append_rule_attestation(attestation) is True
+    assert store.append_rule_attestation(attestation) is False
+    with pytest.raises(ConflictingRecordError):
+        store.append_rule_attestation(
+            attestation.model_copy(update={"review_identity": "someone-else@example.test"})
+        )
+
+
+def test_latest_attestation_for_rule_version_respects_the_cutoff(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = rule_attestation(
+        attestation_id=UUID("00000000-0000-0000-0000-000000005201"),
+        reviewed_at=NOW - timedelta(hours=1),
+    )
+    late = rule_attestation(
+        attestation_id=UUID("00000000-0000-0000-0000-000000005202"),
+        reviewed_at=NOW,
+    )
+    store.append_rule_attestation(early)
+    store.append_rule_attestation(late)
+
+    assert store.latest_attestation_for_rule_version(
+        early.rule_version_id, NOW - timedelta(minutes=30)
+    ) == early
+    assert store.latest_attestation_for_rule_version(early.rule_version_id, NOW) == late
+    assert (
+        store.latest_attestation_for_rule_version(early.rule_version_id, NOW - timedelta(hours=2))
+        is None
+    )
