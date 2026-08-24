@@ -349,6 +349,76 @@ def test_candidates_command_persists_deterministic_candidates_idempotently(
     }
 
 
+def test_candidates_command_is_idempotent_across_different_as_of_values(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record())
+    store.append_rule_version(rule_version())
+    store.close()
+
+    first_as_of = "2026-08-15T12:00:00Z"
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            first_as_of,
+            "--format",
+            "json",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    polymarket_counts = output["venues"]["polymarket"]
+    assert polymarket_counts[RelationshipType.BINARY_COMPLEMENT.value] == {
+        "newly_appended": 1,
+        "already_known": 0,
+    }
+
+    # A second run at a LATER --as-of regenerates the same deterministic candidate_id
+    # (same legs, same relationship type) but with a different observed_at/
+    # information_cutoff. Before the fix this raised ConflictingRecordError and rolled
+    # back the whole transaction, hard-failing the command; it must instead report the
+    # regenerated candidate as already_known and exit 0.
+    second_as_of = "2026-08-16T12:00:00Z"
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            second_as_of,
+            "--format",
+            "json",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    polymarket_counts = output["venues"]["polymarket"]
+    assert polymarket_counts[RelationshipType.BINARY_COMPLEMENT.value] == {
+        "newly_appended": 0,
+        "already_known": 1,
+    }
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        candidates = verify_store.candidate_relationships_as_of(datetime(2026, 8, 17, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(candidates) == 1
+    assert candidates[0].observed_at == datetime(2026, 8, 15, 12, tzinfo=UTC)
+    assert candidates[0].information_cutoff == datetime(2026, 8, 15, 12, tzinfo=UTC)
+
+
 def test_candidates_command_reports_cross_venue_abstention(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

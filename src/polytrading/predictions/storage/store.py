@@ -9,6 +9,7 @@ from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import duckdb
 from pydantic import BaseModel
@@ -409,6 +410,21 @@ class PredictionMarketStore:
             [venue.value, market_id, as_of],
         ).fetchone()
         return None if row is None else PredictionFeeRate.model_validate_json(row[0])
+
+    def existing_candidate_ids(self) -> frozenset[UUID]:
+        """Every ``candidate_id`` already persisted, with no ``as_of`` cutoff.
+
+        Regenerating candidates at a later ``--as-of`` reproduces the same deterministic
+        ``candidate_id`` but with a different ``observed_at``/``information_cutoff``
+        (the new as_of). Callers must use this to skip re-appending an id that already
+        exists rather than calling ``append_candidate_relationship`` and relying on it
+        to raise ``ConflictingRecordError`` -- the first-observed record must stand
+        unappended-over, not conflict the whole persisting transaction.
+        """
+        rows = self._connection.execute(
+            "SELECT candidate_id FROM candidate_relationships"
+        ).fetchall()
+        return frozenset(row[0] for row in rows)
 
     def candidate_relationships_as_of(self, as_of: datetime) -> tuple[CandidateRelationship, ...]:
         rows = self._connection.execute(

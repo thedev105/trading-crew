@@ -281,7 +281,18 @@ def _run_candidates(arguments: argparse.Namespace) -> int:
                     proposed[venue] = binary_complements + outcome_sets
 
                 with store.transaction() as transaction:
+                    # Regenerating candidates at a later --as-of reproduces the same
+                    # deterministic candidate_id (uuid5 over type+legs) with a different
+                    # observed_at/information_cutoff. Appending it again would raise
+                    # ConflictingRecordError and roll back genuinely new candidates in
+                    # this same transaction, so skip already-known ids up front: the
+                    # first-observed record stands, append-only immutability preserved.
+                    known_candidate_ids = set(transaction.existing_candidate_ids())
                     for venue in venues:
+                        # Pre-seeded with exactly the two generators called above
+                        # (propose_binary_complements, propose_venue_native_outcome_sets);
+                        # a future generator wired into `proposed` without a matching
+                        # key here would KeyError below instead of silently dropping counts.
                         counts: dict[RelationshipType, dict[str, int]] = {
                             RelationshipType.BINARY_COMPLEMENT: {
                                 "newly_appended": 0,
@@ -294,8 +305,12 @@ def _run_candidates(arguments: argparse.Namespace) -> int:
                         }
                         for candidate in proposed[venue]:
                             bucket = counts[candidate.relationship_type]
+                            if candidate.candidate_id in known_candidate_ids:
+                                bucket["already_known"] += 1
+                                continue
                             if transaction.append_candidate_relationship(candidate):
                                 bucket["newly_appended"] += 1
+                                known_candidate_ids.add(candidate.candidate_id)
                             else:
                                 bucket["already_known"] += 1
                         venue_counts[venue] = counts
