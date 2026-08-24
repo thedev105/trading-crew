@@ -1167,6 +1167,39 @@ undoubled cost assumptions is visibly fragile rather than hidden behind a single
 number. `predictions scan` is idempotent at a fixed `--as-of`: re-running it over unchanged
 evidence reproduces the same `ScanReport` ids rather than appending duplicates.
 
+### The real end-to-end reachable surface
+
+Despite four proof templates and three venues, in this increment only **Polymarket
+binary-complement candidates** can actually traverse the whole
+collect → attest → prove → scan pipeline through to a persisted `SHADOW_CANDIDATE`. Every other
+combination is structurally blocked before economics ever runs, for reasons specific to each
+venue and template rather than one shared gap:
+
+- **Kalshi legs never reach `proof_ready` economics.** Kalshi exposes no public live fee-rate
+  endpoint, so `--books` collection against Kalshi never records fee evidence (above); a scan
+  stays `INSUFFICIENT_EVIDENCE`/`MISSING_FEE` for any Kalshi leg by design. Independently, Kalshi's
+  order books are keyed by the literal outcome strings `"yes"`/`"no"`, while Kalshi's
+  `MarketRecord.outcome_token_ids` is always `None` — so a Kalshi candidate leg's
+  `outcome_token_id` is always `None` too (candidates derive it from `outcome_token_ids[index]`,
+  which doesn't exist for Kalshi). A scan's book lookup is keyed on that per-leg
+  `outcome_token_id`, so it can never match a Kalshi book snapshot regardless of fee evidence —
+  `MISSING_BOOK` either way.
+- **`exhaustive_outcome_set@1` legs carry no per-side token identity either**, for the same
+  underlying reason (outcome-set members are grouped by market, not by a per-side token), so this
+  template's proofs face the identical book-lookup gap once compiled.
+- **`cross_venue_equivalence@1` cannot reach `proof_ready` at all in this increment** (above) —
+  two of its eight equivalence dimensions have no attested basis yet, so every compiled artifact
+  rejects before a scan would even need book/fee evidence.
+- **`logical_implication@1`** proofs can reach `proof_ready` on Polymarket-only baskets, but the
+  same Polymarket-only per-leg token identity requirement applies to its books as it does to
+  `binary_complement@1`.
+
+None of this is an oversight this increment tries to hide: it's the direct, provable consequence
+of per-side token identity existing only on Polymarket legs today. Widening that surface — giving
+Kalshi and outcome-set legs their own per-side token identity, and closing the Kalshi fee gap — is
+scheduled as next-increment work, not a silent limitation of the scan or proof compilers
+themselves.
+
 ### Dashboard and recipes
 
 The dashboard (`predictions dashboard`, section 17) now also shows a proofs panel (status and
