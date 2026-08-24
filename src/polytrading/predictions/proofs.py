@@ -11,6 +11,8 @@ from polytrading.predictions.attestations import RuleAttestation
 from polytrading.predictions.candidates_models import CandidateRelationship, RelationshipType
 from polytrading.predictions.domain import RuleVersion, Sha256
 from polytrading.predictions.proofs_models import (
+    EquivalenceDimensionResult,
+    EquivalenceMatrix,
     ExcludedState,
     ProofArtifact,
     ProofAssumption,
@@ -38,6 +40,9 @@ _EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION = "1"
 
 _LOGICAL_IMPLICATION_TEMPLATE = "logical_implication@1"
 _LOGICAL_IMPLICATION_COMPILER_VERSION = "1"
+
+_CROSS_VENUE_EQUIVALENCE_TEMPLATE = "cross_venue_equivalence@1"
+_CROSS_VENUE_EQUIVALENCE_COMPILER_VERSION = "1"
 
 # Predicate strings this template recognizes as threshold "direction" families: an
 # "up" bound (>=, >) is satisfied by values at-or-above/strictly-above the threshold;
@@ -75,6 +80,10 @@ def compile_proof(
         )
     if candidate.relationship_type is RelationshipType.LOGICAL_IMPLICATION:
         return _compile_logical_implication(
+            candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
+        )
+    if candidate.relationship_type is RelationshipType.CROSS_VENUE_EQUIVALENCE:
+        return _compile_cross_venue_equivalence(
             candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
         )
     raise NotImplementedError(
@@ -807,6 +816,337 @@ def _compile_logical_implication(
     return _finalize(artifact)
 
 
+def _compile_cross_venue_equivalence(
+    candidate: CandidateRelationship,
+    rule_versions: Mapping[UUID, RuleVersion],
+    attestations: Mapping[UUID, RuleAttestation],
+    *,
+    as_of: datetime,
+    review_identity: str,
+) -> ProofArtifact:
+    """Implements the ``cross_venue_equivalence@1`` template (Engine D).
+
+    Leg 0 and leg 1 are each one market on a distinct venue, independently attested
+    (unlike ``binary_complement``, they never share a ``rule_version_id``). Rather than
+    directly modeling a payoff table, this template's real work is compiling an
+    ``EquivalenceMatrix``: an 8-dimension compatibility verdict comparing the two legs'
+    attestations field-by-field, reusing the identical field names as increment 2's
+    ``scout_bridge._ENGINE_D_UNRESOLVED_FIELDS`` -- a cross-venue nomination starts
+    with all 8 fields unresolved, and this compiler is the only thing permitted to
+    narrow them.
+
+    Every dimension must independently be derived as ``"compatible"``,
+    ``"incompatible"``, or ``"unknown"`` from only the two attestations' own fields --
+    never inferred from anything else, and never guessed when the underlying fact
+    was never attested. Two dimensions (``settlement_finality_timing``,
+    ``venue_access_custody_rules``) have no attested basis anywhere in v1's
+    ``RuleAttestation`` model, so they are unconditionally ``"unknown"``: this means
+    ``proof_ready`` is UNREACHABLE for this template in v1 -- every compiled artifact
+    rejects, at minimum on those two dimensions. That is the spec-correct fail-closed
+    outcome (equivalence across venues is a strong claim; v1 simply doesn't yet attest
+    enough to support it), not a bug to soften.
+
+    Rejection precedence when the matrix carries more than one non-``"compatible"``
+    dimension: ``"incompatible"`` wins over ``"unknown"`` for the artifact's single
+    ``rejection_reason`` -- a proven divergence is a stronger, more specific finding
+    than an absence of evidence, so ``EQUIVALENCE_DIMENSION_INCOMPATIBLE`` is reported
+    whenever any dimension is incompatible, even if others are also unknown. Only when
+    no dimension is incompatible (but at least one is unknown, which given the two
+    always-unknown dimensions is every artifact in v1) does the artifact reject as
+    ``EQUIVALENCE_DIMENSION_UNKNOWN``.
+
+    Within the ``void_dispute_behavior`` dimension specifically, "needed but unknown"
+    is checked before equality: either leg attesting ``void_or_invalid_possible=True``
+    with ``void_behavior=="unknown"`` makes that dimension ``"unknown"`` regardless of
+    whether the other leg's void tuple matches, since the fact this dimension needs
+    (how a void resolves) was never actually attested on that leg.
+
+    Were ``proof_ready`` ever reachable (a future increment attesting the two
+    currently-unknown dimensions), the basket is buying opposite sides across the two
+    equivalent legs -- YES on leg 0, NO on leg 1 -- yielding exactly two terminal
+    states (the proposition resolving true or false, identically on both venues since
+    they're proven equivalent): no excluded states, and no separate void/tie payoff
+    modeling, since a "compatible" ``void_dispute_behavior`` dimension already
+    guarantees the two legs' void/tie facts agree.
+
+    Check order: missing attestation (either leg) is checked first, before rule-version
+    currency, before the matrix can even be built -- an all-``"unknown"`` matrix is
+    still emitted (using whichever attestation IDs exist as its basis) since
+    ``ProofArtifact`` requires a matrix on every status for this template, never only
+    on ``proof_ready``.
+
+    A candidate whose legs don't fit this shape (not exactly 2 legs) is a structural
+    integrity error, not a research outcome -- raised rather than silently reading only
+    ``legs[0]``/``legs[1]``. Legs spanning at least two distinct venues is already
+    enforced by ``CandidateRelationship`` itself.
+    """
+    legs = candidate.legs
+    if len(legs) != 2:
+        raise ValueError(
+            "a cross_venue_equivalence candidate must have exactly 2 legs (spanning "
+            f"two distinct venues); got legs={legs!r}"
+        )
+    leg_a, leg_b = legs
+    rule_version_ids = (leg_a.rule_version_id, leg_b.rule_version_id)
+
+    attestation_a = attestations.get(leg_a.rule_version_id)
+    attestation_b = attestations.get(leg_b.rule_version_id)
+    if attestation_a is None or attestation_b is None:
+        basis_ids = tuple(
+            sorted(
+                attestation.attestation_id
+                for attestation in (attestation_a, attestation_b)
+                if attestation is not None
+            )
+        )
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_CROSS_VENUE_EQUIVALENCE_TEMPLATE,
+                compiler_version=_CROSS_VENUE_EQUIVALENCE_COMPILER_VERSION,
+                status="insufficient_evidence",
+                rejection_reason="MISSING_ATTESTATION",
+                rule_version_ids=rule_version_ids,
+                source_hashes=_sorted_unique_hashes(leg.rule_source_hash for leg in legs),
+                as_of=as_of,
+                review_identity=review_identity,
+                equivalence_matrix=_all_unknown_equivalence_matrix(basis_ids),
+            )
+        )
+
+    source_hashes = _sorted_unique_hashes(
+        [leg.rule_source_hash for leg in legs]
+        + [attestation_a.rule_source_hash, attestation_b.rule_source_hash]
+    )
+    basis_ids = tuple(sorted((attestation_a.attestation_id, attestation_b.attestation_id)))
+
+    if not all(leg.rule_version_id in rule_versions for leg in legs):
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_CROSS_VENUE_EQUIVALENCE_TEMPLATE,
+                compiler_version=_CROSS_VENUE_EQUIVALENCE_COMPILER_VERSION,
+                status="rejected",
+                rejection_reason="RULE_VERSION_CHANGED",
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+                equivalence_matrix=_all_unknown_equivalence_matrix(basis_ids),
+            )
+        )
+
+    matrix = _build_equivalence_matrix(attestation_a, attestation_b, basis_ids)
+    dimensions = (
+        matrix.proposition_threshold_inclusivity,
+        matrix.observation_period_timezone,
+        matrix.resolution_sources,
+        matrix.void_dispute_behavior,
+        matrix.outcome_completeness,
+        matrix.denomination_collateral_rounding,
+        matrix.settlement_finality_timing,
+        matrix.venue_access_custody_rules,
+    )
+
+    def _reject(reason: ProofRejectionReason) -> ProofArtifact:
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_CROSS_VENUE_EQUIVALENCE_TEMPLATE,
+                compiler_version=_CROSS_VENUE_EQUIVALENCE_COMPILER_VERSION,
+                status="rejected",
+                rejection_reason=reason,
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+                equivalence_matrix=matrix,
+            )
+        )
+
+    # Incompatible wins over unknown: a proven divergence is a stronger finding than
+    # an absence of evidence (see docstring).
+    if "incompatible" in dimensions:
+        return _reject("EQUIVALENCE_DIMENSION_INCOMPATIBLE")
+    if "unknown" in dimensions:
+        return _reject("EQUIVALENCE_DIMENSION_UNKNOWN")
+
+    # Unreachable in v1 (settlement_finality_timing and venue_access_custody_rules are
+    # always "unknown" above), retained so a future increment that attests those two
+    # dimensions doesn't need to touch this branch.
+    market_a = leg_a.market_id
+    market_b = leg_b.market_id
+    terminal_states = (
+        TerminalState(
+            state_id="proposition_true",
+            description=(
+                f"{market_a} and {market_b}: the shared proposition resolves true on "
+                "both venues (proven equivalent); YES(leg 0) wins, NO(leg 1) loses."
+            ),
+            leg_payouts=(
+                attestation_a.winner_payout_per_share,
+                attestation_b.loser_payout_per_share,
+            ),
+        ),
+        TerminalState(
+            state_id="proposition_false",
+            description=(
+                f"{market_a} and {market_b}: the shared proposition resolves false on "
+                "both venues (proven equivalent); NO(leg 1) wins, YES(leg 0) loses."
+            ),
+            leg_payouts=(
+                attestation_a.loser_payout_per_share,
+                attestation_b.winner_payout_per_share,
+            ),
+        ),
+    )
+    payout_sums: list[Decimal] = [sum(state.leg_payouts) for state in terminal_states]
+
+    assumption = ProofAssumption(
+        claim=(
+            f"{market_a} (leg 0) and {market_b} (leg 1) attest an identical proposition "
+            "across venues per every equivalence dimension"
+        ),
+        attestation_id=attestation_a.attestation_id,
+        supporting_spans=attestation_a.supporting_spans + attestation_b.supporting_spans,
+    )
+
+    artifact = ProofArtifact(
+        schema_version=1,
+        proof_id=_PLACEHOLDER_PROOF_ID,
+        candidate_id=candidate.candidate_id,
+        template=_CROSS_VENUE_EQUIVALENCE_TEMPLATE,
+        compiler_version=_CROSS_VENUE_EQUIVALENCE_COMPILER_VERSION,
+        status="proof_ready",
+        rejection_reason=None,
+        terminal_states=terminal_states,
+        minimum_basket_payout=min(payout_sums),
+        maximum_basket_payout=max(payout_sums),
+        assumptions=(assumption,),
+        excluded_states=(),
+        equivalence_matrix=matrix,
+        rule_version_ids=rule_version_ids,
+        source_hashes=source_hashes,
+        review_identity=review_identity,
+        invalidation_conditions=(_RULE_VERSION_CHANGE_CONDITION,),
+        information_cutoff=as_of,
+        observed_at=as_of,
+    )
+    return _finalize(artifact)
+
+
+def _build_equivalence_matrix(
+    attestation_a: RuleAttestation,
+    attestation_b: RuleAttestation,
+    basis_attestation_ids: tuple[UUID, ...],
+) -> EquivalenceMatrix:
+    return EquivalenceMatrix(
+        proposition_threshold_inclusivity=_threshold_inclusivity_dimension(
+            attestation_a, attestation_b
+        ),
+        observation_period_timezone=_deadline_dimension(attestation_a, attestation_b),
+        resolution_sources=_resolution_sources_dimension(attestation_a, attestation_b),
+        void_dispute_behavior=_void_dispute_behavior_dimension(attestation_a, attestation_b),
+        outcome_completeness=_outcome_completeness_dimension(attestation_a, attestation_b),
+        denomination_collateral_rounding=_denomination_dimension(attestation_a, attestation_b),
+        settlement_finality_timing="unknown",
+        venue_access_custody_rules="unknown",
+        basis_attestation_ids=basis_attestation_ids,
+    )
+
+
+def _all_unknown_equivalence_matrix(
+    basis_attestation_ids: tuple[UUID, ...],
+) -> EquivalenceMatrix:
+    return EquivalenceMatrix(
+        proposition_threshold_inclusivity="unknown",
+        observation_period_timezone="unknown",
+        resolution_sources="unknown",
+        void_dispute_behavior="unknown",
+        outcome_completeness="unknown",
+        denomination_collateral_rounding="unknown",
+        settlement_finality_timing="unknown",
+        venue_access_custody_rules="unknown",
+        basis_attestation_ids=basis_attestation_ids,
+    )
+
+
+def _threshold_inclusivity_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    if attestation_a.threshold_text is None or attestation_b.threshold_text is None:
+        return "unknown"
+    if (
+        attestation_a.threshold_text == attestation_b.threshold_text
+        and attestation_a.threshold_inclusive == attestation_b.threshold_inclusive
+    ):
+        return "compatible"
+    return "incompatible"
+
+
+def _deadline_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    if attestation_a.deadline_utc is None or attestation_b.deadline_utc is None:
+        return "unknown"
+    if attestation_a.deadline_utc == attestation_b.deadline_utc:
+        return "compatible"
+    return "incompatible"
+
+
+def _resolution_sources_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    if attestation_a.resolution_source_attested == attestation_b.resolution_source_attested:
+        return "compatible"
+    return "incompatible"
+
+
+def _void_dispute_behavior_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    # "Needed but unknown" is checked before equality: either leg attesting a possible
+    # void with an unknown behavior means this dimension's underlying fact was never
+    # actually attested on that leg, regardless of what the other leg says.
+    if (attestation_a.void_or_invalid_possible and attestation_a.void_behavior == "unknown") or (
+        attestation_b.void_or_invalid_possible and attestation_b.void_behavior == "unknown"
+    ):
+        return "unknown"
+    tuple_a = (
+        attestation_a.void_or_invalid_possible,
+        attestation_a.void_behavior,
+        attestation_a.tie_possible,
+        attestation_a.tie_behavior,
+    )
+    tuple_b = (
+        attestation_b.void_or_invalid_possible,
+        attestation_b.void_behavior,
+        attestation_b.tie_possible,
+        attestation_b.tie_behavior,
+    )
+    return "compatible" if tuple_a == tuple_b else "incompatible"
+
+
+def _outcome_completeness_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    if attestation_a.outcome_set_exhaustive and attestation_b.outcome_set_exhaustive:
+        return "compatible"
+    return "incompatible"
+
+
+def _denomination_dimension(
+    attestation_a: RuleAttestation, attestation_b: RuleAttestation
+) -> EquivalenceDimensionResult:
+    if (
+        attestation_a.payout_unit == attestation_b.payout_unit
+        and attestation_a.winner_payout_per_share == attestation_b.winner_payout_per_share
+        and attestation_a.loser_payout_per_share == attestation_b.loser_payout_per_share
+    ):
+        return "compatible"
+    return "incompatible"
+
+
 def _parse_decimal(value: str | None) -> Decimal | None:
     if value is None:
         return None
@@ -861,8 +1201,15 @@ def _terminal_artifact(
     source_hashes: tuple[Sha256, ...],
     as_of: datetime,
     review_identity: str,
+    equivalence_matrix: EquivalenceMatrix | None = None,
 ) -> ProofArtifact:
-    """Build a non-``proof_ready`` (``rejected``/``insufficient_evidence``) artifact."""
+    """Build a non-``proof_ready`` (``rejected``/``insufficient_evidence``) artifact.
+
+    ``equivalence_matrix`` is only ever non-``None`` for the ``cross_venue_equivalence@1``
+    template: ``ProofArtifact`` requires a matrix on every status for that template,
+    including rejection (see ``ProofArtifact._require_consistent_proof``), while every
+    other template never carries one.
+    """
     return ProofArtifact(
         schema_version=1,
         proof_id=_PLACEHOLDER_PROOF_ID,
@@ -876,7 +1223,7 @@ def _terminal_artifact(
         maximum_basket_payout=None,
         assumptions=(),
         excluded_states=(),
-        equivalence_matrix=None,
+        equivalence_matrix=equivalence_matrix,
         rule_version_ids=rule_version_ids,
         source_hashes=source_hashes,
         review_identity=review_identity,

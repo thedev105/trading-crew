@@ -5,7 +5,6 @@ from decimal import Decimal
 
 import pytest
 
-from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.proofs import compile_proof
 from tests.predictions.attestation_helpers import rule_attestation
@@ -247,24 +246,6 @@ def test_compile_proof_is_deterministic_and_idempotent() -> None:
 
     assert first == second
     assert first.proof_id == second.proof_id
-
-
-def test_unimplemented_relationship_type_raises_not_implemented_error() -> None:
-    # CROSS_VENUE_EQUIVALENCE is the only relationship_type without a compiler yet
-    # (Task 9); it requires legs spanning at least two distinct venues.
-    candidate = _candidate(
-        relationship_type=RelationshipType.CROSS_VENUE_EQUIVALENCE,
-        legs=(leg(), leg(venue=PredictionVenue.KALSHI, market_id="0xother", outcome_index=1)),
-    )
-
-    with pytest.raises(NotImplementedError):
-        compile_proof(
-            candidate,
-            {},
-            {},
-            as_of=NOW,
-            review_identity=REVIEW_IDENTITY,
-        )
 
 
 def test_three_leg_complement_candidate_is_a_structural_error() -> None:
