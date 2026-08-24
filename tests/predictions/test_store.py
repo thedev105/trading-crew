@@ -18,6 +18,7 @@ from tests.predictions.domain_helpers import (
     trade_record,
 )
 from tests.predictions.manifest_helpers import venue_manifest
+from tests.predictions.proof_helpers import proof_artifact
 from tests.predictions.store_helpers import raw_envelope
 
 
@@ -35,6 +36,7 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "prediction_fee_rates",
         "candidate_relationships",
         "rule_attestations",
+        "proof_artifacts",
         "schema_migrations",
     } <= tables
     perpetual_futures_tables = {
@@ -317,11 +319,81 @@ def test_latest_attestation_for_rule_version_respects_the_cutoff(tmp_path: Path)
     store.append_rule_attestation(early)
     store.append_rule_attestation(late)
 
-    assert store.latest_attestation_for_rule_version(
-        early.rule_version_id, NOW - timedelta(minutes=30)
-    ) == early
+    assert (
+        store.latest_attestation_for_rule_version(
+            early.rule_version_id, NOW - timedelta(minutes=30)
+        )
+        == early
+    )
     assert store.latest_attestation_for_rule_version(early.rule_version_id, NOW) == late
     assert (
         store.latest_attestation_for_rule_version(early.rule_version_id, NOW - timedelta(hours=2))
         is None
     )
+
+
+def test_proof_artifact_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    proof = proof_artifact()
+
+    assert store.append_proof_artifact(proof) is True
+    assert store.append_proof_artifact(proof) is False
+    with pytest.raises(ConflictingRecordError):
+        store.append_proof_artifact(proof.model_copy(update={"compiler_version": "different"}))
+
+
+def test_proof_artifacts_for_candidate_is_ordered_and_cutoff_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006101"),
+        observed_at=NOW - timedelta(hours=1),
+        information_cutoff=NOW - timedelta(hours=1),
+    )
+    late = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006102"),
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    store.append_proof_artifact(early)
+    store.append_proof_artifact(late)
+
+    assert store.proof_artifacts_for_candidate(early.candidate_id, NOW - timedelta(minutes=30)) == (
+        early,
+    )
+    assert store.proof_artifacts_for_candidate(early.candidate_id, NOW) == (early, late)
+    assert store.proof_artifacts_for_candidate(early.candidate_id, NOW - timedelta(hours=2)) == ()
+
+
+def test_proof_artifacts_for_candidate_excludes_other_candidates(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    mine = proof_artifact(proof_id=UUID("00000000-0000-0000-0000-000000006201"))
+    other = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006202"),
+        candidate_id=UUID("00000000-0000-0000-0000-000000003999"),
+    )
+    store.append_proof_artifact(mine)
+    store.append_proof_artifact(other)
+
+    assert store.proof_artifacts_for_candidate(mine.candidate_id, NOW) == (mine,)
+
+
+def test_latest_proof_for_candidate_returns_the_most_recently_observed(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006301"),
+        observed_at=NOW - timedelta(hours=1),
+        information_cutoff=NOW - timedelta(hours=1),
+    )
+    late = proof_artifact(
+        proof_id=UUID("00000000-0000-0000-0000-000000006302"),
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    store.append_proof_artifact(early)
+    store.append_proof_artifact(late)
+
+    assert store.latest_proof_for_candidate(early.candidate_id, NOW - timedelta(minutes=30)) == (
+        early
+    )
+    assert store.latest_proof_for_candidate(early.candidate_id, NOW) == late
+    assert store.latest_proof_for_candidate(early.candidate_id, NOW - timedelta(hours=2)) is None

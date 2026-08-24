@@ -26,6 +26,7 @@ from polytrading.predictions.domain import (
     TradeRecord,
 )
 from polytrading.predictions.manifest import VenueManifest
+from polytrading.predictions.proofs_models import ProofArtifact
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -281,6 +282,27 @@ class PredictionMarketStore:
             ],
         )
 
+    def append_proof_artifact(self, record: ProofArtifact) -> bool:
+        return self._append_keyed(
+            table="proof_artifacts",
+            record=record,
+            label="proof artifact",
+            where="proof_id = ?",
+            key_params=[record.proof_id],
+            insert_columns=(
+                "proof_id, candidate_id, template, status, observed_at, "
+                "information_cutoff, record_json, record_hash"
+            ),
+            insert_params=[
+                record.proof_id,
+                record.candidate_id,
+                record.template,
+                record.status,
+                record.observed_at,
+                record.information_cutoff,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -478,6 +500,33 @@ class PredictionMarketStore:
             [rule_version_id, as_of],
         ).fetchone()
         return None if row is None else RuleAttestation.model_validate_json(row[0])
+
+    def proof_artifacts_for_candidate(
+        self, candidate_id: UUID, as_of: datetime
+    ) -> tuple[ProofArtifact, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM proof_artifacts
+            WHERE candidate_id = ? AND observed_at <= ?
+            ORDER BY observed_at, proof_id
+            """,
+            [candidate_id, as_of],
+        ).fetchall()
+        return tuple(ProofArtifact.model_validate_json(row[0]) for row in rows)
+
+    def latest_proof_for_candidate(
+        self, candidate_id: UUID, as_of: datetime
+    ) -> ProofArtifact | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM proof_artifacts
+            WHERE candidate_id = ? AND observed_at <= ?
+            ORDER BY observed_at DESC, proof_id DESC
+            LIMIT 1
+            """,
+            [candidate_id, as_of],
+        ).fetchone()
+        return None if row is None else ProofArtifact.model_validate_json(row[0])
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {
