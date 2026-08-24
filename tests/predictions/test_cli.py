@@ -17,6 +17,27 @@ from tests.predictions.manifest_helpers import venue_manifest
 
 MARKETS_FIXTURE = Path("tests/fixtures/predictions/polymarket/gamma_markets_page_1.json")
 LIMITLESS_MARKETS_FIXTURE = Path("tests/fixtures/predictions/limitless/markets_active_page_1.json")
+CLOB_BOOK_FIXTURE = Path("tests/fixtures/predictions/polymarket/clob_book.json")
+FEE_RATE_FIXTURE = Path("tests/fixtures/predictions/polymarket/fee_rate.json")
+
+# Sorted ascending by market_id (condition_id) -- "0x0f49..." < "0xa467...".
+_LOWER_MARKET_ID = "0x0f49db97f71c68b1e42a6d16e3de93d85dbf7d4148e3f018eb79e88554be9f75"
+_LOWER_MARKET_TOKEN_IDS = (
+    "54533043819946592547517511176940999955633860128497669742211153063842200957669",
+    "87854174148074652060467921081181402357467303721471806610111179101805869578687",
+)
+_HIGHER_MARKET_ID = "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7"
+_HIGHER_MARKET_TOKEN_IDS = (
+    "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+    "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+)
+
+
+def _polymarket_client_factory(handler):
+    def fake_client(**_kwargs: object) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    return fake_client
 
 
 def test_predictions_collect_is_a_subcommand_tree_not_a_venue_flag() -> None:
@@ -514,3 +535,269 @@ def test_candidates_command_sanitizes_a_persistence_conflict(
     captured = capsys.readouterr()
     assert "candidate discovery failed to persist durably" in captured.err
     assert "conflicting candidate relationship" not in captured.err
+
+
+def test_collect_polymarket_default_books_fetches_no_book_or_fee_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets":
+            return httpx.Response(
+                200,
+                content=MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(f"unexpected request to {request.url.path} with --books 0")
+
+    monkeypatch.setattr(
+        predictions_cli, "make_public_http_client", _polymarket_client_factory(handler)
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.POLYMARKET,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(["predictions", "collect", "polymarket", "--db", str(database)])
+    assert exit_code == 0
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        far_future = datetime.now(UTC) + timedelta(days=1)
+        assert (
+            verify_store.latest_book_as_of(
+                PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, _LOWER_MARKET_TOKEN_IDS[0], far_future
+            )
+            is None
+        )
+        assert (
+            verify_store.latest_fee_rate_as_of(
+                PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, far_future
+            )
+            is None
+        )
+    finally:
+        verify_store.close()
+
+
+def test_collect_polymarket_with_books_persists_book_and_fee_evidence_for_selected_market(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets":
+            return httpx.Response(
+                200,
+                content=MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path == "/book":
+            return httpx.Response(
+                200,
+                content=CLOB_BOOK_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path == "/fee-rate":
+            return httpx.Response(
+                200,
+                content=FEE_RATE_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(
+        predictions_cli, "make_public_http_client", _polymarket_client_factory(handler)
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.POLYMARKET,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(
+        ["predictions", "collect", "polymarket", "--db", str(database), "--books", "1"]
+    )
+    assert exit_code == 0
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        far_future = datetime.now(UTC) + timedelta(days=1)
+        # --books 1 selects the deterministically-lowest market_id.
+        for token_id in _LOWER_MARKET_TOKEN_IDS:
+            book = verify_store.latest_book_as_of(
+                PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, token_id, far_future
+            )
+            assert book is not None
+            assert book.outcome_token_id == token_id
+        fee = verify_store.latest_fee_rate_as_of(
+            PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, far_future
+        )
+        assert fee is not None
+
+        # The higher-sorted market was not selected -- no evidence collected for it.
+        assert (
+            verify_store.latest_book_as_of(
+                PredictionVenue.POLYMARKET,
+                _HIGHER_MARKET_ID,
+                _HIGHER_MARKET_TOKEN_IDS[0],
+                far_future,
+            )
+            is None
+        )
+        assert (
+            verify_store.latest_fee_rate_as_of(
+                PredictionVenue.POLYMARKET, _HIGHER_MARKET_ID, far_future
+            )
+            is None
+        )
+    finally:
+        verify_store.close()
+
+
+def test_collect_polymarket_with_books_isolates_a_single_market_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets":
+            return httpx.Response(
+                200,
+                content=MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path == "/book":
+            token_id = request.url.params.get("token_id")
+            if token_id in _HIGHER_MARKET_TOKEN_IDS:
+                return httpx.Response(500, content=b"server error")
+            return httpx.Response(
+                200,
+                content=CLOB_BOOK_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path == "/fee-rate":
+            return httpx.Response(
+                200,
+                content=FEE_RATE_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(
+        predictions_cli, "make_public_http_client", _polymarket_client_factory(handler)
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.POLYMARKET,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(
+        ["predictions", "collect", "polymarket", "--db", str(database), "--books", "2"]
+    )
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "polymarket" in captured.err
+    assert _HIGHER_MARKET_ID in captured.err
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        far_future = datetime.now(UTC) + timedelta(days=1)
+        # The healthy market still collected successfully.
+        for token_id in _LOWER_MARKET_TOKEN_IDS:
+            assert (
+                verify_store.latest_book_as_of(
+                    PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, token_id, far_future
+                )
+                is not None
+            )
+        assert (
+            verify_store.latest_fee_rate_as_of(
+                PredictionVenue.POLYMARKET, _LOWER_MARKET_ID, far_future
+            )
+            is not None
+        )
+        # The failing market has no book or fee evidence persisted.
+        assert (
+            verify_store.latest_book_as_of(
+                PredictionVenue.POLYMARKET,
+                _HIGHER_MARKET_ID,
+                _HIGHER_MARKET_TOKEN_IDS[0],
+                far_future,
+            )
+            is None
+        )
+        assert (
+            verify_store.latest_fee_rate_as_of(
+                PredictionVenue.POLYMARKET, _HIGHER_MARKET_ID, far_future
+            )
+            is None
+        )
+    finally:
+        verify_store.close()
+
+
+def test_collect_limitless_rejects_books_greater_than_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def reject_network(*_a: object, **_k: object) -> httpx.AsyncClient:
+        raise AssertionError("collect must not open a network client on a --books usage error")
+
+    monkeypatch.setattr(predictions_cli, "make_public_http_client", reject_network)
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.LIMITLESS,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(["predictions", "collect", "limitless", "--db", str(database), "--books", "1"])
+    assert exit_code == 2
+    assert "limitless_endpoint_not_collected" in capsys.readouterr().err
+
+
+def test_collect_limitless_default_books_is_unaffected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/markets/active":
+            return httpx.Response(
+                200,
+                content=LIMITLESS_MARKETS_FIXTURE.read_bytes(),
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, content=b"[]", headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(
+        predictions_cli, "make_public_http_client", _polymarket_client_factory(handler)
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(
+            venue=PredictionVenue.LIMITLESS,
+            implementation_state=AdapterImplementationState.READ_ONLY,
+        )
+    )
+    store.close()
+
+    exit_code = main(["predictions", "collect", "limitless", "--db", str(database)])
+    assert exit_code == 0
+    assert "collected 3 limitless markets" in capsys.readouterr().out

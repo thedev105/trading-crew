@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from polytrading.http_client import make_public_http_client
 from polytrading.predictions.adapter import PredictionCollectionGateError
@@ -86,6 +87,15 @@ def add_predictions_subcommands(
     for name in ("polymarket", "kalshi", "limitless"):
         collector = collect_commands.add_parser(name, help=f"collect {name} public evidence")
         collector.add_argument("--db", required=True, type=Path)
+        collector.add_argument(
+            "--books",
+            type=int,
+            default=0,
+            help=(
+                "collect this many order-book-enabled/active/open markets' executable "
+                "books and fee rates too (default 0: markets/rules only)"
+            ),
+        )
 
     health = predictions_commands.add_parser(
         "health", help="audit per-venue collection and continuity health"
@@ -161,8 +171,20 @@ def _run_venues_status(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _books_eligible(market: MarketRecord) -> bool:
+    return market.order_book_enabled and market.active and not market.closed
+
+
 async def _run_collect(arguments: argparse.Namespace) -> int:
     venue = PredictionVenue(arguments.predictions_collect_command)
+    books = arguments.books
+    if books < 0:
+        raise PredictionsUsageError("--books must be zero or a positive integer")
+    if books > 0 and venue is PredictionVenue.LIMITLESS:
+        raise PredictionsUsageError(
+            "limitless_endpoint_not_collected: books are not collected for the "
+            "conditional-token limitless venue by increment-2 ruling"
+        )
     adapter_cls = _ADAPTER_BY_VENUE[venue]
     try:
         with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
@@ -175,20 +197,66 @@ async def _run_collect(arguments: argparse.Namespace) -> int:
                     raise PredictionsUsageError(
                         f"{venue.value} collection is not permitted: {gate.reason}"
                     )
+                market_count = 0
+                extra_warnings: list[object] = []
                 async with make_public_http_client() as client:
                     adapter = adapter_cls(client, _utc_now, time.monotonic_ns)
                     batch = await adapter.fetch_markets(information_cutoff=as_of)
-                market_count = 0
-                with store.transaction() as transaction:
-                    for raw in batch.raw:
-                        transaction.append_raw(raw)
-                    for item in batch.normalized:
-                        if isinstance(item, MarketRecord):
-                            transaction.append_market(item)
-                            market_count += 1
-                        elif isinstance(item, RuleVersion):
-                            transaction.append_rule_version(item)
-                for warning in batch.warnings:
+                    with store.transaction() as transaction:
+                        for raw in batch.raw:
+                            transaction.append_raw(raw)
+                        for item in batch.normalized:
+                            if isinstance(item, MarketRecord):
+                                transaction.append_market(item)
+                                market_count += 1
+                            elif isinstance(item, RuleVersion):
+                                transaction.append_rule_version(item)
+                        if books > 0:
+                            selected_markets = sorted(
+                                (
+                                    item
+                                    for item in batch.normalized
+                                    if isinstance(item, MarketRecord) and _books_eligible(item)
+                                ),
+                                key=lambda market: market.market_id,
+                            )[:books]
+                            cycle_id = uuid4()
+                            books_observed_at = _utc_now()
+                            for market in selected_markets:
+                                try:
+                                    token_ids = (
+                                        market.outcome_token_ids
+                                        if market.outcome_token_ids is not None
+                                        else market.outcomes
+                                    )
+                                    for token_id in token_ids:
+                                        book_batch = await adapter.fetch_book_snapshot(
+                                            market.market_id,
+                                            token_id,
+                                            books_observed_at,
+                                            cycle_id,
+                                        )
+                                        for raw in book_batch.raw:
+                                            transaction.append_raw(raw)
+                                        for record in book_batch.normalized:
+                                            transaction.append_book_snapshot(record)
+                                        extra_warnings.extend(book_batch.warnings)
+                                    fee_batch = await adapter.fetch_fee_rate(
+                                        market.market_id, books_observed_at
+                                    )
+                                    for raw in fee_batch.raw:
+                                        transaction.append_raw(raw)
+                                    for record in fee_batch.normalized:
+                                        transaction.append_fee_rate(record)
+                                    extra_warnings.extend(fee_batch.warnings)
+                                except Exception as error:
+                                    print(
+                                        f"polytrading: warning: {venue.value} "
+                                        f"{market.market_id}: book/fee collection failed: "
+                                        f"{error}",
+                                        file=sys.stderr,
+                                    )
+                for warning in (*batch.warnings, *extra_warnings):
                     print(
                         f"polytrading: warning: {warning.venue.value} {warning.code} "
                         f"{warning.market_id}: {warning.message}",
