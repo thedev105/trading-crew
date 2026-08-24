@@ -312,11 +312,14 @@ async def _run_collect(arguments: argparse.Namespace) -> int:
                                     for record in fee_batch.normalized:
                                         transaction.append_fee_rate(record)
                                     extra_warnings.extend(fee_batch.warnings)
-                                except Exception as error:
+                                except Exception:
+                                    # Sanitized per §14: never print raw exception text here,
+                                    # which may carry URLs or response fragments -- a stable
+                                    # code plus venue and market id only.
                                     print(
-                                        f"polytrading: warning: {venue.value} "
-                                        f"{market.market_id}: book/fee collection failed: "
-                                        f"{error}",
+                                        "polytrading: warning: "
+                                        f"{venue.value} BOOK_FEE_COLLECTION_FAILED "
+                                        f"{market.market_id}",
                                         file=sys.stderr,
                                     )
                 for warning in (*batch.warnings, *extra_warnings):

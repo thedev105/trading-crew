@@ -730,8 +730,14 @@ def test_collect_polymarket_with_books_isolates_a_single_market_failure(
     )
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "polymarket" in captured.err
-    assert _HIGHER_MARKET_ID in captured.err
+    # Sanitized per §14: a stable code plus venue and market id only -- never the raw
+    # exception text, which may carry a URL or response-body fragment (the transport's
+    # "server error" body here) that shouldn't reach the console.
+    assert (
+        f"polytrading: warning: polymarket BOOK_FEE_COLLECTION_FAILED {_HIGHER_MARKET_ID}"
+        in captured.err
+    )
+    assert "server error" not in captured.err
 
     verify_store = PredictionMarketStore(database, read_only=True)
     try:
