@@ -973,33 +973,12 @@ def _compile_cross_venue_equivalence(
 
     # Unreachable in v1 (settlement_finality_timing and venue_access_custody_rules are
     # always "unknown" above), retained so a future increment that attests those two
-    # dimensions doesn't need to touch this branch.
+    # dimensions doesn't need to touch this branch. Split into a pure helper
+    # (_equivalence_terminal_states) so the payoff-table shape has direct unit test
+    # coverage today, despite being unreachable through compile_proof itself in v1.
     market_a = leg_a.market_id
     market_b = leg_b.market_id
-    terminal_states = (
-        TerminalState(
-            state_id="proposition_true",
-            description=(
-                f"{market_a} and {market_b}: the shared proposition resolves true on "
-                "both venues (proven equivalent); YES(leg 0) wins, NO(leg 1) loses."
-            ),
-            leg_payouts=(
-                attestation_a.winner_payout_per_share,
-                attestation_b.loser_payout_per_share,
-            ),
-        ),
-        TerminalState(
-            state_id="proposition_false",
-            description=(
-                f"{market_a} and {market_b}: the shared proposition resolves false on "
-                "both venues (proven equivalent); NO(leg 1) wins, YES(leg 0) loses."
-            ),
-            leg_payouts=(
-                attestation_a.loser_payout_per_share,
-                attestation_b.winner_payout_per_share,
-            ),
-        ),
-    )
+    terminal_states = _equivalence_terminal_states(attestation_a, attestation_b, market_a, market_b)
     payout_sums: list[Decimal] = [sum(state.leg_payouts) for state in terminal_states]
 
     assumption = ProofAssumption(
@@ -1033,6 +1012,48 @@ def _compile_cross_venue_equivalence(
         observed_at=as_of,
     )
     return _finalize(artifact)
+
+
+def _equivalence_terminal_states(
+    attestation_a: RuleAttestation,
+    attestation_b: RuleAttestation,
+    market_a: str,
+    market_b: str,
+) -> tuple[TerminalState, TerminalState]:
+    """The two-state payoff table for a fully-``"compatible"`` equivalence matrix.
+
+    Basket = YES(leg 0) + NO(leg 1) ("opposite sides"): since the two legs' proposition
+    is proven equivalent, exactly one of these two states can occur. Pure and total
+    over any two attestations -- the caller (``_compile_cross_venue_equivalence``) is
+    responsible for only invoking this once every matrix dimension is ``"compatible"``,
+    which in v1 never actually happens (see that function's docstring), so this helper
+    exists to give the payoff-table shape direct unit test coverage today, ahead of any
+    future increment that makes the ``proof_ready`` path reachable.
+    """
+    return (
+        TerminalState(
+            state_id="proposition_true",
+            description=(
+                f"{market_a} and {market_b}: the shared proposition resolves true on "
+                "both venues (proven equivalent); YES(leg 0) wins, NO(leg 1) loses."
+            ),
+            leg_payouts=(
+                attestation_a.winner_payout_per_share,
+                attestation_b.loser_payout_per_share,
+            ),
+        ),
+        TerminalState(
+            state_id="proposition_false",
+            description=(
+                f"{market_a} and {market_b}: the shared proposition resolves false on "
+                "both venues (proven equivalent); NO(leg 1) wins, YES(leg 0) loses."
+            ),
+            leg_payouts=(
+                attestation_a.loser_payout_per_share,
+                attestation_b.winner_payout_per_share,
+            ),
+        ),
+    )
 
 
 def _build_equivalence_matrix(

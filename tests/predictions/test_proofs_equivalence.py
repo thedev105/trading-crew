@@ -5,14 +5,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
 from polytrading.predictions.attestations import RuleAttestation
 from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
-from polytrading.predictions.proofs import compile_proof
+from polytrading.predictions.proofs import _equivalence_terminal_states, compile_proof
 from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.candidate_helpers import HASH, candidate_relationship, leg
 from tests.predictions.domain_helpers import rule_version
@@ -580,6 +580,48 @@ def test_compile_proof_is_deterministic_and_idempotent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _equivalence_terminal_states: the proof_ready payoff-table helper. compile_proof
+# can never actually reach this branch in v1 (settlement_finality_timing and
+# venue_access_custody_rules are always "unknown"), so this pure helper is unit
+# tested directly to give the payoff-table shape coverage ahead of any future
+# increment that makes proof_ready reachable.
+# ---------------------------------------------------------------------------
+
+
+def test_equivalence_terminal_states_hand_computed_two_state_table() -> None:
+    attestation_a = _attestation_a(
+        winner_payout_per_share=Decimal("1"), loser_payout_per_share=Decimal("0.2")
+    )
+    attestation_b = _attestation_b(
+        winner_payout_per_share=Decimal("1"), loser_payout_per_share=Decimal("0.3")
+    )
+
+    states = _equivalence_terminal_states(attestation_a, attestation_b, MARKET_A, MARKET_B)
+
+    assert [state.state_id for state in states] == ["proposition_true", "proposition_false"]
+    proposition_true, proposition_false = states
+    # YES(leg 0) + NO(leg 1): true -> leg 0 wins, leg 1 loses; false -> the reverse.
+    assert proposition_true.leg_payouts == (Decimal("1"), Decimal("0.3"))
+    assert proposition_false.leg_payouts == (Decimal("0.2"), Decimal("1"))
+
+    payout_sums = [sum(state.leg_payouts) for state in states]
+    assert min(payout_sums) == Decimal("1.2")  # 0.2 + 1
+    assert max(payout_sums) == Decimal("1.3")  # 1 + 0.3
+
+
+def test_equivalence_terminal_states_descriptions_cite_both_markets() -> None:
+    attestation_a = _attestation_a()
+    attestation_b = _attestation_b()
+
+    states = _equivalence_terminal_states(attestation_a, attestation_b, MARKET_A, MARKET_B)
+
+    for state in states:
+        assert MARKET_A in state.description
+        assert MARKET_B in state.description
+    assert len(states) == len({state.state_id for state in states})  # unique state_ids
+
+
+# ---------------------------------------------------------------------------
 # Hard negatives (spec section 15.2): every fixture pair, attested faithfully to its
 # rule texts, must reject with its expected divergent matrix dimension flagged
 # incompatible.
@@ -592,14 +634,10 @@ def _load_pairs() -> list[dict[str, Any]]:
 
 
 def _hn_rule_version_id(market_id: str) -> UUID:
-    from uuid import NAMESPACE_URL
-
     return uuid5(NAMESPACE_URL, f"hard-negative-equivalence:{market_id}")
 
 
 def _hn_attestation_id(market_id: str) -> UUID:
-    from uuid import NAMESPACE_URL
-
     return uuid5(NAMESPACE_URL, f"hard-negative-equivalence-attestation:{market_id}")
 
 
