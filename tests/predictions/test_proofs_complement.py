@@ -251,7 +251,7 @@ def test_compile_proof_is_deterministic_and_idempotent() -> None:
 
 def test_unimplemented_relationship_type_raises_not_implemented_error() -> None:
     candidate = _candidate(
-        relationship_type=RelationshipType.EXHAUSTIVE_OUTCOME_SET,
+        relationship_type=RelationshipType.LOGICAL_IMPLICATION,
         legs=(leg(), leg(outcome_index=1), leg(outcome_index=2)),
     )
 

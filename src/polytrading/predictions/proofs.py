@@ -32,6 +32,9 @@ _RULE_VERSION_CHANGE_CONDITION = "any participating rule_version change"
 _BINARY_COMPLEMENT_TEMPLATE = "binary_complement@1"
 _BINARY_COMPLEMENT_COMPILER_VERSION = "1"
 
+_EXHAUSTIVE_OUTCOME_SET_TEMPLATE = "exhaustive_outcome_set@1"
+_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION = "1"
+
 
 def compile_proof(
     candidate: CandidateRelationship,
@@ -52,6 +55,10 @@ def compile_proof(
     """
     if candidate.relationship_type is RelationshipType.BINARY_COMPLEMENT:
         return _compile_binary_complement(
+            candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
+        )
+    if candidate.relationship_type is RelationshipType.EXHAUSTIVE_OUTCOME_SET:
+        return _compile_exhaustive_outcome_set(
             candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
         )
     raise NotImplementedError(
@@ -101,6 +108,8 @@ def _compile_binary_complement(
         return _finalize(
             _terminal_artifact(
                 candidate,
+                template=_BINARY_COMPLEMENT_TEMPLATE,
+                compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
                 status="insufficient_evidence",
                 rejection_reason="MISSING_ATTESTATION",
                 rule_version_ids=rule_version_ids,
@@ -118,6 +127,8 @@ def _compile_binary_complement(
         return _finalize(
             _terminal_artifact(
                 candidate,
+                template=_BINARY_COMPLEMENT_TEMPLATE,
+                compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
                 status="rejected",
                 rejection_reason="OUTCOME_SET_NOT_EXHAUSTIVE",
                 rule_version_ids=rule_version_ids,
@@ -131,6 +142,8 @@ def _compile_binary_complement(
         return _finalize(
             _terminal_artifact(
                 candidate,
+                template=_BINARY_COMPLEMENT_TEMPLATE,
+                compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
                 status="rejected",
                 rejection_reason="RULE_VERSION_CHANGED",
                 rule_version_ids=rule_version_ids,
@@ -144,6 +157,8 @@ def _compile_binary_complement(
         return _finalize(
             _terminal_artifact(
                 candidate,
+                template=_BINARY_COMPLEMENT_TEMPLATE,
+                compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
                 status="rejected",
                 rejection_reason="TIE_UNMODELED",
                 rule_version_ids=rule_version_ids,
@@ -182,6 +197,8 @@ def _compile_binary_complement(
             return _finalize(
                 _terminal_artifact(
                     candidate,
+                    template=_BINARY_COMPLEMENT_TEMPLATE,
+                    compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
                     status="rejected",
                     rejection_reason="VOID_BEHAVIOR_UNKNOWN",
                     rule_version_ids=rule_version_ids,
@@ -249,9 +266,249 @@ def _compile_binary_complement(
     return _finalize(artifact)
 
 
+def _compile_exhaustive_outcome_set(
+    candidate: CandidateRelationship,
+    rule_versions: Mapping[UUID, RuleVersion],
+    attestations: Mapping[UUID, RuleAttestation],
+    *,
+    as_of: datetime,
+    review_identity: str,
+) -> ProofArtifact:
+    """Implements the ``exhaustive_outcome_set@1`` template.
+
+    Each leg is one member market of a single venue-native event group (the
+    increment-2 generator emits exactly one leg per member, ``outcome_index=None``),
+    so the basket is buying every member's YES side. Terminal states model exactly one
+    member winning at a time (``member_i_wins``): leg ``i`` pays its own attestation's
+    ``winner_payout_per_share`` and every other leg ``j`` pays leg ``j``'s own
+    attestation's ``loser_payout_per_share`` -- unlike ``binary_complement``, each
+    member may attest different payout values, so every leg is always priced from its
+    *own* attestation, never another member's.
+
+    The group-level exhaustiveness claim ("exactly one member wins") is only as good
+    as *every* member's attestation independently affirming it, so this requires an
+    attestation for every leg (any missing -> insufficient_evidence) and every one of
+    them to carry ``outcome_set_exhaustive=True`` (any False -> rejected); the
+    resulting ``ProofAssumption`` set carries one assumption per member, each citing
+    that member's own attestation, rather than a single pooled assumption.
+
+    A void or tie condition on any single member invalidates the whole group's
+    mutual-exclusivity model, not just that member, so:
+    - any member with ``tie_possible`` rejects the whole proof (no group-level split
+      model is attempted);
+    - a member with ``void_behavior="unknown"`` rejects the whole proof;
+    - a member with ``void_behavior="refund_at_cost"`` contributes its own excluded
+      state (one per such member), citing that member's attestation;
+    - a member with ``void_behavior="resolve_to_rules_price"`` contributes to *one*
+      combined group-level ``void`` terminal state, modeling the whole group voiding
+      together, in which every leg (not only the void-flagged members) pays its own
+      attestation's ``loser_payout_per_share`` -- this single combined state is
+      template v1's simplification: it cannot represent one member voiding while its
+      siblings still resolve normally, only "the whole group is void together" or
+      "the whole group resolves normally";
+    - members disagreeing on void behavior (some ``refund_at_cost``, some
+      ``resolve_to_rules_price``) can't be reconciled into that one combined state, so
+      that mix also rejects as ``VOID_BEHAVIOR_UNKNOWN``.
+
+    A candidate whose legs don't actually fit this shape (fewer than 2 legs, or two
+    legs sharing one member's market_id) is a structural integrity error, not a
+    research outcome to reject or defer -- raised rather than silently building
+    mismatched per-leg state.
+    """
+    legs = candidate.legs
+    market_ids = tuple(leg.market_id for leg in legs)
+    if len(legs) < 2 or len(set(market_ids)) != len(market_ids):
+        raise ValueError(
+            "an exhaustive_outcome_set candidate must have at least 2 legs, each from "
+            f"a distinct member market; got legs={legs!r}"
+        )
+
+    rule_version_ids = tuple(leg.rule_version_id for leg in legs)
+
+    member_attestations = [attestations.get(leg.rule_version_id) for leg in legs]
+    if any(attestation is None for attestation in member_attestations):
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+                compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+                status="insufficient_evidence",
+                rejection_reason="MISSING_ATTESTATION",
+                rule_version_ids=rule_version_ids,
+                source_hashes=_sorted_unique_hashes(leg.rule_source_hash for leg in legs),
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+    # mypy/type-narrowing: every element is non-None past the guard above.
+    member_attestations_present = [a for a in member_attestations if a is not None]
+
+    source_hashes = _sorted_unique_hashes(
+        [leg.rule_source_hash for leg in legs]
+        + [attestation.rule_source_hash for attestation in member_attestations_present]
+    )
+
+    if not all(attestation.outcome_set_exhaustive for attestation in member_attestations_present):
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+                compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+                status="rejected",
+                rejection_reason="OUTCOME_SET_NOT_EXHAUSTIVE",
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+
+    if not all(leg.rule_version_id in rule_versions for leg in legs):
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+                compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+                status="rejected",
+                rejection_reason="RULE_VERSION_CHANGED",
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+
+    if any(attestation.tie_possible for attestation in member_attestations_present):
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+                compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+                status="rejected",
+                rejection_reason="TIE_UNMODELED",
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+
+    void_members = [a for a in member_attestations_present if a.void_or_invalid_possible]
+    excluded_states: list[ExcludedState] = []
+    model_combined_void_state = False
+
+    if void_members:
+        void_behaviors = {a.void_behavior for a in void_members}
+        if "unknown" in void_behaviors or len(void_behaviors) > 1:
+            return _finalize(
+                _terminal_artifact(
+                    candidate,
+                    template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+                    compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+                    status="rejected",
+                    rejection_reason="VOID_BEHAVIOR_UNKNOWN",
+                    rule_version_ids=rule_version_ids,
+                    source_hashes=source_hashes,
+                    as_of=as_of,
+                    review_identity=review_identity,
+                )
+            )
+        (void_behavior,) = void_behaviors
+        if void_behavior == "refund_at_cost":
+            for attestation in void_members:
+                excluded_states.append(
+                    ExcludedState(
+                        description=f"{attestation.market_id}: resolves void or invalid.",
+                        exclusion_reason=(
+                            "a void resolution refunds cost at par per the attested "
+                            "rules, so it carries no basket payout risk and is "
+                            "excluded rather than modeled as a terminal state"
+                        ),
+                        attestation_id=attestation.attestation_id,
+                    )
+                )
+        else:  # void_behavior == "resolve_to_rules_price"
+            model_combined_void_state = True
+
+    terminal_states: list[TerminalState] = []
+    for i, winning_leg in enumerate(legs):
+        leg_payouts = tuple(
+            member_attestations_present[i].winner_payout_per_share
+            if j == i
+            else member_attestations_present[j].loser_payout_per_share
+            for j in range(len(legs))
+        )
+        terminal_states.append(
+            TerminalState(
+                state_id=f"member_{i}_wins",
+                description=(
+                    f"{winning_leg.market_id}: member index {i} resolves as the winning "
+                    "outcome; every other member resolves as losing."
+                ),
+                leg_payouts=leg_payouts,
+            )
+        )
+
+    if model_combined_void_state:
+        terminal_states.append(
+            TerminalState(
+                state_id="void",
+                description=(
+                    "the group resolves void together; every member settles at its "
+                    "own attested rules (loser) price. Template v1 models group-wide "
+                    "void as a single combined state and cannot represent one member "
+                    "voiding while its siblings resolve normally."
+                ),
+                leg_payouts=tuple(
+                    attestation.loser_payout_per_share
+                    for attestation in member_attestations_present
+                ),
+            )
+        )
+
+    payout_sums: list[Decimal] = [sum(state.leg_payouts) for state in terminal_states]
+
+    assumptions = tuple(
+        ProofAssumption(
+            claim=(
+                f"{member_leg.market_id} is one exhaustive, mutually-exclusive member "
+                "of this venue-native outcome set, per the attested rules"
+            ),
+            attestation_id=member_attestations_present[i].attestation_id,
+            supporting_spans=member_attestations_present[i].supporting_spans,
+        )
+        for i, member_leg in enumerate(legs)
+    )
+
+    artifact = ProofArtifact(
+        schema_version=1,
+        proof_id=_PLACEHOLDER_PROOF_ID,
+        candidate_id=candidate.candidate_id,
+        template=_EXHAUSTIVE_OUTCOME_SET_TEMPLATE,
+        compiler_version=_EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION,
+        status="proof_ready",
+        rejection_reason=None,
+        terminal_states=tuple(terminal_states),
+        minimum_basket_payout=min(payout_sums),
+        maximum_basket_payout=max(payout_sums),
+        assumptions=assumptions,
+        excluded_states=tuple(excluded_states),
+        equivalence_matrix=None,
+        rule_version_ids=rule_version_ids,
+        source_hashes=source_hashes,
+        review_identity=review_identity,
+        invalidation_conditions=(_RULE_VERSION_CHANGE_CONDITION,),
+        information_cutoff=as_of,
+        observed_at=as_of,
+    )
+    return _finalize(artifact)
+
+
 def _terminal_artifact(
     candidate: CandidateRelationship,
     *,
+    template: str,
+    compiler_version: str,
     status: ProofStatus,
     rejection_reason: ProofRejectionReason,
     rule_version_ids: tuple[UUID, ...],
@@ -264,8 +521,8 @@ def _terminal_artifact(
         schema_version=1,
         proof_id=_PLACEHOLDER_PROOF_ID,
         candidate_id=candidate.candidate_id,
-        template=_BINARY_COMPLEMENT_TEMPLATE,
-        compiler_version=_BINARY_COMPLEMENT_COMPILER_VERSION,
+        template=template,
+        compiler_version=compiler_version,
         status=status,
         rejection_reason=rejection_reason,
         terminal_states=(),
