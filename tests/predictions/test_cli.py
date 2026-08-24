@@ -925,9 +925,7 @@ def test_attest_command_appends_and_reports_counts(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "appended 1" in output
@@ -960,13 +958,9 @@ def test_attest_command_is_idempotent_across_reimport(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    first_exit = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    first_exit = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     capsys.readouterr()
-    second_exit = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    second_exit = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert first_exit == 0
     assert second_exit == 0
     output = capsys.readouterr().out
@@ -987,9 +981,7 @@ def test_attest_command_rejects_a_rule_source_hash_mismatch(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
     captured = capsys.readouterr()
     assert str(attestation.rule_version_id) in captured.err
@@ -1023,9 +1015,7 @@ def test_attest_command_rejects_a_venue_mismatch(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
     captured = capsys.readouterr()
     assert str(attestation.attestation_id) in captured.err
@@ -1059,9 +1049,7 @@ def test_attest_command_rejects_a_market_id_mismatch(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
     captured = capsys.readouterr()
     assert str(attestation.attestation_id) in captured.err
@@ -1087,9 +1075,7 @@ def test_attest_command_rejects_an_unknown_rule_version_id(
     input_path = tmp_path / "attestations.json"
     _write_attestations(input_path, attestation)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
     captured = capsys.readouterr()
     assert str(attestation.rule_version_id) in captured.err
@@ -1104,9 +1090,7 @@ def test_attest_command_rejects_a_non_array_json_payload(
     input_path = tmp_path / "attestations.json"
     input_path.write_text(json.dumps({"not": "an array"}), encoding="utf-8")
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
 
 
@@ -1122,9 +1106,7 @@ def test_attest_command_rejects_a_strictly_invalid_attestation_object(
     input_path = tmp_path / "attestations.json"
     input_path.write_text(json.dumps([payload]), encoding="utf-8")
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 2
 
 
@@ -1150,9 +1132,7 @@ def test_attest_command_sanitizes_a_persistence_failure(
 
     monkeypatch.setattr(PredictionMarketStore, "append_rule_attestation", raise_conflict)
 
-    exit_code = main(
-        ["predictions", "attest", "--db", str(database), "--input", str(input_path)]
-    )
+    exit_code = main(["predictions", "attest", "--db", str(database), "--input", str(input_path)])
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "rule attestation" in captured.err

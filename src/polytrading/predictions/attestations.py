@@ -66,11 +66,8 @@ class RuleAttestation(PredictionRecord):
     def _require_consistent_attestation(self) -> RuleAttestation:
         if self.tie_possible and self.tie_behavior is None:
             raise ValueError("tie_possible=True requires a non-None tie_behavior")
-        if any(
-            span.rule_source_hash != self.rule_source_hash for span in self.supporting_spans
-        ):
+        if any(span.rule_source_hash != self.rule_source_hash for span in self.supporting_spans):
             raise ValueError(
-                "every supporting span must be bound to this attestation's own "
-                "rule_source_hash"
+                "every supporting span must be bound to this attestation's own rule_source_hash"
             )
         return self

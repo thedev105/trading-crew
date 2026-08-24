@@ -66,9 +66,7 @@ _CROSS_VENUE_ABSTENTION_LINE = (
 # inventing a new one. An operator who needs a real reviewer identity on record must
 # pass --review-identity explicitly.
 _DEFAULT_REVIEW_IDENTITY = "cli-operator"
-_RULE_ATTESTATIONS_ADAPTER: TypeAdapter[list[RuleAttestation]] = TypeAdapter(
-    list[RuleAttestation]
-)
+_RULE_ATTESTATIONS_ADAPTER: TypeAdapter[list[RuleAttestation]] = TypeAdapter(list[RuleAttestation])
 
 
 class PredictionsUsageError(ValueError):

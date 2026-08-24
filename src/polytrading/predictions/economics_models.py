@@ -142,9 +142,7 @@ class ScanReport(PredictionRecord):
             if self.proof_id is None:
                 raise ValueError("a SHADOW_CANDIDATE report requires a proof_id")
             if self.economics is None or self.economics.status != "evaluated":
-                raise ValueError(
-                    "a SHADOW_CANDIDATE report requires an evaluated economics result"
-                )
+                raise ValueError("a SHADOW_CANDIDATE report requires an evaluated economics result")
             if self.economics.conservative_surplus_usd <= 0:
                 raise ValueError(
                     "a SHADOW_CANDIDATE report requires a positive conservative surplus"
