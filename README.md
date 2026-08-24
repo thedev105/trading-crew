@@ -971,10 +971,11 @@ exists to prevent.
 `tests/fixtures/predictions/hard_negatives.json` checks in six gold hard-negative pairs: markets
 with near-identical titles that TF-IDF retrieval would plausibly nominate across venues, but whose
 rule text diverges on exactly one critical dimension (threshold inclusivity, deadline timezone,
-resolution-source authority, observation window, or scope). Each pair's two markets are
-deliberately separate events, so the deterministic generators above never relate them. These fixed
-pairs are the concrete cases increment 3's equivalence-compiler mutation tests and this increment's
-generator-determinism tests both reuse: a scout or compiler that cannot tell the two members of a
+resolution-source authority, observation window, same-underlying-exchange/frontend, or scope).
+Each pair's two markets are deliberately separate events, so the deterministic generators above
+never relate them. These fixed pairs are the concrete cases increment 3's equivalence-compiler
+mutation tests and this increment's generator-determinism tests both reuse: a scout or compiler
+that cannot tell the two members of a
 hard-negative pair apart is not ready to nominate anything across venues.
 
 ### Reading candidates on the dashboard
