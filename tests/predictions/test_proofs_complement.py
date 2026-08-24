@@ -263,3 +263,61 @@ def test_unimplemented_relationship_type_raises_not_implemented_error() -> None:
             as_of=NOW,
             review_identity=REVIEW_IDENTITY,
         )
+
+
+def test_three_leg_complement_candidate_is_a_structural_error() -> None:
+    # A malformed candidate: BINARY_COMPLEMENT with 3 legs of the same market. Silently
+    # reading only legs[0]/legs[1] would drop legs[2] and still emit 2-tuple
+    # leg_payouts, violating the "leg_payouts length == len(candidate.legs)" invariant
+    # this compiler owns -- so this must raise, not reject or ignore.
+    candidate = _candidate(legs=(leg(), leg(outcome_index=1), leg(outcome_index=2)))
+    attestation = _attestation()
+    rule_versions = _rule_versions()
+
+    with pytest.raises(ValueError, match="exactly 2 legs"):
+        compile_proof(
+            candidate,
+            rule_versions,
+            {RULE_VERSION_ID: attestation},
+            as_of=NOW,
+            review_identity=REVIEW_IDENTITY,
+        )
+
+
+def test_cross_market_two_leg_complement_candidate_is_a_structural_error() -> None:
+    # A malformed candidate: 2 legs, same venue (satisfies CandidateRelationship's own
+    # validator), but from two different markets. Treating legs[0]/legs[1] as one
+    # market's two outcomes here would silently apply leg 0's market's attestation to
+    # an unrelated market -- must raise rather than guess.
+    candidate = _candidate(
+        legs=(leg(), leg(outcome_index=1, market_id="0xother", outcome_token_id="222"))
+    )
+    attestation = _attestation()
+    rule_versions = _rule_versions()
+
+    with pytest.raises(ValueError, match="market_id"):
+        compile_proof(
+            candidate,
+            rule_versions,
+            {RULE_VERSION_ID: attestation},
+            as_of=NOW,
+            review_identity=REVIEW_IDENTITY,
+        )
+
+
+def test_missing_attestation_wins_over_changed_rule_version() -> None:
+    # Locks in the documented check order: MISSING_ATTESTATION is checked before the
+    # RULE_VERSION_CHANGED cross-check, so when both conditions hold simultaneously the
+    # attestation check wins.
+    candidate = _candidate()
+
+    artifact = compile_proof(
+        candidate,
+        {},  # rule version also absent from current registry state
+        {},  # no attestation at all
+        as_of=NOW,
+        review_identity=REVIEW_IDENTITY,
+    )
+
+    assert artifact.status == "insufficient_evidence"
+    assert artifact.rejection_reason == "MISSING_ATTESTATION"

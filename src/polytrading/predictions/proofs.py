@@ -75,8 +75,24 @@ def _compile_binary_complement(
     time; a possible void resolution is either excluded (refund_at_cost) or modeled as
     a third terminal state (resolve_to_rules_price); anything unmodeled -- an unknown
     void behavior, or a possible tie -- rejects rather than guesses.
+
+    A candidate whose legs don't actually fit this shape (not exactly 2 legs, or legs
+    spanning two markets/rule versions) is a structural integrity error, not a research
+    outcome to reject or defer -- ``CandidateRelationship`` itself doesn't enforce
+    per-relationship-type leg shape, so this compiler raises rather than silently
+    reading only ``legs[0]``/``legs[1]`` and dropping the rest.
     """
     legs = candidate.legs
+    if (
+        len(legs) != 2
+        or legs[0].market_id != legs[1].market_id
+        or legs[0].rule_version_id != legs[1].rule_version_id
+    ):
+        raise ValueError(
+            "a binary_complement candidate must have exactly 2 legs sharing one "
+            f"market's market_id and rule_version_id; got legs={legs!r}"
+        )
+
     rule_version_ids = tuple(leg.rule_version_id for leg in legs)
     market_rule_version_id = legs[0].rule_version_id
 
