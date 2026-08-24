@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "description": "Gold hard-negative pairs: title-similar prediction-market pairs whose rule text diverges on exactly one critical dimension. Consumed by increment 2's scout/generator determinism tests and reused by increment 3's equivalence-compiler mutation tests. Each pair's two members are deliberately separate events (distinct event_id, distinct market_id) so the deterministic generators (Task 6) never relate them, while their near-identical titles are similar enough that TF-IDF retrieval (Task 8's scout bridge) would plausibly nominate them across venues.",
+  "pairs": [
+    {
+      "pair_id": "btc-100k-threshold-inclusivity",
+      "divergent_field": "threshold_inclusivity",
+      "notes": "Market A resolves YES on a price AT OR ABOVE the strike; Market B requires the price to be STRICTLY ABOVE the strike. A print of exactly $100,000.00 resolves the pair oppositely.",
+      "market_a": {
+        "market_id": "poly-btc-100k-at-or-above-2026",
+        "venue": "polymarket",
+        "question": "Will Bitcoin reach $100,000 or higher by December 31, 2026?",
+        "underlying_exchange": null,
+        "event_id": "poly-btc-100k-2026-event",
+        "resolution_source": "Coinbase BTC-USD spot index",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the Coinbase BTC/USD spot price is greater than or equal to $100,000.00 at any point between 12:00:00 AM ET on January 1, 2026 and 11:59:59 PM ET on December 31, 2026, per the Coinbase spot index. A print of exactly $100,000.00 satisfies this condition. Resolves NO if the threshold is never reached during the window."
+      },
+      "market_b": {
+        "market_id": "kalshi-btc-100k-strictly-above-2026",
+        "venue": "kalshi",
+        "question": "Will Bitcoin be above $100,000 by December 31, 2026?",
+        "underlying_exchange": null,
+        "event_id": "kalshi-btc-100k-2026-event",
+        "resolution_source": "Coinbase BTC-USD spot index",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": null,
+        "rule_text": "This market resolves YES if the Coinbase BTC/USD spot price is strictly greater than $100,000.00 at any point between 12:00:00 AM ET on January 1, 2026 and 11:59:59 PM ET on December 31, 2026. A print of exactly $100,000.00 does NOT satisfy this condition. Resolves NO if the price never exceeds the threshold during the window."
+      }
+    },
+    {
+      "pair_id": "fomc-march-2026-deadline-timezone",
+      "divergent_field": "deadline_timezone",
+      "notes": "Market A's deadline is midnight Eastern Time; Market B's deadline is midnight UTC, roughly five hours earlier. A rate cut announced between those two cutoffs resolves the pair oppositely.",
+      "market_a": {
+        "market_id": "poly-fed-cut-march-2026-et-deadline",
+        "venue": "polymarket",
+        "question": "Will the Federal Reserve cut interest rates by March 19, 2026?",
+        "underlying_exchange": null,
+        "event_id": "poly-fomc-march-2026-event",
+        "resolution_source": "Federal Reserve FOMC press release",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the Federal Open Market Committee announces a reduction in the federal funds rate target range at or before 11:59:59 PM Eastern Time on March 19, 2026 (i.e., before 04:59:59 AM UTC on March 20, 2026). Resolves NO if no cut is announced by that Eastern Time deadline."
+      },
+      "market_b": {
+        "market_id": "kalshi-fed-cut-march-2026-utc-deadline",
+        "venue": "kalshi",
+        "question": "Will the Fed cut interest rates by March 19, 2026?",
+        "underlying_exchange": null,
+        "event_id": "kalshi-fomc-march-2026-event",
+        "resolution_source": "Federal Reserve FOMC press release",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": null,
+        "rule_text": "This market resolves YES if the Federal Open Market Committee announces a reduction in the federal funds rate target range at or before 11:59:59 PM UTC on March 19, 2026. Resolves NO if no cut is announced by that UTC deadline."
+      }
+    },
+    {
+      "pair_id": "ga-senate-2026-resolution-source",
+      "divergent_field": "resolution_source",
+      "notes": "Market A settles strictly on the Associated Press race call; Market B settles strictly on the Decision Desk HQ race call. The two outlets have historically called razor-thin races on different days.",
+      "market_a": {
+        "market_id": "poly-ga-senate-2026-ap-call",
+        "venue": "polymarket",
+        "question": "Will the Republican candidate win the 2026 Georgia Senate race?",
+        "underlying_exchange": null,
+        "event_id": "poly-ga-senate-2026-event",
+        "resolution_source": "Associated Press race call",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the Associated Press calls the 2026 Georgia U.S. Senate general election for the Republican candidate. Resolution is based solely on the AP race call, regardless of subsequent recounts, certifications, or legal challenges. If the AP declines to call the race, this market resolves based on the AP's final published status as of the resolution deadline."
+      },
+      "market_b": {
+        "market_id": "kalshi-ga-senate-2026-ddhq-call",
+        "venue": "kalshi",
+        "question": "Will the Republican candidate win the Georgia Senate race in 2026?",
+        "underlying_exchange": null,
+        "event_id": "kalshi-ga-senate-2026-event",
+        "resolution_source": "Decision Desk HQ race call",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": null,
+        "rule_text": "This market resolves YES if Decision Desk HQ calls the 2026 Georgia U.S. Senate general election for the Republican candidate. Resolution is based solely on the Decision Desk HQ race call, regardless of subsequent recounts, certifications, or legal challenges. If Decision Desk HQ declines to call the race, this market resolves based on its final published status as of the resolution deadline."
+      }
+    },
+    {
+      "pair_id": "nyc-temp-july4-observation-window",
+      "divergent_field": "observation_window",
+      "notes": "Market A observes the NWS calendar day (midnight-to-midnight ET); Market B observes a shifted 24-hour window (7 AM to 7 AM ET). A pre-dawn heat spike on the morning of July 5 falls inside Market B's window but outside Market A's.",
+      "market_a": {
+        "market_id": "poly-nyc-temp-july4-calendar-day",
+        "venue": "polymarket",
+        "question": "Will the high temperature in NYC exceed 95 degrees F on July 4, 2026?",
+        "underlying_exchange": null,
+        "event_id": "poly-nyc-temp-july4-2026-event",
+        "resolution_source": "National Weather Service Central Park station",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the National Weather Service reports a high temperature above 95 degrees Fahrenheit for Central Park during the calendar day of July 4, 2026 (12:00:00 AM to 11:59:59 PM Eastern Time). Resolves NO otherwise."
+      },
+      "market_b": {
+        "market_id": "kalshi-nyc-temp-july4-shifted-window",
+        "venue": "kalshi",
+        "question": "Will the high temperature in NYC exceed 95 degrees F on July 4, 2026?",
+        "underlying_exchange": null,
+        "event_id": "kalshi-nyc-temp-july4-2026-event",
+        "resolution_source": "National Weather Service Central Park station",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": null,
+        "rule_text": "This market resolves YES if the National Weather Service reports a high temperature above 95 degrees Fahrenheit for Central Park during the 24-hour observation window from 7:00:00 AM Eastern Time on July 4, 2026 to 6:59:59 AM Eastern Time on July 5, 2026. Resolves NO otherwise."
+      }
+    },
+    {
+      "pair_id": "fomc-march-2026-same-underlying-exchange-frontend",
+      "divergent_field": "underlying_exchange",
+      "notes": "Not a genuine cross-venue pair: both members are consumer front-ends that route all order flow to the identical underlying exchange contract. Increment 3 must reject this pair as non-independent rather than treat it as two separately-priced venues.",
+      "market_a": {
+        "market_id": "poly-fed-cut-march-2026-frontend-a",
+        "venue": "polymarket",
+        "question": "Will the Fed cut interest rates at the March 2026 FOMC meeting?",
+        "underlying_exchange": "polymarket-negrisk-clob:0x9a4fce1b7d2c8e5f6a10ab12",
+        "event_id": "poly-fomc-march-2026-frontend-event",
+        "resolution_source": "Federal Reserve FOMC press release",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the FOMC announces a rate cut at the conclusion of its March 2026 meeting. Order flow and settlement for this market occur entirely on the Polymarket negRisk CLOB contract 0x9a4fce1b7d2c8e5f6a10ab12."
+      },
+      "market_b": {
+        "market_id": "limitless-fed-cut-march-2026-frontend-b",
+        "venue": "limitless",
+        "question": "Will the Fed cut rates at the March 2026 FOMC meeting?",
+        "underlying_exchange": "polymarket-negrisk-clob:0x9a4fce1b7d2c8e5f6a10ab12",
+        "event_id": "limitless-fomc-march-2026-frontend-event",
+        "resolution_source": "Federal Reserve FOMC press release",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the FOMC announces a rate cut at the conclusion of its March 2026 meeting. Limitless is a consumer front-end that routes all order flow for this market to the underlying Polymarket negRisk CLOB contract 0x9a4fce1b7d2c8e5f6a10ab12; it is not an independent liquidity venue."
+      }
+    },
+    {
+      "pair_id": "btc-100k-subset-superset-scope",
+      "divergent_field": "scope_subset_superset",
+      "notes": "Market A (superset) resolves YES on any intraday touch of the strike during the whole year; Market B (subset) resolves only on the year-end closing print. Every Market B YES implies Market A YES, but not vice versa -- an intraday spike that fades before year-end resolves A YES and B NO.",
+      "market_a": {
+        "market_id": "poly-btc-100k-anytime-2026",
+        "venue": "polymarket",
+        "question": "Will Bitcoin trade above $100,000 at any point in 2026?",
+        "underlying_exchange": null,
+        "event_id": "poly-btc-100k-anytime-2026-event",
+        "resolution_source": "Coinbase BTC-USD spot index",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": false,
+        "rule_text": "This market resolves YES if the Coinbase BTC/USD spot price trades above $100,000.00 at any point between January 1, 2026 00:00:00 ET and December 31, 2026 23:59:59 ET, whether or not it holds that level at year end. Resolves NO if the threshold is never touched during the year."
+      },
+      "market_b": {
+        "market_id": "kalshi-btc-100k-close-dec31-2026",
+        "venue": "kalshi",
+        "question": "Will Bitcoin close above $100,000 on December 31, 2026?",
+        "underlying_exchange": null,
+        "event_id": "kalshi-btc-100k-dec31-2026-event",
+        "resolution_source": "Coinbase BTC-USD spot index",
+        "outcomes": ["Yes", "No"],
+        "negative_risk": null,
+        "rule_text": "This market resolves YES if the Coinbase BTC/USD closing price at 11:59:59 PM ET on December 31, 2026 is above $100,000.00. Intraday moves earlier in the year do not affect resolution; only the year-end closing print matters. Resolves NO otherwise."
+      }
+    }
+  ]
+}
