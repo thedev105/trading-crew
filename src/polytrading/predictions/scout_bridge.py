@@ -10,7 +10,7 @@ from polytrading.ai.retrieval import (
     TfidfCandidateRetriever,
     build_tfidf_model_card,
 )
-from polytrading.predictions.candidates import _all_legs_or_none, _is_eligible_open_market
+from polytrading.predictions.candidates import all_legs_or_none, is_eligible_open_market
 from polytrading.predictions.candidates_models import (
     AIProvenance,
     CandidateDisposition,
@@ -46,7 +46,9 @@ _UNVALIDATED_DATASET_HASH = "0" * 64
 class ScoutAbstention(PredictionRecord):
     """A typed, fail-closed refusal to nominate -- never a silent empty result."""
 
-    reason: Literal["SCOUT_GATE_UNMET", "NO_EVALUATION_SUPPLIED", "NO_ELIGIBLE_MARKETS"]
+    reason: Literal[
+        "SCOUT_GATE_UNMET", "NO_EVALUATION_SUPPLIED", "NO_ELIGIBLE_MARKETS", "SAME_VENUE"
+    ]
     evaluation_request_hash: Sha256 | None
     as_of: datetime
 
@@ -65,10 +67,22 @@ def nominate_cross_venue_candidates(
 
     Pure nomination: no storage writes, no network access, no disposition mutation. Every
     emitted candidate is quarantined AI provenance carrying every Engine D equivalence
-    dimension unresolved. Fails closed: a missing or non-passing evaluation, or an empty
-    eligible-market set on either venue, produces a typed ``ScoutAbstention`` instead of an
-    empty tuple.
+    dimension unresolved. Fails closed: a missing or non-passing evaluation, an empty
+    eligible-market set on either venue, or equal venues, produces a typed
+    ``ScoutAbstention`` instead of an empty tuple or a raised error.
+
+    ``venue_a is venue_b`` is checked first, before any retrieval or evaluation-state
+    check: a ``CROSS_VENUE_EQUIVALENCE`` candidate's legs must span at least two distinct
+    venues (``CandidateRelationship`` enforces this), so proceeding on a same-venue
+    request would eventually raise a ``ValidationError`` deep in candidate construction
+    instead of failing closed with a typed reason.
     """
+    if venue_a is venue_b:
+        return ScoutAbstention(
+            reason="SAME_VENUE",
+            evaluation_request_hash=evaluation.request_hash if evaluation is not None else None,
+            as_of=as_of,
+        )
     if evaluation is None:
         return ScoutAbstention(
             reason="NO_EVALUATION_SUPPLIED", evaluation_request_hash=None, as_of=as_of
@@ -83,12 +97,12 @@ def nominate_cross_venue_candidates(
     markets_a = {
         market.market_id: market
         for market in registry.markets_by_venue_as_of(venue_a, as_of)
-        if _is_eligible_open_market(market)
+        if is_eligible_open_market(market)
     }
     markets_b = {
         market.market_id: market
         for market in registry.markets_by_venue_as_of(venue_b, as_of)
-        if _is_eligible_open_market(market)
+        if is_eligible_open_market(market)
     }
     if not markets_a or not markets_b:
         return ScoutAbstention(
@@ -128,7 +142,7 @@ def nominate_cross_venue_candidates(
             market_b = markets_b.get(_market_id_from_contract_id(result.candidate_contract_id))
             if market_b is None:
                 continue
-            legs = _all_legs_or_none(registry, [market_a, market_b], as_of)
+            legs = all_legs_or_none(registry, [market_a, market_b], as_of)
             if legs is None:
                 continue
             candidates.append(

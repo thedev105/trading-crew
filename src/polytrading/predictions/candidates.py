@@ -50,7 +50,7 @@ def _leg_or_none(
     )
 
 
-def _all_legs_or_none(
+def all_legs_or_none(
     registry: PredictionRegistry,
     markets: list[MarketRecord],
     as_of: datetime,
@@ -87,7 +87,7 @@ def _outcome_membership_propositions(
     )
 
 
-def _is_eligible_open_market(market: MarketRecord) -> bool:
+def is_eligible_open_market(market: MarketRecord) -> bool:
     return market.active and not market.closed and market.order_book_enabled
 
 
@@ -113,7 +113,7 @@ def propose_binary_complements(
 
     candidates: list[CandidateRelationship] = []
     for market in registry.markets_by_venue_as_of(venue, as_of):
-        if not _is_eligible_open_market(market):
+        if not is_eligible_open_market(market):
             continue
         if len(market.outcomes) != 2:
             continue
@@ -171,7 +171,7 @@ def propose_venue_native_outcome_sets(
 
     groups: dict[str, list[MarketRecord]] = {}
     for market in registry.markets_by_venue_as_of(venue, as_of):
-        if not _is_eligible_open_market(market):
+        if not is_eligible_open_market(market):
             continue
         if market.event_id is None:
             continue
@@ -187,7 +187,7 @@ def propose_venue_native_outcome_sets(
             continue
 
         members = sorted(members, key=lambda member: member.market_id)
-        legs_tuple = _all_legs_or_none(registry, members, as_of)
+        legs_tuple = all_legs_or_none(registry, members, as_of)
         if legs_tuple is None:
             continue
         candidates.append(

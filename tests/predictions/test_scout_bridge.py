@@ -40,6 +40,43 @@ def evaluation(**overrides: Any) -> SemanticEvaluation:
     return SemanticEvaluation(**values)
 
 
+def test_same_venue_request_abstains_typed_and_never_raises(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = PredictionRegistry(store)
+
+    result = nominate_cross_venue_candidates(
+        registry,
+        evaluation(),
+        PredictionVenue.POLYMARKET,
+        PredictionVenue.POLYMARKET,
+        AS_OF,
+        trial_family_id="tf-1",
+    )
+
+    assert isinstance(result, ScoutAbstention)
+    assert result.reason == "SAME_VENUE"
+    assert result.evaluation_request_hash == "b" * 64
+    assert result.as_of == AS_OF
+
+
+def test_same_venue_request_abstains_even_with_no_evaluation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    registry = PredictionRegistry(store)
+
+    result = nominate_cross_venue_candidates(
+        registry,
+        None,
+        PredictionVenue.KALSHI,
+        PredictionVenue.KALSHI,
+        AS_OF,
+        trial_family_id="tf-1",
+    )
+
+    assert isinstance(result, ScoutAbstention)
+    assert result.reason == "SAME_VENUE"
+    assert result.evaluation_request_hash is None
+
+
 def test_missing_evaluation_abstains_typed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     registry = PredictionRegistry(store)
