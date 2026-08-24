@@ -8,7 +8,11 @@ from typing import Literal
 from uuid import UUID, uuid5
 
 from polytrading.predictions.attestations import RuleAttestation
-from polytrading.predictions.candidates_models import CandidateRelationship, RelationshipType
+from polytrading.predictions.candidates_models import (
+    CandidateLeg,
+    CandidateRelationship,
+    RelationshipType,
+)
 from polytrading.predictions.domain import RuleVersion, Sha256
 from polytrading.predictions.proofs_models import (
     EquivalenceDimensionResult,
@@ -549,6 +553,14 @@ def _compile_logical_implication(
     side of A's market actually wins (here, NO(A) when A resolves false), and
     correspondingly for B's attestation and the YES(B) leg.
 
+    This NO(A)/YES(B) orientation is never assumed from leg position -- it's verified
+    from typed data via ``_leg_orientation_matches``: each leg's ``outcome_index`` must
+    be non-None and resolve into its own currently-effective ``RuleVersion.outcomes``,
+    and the resolved label must case-insensitively equal "no" for leg 0 and "yes" for
+    leg 1. Any failure there (a ``None`` index, an out-of-range index, or a label that
+    isn't yes/no) rejects as ``IMPLICATION_INVALID`` -- the candidate is well-formed,
+    just unverifiable, which is a rejection rather than a raised error.
+
     Implication validity is checked deterministically over both legs' typed
     propositions and attestations -- never inferred from natural language. Template
     v1 only understands two proposition kinds (``threshold`` and ``deadline``); any
@@ -685,6 +697,11 @@ def _compile_logical_implication(
 
     if not all(leg.rule_version_id in rule_versions for leg in legs):
         return _reject("RULE_VERSION_CHANGED")
+
+    if not _leg_orientation_matches(
+        leg_a, rule_versions[leg_a.rule_version_id], "no"
+    ) or not _leg_orientation_matches(leg_b, rule_versions[leg_b.rule_version_id], "yes"):
+        return _reject("IMPLICATION_INVALID")
 
     if attestation_a.tie_possible or attestation_b.tie_possible:
         return _reject("TIE_UNMODELED")
@@ -1175,6 +1192,23 @@ def _parse_decimal(value: str | None) -> Decimal | None:
         return Decimal(value)
     except InvalidOperation:
         return None
+
+
+def _leg_orientation_matches(
+    leg: CandidateLeg, rule_version: RuleVersion, expected_label: Literal["no", "yes"]
+) -> bool:
+    """True iff ``leg``'s own typed outcome resolves to ``expected_label`` in ``rule_version``.
+
+    Orientation is verified from typed data only -- ``leg.outcome_index`` resolved
+    against ``rule_version.outcomes`` -- never assumed from leg position. A ``None``
+    index, an out-of-range index, or a resolved label that isn't case-insensitively
+    "yes"/"no" all fail closed (the caller rejects as ``IMPLICATION_INVALID`` rather
+    than raising, since the candidate is well-formed -- just unverifiable).
+    """
+    index = leg.outcome_index
+    if index is None or index >= len(rule_version.outcomes):
+        return False
+    return rule_version.outcomes[index].strip().casefold() == expected_label
 
 
 def _threshold_direction(predicate: str) -> Literal["up", "down"] | None:

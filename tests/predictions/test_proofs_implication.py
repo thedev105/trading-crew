@@ -682,6 +682,87 @@ def test_missing_attestation_yields_insufficient_evidence() -> None:
     assert artifact.minimum_basket_payout is None
 
 
+def test_swapped_leg_orientation_rejects_as_implication_invalid() -> None:
+    # leg 0 carries the YES side of A (not NO) -- orientation is wrong even though
+    # every other fact lines up, so this must reject rather than silently flip the
+    # conservative direction.
+    swapped_legs = (
+        leg(
+            market_id=MARKET_A,
+            outcome_index=0,  # YES side, but leg 0 must be NO(A)
+            outcome_token_id="a-yes",
+            rule_version_id=RULE_VERSION_ID_A,
+            rule_source_hash=HASH,
+        ),
+        leg(
+            market_id=MARKET_B,
+            outcome_index=0,  # YES side -- correct for leg 1
+            outcome_token_id="b-yes",
+            rule_version_id=RULE_VERSION_ID_B,
+            rule_source_hash=HASH,
+        ),
+    )
+    candidate = _candidate(legs=swapped_legs)
+    attestations = _attestations()
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def test_non_yes_no_outcome_labels_reject_as_implication_invalid() -> None:
+    candidate = _candidate()
+    attestations = _attestations()
+    rule_versions = _rule_versions()
+    rule_versions[RULE_VERSION_ID_A] = rule_version(
+        rule_version_id=RULE_VERSION_ID_A,
+        market_id=MARKET_A,
+        venue=PredictionVenue.POLYMARKET,
+        source_hash=HASH,
+        outcomes=("Over", "Under"),  # leg 0's outcome_index=1 resolves to "Under", not "no"
+    )
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def test_none_outcome_index_rejects_as_implication_invalid() -> None:
+    legs_with_none_index = (
+        leg(
+            market_id=MARKET_A,
+            outcome_index=None,
+            outcome_token_id="a-no",
+            rule_version_id=RULE_VERSION_ID_A,
+            rule_source_hash=HASH,
+        ),
+        leg(
+            market_id=MARKET_B,
+            outcome_index=0,
+            outcome_token_id="b-yes",
+            rule_version_id=RULE_VERSION_ID_B,
+            rule_source_hash=HASH,
+        ),
+    )
+    candidate = _candidate(legs=legs_with_none_index)
+    attestations = _attestations()
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
 def test_changed_rule_version_is_rejected() -> None:
     candidate = _candidate()
     attestations = _attestations()
