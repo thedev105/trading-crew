@@ -294,6 +294,102 @@ def test_mismatched_direction_rejects() -> None:
     assert artifact.rejection_reason == "IMPLICATION_INVALID"
 
 
+def test_down_family_looser_threshold_implies_stricter_threshold() -> None:
+    # A: price <= 90000 (stricter/lower ceiling); B: price <= 100000 (looser ceiling).
+    # A implies B: anything satisfying A's tighter ceiling also satisfies B's looser one.
+    candidate = _candidate(
+        propositions=(
+            _proposition(predicate="<=", value="90000"),
+            _proposition(predicate="<=", value="100000"),
+        )
+    )
+    attestations = _attestations()
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "proof_ready"
+    neither = next(s for s in artifact.terminal_states if s.state_id == "neither")
+    b_only = next(s for s in artifact.terminal_states if s.state_id == "b_only")
+    both = next(s for s in artifact.terminal_states if s.state_id == "both")
+    assert neither.leg_payouts == (Decimal("1"), Decimal("0"))
+    assert b_only.leg_payouts == (Decimal("1"), Decimal("1"))
+    assert both.leg_payouts == (Decimal("0"), Decimal("1"))
+    assert artifact.minimum_basket_payout == Decimal("1")
+    assert artifact.maximum_basket_payout == Decimal("2")
+
+
+def test_down_family_stricter_threshold_does_not_imply_looser_ceiling() -> None:
+    # A: price <= 100000 (looser); B: price <= 90000 (stricter ceiling). A does not imply B:
+    # a value of 95000 satisfies A but not B.
+    candidate = _candidate(
+        propositions=(
+            _proposition(predicate="<=", value="100000"),
+            _proposition(predicate="<=", value="90000"),
+        )
+    )
+    attestations = _attestations()
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def test_down_family_strict_a_implies_inclusive_b_at_same_value() -> None:
+    # A: price < 100000 (exclusive ceiling); B: price <= 100000 (inclusive ceiling). Same
+    # value: valid, since anything strictly below 100000 is also <= 100000.
+    candidate = _candidate(
+        propositions=(
+            _proposition(predicate="<", value="100000"),
+            _proposition(predicate="<=", value="100000"),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_A: _attestation_a(threshold_inclusive=False),
+            RULE_VERSION_ID_B: _attestation_b(threshold_inclusive=True),
+        }
+    )
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "proof_ready"
+
+
+def test_down_family_inclusive_a_does_not_imply_strict_b_at_same_value() -> None:
+    # A: price <= 100000 (inclusive ceiling); B: price < 100000 (exclusive ceiling). Same
+    # value: invalid, since price==100000 satisfies A but not B.
+    candidate = _candidate(
+        propositions=(
+            _proposition(predicate="<=", value="100000"),
+            _proposition(predicate="<", value="100000"),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_A: _attestation_a(threshold_inclusive=True),
+            RULE_VERSION_ID_B: _attestation_b(threshold_inclusive=False),
+        }
+    )
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
 def test_threshold_inclusive_none_rejects_as_implication_invalid() -> None:
     candidate = _candidate()
     attestations = _attestations({RULE_VERSION_ID_A: _attestation_a(threshold_inclusive=None)})
@@ -367,6 +463,145 @@ def test_kind_mismatch_rejects() -> None:
         )
     )
     attestations = _attestations()
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def _deadline_proposition(**overrides) -> TypedProposition:
+    values = {
+        "kind": "deadline",
+        "predicate": "resolves_by",
+        "value": "2026-12-31T00:00:00Z",
+    }
+    values.update(overrides)
+    return _proposition(**values)
+
+
+def test_deadline_happy_path_emits_proof_ready_with_expected_states() -> None:
+    # A: resolves by NOW (leg 0, NO side); B: resolves by NOW+1day (leg 1, YES side).
+    # deadline_A <= deadline_B, so A implies B and a_without_b is excluded.
+    candidate = _candidate(
+        propositions=(
+            _deadline_proposition(),
+            _deadline_proposition(supporting_spans=(_span(exact_text="deadline b"),)),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_A: _attestation_a(
+                deadline_utc=NOW, threshold_text="resolves by the stated deadline"
+            ),
+            RULE_VERSION_ID_B: _attestation_b(
+                deadline_utc=NOW + timedelta(days=1),
+                threshold_text="resolves by the stated deadline",
+            ),
+        }
+    )
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "proof_ready"
+    assert artifact.rejection_reason is None
+    assert {state.state_id for state in artifact.terminal_states} == {
+        "neither",
+        "b_only",
+        "both",
+    }
+    neither = next(s for s in artifact.terminal_states if s.state_id == "neither")
+    b_only = next(s for s in artifact.terminal_states if s.state_id == "b_only")
+    both = next(s for s in artifact.terminal_states if s.state_id == "both")
+    assert neither.leg_payouts == (Decimal("1"), Decimal("0"))
+    assert b_only.leg_payouts == (Decimal("1"), Decimal("1"))
+    assert both.leg_payouts == (Decimal("0"), Decimal("1"))
+    assert artifact.minimum_basket_payout == Decimal("1")
+    assert artifact.maximum_basket_payout == Decimal("2")
+    assert len(artifact.excluded_states) == 1
+
+
+def test_deadline_ordering_violation_rejects() -> None:
+    # A: resolves by NOW+1day (leg 0); B: resolves by NOW (leg 1). deadline_A > deadline_B,
+    # so A does not imply B: A could still be pending after B has already resolved.
+    candidate = _candidate(
+        propositions=(
+            _deadline_proposition(),
+            _deadline_proposition(supporting_spans=(_span(exact_text="deadline b"),)),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_A: _attestation_a(
+                deadline_utc=NOW + timedelta(days=1),
+                threshold_text="resolves by the stated deadline",
+            ),
+            RULE_VERSION_ID_B: _attestation_b(
+                deadline_utc=NOW, threshold_text="resolves by the stated deadline"
+            ),
+        }
+    )
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def test_deadline_threshold_text_mismatch_rejects() -> None:
+    candidate = _candidate(
+        propositions=(
+            _deadline_proposition(),
+            _deadline_proposition(supporting_spans=(_span(exact_text="deadline b"),)),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_A: _attestation_a(
+                deadline_utc=NOW, threshold_text="resolves by the stated deadline"
+            ),
+            RULE_VERSION_ID_B: _attestation_b(
+                deadline_utc=NOW + timedelta(days=1),
+                threshold_text="resolves by a different deadline",
+            ),
+        }
+    )
+    rule_versions = _rule_versions()
+
+    artifact = compile_proof(
+        candidate, rule_versions, attestations, as_of=NOW, review_identity=REVIEW_IDENTITY
+    )
+
+    assert artifact.status == "rejected"
+    assert artifact.rejection_reason == "IMPLICATION_INVALID"
+
+
+def test_deadline_utc_none_on_deadline_kind_attestation_rejects() -> None:
+    # attestation_a's default deadline_utc is None -- a deadline-kind proposition whose
+    # own attestation never attested a deadline_utc can't support the ordering check.
+    candidate = _candidate(
+        propositions=(
+            _deadline_proposition(),
+            _deadline_proposition(supporting_spans=(_span(exact_text="deadline b"),)),
+        )
+    )
+    attestations = _attestations(
+        {
+            RULE_VERSION_ID_B: _attestation_b(
+                deadline_utc=NOW + timedelta(days=1),
+                threshold_text="at least $100,000",
+            )
+        }
+    )
     rule_versions = _rule_versions()
 
     artifact = compile_proof(
