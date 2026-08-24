@@ -8,10 +8,11 @@ import pytest
 import polytrading.cli as cli
 import polytrading.predictions.cli as predictions_cli
 from polytrading.cli import build_parser, main
+from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import PredictionMarketStore
-from tests.predictions.domain_helpers import NOW
+from tests.predictions.domain_helpers import NOW, market_record, rule_version
 from tests.predictions.manifest_helpers import venue_manifest
 
 MARKETS_FIXTURE = Path("tests/fixtures/predictions/polymarket/gamma_markets_page_1.json")
@@ -283,3 +284,131 @@ def test_predictions_dashboard_dispatches_to_validate_and_serve(
 
     assert exit_code == 0
     assert calls == [f"validate:{database}", f"serve:{database}:8787"]
+
+
+def test_candidates_command_persists_deterministic_candidates_idempotently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record())
+    store.append_rule_version(rule_version())
+    store.close()
+
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+            "--format",
+            "json",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    polymarket_counts = output["venues"]["polymarket"]
+    assert polymarket_counts[RelationshipType.BINARY_COMPLEMENT.value] == {
+        "newly_appended": 1,
+        "already_known": 0,
+    }
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        candidates = verify_store.candidate_relationships_as_of(
+            datetime(2026, 8, 15, 12, tzinfo=UTC)
+        )
+    finally:
+        verify_store.close()
+    assert len(candidates) == 1
+
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+            "--format",
+            "json",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    polymarket_counts = output["venues"]["polymarket"]
+    assert polymarket_counts[RelationshipType.BINARY_COMPLEMENT.value] == {
+        "newly_appended": 0,
+        "already_known": 1,
+    }
+
+
+def test_candidates_command_reports_cross_venue_abstention(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket",
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+        ]
+    )
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "SCOUT_GATE_UNMET" in captured.out
+
+
+def test_candidates_rejects_unknown_venue_name(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    exit_code = main(
+        [
+            "predictions",
+            "candidates",
+            "--db",
+            str(database),
+            "--venues",
+            "polymarket,not-a-venue",
+        ]
+    )
+    assert exit_code == 2
+
+
+def test_candidates_command_defaults_trial_family_and_as_of(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_market(market_record())
+    store.append_rule_version(rule_version())
+    store.close()
+
+    exit_code = main(["predictions", "candidates", "--db", str(database), "--venues", "polymarket"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "trial_family=increment-2-structural" in output
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        candidates = verify_store.candidate_relationships_as_of(
+            datetime.now(UTC) + timedelta(days=1)
+        )
+    finally:
+        verify_store.close()
+    assert len(candidates) == 1
+    assert candidates[0].trial_family_id == "increment-2-structural"
