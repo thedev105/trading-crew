@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
+from uuid import UUID, uuid5
 
 from pydantic import Field, model_validator
 
@@ -14,6 +17,8 @@ InsufficiencyReason = Literal[
     "MISSING_FEE",
     "ZERO_EXECUTABLE_DEPTH",
 ]
+
+ScanDecision = Literal["SHADOW_CANDIDATE", "REJECTED", "INSUFFICIENT_EVIDENCE"]
 
 
 class PredictionEconomicsPolicy(PredictionRecord):
@@ -97,6 +102,93 @@ class EconomicsResult(PredictionRecord):
         elif self.insufficiency_reason is not None:
             raise ValueError("an evaluated result must not carry an insufficiency_reason")
         return self
+
+
+# Fixed namespace for deterministic scan-report identity (UUIDv5). Generated once via
+# uuid4() and pinned here as a literal -- never regenerate this value, or every
+# previously derived report_id would silently change identity, breaking append-idempotent
+# persistence (see ``deterministic_scan_report_id``).
+_SCAN_REPORT_IDENTITY_NAMESPACE = UUID("602940c3-ac97-499d-a120-33da483a1055")
+
+
+class ScanReport(PredictionRecord):
+    """Task 11's append-only per-candidate scan decision (spec section 8/9's gate).
+
+    A scan joins a candidate's latest proof (if any) with fresh book/fee evidence and
+    ``DEFAULT_RESEARCH_POLICY`` into exactly one of three fail-closed outcomes:
+    ``SHADOW_CANDIDATE`` (a proof-backed, economically-positive basket -- research
+    shadow tracking only, never a live trading signal), ``REJECTED``, or
+    ``INSUFFICIENT_EVIDENCE``. ``proof_id``/``economics`` are the report's own citation
+    of exactly which persisted proof and computed economics evaluation (if any)
+    justify ``decision``; ``policy_id``/``policy_version`` cite the frozen policy
+    thresholds evaluated against, matching ``EconomicsResult``'s own citation
+    convention (spec section 7's "frozen policy thresholds" gate).
+    """
+
+    report_id: UUID
+    candidate_id: UUID
+    proof_id: UUID | None
+    decision: ScanDecision
+    reason: str
+    economics: EconomicsResult | None
+    policy_id: str
+    policy_version: str
+    as_of: datetime
+    observed_at: datetime
+
+    @model_validator(mode="after")
+    def _require_consistent_report(self) -> ScanReport:
+        if self.decision == "SHADOW_CANDIDATE":
+            if self.proof_id is None:
+                raise ValueError("a SHADOW_CANDIDATE report requires a proof_id")
+            if self.economics is None or self.economics.status != "evaluated":
+                raise ValueError(
+                    "a SHADOW_CANDIDATE report requires an evaluated economics result"
+                )
+            if self.economics.conservative_surplus_usd <= 0:
+                raise ValueError(
+                    "a SHADOW_CANDIDATE report requires a positive conservative surplus"
+                )
+        return self
+
+
+def deterministic_scan_report_id(
+    *,
+    candidate_id: UUID,
+    proof_id: UUID | None,
+    decision: ScanDecision,
+    reason: str,
+    economics: EconomicsResult | None,
+    policy_id: str,
+    policy_version: str,
+    as_of: datetime,
+) -> UUID:
+    """Derive a stable identity for one candidate's scan decision at one ``as_of``.
+
+    Deliberately excludes ``observed_at`` (mirrors ``candidates_models.
+    deterministic_candidate_id`` and ``proofs._finalize``'s append-idempotent style):
+    re-running ``predictions scan`` at the *same* ``as_of`` over unchanged evidence
+    always reproduces the same ``report_id``, so persisting it again is a no-op rather
+    than a conflict. A later ``as_of`` (or evidence that has since changed) is folded
+    into the hash and legitimately mints a new report -- a scan is a fresh evaluation
+    of current state, not a regenerated fact about an immutable identity.
+    """
+    canonical = json.dumps(
+        [
+            str(candidate_id),
+            str(proof_id) if proof_id is not None else None,
+            decision,
+            reason,
+            economics.model_dump(mode="json") if economics is not None else None,
+            policy_id,
+            policy_version,
+            as_of.isoformat(),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return uuid5(_SCAN_REPORT_IDENTITY_NAMESPACE, canonical)
 
 
 # Conservative research-mode defaults. These are deliberately small-but-nonzero so

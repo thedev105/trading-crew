@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -24,6 +24,13 @@ from polytrading.predictions.dashboard_server import (
     validate_prediction_dashboard_database,
 )
 from polytrading.predictions.domain import MarketRecord, PredictionVenue, RuleVersion
+from polytrading.predictions.economics import evaluate_basket_economics
+from polytrading.predictions.economics_models import (
+    DEFAULT_RESEARCH_POLICY,
+    EconomicsResult,
+    ScanReport,
+    deterministic_scan_report_id,
+)
 from polytrading.predictions.health import PredictionHealthAuditor, VenueEvidenceStatus
 from polytrading.predictions.health_report import (
     render_prediction_health_json,
@@ -33,6 +40,8 @@ from polytrading.predictions.kalshi import KalshiAdapter
 from polytrading.predictions.limitless import LimitlessAdapter
 from polytrading.predictions.manifest import evaluate_collection_gate
 from polytrading.predictions.polymarket import PolymarketAdapter
+from polytrading.predictions.proofs import compile_proof
+from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.registry import PredictionRegistry
 from polytrading.predictions.storage.store import PredictionMarketStore
 from polytrading.trial.writer_lease import database_writer_lease
@@ -51,6 +60,11 @@ _CANDIDATES_CODE_REVISION = "unversioned"
 _CROSS_VENUE_ABSTENTION_LINE = (
     "cross-venue nomination: abstained (SCOUT_GATE_UNMET: no adjudicated gold evaluation)"
 )
+# No CLI-invoked reviewer-identity source exists yet (no auth/session layer); this
+# mirrors _CANDIDATES_CODE_REVISION's fixed placeholder-constant pattern rather than
+# inventing a new one. An operator who needs a real reviewer identity on record must
+# pass --review-identity explicitly.
+_DEFAULT_REVIEW_IDENTITY = "cli-operator"
 _RULE_ATTESTATIONS_ADAPTER: TypeAdapter[list[RuleAttestation]] = TypeAdapter(
     list[RuleAttestation]
 )
@@ -70,6 +84,14 @@ class PredictionCandidatesError(RuntimeError):
 
 class PredictionAttestError(RuntimeError):
     """A prediction-market rule-attestation import failure, sanitized for CLI output."""
+
+
+class PredictionProveError(RuntimeError):
+    """A prediction-market proof-compilation failure, sanitized for CLI output."""
+
+
+class PredictionScanError(RuntimeError):
+    """A prediction-market scan failure, sanitized for CLI output."""
 
 
 def _utc_now() -> datetime:
@@ -129,6 +151,26 @@ def add_predictions_subcommands(
     attest.add_argument("--db", required=True, type=Path)
     attest.add_argument("--input", required=True, type=Path)
 
+    prove = predictions_commands.add_parser(
+        "prove", help="compile and persist a deterministic payoff proof for one candidate"
+    )
+    prove.add_argument("--db", required=True, type=Path)
+    prove.add_argument("--candidate-id", required=True)
+    prove.add_argument("--as-of")
+    prove.add_argument("--review-identity")
+    prove.add_argument("--format", choices=("text", "json"), default="text")
+
+    scan = predictions_commands.add_parser(
+        "scan",
+        help=(
+            "join every candidate's latest proof with fresh books/fees/economics into "
+            "a persisted per-candidate scan decision"
+        ),
+    )
+    scan.add_argument("--db", required=True, type=Path)
+    scan.add_argument("--as-of")
+    scan.add_argument("--format", choices=("text", "json"), default="text")
+
     dashboard = predictions_commands.add_parser(
         "dashboard", help="serve the loopback-only prediction-market evidence console"
     )
@@ -145,6 +187,10 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
         return _run_candidates(arguments)
     if arguments.predictions_command == "attest":
         return _run_attest(arguments)
+    if arguments.predictions_command == "prove":
+        return _run_prove(arguments)
+    if arguments.predictions_command == "scan":
+        return _run_scan(arguments)
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
@@ -505,6 +551,258 @@ def _run_attest(arguments: argparse.Namespace) -> int:
         raise PredictionAttestError("rule attestation import failed to persist durably") from error
 
     print(f"appended {appended} attestations, already_known={already_known}")
+    return 0
+
+
+def _current_rule_versions_for_candidate(
+    store: PredictionMarketStore, candidate: CandidateRelationship, as_of: datetime
+) -> dict[UUID, RuleVersion]:
+    """The candidate's legs' markets' presently-effective rule versions, keyed by id.
+
+    ``compile_proof`` treats ``rule_versions`` as the caller's current registry state:
+    a leg whose own ``rule_version_id`` isn't its market's latest-effective version as
+    of ``as_of`` must be absent from this mapping, so the compiler correctly rejects
+    RULE_VERSION_CHANGED rather than silently proving against a superseded rule.
+    """
+    current: dict[UUID, RuleVersion] = {}
+    seen_markets: set[tuple[PredictionVenue, str]] = set()
+    for leg in candidate.legs:
+        market_key = (leg.venue, leg.market_id)
+        if market_key in seen_markets:
+            continue
+        seen_markets.add(market_key)
+        venue_versions = tuple(
+            version
+            for version in store.rule_versions_for_market(leg.market_id, as_of)
+            if version.venue is leg.venue
+        )
+        if venue_versions:
+            # rule_versions_for_market orders ascending by effective_at; the last
+            # entry at-or-before as_of is the market's presently-effective version.
+            latest = venue_versions[-1]
+            current[latest.rule_version_id] = latest
+    return current
+
+
+def _run_prove(arguments: argparse.Namespace) -> int:
+    as_of = _parse_timestamp(arguments.as_of) if arguments.as_of else _utc_now()
+    review_identity = arguments.review_identity or _DEFAULT_REVIEW_IDENTITY
+    try:
+        candidate_id = UUID(arguments.candidate_id)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise PredictionsUsageError(f"invalid --candidate-id {arguments.candidate_id!r}") from error
+
+    artifact: ProofArtifact | None = None
+    persisted = False
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                candidate = next(
+                    (
+                        item
+                        for item in store.candidate_relationships_as_of(as_of)
+                        if item.candidate_id == candidate_id
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    raise PredictionsUsageError(f"unknown candidate_id {candidate_id}")
+
+                rule_versions = _current_rule_versions_for_candidate(store, candidate, as_of)
+                attestations = {
+                    leg.rule_version_id: attestation
+                    for leg in candidate.legs
+                    if (
+                        attestation := store.latest_attestation_for_rule_version(
+                            leg.rule_version_id, as_of
+                        )
+                    )
+                    is not None
+                }
+
+                artifact = compile_proof(
+                    candidate,
+                    rule_versions,
+                    attestations,
+                    as_of=as_of,
+                    review_identity=review_identity,
+                )
+
+                with store.transaction() as transaction:
+                    persisted = transaction.append_proof_artifact(artifact)
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionProveError("proof compilation failed to persist durably") from error
+
+    assert artifact is not None  # narrowed: only PredictionsUsageError exits before this point
+    if arguments.format == "json":
+        print(
+            json.dumps(
+                {
+                    "candidate_id": str(candidate_id),
+                    "proof_id": str(artifact.proof_id),
+                    "status": artifact.status,
+                    "rejection_reason": artifact.rejection_reason,
+                    "minimum_basket_payout": (
+                        str(artifact.minimum_basket_payout)
+                        if artifact.minimum_basket_payout is not None
+                        else None
+                    ),
+                    "persisted": persisted,
+                    "as_of": _timestamp(as_of),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(
+            f"predictions prove | candidate_id={candidate_id} | status={artifact.status} | "
+            f"reason={artifact.rejection_reason} | "
+            f"minimum_basket_payout={artifact.minimum_basket_payout} | persisted={persisted}"
+        )
+    return 0
+
+
+def _scan_one_candidate(
+    store: PredictionMarketStore, candidate: CandidateRelationship, as_of: datetime
+) -> ScanReport:
+    """Join one candidate's latest proof with fresh evidence into a scan decision.
+
+    Read-only over already-persisted proofs (never calls ``compile_proof``): a scan
+    reports on what ``predictions prove`` has already established, joined with
+    current books/fees/economics -- it never mints new proof evidence itself.
+    """
+    proof = store.latest_proof_for_candidate(candidate.candidate_id, as_of)
+    economics: EconomicsResult | None = None
+    proof_id: UUID | None = None
+    decision: str
+    reason: str
+
+    if proof is None:
+        decision, reason = "INSUFFICIENT_EVIDENCE", "no proof compiled"
+    else:
+        proof_id = proof.proof_id
+        if proof.status == "insufficient_evidence":
+            assert proof.rejection_reason is not None  # ProofArtifact invariant
+            decision, reason = "INSUFFICIENT_EVIDENCE", proof.rejection_reason
+        elif proof.status == "rejected":
+            assert proof.rejection_reason is not None  # ProofArtifact invariant
+            decision, reason = "REJECTED", proof.rejection_reason
+        else:  # proof_ready
+            books = {
+                i: store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, as_of)
+                for i, leg in enumerate(candidate.legs)
+            }
+            fees = {
+                i: store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
+                for i, leg in enumerate(candidate.legs)
+            }
+            economics = evaluate_basket_economics(
+                proof,
+                candidate,
+                books=books,
+                fees=fees,
+                policy=DEFAULT_RESEARCH_POLICY,
+                as_of=as_of,
+            )
+            if economics.status == "insufficient_evidence":
+                assert economics.insufficiency_reason is not None  # EconomicsResult invariant
+                decision, reason = "INSUFFICIENT_EVIDENCE", economics.insufficiency_reason
+            elif economics.conservative_surplus_usd > 0:
+                decision = "SHADOW_CANDIDATE"
+                reason = "conservative surplus positive at current depth"
+            else:
+                decision, reason = "REJECTED", "conservative surplus not positive"
+
+    report_id = deterministic_scan_report_id(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof_id,
+        decision=decision,  # type: ignore[arg-type]
+        reason=reason,
+        economics=economics,
+        policy_id=DEFAULT_RESEARCH_POLICY.policy_id,
+        policy_version=DEFAULT_RESEARCH_POLICY.policy_version,
+        as_of=as_of,
+    )
+    return ScanReport(
+        report_id=report_id,
+        candidate_id=candidate.candidate_id,
+        proof_id=proof_id,
+        decision=decision,  # type: ignore[arg-type]
+        reason=reason,
+        economics=economics,
+        policy_id=DEFAULT_RESEARCH_POLICY.policy_id,
+        policy_version=DEFAULT_RESEARCH_POLICY.policy_version,
+        as_of=as_of,
+        observed_at=as_of,
+    )
+
+
+def _run_scan(arguments: argparse.Namespace) -> int:
+    as_of = _parse_timestamp(arguments.as_of) if arguments.as_of else _utc_now()
+
+    tally: dict[str, int] = {"SHADOW_CANDIDATE": 0, "REJECTED": 0, "INSUFFICIENT_EVIDENCE": 0}
+    shadow_candidates: list[dict[str, str]] = []
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                candidates = store.candidate_relationships_as_of(as_of)
+                with store.transaction() as transaction:
+                    known_report_ids = set(transaction.existing_scan_report_ids())
+                    for candidate in candidates:
+                        report = _scan_one_candidate(transaction, candidate, as_of)
+                        tally[report.decision] += 1
+                        if report.decision == "SHADOW_CANDIDATE":
+                            assert report.economics is not None  # narrowed by ScanReport validator
+                            shadow_candidates.append(
+                                {
+                                    "candidate_id": str(report.candidate_id),
+                                    "conservative_surplus_usd": str(
+                                        report.economics.conservative_surplus_usd
+                                    ),
+                                    "capacity_usd_at_current_depth": str(
+                                        report.economics.capacity_usd_at_current_depth
+                                    ),
+                                }
+                            )
+                        already_known = report.report_id in known_report_ids
+                        if not already_known and transaction.append_scan_report(report):
+                            known_report_ids.add(report.report_id)
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionScanError("scan failed to persist durably") from error
+
+    if arguments.format == "json":
+        print(
+            json.dumps(
+                {
+                    "as_of": _timestamp(as_of),
+                    "tally": tally,
+                    "shadow_candidates": shadow_candidates,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"predictions scan | as_of={_timestamp(as_of)}")
+        for decision, count in tally.items():
+            print(f"{decision}: {count}")
+        for entry in shadow_candidates:
+            print(
+                f"shadow candidate {entry['candidate_id']} | "
+                f"surplus={entry['conservative_surplus_usd']} | "
+                f"capacity={entry['capacity_usd_at_current_depth']}"
+            )
     return 0
 
 

@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -13,7 +14,19 @@ from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.attestation_helpers import rule_attestation
-from tests.predictions.domain_helpers import NOW, market_record, rule_version
+from tests.predictions.candidate_helpers import (
+    CANDIDATE_ID,
+    RULE_VERSION_ID,
+    candidate_relationship,
+)
+from tests.predictions.domain_helpers import (
+    NOW,
+    fee_rate,
+    level,
+    market_record,
+    prediction_book_snapshot,
+    rule_version,
+)
 from tests.predictions.manifest_helpers import venue_manifest
 
 MARKETS_FIXTURE = Path("tests/fixtures/predictions/polymarket/gamma_markets_page_1.json")
@@ -1144,3 +1157,378 @@ def test_attest_command_sanitizes_a_persistence_failure(
     captured = capsys.readouterr()
     assert "rule attestation" in captured.err
     assert "conflicting rule attestation" not in captured.err
+
+
+def _seed_candidate_with_rule_and_attestation(database: Path) -> None:
+    store = PredictionMarketStore(database)
+    store.append_market(market_record(rule_version_id=RULE_VERSION_ID))
+    store.append_rule_version(rule_version(rule_version_id=RULE_VERSION_ID, effective_at=NOW))
+    store.append_rule_attestation(
+        rule_attestation(rule_version_id=RULE_VERSION_ID, reviewed_at=NOW)
+    )
+    store.append_candidate_relationship(candidate_relationship())
+    store.close()
+
+
+def test_prove_command_compiles_and_persists_a_proof_ready_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+
+    exit_code = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+            "--review-identity",
+            "tester@example.test",
+            "--format",
+            "json",
+        ]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["candidate_id"] == str(CANDIDATE_ID)
+    assert output["status"] == "proof_ready"
+    assert output["rejection_reason"] is None
+    assert output["minimum_basket_payout"] == "1"
+    assert output["persisted"] is True
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        proof = verify_store.latest_proof_for_candidate(
+            CANDIDATE_ID, datetime(2026, 8, 15, 12, tzinfo=UTC)
+        )
+    finally:
+        verify_store.close()
+    assert proof is not None
+    assert proof.status == "proof_ready"
+    assert str(proof.proof_id) == output["proof_id"]
+
+
+def test_prove_command_rejects_an_unknown_candidate_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    exit_code = main(
+        ["predictions", "prove", "--db", str(database), "--candidate-id", str(CANDIDATE_ID)]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert str(CANDIDATE_ID) in captured.err
+
+
+def test_prove_command_rejects_a_malformed_candidate_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    exit_code = main(
+        ["predictions", "prove", "--db", str(database), "--candidate-id", "not-a-uuid"]
+    )
+    assert exit_code == 2
+
+
+def test_prove_command_is_idempotent_across_reruns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+
+    args = [
+        "predictions",
+        "prove",
+        "--db",
+        str(database),
+        "--candidate-id",
+        str(CANDIDATE_ID),
+        "--as-of",
+        "2026-08-15T12:00:00Z",
+        "--format",
+        "json",
+    ]
+    first_exit = main(args)
+    first_output = json.loads(capsys.readouterr().out)
+    second_exit = main(args)
+    second_output = json.loads(capsys.readouterr().out)
+
+    assert first_exit == 0
+    assert second_exit == 0
+    assert first_output["persisted"] is True
+    assert second_output["persisted"] is False
+    assert first_output["proof_id"] == second_output["proof_id"]
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        proofs = verify_store.proof_artifacts_for_candidate(
+            CANDIDATE_ID, datetime(2026, 8, 15, 12, tzinfo=UTC)
+        )
+    finally:
+        verify_store.close()
+    assert len(proofs) == 1
+
+
+def test_prove_command_sanitizes_a_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+
+    def raise_conflict(self: PredictionMarketStore, record: object) -> bool:
+        raise ConflictingRecordError("conflicting proof artifact for immutable identity")
+
+    monkeypatch.setattr(PredictionMarketStore, "append_proof_artifact", raise_conflict)
+
+    exit_code = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+        ]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "proof compilation failed to persist durably" in captured.err
+    assert "conflicting proof artifact" not in captured.err
+
+
+def test_scan_command_persists_a_shadow_candidate_with_hand_checked_surplus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="111",
+            bids=(level("0.20", "10"),),
+            asks=(level("0.30", "100"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="222",
+            bids=(level("0.30", "10"),),
+            asks=(level("0.35", "80"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_fee_rate(fee_rate(market_id="0xcondition", taker_rate=Decimal("0.01")))
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    prove_exit = main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    assert prove_exit == 0
+    capsys.readouterr()
+
+    scan_exit = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert scan_exit == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 1,
+        "REJECTED": 0,
+        "INSUFFICIENT_EVIDENCE": 0,
+    }
+    assert len(output["shadow_candidates"]) == 1
+    shadow = output["shadow_candidates"][0]
+    assert shadow["candidate_id"] == str(CANDIDATE_ID)
+    # Hand-checked against DEFAULT_RESEARCH_POLICY (research-v1):
+    #   bottleneck quantity q = min(leg0 ask depth 100, leg1 ask depth 80) = 80
+    #   acquisition0 = 0.30 * 80 = 24.00; acquisition1 = 0.35 * 80 = 28.00
+    #   acquisition_total = 52.00
+    #   fee_total = 52.00 * 0.01 taker (applied per leg) = 0.24 + 0.28 = 0.52
+    #   currency_basis_reserve = 52.00 * 0.0025 = 0.13
+    #   capital_lockup_reserve = 52.00 * 0.0002 * 3 = 0.0312
+    #   all_in_cost = 52.00 + 0.52 + 2.00(gas) + 0.13 + 1.00(transfer) + 0.0312 + 0.50(ops)
+    #               = 56.1812
+    #   failure_reserve = 52.00 * (0.01+0.005+0.005+0.0025) = 52.00 * 0.0225 = 1.17
+    #   proven_floor = q * minimum_basket_payout(1) = 80.00
+    #   surplus = 80.00 - 56.1812 - 1.17 = 22.6488
+    assert Decimal(shadow["conservative_surplus_usd"]) == Decimal("22.6488")
+    assert Decimal(shadow["capacity_usd_at_current_depth"]) == Decimal("52.00")
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    assert reports[0].decision == "SHADOW_CANDIDATE"
+    assert reports[0].economics is not None
+    assert reports[0].economics.conservative_surplus_usd == Decimal("22.6488")
+
+
+def test_scan_command_reports_insufficient_evidence_without_books(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+
+    as_of = "2026-08-15T12:00:00Z"
+    main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    capsys.readouterr()
+
+    exit_code = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", as_of, "--format", "json"]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["tally"] == {
+        "SHADOW_CANDIDATE": 0,
+        "REJECTED": 0,
+        "INSUFFICIENT_EVIDENCE": 1,
+    }
+    assert output["shadow_candidates"] == []
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+    assert reports[0].decision == "INSUFFICIENT_EVIDENCE"
+    assert reports[0].reason == "MISSING_BOOK"
+
+
+def test_scan_command_is_idempotent_across_reruns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+
+    as_of = "2026-08-15T12:00:00Z"
+    main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    capsys.readouterr()
+
+    first_exit = main(["predictions", "scan", "--db", str(database), "--as-of", as_of])
+    capsys.readouterr()
+    second_exit = main(["predictions", "scan", "--db", str(database), "--as-of", as_of])
+    capsys.readouterr()
+
+    assert first_exit == 0
+    assert second_exit == 0
+
+    verify_store = PredictionMarketStore(database, read_only=True)
+    try:
+        reports = verify_store.scan_reports_as_of(datetime(2026, 8, 15, 12, tzinfo=UTC))
+    finally:
+        verify_store.close()
+    assert len(reports) == 1
+
+
+def test_scan_command_sanitizes_a_persistence_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate_relationship())
+    store.close()
+
+    def raise_conflict(self: PredictionMarketStore, record: object) -> bool:
+        raise ConflictingRecordError("conflicting scan report for immutable identity")
+
+    monkeypatch.setattr(PredictionMarketStore, "append_scan_report", raise_conflict)
+
+    exit_code = main(
+        ["predictions", "scan", "--db", str(database), "--as-of", "2026-08-15T12:00:00Z"]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "scan failed to persist durably" in captured.err
+    assert "conflicting scan report" not in captured.err
+
+
+def test_scan_command_never_prints_a_forbidden_promotional_word(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_candidate_with_rule_and_attestation(database)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="111",
+            bids=(level("0.20", "10"),),
+            asks=(level("0.30", "100"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="222",
+            bids=(level("0.30", "10"),),
+            asks=(level("0.35", "80"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_fee_rate(fee_rate(market_id="0xcondition", taker_rate=Decimal("0.01")))
+    store.close()
+
+    as_of = "2026-08-15T12:00:00Z"
+    main(
+        [
+            "predictions",
+            "prove",
+            "--db",
+            str(database),
+            "--candidate-id",
+            str(CANDIDATE_ID),
+            "--as-of",
+            as_of,
+        ]
+    )
+    capsys.readouterr()
+
+    main(["predictions", "scan", "--db", str(database), "--as-of", as_of])
+    output = capsys.readouterr().out.lower()
+    for forbidden in ("risk-free", "guaranteed", "approved", "live eligible"):
+        assert forbidden not in output

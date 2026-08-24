@@ -1,10 +1,13 @@
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.economics_models import EconomicsResult
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.attestation_helpers import rule_attestation
@@ -19,6 +22,7 @@ from tests.predictions.domain_helpers import (
 )
 from tests.predictions.manifest_helpers import venue_manifest
 from tests.predictions.proof_helpers import proof_artifact
+from tests.predictions.scan_helpers import scan_report
 from tests.predictions.store_helpers import raw_envelope
 
 
@@ -37,6 +41,7 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "candidate_relationships",
         "rule_attestations",
         "proof_artifacts",
+        "scan_reports",
         "schema_migrations",
     } <= tables
     perpetual_futures_tables = {
@@ -397,3 +402,111 @@ def test_latest_proof_for_candidate_returns_the_most_recently_observed(tmp_path:
     )
     assert store.latest_proof_for_candidate(early.candidate_id, NOW) == late
     assert store.latest_proof_for_candidate(early.candidate_id, NOW - timedelta(hours=2)) is None
+
+
+def _economics_result(
+    *,
+    status: str = "evaluated",
+    surplus: Decimal = Decimal("10"),
+    insufficiency_reason: str | None = None,
+) -> EconomicsResult:
+    if status == "insufficient_evidence":
+        return EconomicsResult(
+            status="insufficient_evidence",
+            insufficiency_reason=insufficiency_reason or "MISSING_BOOK",
+            quantity=Decimal("0"),
+            leg_plans=(),
+            proven_floor_usd=Decimal("0"),
+            all_in_cost_usd=Decimal("0"),
+            failure_reserve_usd=Decimal("0"),
+            conservative_surplus_usd=Decimal("0"),
+            return_on_assigned_capital=Decimal("0"),
+            capacity_usd_at_current_depth=Decimal("0"),
+            stranded_collateral_by_venue={},
+            max_capital_lock_days=Decimal("3"),
+            doubled_cost_surplus_usd=Decimal("0"),
+        )
+    return EconomicsResult(
+        status="evaluated",
+        insufficiency_reason=None,
+        quantity=Decimal("10"),
+        leg_plans=(),
+        proven_floor_usd=Decimal("10"),
+        all_in_cost_usd=Decimal("1"),
+        failure_reserve_usd=Decimal("0"),
+        conservative_surplus_usd=surplus,
+        return_on_assigned_capital=Decimal("0"),
+        capacity_usd_at_current_depth=Decimal("5"),
+        stranded_collateral_by_venue={},
+        max_capital_lock_days=Decimal("3"),
+        doubled_cost_surplus_usd=Decimal("0"),
+    )
+
+
+def test_scan_report_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    report = scan_report()
+
+    assert store.append_scan_report(report) is True
+    assert store.append_scan_report(report) is False
+    assert store.existing_scan_report_ids() == frozenset({report.report_id})
+    with pytest.raises(ConflictingRecordError):
+        store.append_scan_report(report.model_copy(update={"reason": "a different reason"}))
+
+
+def test_scan_reports_as_of_respects_the_cutoff(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = scan_report(
+        candidate_id=UUID("00000000-0000-0000-0000-000000007001"),
+        as_of=NOW - timedelta(hours=1),
+        observed_at=NOW - timedelta(hours=1),
+    )
+    late = scan_report(
+        candidate_id=UUID("00000000-0000-0000-0000-000000007002"),
+        as_of=NOW,
+        observed_at=NOW,
+    )
+    store.append_scan_report(early)
+    store.append_scan_report(late)
+
+    assert store.scan_reports_as_of(NOW - timedelta(minutes=30)) == (early,)
+    assert store.scan_reports_as_of(NOW) == (early, late)
+    assert store.scan_reports_as_of(NOW - timedelta(hours=2)) == ()
+
+
+def test_scan_report_shadow_candidate_requires_a_proof_id() -> None:
+    with pytest.raises(ValidationError):
+        scan_report(
+            decision="SHADOW_CANDIDATE",
+            reason="conservative surplus positive at current depth",
+        )
+
+
+def test_scan_report_shadow_candidate_requires_evaluated_economics() -> None:
+    with pytest.raises(ValidationError):
+        scan_report(
+            decision="SHADOW_CANDIDATE",
+            reason="conservative surplus positive at current depth",
+            proof_id=UUID("00000000-0000-0000-0000-000000006001"),
+            economics=_economics_result(status="insufficient_evidence"),
+        )
+
+
+def test_scan_report_shadow_candidate_requires_a_positive_surplus() -> None:
+    with pytest.raises(ValidationError):
+        scan_report(
+            decision="SHADOW_CANDIDATE",
+            reason="conservative surplus not positive",
+            proof_id=UUID("00000000-0000-0000-0000-000000006001"),
+            economics=_economics_result(surplus=Decimal("-1")),
+        )
+
+
+def test_scan_report_shadow_candidate_accepts_a_fully_consistent_report() -> None:
+    report = scan_report(
+        decision="SHADOW_CANDIDATE",
+        reason="conservative surplus positive at current depth",
+        proof_id=UUID("00000000-0000-0000-0000-000000006001"),
+        economics=_economics_result(surplus=Decimal("10")),
+    )
+    assert report.decision == "SHADOW_CANDIDATE"

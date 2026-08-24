@@ -25,6 +25,7 @@ from polytrading.predictions.domain import (
     RuleVersion,
     TradeRecord,
 )
+from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.proofs_models import ProofArtifact
 
@@ -303,6 +304,25 @@ class PredictionMarketStore:
             ],
         )
 
+    def append_scan_report(self, record: ScanReport) -> bool:
+        return self._append_keyed(
+            table="scan_reports",
+            record=record,
+            label="scan report",
+            where="report_id = ?",
+            key_params=[record.report_id],
+            insert_columns=(
+                "report_id, candidate_id, decision, as_of, observed_at, record_json, record_hash"
+            ),
+            insert_params=[
+                record.report_id,
+                record.candidate_id,
+                record.decision,
+                record.as_of,
+                record.observed_at,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -476,6 +496,21 @@ class PredictionMarketStore:
         ).fetchall()
         return frozenset(row[0] for row in rows)
 
+    def existing_scan_report_ids(self) -> frozenset[UUID]:
+        """Every ``report_id`` already persisted, with no ``as_of`` cutoff.
+
+        Mirrors ``existing_candidate_ids``: ``deterministic_scan_report_id`` excludes
+        ``observed_at``, so a report_id is stable for a given (candidate, decision,
+        evidence, as_of) tuple. Callers must use this to pre-check and skip an id that
+        already exists rather than relying on ``append_scan_report`` to raise
+        ``ConflictingRecordError`` on a same-content retry -- that never actually
+        happens here (identical content always hashes to the identical id), but a
+        pre-fetched set lets a batch scan skip already-known reports without one
+        round-trip query per candidate.
+        """
+        rows = self._connection.execute("SELECT report_id FROM scan_reports").fetchall()
+        return frozenset(row[0] for row in rows)
+
     def candidate_relationships_as_of(self, as_of: datetime) -> tuple[CandidateRelationship, ...]:
         rows = self._connection.execute(
             """
@@ -527,6 +562,17 @@ class PredictionMarketStore:
             [candidate_id, as_of],
         ).fetchone()
         return None if row is None else ProofArtifact.model_validate_json(row[0])
+
+    def scan_reports_as_of(self, as_of: datetime) -> tuple[ScanReport, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM scan_reports
+            WHERE observed_at <= ?
+            ORDER BY observed_at, report_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(ScanReport.model_validate_json(row[0]) for row in rows)
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {
