@@ -65,9 +65,7 @@ def test_monitor_closes_at_max_horizon_despite_insufficient_funding_coverage(
     finally:
         store.close()
 
-    exit_code = main(
-        ["trial", "paper", "monitor", "--db", str(db), "--as-of", as_of.isoformat()]
-    )
+    exit_code = main(["trial", "paper", "monitor", "--db", str(db), "--as-of", as_of.isoformat()])
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "MAX_HORIZON_REACHED" in out
@@ -119,9 +117,7 @@ def test_monitor_isolates_one_asset_error_from_the_others(
 
     monkeypatch.setattr(DuckDBStore, "open_paper_position_for_asset", _boom)
 
-    exit_code = main(
-        ["trial", "paper", "monitor", "--db", str(db), "--as-of", as_of.isoformat()]
-    )
+    exit_code = main(["trial", "paper", "monitor", "--db", str(db), "--as-of", as_of.isoformat()])
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "BTC: error (simulated failure for BTC)" in out

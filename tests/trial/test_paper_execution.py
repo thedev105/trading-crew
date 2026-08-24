@@ -352,8 +352,8 @@ def test_close_paper_position_realized_pnl_matches_signed_leg_pnl() -> None:
     )
     # short Lighter: entry(bid 60000) - exit(ask 59010) = 990 profit on the short leg
     # long dYdX: exit(bid 59005) - entry(ask 60015) = -1010 loss on the long leg
-    expected_trading_pnl = Decimal("60000") - Decimal("59010") + (
-        Decimal("59005") - Decimal("60015")
+    expected_trading_pnl = (
+        Decimal("60000") - Decimal("59010") + (Decimal("59005") - Decimal("60015"))
     )
     assert closure.realized_pnl_usd == expected_trading_pnl + Decimal("10")
     assert sum(p.debit for p in transaction.postings) == sum(p.credit for p in transaction.postings)

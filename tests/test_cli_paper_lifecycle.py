@@ -113,9 +113,7 @@ def _seed_trailing_week_of_paired_funding(
     return boundaries
 
 
-def test_paper_position_full_lifecycle_through_the_cli(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_paper_position_full_lifecycle_through_the_cli(tmp_path: Path, monkeypatch, capsys) -> None:
     db = tmp_path / "test.duckdb"
     evaluation_id = uuid4()
     opened_at = KNOWN_AS_OF + timedelta(hours=1)
