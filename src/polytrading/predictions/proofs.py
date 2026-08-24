@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import Literal
 from uuid import UUID, uuid5
 
 from polytrading.predictions.attestations import RuleAttestation
@@ -35,6 +36,17 @@ _BINARY_COMPLEMENT_COMPILER_VERSION = "1"
 _EXHAUSTIVE_OUTCOME_SET_TEMPLATE = "exhaustive_outcome_set@1"
 _EXHAUSTIVE_OUTCOME_SET_COMPILER_VERSION = "1"
 
+_LOGICAL_IMPLICATION_TEMPLATE = "logical_implication@1"
+_LOGICAL_IMPLICATION_COMPILER_VERSION = "1"
+
+# Predicate strings this template recognizes as threshold "direction" families: an
+# "up" bound (>=, >) is satisfied by values at-or-above/strictly-above the threshold;
+# a "down" bound (<=, <) is satisfied by values at-or-below/strictly-below it. Any
+# other predicate string on a threshold proposition isn't a family this template's
+# strictness comparison understands, so it can't be checked deterministically.
+_THRESHOLD_UP_PREDICATES = frozenset({">=", ">"})
+_THRESHOLD_DOWN_PREDICATES = frozenset({"<=", "<"})
+
 
 def compile_proof(
     candidate: CandidateRelationship,
@@ -59,6 +71,10 @@ def compile_proof(
         )
     if candidate.relationship_type is RelationshipType.EXHAUSTIVE_OUTCOME_SET:
         return _compile_exhaustive_outcome_set(
+            candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
+        )
+    if candidate.relationship_type is RelationshipType.LOGICAL_IMPLICATION:
+        return _compile_logical_implication(
             candidate, rule_versions, attestations, as_of=as_of, review_identity=review_identity
         )
     raise NotImplementedError(
@@ -502,6 +518,336 @@ def _compile_exhaustive_outcome_set(
         observed_at=as_of,
     )
     return _finalize(artifact)
+
+
+def _compile_logical_implication(
+    candidate: CandidateRelationship,
+    rule_versions: Mapping[UUID, RuleVersion],
+    attestations: Mapping[UUID, RuleAttestation],
+    *,
+    as_of: datetime,
+    review_identity: str,
+) -> ProofArtifact:
+    """Implements the ``logical_implication@1`` template.
+
+    Leg 0 is the NO side of proposition A's market; leg 1 is the YES side of
+    proposition B's market -- two distinct markets, one venue. The basket is
+    NO(A) + YES(B); given a deterministically-verified implication A => B, the only
+    combination that can never occur is "A true, B false" (``a_without_b``), which the
+    implication excludes rather than models as a terminal state. Because leg 0 rides
+    the NO side of A's market, v1 treats each attestation's winner/loser payouts as
+    side-symmetric: A's attestation's ``winner_payout_per_share`` is paid to whichever
+    side of A's market actually wins (here, NO(A) when A resolves false), and
+    correspondingly for B's attestation and the YES(B) leg.
+
+    Implication validity is checked deterministically over both legs' typed
+    propositions and attestations -- never inferred from natural language. Template
+    v1 only understands two proposition kinds (``threshold`` and ``deadline``); any
+    other kind, or either proposition not ``status=="extracted"``, is insufficient
+    evidence (the fact simply isn't usable yet), as is an unparsable threshold
+    ``value``. Everything else that breaks the implication -- a kind, subject,
+    resolution-source, or (for deadlines) ``threshold_text`` mismatch; an attested
+    ``threshold_inclusive`` of ``None``; a deadline-kind attestation with
+    ``deadline_utc`` of ``None``; an unrecognized or mismatched threshold predicate
+    direction; or a bound/deadline ordering that doesn't support A => B -- rejects as
+    ``IMPLICATION_INVALID``: in each of those cases the proposition and its
+    attestation both exist, but the specific fact this template needs was never
+    attested (or contradicts the other leg's), which is a different failure mode than
+    missing evidence.
+
+    Rule-version currency, tie, and void checks apply the same semantics as the other
+    templates, evaluated over both legs' attestations independently: a void or tie
+    condition on either leg is enough to affect the whole proof, since the basket
+    holds both legs simultaneously. A void member with ``refund_at_cost`` contributes
+    its own excluded state; ``resolve_to_rules_price`` contributes one combined
+    ``void`` terminal state in which each leg pays its own attestation's
+    ``loser_payout_per_share`` (never the other leg's).
+
+    A candidate whose legs don't fit this shape (not exactly 2 legs, or legs sharing
+    one market_id) is a structural integrity error, as is a candidate whose
+    ``propositions`` don't line up one-per-leg -- raised rather than silently
+    building mismatched per-leg state.
+    """
+    legs = candidate.legs
+    if len(legs) != 2 or legs[0].market_id == legs[1].market_id:
+        raise ValueError(
+            "a logical_implication candidate must have exactly 2 legs from 2 "
+            f"distinct markets; got legs={legs!r}"
+        )
+    if len(candidate.propositions) != len(legs):
+        raise ValueError(
+            "a logical_implication candidate requires exactly one TypedProposition "
+            "per leg (propositions[i] belongs to legs[i]); got "
+            f"propositions={candidate.propositions!r} legs={legs!r}"
+        )
+
+    leg_a, leg_b = legs
+    prop_a, prop_b = candidate.propositions
+    rule_version_ids = (leg_a.rule_version_id, leg_b.rule_version_id)
+
+    attestation_a = attestations.get(leg_a.rule_version_id)
+    attestation_b = attestations.get(leg_b.rule_version_id)
+    if attestation_a is None or attestation_b is None:
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_LOGICAL_IMPLICATION_TEMPLATE,
+                compiler_version=_LOGICAL_IMPLICATION_COMPILER_VERSION,
+                status="insufficient_evidence",
+                rejection_reason="MISSING_ATTESTATION",
+                rule_version_ids=rule_version_ids,
+                source_hashes=_sorted_unique_hashes(leg.rule_source_hash for leg in legs),
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+
+    source_hashes = _sorted_unique_hashes(
+        [leg.rule_source_hash for leg in legs]
+        + [attestation_a.rule_source_hash, attestation_b.rule_source_hash]
+    )
+
+    def _reject(reason: ProofRejectionReason, *, status: ProofStatus = "rejected") -> ProofArtifact:
+        return _finalize(
+            _terminal_artifact(
+                candidate,
+                template=_LOGICAL_IMPLICATION_TEMPLATE,
+                compiler_version=_LOGICAL_IMPLICATION_COMPILER_VERSION,
+                status=status,
+                rejection_reason=reason,
+                rule_version_ids=rule_version_ids,
+                source_hashes=source_hashes,
+                as_of=as_of,
+                review_identity=review_identity,
+            )
+        )
+
+    if (
+        prop_a.kind not in ("threshold", "deadline")
+        or prop_a.status != "extracted"
+        or prop_b.kind not in ("threshold", "deadline")
+        or prop_b.status != "extracted"
+    ):
+        return _reject("PROPOSITIONS_NOT_EXTRACTED", status="insufficient_evidence")
+
+    if prop_a.kind != prop_b.kind:
+        return _reject("IMPLICATION_INVALID")
+
+    if prop_a.subject != prop_b.subject:
+        return _reject("IMPLICATION_INVALID")
+
+    if attestation_a.resolution_source_attested != attestation_b.resolution_source_attested:
+        return _reject("IMPLICATION_INVALID")
+
+    if prop_a.kind == "threshold":
+        # Thresholds additionally require both legs to attest the same resolution
+        # deadline, so the implication holds over the same observation window.
+        if attestation_a.deadline_utc != attestation_b.deadline_utc:
+            return _reject("IMPLICATION_INVALID")
+
+        value_a = _parse_decimal(prop_a.value)
+        value_b = _parse_decimal(prop_b.value)
+        if value_a is None or value_b is None:
+            return _reject("PROPOSITIONS_NOT_EXTRACTED", status="insufficient_evidence")
+
+        if attestation_a.threshold_inclusive is None or attestation_b.threshold_inclusive is None:
+            return _reject("IMPLICATION_INVALID")
+
+        direction_a = _threshold_direction(prop_a.predicate)
+        direction_b = _threshold_direction(prop_b.predicate)
+        if direction_a is None or direction_b is None or direction_a != direction_b:
+            return _reject("IMPLICATION_INVALID")
+
+        if not _threshold_implies(
+            value_a,
+            attestation_a.threshold_inclusive,
+            value_b,
+            attestation_b.threshold_inclusive,
+            direction_a,
+        ):
+            return _reject("IMPLICATION_INVALID")
+    else:  # prop_a.kind == "deadline"
+        if attestation_a.threshold_text != attestation_b.threshold_text:
+            return _reject("IMPLICATION_INVALID")
+        if attestation_a.deadline_utc is None or attestation_b.deadline_utc is None:
+            return _reject("IMPLICATION_INVALID")
+        if attestation_a.deadline_utc > attestation_b.deadline_utc:
+            return _reject("IMPLICATION_INVALID")
+
+    if not all(leg.rule_version_id in rule_versions for leg in legs):
+        return _reject("RULE_VERSION_CHANGED")
+
+    if attestation_a.tie_possible or attestation_b.tie_possible:
+        return _reject("TIE_UNMODELED")
+
+    excluded_states: list[ExcludedState] = []
+    model_combined_void_state = False
+
+    void_attestations = [a for a in (attestation_a, attestation_b) if a.void_or_invalid_possible]
+    if void_attestations:
+        void_behaviors = {a.void_behavior for a in void_attestations}
+        if "unknown" in void_behaviors or len(void_behaviors) > 1:
+            return _reject("VOID_BEHAVIOR_UNKNOWN")
+        (void_behavior,) = void_behaviors
+        if void_behavior == "refund_at_cost":
+            for attestation in void_attestations:
+                excluded_states.append(
+                    ExcludedState(
+                        description=f"{attestation.market_id}: resolves void or invalid.",
+                        exclusion_reason=(
+                            "a void resolution refunds cost at par per the attested "
+                            "rules, so it carries no basket payout risk and is "
+                            "excluded rather than modeled as a terminal state"
+                        ),
+                        attestation_id=attestation.attestation_id,
+                    )
+                )
+        else:  # void_behavior == "resolve_to_rules_price"
+            model_combined_void_state = True
+
+    winner_a = attestation_a.winner_payout_per_share
+    loser_a = attestation_a.loser_payout_per_share
+    winner_b = attestation_b.winner_payout_per_share
+    loser_b = attestation_b.loser_payout_per_share
+    market_a = leg_a.market_id
+    market_b = leg_b.market_id
+
+    terminal_states: list[TerminalState] = [
+        TerminalState(
+            state_id="neither",
+            description=(
+                f"{market_a}: proposition A resolves false (NO(A) wins); {market_b}: "
+                "proposition B resolves false (YES(B) loses)."
+            ),
+            leg_payouts=(winner_a, loser_b),
+        ),
+        TerminalState(
+            state_id="b_only",
+            description=(
+                f"{market_a}: proposition A resolves false (NO(A) wins); {market_b}: "
+                "proposition B resolves true (YES(B) wins)."
+            ),
+            leg_payouts=(winner_a, winner_b),
+        ),
+        TerminalState(
+            state_id="both",
+            description=(
+                f"{market_a}: proposition A resolves true (NO(A) loses); {market_b}: "
+                "proposition B resolves true (YES(B) wins)."
+            ),
+            leg_payouts=(loser_a, winner_b),
+        ),
+    ]
+
+    if model_combined_void_state:
+        terminal_states.append(
+            TerminalState(
+                state_id="void",
+                description=(
+                    f"{market_a} and {market_b} both resolve void together; each leg "
+                    "settles at its own attested rules (loser) price."
+                ),
+                leg_payouts=(loser_a, loser_b),
+            )
+        )
+
+    # The a_without_b combination (A true, B false) is excluded because the verified
+    # implication makes it logically impossible, not because of a void condition --
+    # this excluded state is unconditional on the proof being proof_ready.
+    excluded_states.insert(
+        0,
+        ExcludedState(
+            description=(
+                f"{market_a}: proposition A resolves true; {market_b}: proposition B "
+                "resolves false."
+            ),
+            exclusion_reason=(
+                "proposition A deterministically implies proposition B per the "
+                "attested rules, so A resolving true with B resolving false is a "
+                "logically impossible combination, not modeled as a terminal state"
+            ),
+            attestation_id=attestation_a.attestation_id,
+        ),
+    )
+
+    assumption = ProofAssumption(
+        claim=(
+            f"{market_a}'s proposition ({prop_a.subject!r} {prop_a.predicate} "
+            f"{prop_a.value}) deterministically implies {market_b}'s proposition "
+            f"({prop_b.subject!r} {prop_b.predicate} {prop_b.value}), per the "
+            "attested rules"
+        ),
+        attestation_id=attestation_a.attestation_id,
+        supporting_spans=prop_a.supporting_spans + prop_b.supporting_spans,
+    )
+
+    payout_sums: list[Decimal] = [sum(state.leg_payouts) for state in terminal_states]
+
+    artifact = ProofArtifact(
+        schema_version=1,
+        proof_id=_PLACEHOLDER_PROOF_ID,
+        candidate_id=candidate.candidate_id,
+        template=_LOGICAL_IMPLICATION_TEMPLATE,
+        compiler_version=_LOGICAL_IMPLICATION_COMPILER_VERSION,
+        status="proof_ready",
+        rejection_reason=None,
+        terminal_states=tuple(terminal_states),
+        minimum_basket_payout=min(payout_sums),
+        maximum_basket_payout=max(payout_sums),
+        assumptions=(assumption,),
+        excluded_states=tuple(excluded_states),
+        equivalence_matrix=None,
+        rule_version_ids=rule_version_ids,
+        source_hashes=source_hashes,
+        review_identity=review_identity,
+        invalidation_conditions=(_RULE_VERSION_CHANGE_CONDITION,),
+        information_cutoff=as_of,
+        observed_at=as_of,
+    )
+    return _finalize(artifact)
+
+
+def _parse_decimal(value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
+
+
+def _threshold_direction(predicate: str) -> Literal["up", "down"] | None:
+    if predicate in _THRESHOLD_UP_PREDICATES:
+        return "up"
+    if predicate in _THRESHOLD_DOWN_PREDICATES:
+        return "down"
+    return None
+
+
+def _threshold_implies(
+    value_a: Decimal,
+    inclusive_a: bool,
+    value_b: Decimal,
+    inclusive_b: bool,
+    direction: Literal["up", "down"],
+) -> bool:
+    """True iff proposition A's threshold bound deterministically implies B's.
+
+    Modeling each bound as an interval on the real line -- ``[value, inf)`` when
+    inclusive or ``(value, inf)`` when exclusive for an "up" bound, mirrored for
+    "down" -- A implies B iff A's interval is a subset of B's. That collapses to
+    comparing the two threshold values, tie-broken by A's own inclusivity only when
+    both propositions share the same threshold value and B's bound is exclusive (an
+    exclusive B excludes its own boundary value, so A can only be a subset there if A
+    excludes it too).
+    """
+    if direction == "up":
+        if inclusive_b:
+            return value_a >= value_b
+        return value_a > value_b or (value_a == value_b and not inclusive_a)
+    if inclusive_b:
+        return value_a <= value_b
+    return value_a < value_b or (value_a == value_b and not inclusive_a)
 
 
 def _terminal_artifact(

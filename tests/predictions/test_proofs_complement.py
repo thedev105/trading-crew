@@ -250,9 +250,11 @@ def test_compile_proof_is_deterministic_and_idempotent() -> None:
 
 
 def test_unimplemented_relationship_type_raises_not_implemented_error() -> None:
+    # CROSS_VENUE_EQUIVALENCE is the only relationship_type without a compiler yet
+    # (Task 9); it requires legs spanning at least two distinct venues.
     candidate = _candidate(
-        relationship_type=RelationshipType.LOGICAL_IMPLICATION,
-        legs=(leg(), leg(outcome_index=1), leg(outcome_index=2)),
+        relationship_type=RelationshipType.CROSS_VENUE_EQUIVALENCE,
+        legs=(leg(), leg(venue=PredictionVenue.KALSHI, market_id="0xother", outcome_index=1)),
     )
 
     with pytest.raises(NotImplementedError):
