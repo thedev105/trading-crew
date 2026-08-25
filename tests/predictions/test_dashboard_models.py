@@ -798,6 +798,31 @@ def test_snapshot_shadow_rejects_repeated_frozen_fee_logical_identity(
         PredictionDashboardBuilder(store, database).build(NOW)
 
 
+def test_snapshot_shadow_rejects_repeated_fee_identity_with_an_unrequested_source_hash(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "fee-different-source.duckdb"
+    store = PredictionMarketStore(database)
+    plan = shadow_plan()
+    append_reconciled_bundle(store, plan, ShadowState.EXPIRED, terminal_at=NOW)
+    sibling = shadow_fees(plan)[0].model_copy(
+        update={"source_hash": "c" * 64, "taker_rate": Decimal("0.25")}
+    )
+    store._connection.execute(
+        "INSERT INTO prediction_fee_rates VALUES (?, ?, ?, ?, ?)",
+        [
+            sibling.venue.value,
+            sibling.market_id,
+            sibling.observed_at,
+            sibling.model_dump_json(),
+            persisted_record_hash(sibling),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="logical identity"):
+        PredictionDashboardBuilder(store, database).build(NOW)
+
+
 def test_snapshot_shadow_accepts_a_cutoff_safe_first_leg_ledger_prefix(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     plan = shadow_plan(observed_at=NOW - timedelta(minutes=10))

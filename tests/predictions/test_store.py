@@ -403,6 +403,47 @@ def test_verified_fee_rate_allows_history_and_selects_latest_cutoff_safe_version
     )
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("hash_valid", "logical identity"),
+        ("stale_hash", "immutable record hash"),
+        ("indexed_venue", "indexed columns"),
+    ],
+)
+def test_verified_fee_rate_validates_sibling_rows_before_source_hash_selection(
+    case: str, expected_error: str, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"fee-sibling-{case}.duckdb")
+    requested = fee_rate()
+    sibling = requested.model_copy(update={"source_hash": "c" * 64, "taker_rate": Decimal("0.25")})
+    store.append_fee_rate(requested)
+    canonical = json.dumps(
+        sibling.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    store._connection.execute(
+        "INSERT INTO prediction_fee_rates VALUES (?, ?, ?, ?, ?)",
+        [
+            PredictionVenue.KALSHI.value if case == "indexed_venue" else sibling.venue.value,
+            sibling.market_id,
+            sibling.observed_at,
+            sibling.model_dump_json(),
+            "0" * 64 if case == "stale_hash" else sha256(canonical.encode()).hexdigest(),
+        ],
+    )
+
+    with pytest.raises(ConflictingRecordError, match=expected_error):
+        store.verified_fee_rate_by_source_hash(
+            requested.venue,
+            requested.market_id,
+            requested.source_hash,
+            NOW,
+        )
+
+
 def test_evidence_counts_as_of_sums_every_table(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     store.append_raw(raw_envelope())

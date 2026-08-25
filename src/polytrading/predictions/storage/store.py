@@ -774,10 +774,9 @@ class PredictionMarketStore:
                         json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
                     ) <= ?
                   )
-              AND json_extract_string(record_json, '$.source_hash') = ?
             ORDER BY observed_at DESC
             """,
-            [venue.value, market_id, venue.value, market_id, as_of, as_of, source_hash],
+            [venue.value, market_id, venue.value, market_id, as_of, as_of],
         ).fetchall()
         records: list[PredictionFeeRate] = []
         for row in rows:
@@ -789,14 +788,15 @@ class PredictionMarketStore:
             if indexed != decoded:
                 raise ConflictingRecordError("stored fee rate indexed columns do not match")
             records.append(record)
-        if not records:
-            return None
         logical_identities = [
             (record.venue, record.market_id, record.observed_at) for record in records
         ]
         if len(set(logical_identities)) != len(logical_identities):
             raise ConflictingRecordError("multiple fee rates share one logical identity")
-        return max(records, key=lambda record: record.observed_at)
+        matches = [record for record in records if record.source_hash == source_hash]
+        if not matches:
+            return None
+        return max(matches, key=lambda record: record.observed_at)
 
     def existing_candidate_ids(self) -> frozenset[UUID]:
         """Every ``candidate_id`` already persisted, with no ``as_of`` cutoff.

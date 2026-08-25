@@ -41,6 +41,10 @@ pending reconciliation.
   whether byte-identical or hash-valid with conflicting normalized rates. Every selected row is
   verified before multiplicity is assessed, and distinct historical observations still resolve to
   the latest cutoff-safe version deterministically.
+- Fee verification now queries every cutoff-safe decoded-or-indexed row for the requested
+  venue/market before considering the requested frozen source hash. A duplicate append identity,
+  stale hash, or indexed-column mutation therefore cannot hide behind a different source hash;
+  exact source selection occurs only after the complete sibling set is verified.
 - Enforced `proposal_id` uniqueness across the complete verified cutoff-safe plan collection before
   any shadow aggregation or latest-20 capping, so an exact or conflicting duplicate cannot inflate
   totals while remaining outside the visible listing window.
@@ -84,6 +88,9 @@ Review-hardening RED-to-GREEN regressions additionally cover:
   reconciliation or paper P&L.
 - exact and conflicting repeated fee logical identities at both the verified store and rendered
   dashboard boundary, plus a distinct-history control for deterministic latest-as-of selection;
+- a hash-valid conflicting fee sibling with an unrequested source hash at both store and dashboard
+  boundaries, plus stale-hash and indexed-venue sibling probes proving tamper cannot hide behind
+  source filtering;
 - exact and hash-valid conflicting duplicate proposal identities placed outside `latest[:20]`,
   proving full-set uniqueness rather than display-slice validation.
 
@@ -97,8 +104,8 @@ served-asset vocabulary checks.
 
 ## Fresh verification
 
-- Focused dashboard/model/server/store/ledger tests — `241 passed in 6.76s`.
-- Final prediction-market suite — `940 passed in 22.58s`.
+- Focused dashboard/model/server/store/ledger tests — `245 passed in 6.76s`.
+- Final prediction-market suite — `944 passed in 21.85s`.
 - `ruff check .` — clean.
 - `ruff format --check .` — `255 files already formatted`.
 - `git diff --check` — clean.
