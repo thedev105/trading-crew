@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -294,6 +295,13 @@ def _plan(**overrides: object) -> object:
     return _planner().plan_shadow_proposal(**inputs)
 
 
+def _unchecked(model: Any, method: str, **updates: object) -> Any:
+    if method == "model_copy":
+        return model.model_copy(update=updates)
+    values = {name: getattr(model, name) for name in type(model).model_fields}
+    return type(model).model_construct(**(values | updates))
+
+
 def test_happy_path_freezes_every_plan_field_and_is_id_stable() -> None:
     """Wrong ordering, arithmetic, lineage, prose, or identity content corrupts replay."""
     first = _plan()
@@ -384,6 +392,40 @@ def test_risk_halved_size_trims_every_ladder_and_recomputes_incomplete_loss() ->
     )
 
 
+def test_risk_halved_size_reruns_positive_economics_with_flat_costs() -> None:
+    """A positive capped basket must retain flat costs while freezing its final ladders."""
+    portfolio = _portfolio(
+        total_equity_usd=Decimal("9500"),
+        peak_equity_usd=Decimal("10000"),
+        equity_24h_ago_usd=Decimal("9500"),
+    )
+    policy = _economics_policy(operational_cost_usd=Decimal("0.50"))
+
+    plan = _plan(portfolio=portfolio, economics_policy=policy)
+
+    # q=2.5: floor 2.5 - acquisition 1.70 - fees .0285 - flat .50 - reserve .17 = .1015.
+    assert plan.max_quantity == Decimal("2.5")
+    assert plan.max_incomplete_exposure_usd == Decimal("1.150")
+    assert sum(size for _, size in plan.legs[0].limit_price_levels) == Decimal("2.5")
+
+
+def test_risk_halved_size_refuses_when_flat_costs_make_final_economics_nonpositive() -> None:
+    """Full-size profitability must not admit a half-size basket made negative by flat costs."""
+    portfolio = _portfolio(
+        total_equity_usd=Decimal("9500"),
+        peak_equity_usd=Decimal("10000"),
+        equity_24h_ago_usd=Decimal("9500"),
+    )
+    policy = _economics_policy(operational_cost_usd=Decimal("0.70"))
+
+    refusal = _plan(portfolio=portfolio, economics_policy=policy)
+
+    # Full q=5 surplus is .169; capped q=2.5 surplus is -.0985 after the unchanged flat cost.
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail
+
+
 def test_non_shadow_scan_is_refused_before_planning() -> None:
     """A rejected scan must never become a proposal."""
     scan = ScanReport(
@@ -458,6 +500,41 @@ def test_missing_or_moved_evidence_is_refused(evidence_case: str) -> None:
     assert refusal.detail
 
 
+@pytest.mark.parametrize(
+    "evidence_case",
+    ("swapped_books", "wrong_token", "wrong_fee_venue", "wrong_specific_fee_market"),
+)
+def test_mismatched_evidence_identity_is_refused(evidence_case: str) -> None:
+    """Positionally supplied evidence must not be attributed to a different candidate leg."""
+    books = _books()
+    fees = _fees()
+    if evidence_case == "swapped_books":
+        books = {0: books[1], 1: books[0]}
+    elif evidence_case == "wrong_token":
+        books[0] = books[0].model_copy(update={"outcome_token_id": "wrong-token"})
+    elif evidence_case == "wrong_fee_venue":
+        fees[0] = fees[0].model_copy(update={"venue": PredictionVenue.KALSHI})
+    else:
+        fees[0] = fees[0].model_copy(update={"market_id": "different-market"})
+
+    refusal = _plan(books=books, fees=fees)
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
+def test_venue_default_fee_identity_is_accepted() -> None:
+    """A fee with no market ID is the venue default and remains valid for either market."""
+    fees = _fees()
+    fees[0] = fees[0].model_copy(update={"market_id": None})
+
+    plan = _plan(fees=fees)
+
+    assert plan.max_quantity == Decimal("5")
+    assert HASH_F in plan.frozen_hashes
+
+
 def test_risk_refusal_wraps_the_exact_gate_decision() -> None:
     """Planner risk refusal must preserve the independent gate's typed explanation."""
     portfolio = _portfolio(
@@ -499,3 +576,105 @@ def test_explicit_empty_event_cluster_is_not_replaced_by_fallback() -> None:
 
     assert refusal.reason == "RISK_REFUSED"
     assert refusal.risk.reason == "CLUSTER_CONCENTRATION"
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize(
+    "input_case",
+    ("scan", "economics_policy", "risk_policy", "book", "portfolio"),
+)
+def test_unchecked_invalid_models_are_revalidated_and_safely_refused(
+    method: str, input_case: str
+) -> None:
+    """Unchecked Pydantic construction must not bypass the planner's public trust boundary."""
+    overrides: dict[str, object]
+    if input_case == "scan":
+        overrides = {"scan_report": _unchecked(_shadow_scan(), method, decision="NOT_A_DECISION")}
+    elif input_case == "economics_policy":
+        overrides = {
+            "economics_policy": _unchecked(
+                _economics_policy(), method, partial_fill_reserve_rate=Decimal("-1")
+            )
+        }
+    elif input_case == "risk_policy":
+        overrides = {
+            "risk_policy": _unchecked(
+                _risk_policy(), method, max_basket_fraction_of_equity=Decimal("0.50")
+            )
+        }
+    elif input_case == "book":
+        books = _books()
+        books[0] = _unchecked(books[0], method, source_hash="invalid")
+        overrides = {"books": books}
+    else:
+        overrides = {"portfolio": _unchecked(_portfolio(), method, total_equity_usd=Decimal("-1"))}
+
+    refusal = _plan(**overrides)
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "scan_report",
+        "candidate",
+        "proof",
+        "books",
+        "fees",
+        "economics_policy",
+        "risk_policy",
+        "portfolio",
+    ),
+)
+def test_arbitrary_non_model_inputs_are_safely_refused(field: str) -> None:
+    """The trust boundary must reject, rather than coerce, arbitrary caller objects."""
+    value: object = {0: "not-a-model"} if field in {"books", "fees"} else "not-a-model"
+
+    refusal = _plan(**{field: value})
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
+def test_proposal_id_changes_with_every_persisted_plan_content_class() -> None:
+    """Proposal identity must cover expiry, ladders, lineage hashes, policy, and sized quantity."""
+    baseline = _plan()
+    later_expiry = _plan(expiry_window_seconds=91)
+
+    ladder_books = _books()
+    ladder_books[0] = _book(
+        leg_index=0,
+        bids=ladder_books[0].bids,
+        asks=(_level("0.21", "2"), _level("0.30", "6")),
+        source_hash=HASH_D,
+    )
+    changed_ladder = _plan(books=ladder_books)
+
+    hash_books = _books()
+    hash_books[0] = hash_books[0].model_copy(update={"source_hash": "0" * 64})
+    changed_hash = _plan(books=hash_books)
+    changed_policy = _plan(
+        economics_policy=_economics_policy(partial_fill_reserve_rate=Decimal("0.09"))
+    )
+    halved = _plan(
+        portfolio=_portfolio(
+            total_equity_usd=Decimal("9500"),
+            peak_equity_usd=Decimal("10000"),
+            equity_24h_ago_usd=Decimal("9500"),
+        )
+    )
+
+    ids = {
+        baseline.proposal_id,
+        later_expiry.proposal_id,
+        changed_ladder.proposal_id,
+        changed_hash.proposal_id,
+        changed_policy.proposal_id,
+        halved.proposal_id,
+    }
+    assert len(ids) == 6
+    assert _plan().proposal_id == baseline.proposal_id

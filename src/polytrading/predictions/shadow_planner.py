@@ -8,8 +8,11 @@ from decimal import Decimal
 from typing import Literal, Protocol
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.domain import (
+    PredictionBookLevel,
     PredictionBookSnapshot,
     PredictionFeeRate,
     PredictionRecord,
@@ -56,6 +59,7 @@ _KILL_CONDITIONS = (
     "book evidence older than policy max age",
     "risk drawdown threshold breached",
 )
+_INVALID_EVIDENCE_DETAIL = "invalid or mismatched planner evidence"
 
 
 def plan_shadow_proposal(
@@ -73,6 +77,18 @@ def plan_shadow_proposal(
     event_cluster_id: str | None = None,
 ) -> ShadowPlan | PlanRefusal:
     """Build one evidence-frozen, deterministic research-only shadow proposal."""
+    try:
+        scan_report = _revalidate_record(scan_report, ScanReport)
+        candidate = _revalidate_record(candidate, CandidateRelationship)
+        proof = _revalidate_record(proof, ProofArtifact)
+        books = _revalidate_evidence_mapping(books, PredictionBookSnapshot)
+        fees = _revalidate_evidence_mapping(fees, PredictionFeeRate)
+        economics_policy = _revalidate_record(economics_policy, PredictionEconomicsPolicy)
+        risk_policy = _revalidate_record(risk_policy, PredictionRiskPolicy)
+        portfolio = _revalidate_record(portfolio, ShadowPortfolioState)
+    except (TypeError, ValueError, ValidationError):
+        return _invalid_evidence_refusal()
+
     as_of = normalize_utc_timestamp(as_of)
     if expiry_window_seconds <= 0:
         raise ValueError("expiry_window_seconds must be positive")
@@ -87,6 +103,9 @@ def plan_shadow_proposal(
     current_failure = _proof_current_failure(scan_report, candidate, proof, as_of)
     if current_failure is not None:
         return PlanRefusal(reason="PROOF_NOT_CURRENT", detail=current_failure, risk=None)
+
+    if not _evidence_identity_matches(candidate, books, fees):
+        return _invalid_evidence_refusal()
 
     economics = evaluate_basket_economics(
         proof,
@@ -149,18 +168,41 @@ def plan_shadow_proposal(
         )
 
     quantity = economics.quantity * risk.size_multiplier
+    capped_books = _cap_ask_books(books, candidate, quantity)
+    final_economics = evaluate_basket_economics(
+        proof,
+        candidate,
+        books=capped_books,
+        fees=fees,
+        policy=economics_policy,
+        as_of=as_of,
+    )
+    if final_economics.status != "evaluated":
+        return PlanRefusal(
+            reason="MISSING_EVIDENCE",
+            detail=(
+                "risk-sized economics could not be evaluated: "
+                f"{final_economics.insufficiency_reason}"
+            ),
+            risk=None,
+        )
+    if final_economics.conservative_surplus_usd <= 0:
+        return PlanRefusal(
+            reason="MISSING_EVIDENCE",
+            detail="risk-sized economics does not have positive conservative surplus",
+            risk=None,
+        )
+
     shadow_legs = tuple(
         _shadow_leg(
-            leg_plan=economics.leg_plans[index],
-            quantity=quantity,
+            leg_plan=final_economics.leg_plans[index],
+            quantity=final_economics.quantity,
             sequence_position=sequence_position,
         )
         for sequence_position, index in enumerate(ordered_indices)
     )
-    first_levels = shadow_legs[0].limit_price_levels
-    first_acquisition_cost = sum(
-        (price * level_quantity for price, level_quantity in first_levels), Decimal("0")
-    )
+    quantity = final_economics.quantity
+    first_acquisition_cost = final_economics.leg_plans[first_index].acquisition_cost_usd
     unwind_proceeds = _walk_bid_proceeds(first_book.bids, quantity)
     if unwind_proceeds is None:
         return PlanRefusal(
@@ -207,6 +249,82 @@ def plan_shadow_proposal(
         provisional.model_dump(mode="json", exclude={"proposal_id"}),
     )
     return ShadowPlan(proposal_id=proposal_id, **plan_fields)
+
+
+def _revalidate_record[RecordT: PredictionRecord](
+    value: object, record_type: type[RecordT]
+) -> RecordT:
+    if not isinstance(value, record_type):
+        raise TypeError(f"expected {record_type.__name__}")
+    return record_type.model_validate(value.model_dump())
+
+
+def _revalidate_evidence_mapping[RecordT: PredictionRecord](
+    value: object,
+    record_type: type[RecordT],
+) -> dict[int, RecordT | None]:
+    if not isinstance(value, Mapping):
+        raise TypeError("evidence must be an index mapping")
+
+    validated: dict[int, RecordT | None] = {}
+    for index, record in value.items():
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("evidence indices must be integers")
+        validated[index] = None if record is None else _revalidate_record(record, record_type)
+    return validated
+
+
+def _invalid_evidence_refusal() -> PlanRefusal:
+    return PlanRefusal(
+        reason="MISSING_EVIDENCE",
+        detail=_INVALID_EVIDENCE_DETAIL,
+        risk=None,
+    )
+
+
+def _evidence_identity_matches(
+    candidate: CandidateRelationship,
+    books: Mapping[int, PredictionBookSnapshot | None],
+    fees: Mapping[int, PredictionFeeRate | None],
+) -> bool:
+    for index, leg in enumerate(candidate.legs):
+        book = books.get(index)
+        if book is not None and (
+            book.venue != leg.venue
+            or book.market_id != leg.market_id
+            or book.outcome_token_id != leg.outcome_token_id
+        ):
+            return False
+
+        fee = fees.get(index)
+        if fee is not None and (
+            fee.venue != leg.venue or (fee.market_id is not None and fee.market_id != leg.market_id)
+        ):
+            return False
+    return True
+
+
+def _cap_ask_books(
+    books: Mapping[int, PredictionBookSnapshot | None],
+    candidate: CandidateRelationship,
+    quantity: Decimal,
+) -> dict[int, PredictionBookSnapshot | None]:
+    capped = dict(books)
+    for index in range(len(candidate.legs)):
+        book = books[index]
+        assert book is not None
+        values = book.model_dump()
+        values["asks"] = tuple(
+            {"price": price, "size": size} for price, size in _trim_book_levels(book.asks, quantity)
+        )
+        capped[index] = PredictionBookSnapshot.model_validate(values)
+    return capped
+
+
+def _trim_book_levels(
+    levels: Sequence[PredictionBookLevel], quantity: Decimal
+) -> tuple[tuple[Decimal, Decimal], ...]:
+    return _trim_levels(tuple((level.price, level.size) for level in levels), quantity)
 
 
 def _proof_current_failure(
