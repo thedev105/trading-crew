@@ -1235,7 +1235,8 @@ Before a shadow run, write one operator-authored trial-family object. For exampl
 The venue list must be nonempty, sorted, and unique. `thresholds_json` is itself a JSON object
 encoded as a string so the exact preregistered threshold document remains immutable. The importer
 rejects duplicate keys, non-standard JSON constants, missing or extra fields, wrong JSON types,
-non-UTC timestamps, blank text, and malformed threshold objects.
+naive timestamps, blank text, and malformed threshold objects. Timezone-aware offsets are
+normalized to UTC before persistence.
 
 Register it into an existing, current prediction-market database:
 

@@ -1242,6 +1242,53 @@ class PredictionMarketStore:
         ).fetchone()
         return _verified_record(row, TrialFamily, "trial family")
 
+    def verified_trial_family_for_registration(
+        self,
+        family_id: str,
+        preregistered_at: datetime,
+    ) -> TrialFamily | None:
+        """Resolve one registration identity only after verifying the complete registry.
+
+        A lookup by indexed columns alone can miss a row whose index was corrupted while its
+        immutable JSON still decodes to the requested identity. Registration therefore verifies
+        every stored row, rejects duplicate decoded identities, and compares each decoded identity
+        with both indexed columns before deciding that an identity is absent.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT family_id, epoch_us(preregistered_at), record_json, record_hash
+            FROM trial_families
+            ORDER BY preregistered_at, family_id
+            """
+        ).fetchall()
+        verified: list[tuple[tuple[str, datetime | None], TrialFamily]] = []
+        for row in rows:
+            try:
+                record = _verified_record((row[2], row[3]), TrialFamily, "trial family")
+            except ConflictingRecordError:
+                raise
+            except (TypeError, ValueError) as error:
+                raise ConflictingRecordError("stored trial family record is invalid") from error
+            if record is None:  # pragma: no cover - rows cannot contain NULL record_json
+                continue
+            verified.append(((row[0], _utc_from_epoch_us(row[1])), record))
+
+        decoded_identities = [(record.family_id, record.preregistered_at) for _, record in verified]
+        if len(set(decoded_identities)) != len(decoded_identities):
+            raise ConflictingRecordError("multiple trial families share one logical identity")
+        for indexed, record in verified:
+            decoded = (record.family_id, record.preregistered_at)
+            if indexed != decoded:
+                raise ConflictingRecordError("stored trial family indexed columns do not match")
+
+        identity = (family_id, preregistered_at)
+        matches = [
+            record
+            for _, record in verified
+            if identity == (record.family_id, record.preregistered_at)
+        ]
+        return matches[0] if matches else None
+
     def trial_families_as_of(self, as_of: datetime) -> tuple[TrialFamily, ...]:
         rows = self._connection.execute(
             """

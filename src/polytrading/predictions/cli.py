@@ -1131,7 +1131,16 @@ def _run_shadow_register_family(arguments: argparse.Namespace) -> int:
             store = PredictionMarketStore(arguments.db)
             try:
                 with store.transaction() as transaction:
-                    appended = transaction.append_trial_family(family)
+                    existing = transaction.verified_trial_family_for_registration(
+                        family.family_id,
+                        family.preregistered_at,
+                    )
+                    if existing is None:
+                        appended = transaction.append_trial_family(family)
+                    elif existing == family:
+                        appended = False
+                    else:
+                        raise ValueError("conflicting trial family for immutable identity")
             finally:
                 store.close()
     except PredictionsUsageError:

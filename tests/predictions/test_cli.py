@@ -2187,6 +2187,78 @@ def test_shadow_register_family_conflict_is_atomic_and_sanitized(
         verify.close()
 
 
+@pytest.mark.parametrize("corruption", ["record-json", "indexed-family-id", "duplicate-logical"])
+def test_shadow_register_family_fails_closed_on_corrupted_logical_identity(
+    corruption: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    family = TrialFamily(
+        family_id="private-family",
+        hypothesis="Original preregistered hypothesis.",
+        preregistered_at=NOW,
+        thresholds_json='{"minimum_days":30}',
+        venues=(PredictionVenue.POLYMARKET,),
+        registered_by="research-operator",
+    )
+    store.append_trial_family(family)
+    stored_json, stored_hash = store._connection.execute(
+        "SELECT record_json, record_hash FROM trial_families"
+    ).fetchone()
+    if corruption == "record-json":
+        store._connection.execute(
+            "UPDATE trial_families SET record_json = ? WHERE family_id = ?",
+            [
+                family.model_copy(
+                    update={"hypothesis": "caller-controlled tampered payload"}
+                ).model_dump_json(),
+                family.family_id,
+            ],
+        )
+    else:
+        store._connection.execute(
+            "UPDATE trial_families SET family_id = ? WHERE family_id = ?",
+            ["tampered-index-a", family.family_id],
+        )
+        if corruption == "duplicate-logical":
+            store._connection.execute(
+                "INSERT INTO trial_families VALUES (?, ?, ?, ?)",
+                ["tampered-index-b", family.preregistered_at, stored_json, stored_hash],
+            )
+    before_count = store._connection.execute("SELECT count(*) FROM trial_families").fetchone()[0]
+    store.close()
+
+    input_path = tmp_path / "family.json"
+    input_path.write_text(json.dumps(family.model_dump(mode="json")), encoding="utf-8")
+    exit_code = main(
+        [
+            "predictions",
+            "shadow",
+            "register-family",
+            "--db",
+            str(database),
+            "--input",
+            str(input_path),
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "trial-family registration failed to persist atomically" in captured.err
+    assert "already_known" not in captured.out
+    assert family.family_id not in captured.err
+    assert "caller-controlled tampered payload" not in captured.err
+    verify = PredictionMarketStore(database)
+    try:
+        assert verify._connection.execute("SELECT count(*) FROM trial_families").fetchone()[0] == (
+            before_count
+        )
+    finally:
+        verify.close()
+
+
 def test_shadow_run_persists_complete_reconciled_lifecycle_with_hand_pnl(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

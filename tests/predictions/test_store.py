@@ -862,6 +862,50 @@ def test_trial_family_round_trip_supports_append_only_preregistration_versions(
         store.append_trial_family(early.model_copy(update={"hypothesis": "conflicting retry"}))
 
 
+def test_verified_trial_family_for_registration_rejects_record_json_tamper(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    family = trial_family()
+    store.append_trial_family(family)
+    store._connection.execute(
+        "UPDATE trial_families SET record_json = ? WHERE family_id = ?",
+        [
+            family.model_copy(update={"hypothesis": "tampered hypothesis"}).model_dump_json(),
+            family.family_id,
+        ],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_trial_family_for_registration(family.family_id, family.preregistered_at)
+
+
+@pytest.mark.parametrize("duplicate_decoded_identity", [False, True])
+def test_verified_trial_family_for_registration_rejects_index_or_logical_duplicates(
+    duplicate_decoded_identity: bool,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    family = trial_family()
+    store.append_trial_family(family)
+    stored_json, stored_hash = store._connection.execute(
+        "SELECT record_json, record_hash FROM trial_families"
+    ).fetchone()
+    store._connection.execute(
+        "UPDATE trial_families SET family_id = ? WHERE family_id = ?",
+        ["tampered-index-a", family.family_id],
+    )
+    if duplicate_decoded_identity:
+        store._connection.execute(
+            "INSERT INTO trial_families VALUES (?, ?, ?, ?)",
+            ["tampered-index-b", family.preregistered_at, stored_json, stored_hash],
+        )
+
+    match = "logical identity" if duplicate_decoded_identity else "indexed columns"
+    with pytest.raises(ConflictingRecordError, match=match):
+        store.verified_trial_family_for_registration(family.family_id, family.preregistered_at)
+
+
 def test_trial_families_as_of_returns_every_known_version_in_deterministic_order(
     tmp_path: Path,
 ) -> None:
