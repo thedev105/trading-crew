@@ -220,6 +220,8 @@ def test_shadow_plan_requires_positive_frozen_minimum_basket_payout() -> None:
         (),
         ((Decimal("-0.40"), Decimal("1")),),
         ((Decimal("0.40"), Decimal("-1")),),
+        ((Decimal("0"), Decimal("1")),),
+        ((Decimal("0.40"), Decimal("0")),),
     ),
 )
 def test_shadow_leg_plan_rejects_empty_or_nonpositive_frozen_limit_levels(
