@@ -62,3 +62,11 @@ pre {
   font-style: italic;
   color: #555;
 }
+
+.shadow-warning {
+  display: block;
+  margin-top: 0.2rem;
+  color: #8a3b12;
+  font-size: 0.8rem;
+  font-weight: 600;
+}

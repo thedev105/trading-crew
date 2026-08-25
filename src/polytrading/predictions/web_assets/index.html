@@ -9,8 +9,8 @@
 <main>
   <h1>Prediction-market evidence (research only)</h1>
   <p class="warning">
-    Research only. No structural-opportunity proof, economics, or trading authority exists in
-    this increment. This page has no collection or execution controls.
+    Research only. Shadow results are simulations against recorded public evidence. This page
+    has no collection or execution controls.
   </p>
   <p id="as-of">Loading&hellip;</p>
 
@@ -105,6 +105,28 @@
       <tbody></tbody>
     </table>
     <p id="scans-empty" hidden>No scan reports observed as of this snapshot.</p>
+  </section>
+
+  <section aria-labelledby="shadow-heading">
+    <h2 id="shadow-heading">Shadow proposals and paper results (simulation only)</h2>
+    <p id="shadow-summary" aria-live="polite"></p>
+    <table id="shadow-proposals">
+      <thead>
+        <tr>
+          <th>Proposal</th>
+          <th>Candidate</th>
+          <th>Current state</th>
+          <th>Scenario</th>
+          <th>Quantity</th>
+          <th>Paper P&amp;L (USD)</th>
+          <th>Observed at</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="shadow-empty" role="status" aria-live="polite" hidden>
+      No shadow proposals observed as of this snapshot.
+    </p>
   </section>
 
   <section>

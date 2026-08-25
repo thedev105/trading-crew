@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -21,11 +22,16 @@ from polytrading.predictions.dashboard_models import (
     ProofSummary,
     ScanListing,
     ScanSummary,
+    ShadowListing,
+    ShadowSummary,
 )
 from polytrading.predictions.domain import MarketRecord, PredictionBookSnapshot, PredictionVenue
 from polytrading.predictions.economics_models import ScanReport
+from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.health import PredictionHealthAuditor
 from polytrading.predictions.proofs_models import ProofArtifact
+from polytrading.predictions.shadow_ledger import ShadowReconciliation
+from polytrading.predictions.shadow_models import ShadowEvent, ShadowState, derive_current_state
 from polytrading.predictions.storage.store import PredictionMarketStore
 
 _MAX_MARKETS_SHOWN = 200
@@ -33,6 +39,7 @@ _MAX_BOOKS_SHOWN = 24
 _MAX_CANDIDATES_SHOWN = 20
 _MAX_PROOFS_SHOWN = 20
 _MAX_SCANS_SHOWN = 20
+_MAX_SHADOW_SHOWN = 20
 
 
 class PredictionDashboardBuilder:
@@ -60,6 +67,7 @@ class PredictionDashboardBuilder:
             candidates=self._candidate_summary(as_of),
             proofs=self._proof_summary(as_of),
             scans=self._scan_summary(as_of),
+            shadow=self._shadow_summary(as_of),
         )
 
     def _latest_books(
@@ -140,6 +148,80 @@ class PredictionDashboardBuilder:
             latest=latest,
         )
 
+    def _shadow_summary(self, as_of: datetime) -> ShadowSummary:
+        experiments = self._store.verified_shadow_experiments_as_of(as_of)
+        experiments_by_proposal: dict[UUID, ShadowExperiment] = {}
+        experiments_by_family: dict[str, int] = {}
+        for experiment in experiments:
+            if experiment.proposal_id in experiments_by_proposal:
+                raise ValueError("multiple shadow experiments exist for one proposal")
+            experiments_by_proposal[experiment.proposal_id] = experiment
+            _increment(experiments_by_family, experiment.family_id)
+
+        listings: list[ShadowListing] = []
+        by_current_state: dict[str, int] = {}
+        reconciled_pnl = Decimal("0")
+        for plan in self._store.verified_shadow_plans_as_of(as_of):
+            events = self._store.shadow_events_for_proposal(plan.proposal_id, as_of)
+            if not events:
+                raise ValueError("shadow plan is missing its event chain")
+            if any(event.proposal_id != plan.proposal_id for event in events):
+                raise ValueError("shadow events do not belong to their plan")
+            if len({event.event_id for event in events}) != len(events):
+                raise ValueError("shadow event identities must be unique")
+            if any(earlier.occurred_at > later.occurred_at for earlier, later in pairwise(events)):
+                raise ValueError("shadow event chain must be chronological")
+            current_state = derive_current_state(events)
+            scenario_id = _scenario_from_execution_events(events)
+            reconciliations = self._store.verified_shadow_reconciliations_for_proposal(
+                plan.proposal_id, as_of
+            )
+            if len(reconciliations) > 1:
+                raise ValueError("multiple shadow reconciliations exist for one proposal")
+            reconciliation = reconciliations[0] if reconciliations else None
+            experiment = experiments_by_proposal.pop(plan.proposal_id, None)
+            paper_pnl = _validated_shadow_pnl(
+                events=events,
+                current_state=current_state,
+                scenario_id=scenario_id,
+                reconciliation=reconciliation,
+                experiment=experiment,
+            )
+            if paper_pnl is not None:
+                reconciled_pnl += paper_pnl
+            _increment(by_current_state, current_state.value)
+            listings.append(
+                ShadowListing(
+                    schema_version=1,
+                    proposal_id=plan.proposal_id,
+                    candidate_id=plan.candidate_id,
+                    current_state=current_state,
+                    scenario_id=scenario_id,
+                    quantity=plan.max_quantity,
+                    paper_pnl=paper_pnl,
+                    observed_at=events[-1].occurred_at,
+                )
+            )
+
+        if experiments_by_proposal:
+            raise ValueError("shadow experiment references an unavailable proposal")
+
+        listings.sort(key=lambda item: (item.observed_at, item.proposal_id), reverse=True)
+        by_current_state = dict(sorted(by_current_state.items()))
+        experiments_by_family = dict(sorted(experiments_by_family.items()))
+        proposals_total = len(listings)
+        reconciled_count = by_current_state.get("reconciled", 0)
+        return ShadowSummary(
+            schema_version=1,
+            proposals_total=proposals_total,
+            by_terminal_state=by_current_state,
+            reconciled_count=reconciled_count,
+            reconciled_paper_pnl_usd=reconciled_pnl,
+            unreconciled_count=proposals_total - reconciled_count,
+            latest=tuple(listings[:_MAX_SHADOW_SHOWN]),
+            experiments_by_family=experiments_by_family,
+        )
+
     def _recipes(self) -> tuple[str, ...]:
         db = self._database_path
         return (
@@ -154,7 +236,89 @@ class PredictionDashboardBuilder:
             f"polytrading predictions attest --db {db} --input attestation.json",
             f"polytrading predictions prove --db {db} --candidate-id <candidate-id> --format json",
             f"polytrading predictions scan --db {db} --format json",
+            f"polytrading predictions shadow run --db {db} "
+            "--trial-family <trial-family> --format json",
+            f"polytrading predictions shadow replay --db {db} "
+            "--proposal-id <proposal-id> --format json",
         )
+
+
+def _scenario_from_execution_events(events: tuple[ShadowEvent, ...]) -> str | None:
+    execution_states = {
+        ShadowState.FIRST_LEG_SIMULATED,
+        ShadowState.COMPLETE,
+        ShadowState.UNWOUND,
+        ShadowState.EXPIRED,
+        ShadowState.UNKNOWN,
+        ShadowState.RECONCILED,
+    }
+    execution_events = tuple(event for event in events if event.to_state in execution_states)
+    provenance_events = tuple(event for event in events if event.to_state not in execution_states)
+    if any(event.scenario_id is not None for event in provenance_events):
+        raise ValueError("provenance events cannot define a shadow scenario")
+    if not execution_events:
+        return None
+    scenario_ids = {event.scenario_id for event in execution_events}
+    if None in scenario_ids or len(scenario_ids) != 1:
+        raise ValueError("shadow execution events require one scenario")
+    return next(iter(scenario_ids))
+
+
+def _validated_shadow_pnl(
+    *,
+    events: tuple[ShadowEvent, ...],
+    current_state: ShadowState,
+    scenario_id: str | None,
+    reconciliation: ShadowReconciliation | None,
+    experiment: ShadowExperiment | None,
+) -> Decimal | None:
+    execution_terminals = {
+        ShadowState.COMPLETE,
+        ShadowState.UNWOUND,
+        ShadowState.EXPIRED,
+        ShadowState.UNKNOWN,
+    }
+    if current_state is ShadowState.RECONCILED:
+        if len(events) < 2 or events[-2].to_state not in execution_terminals:
+            raise ValueError("reconciled shadow chain is missing its execution terminal")
+        terminal = events[-2]
+        if reconciliation is None or experiment is None:
+            raise ValueError("reconciled shadow proposal is missing result evidence")
+        if (
+            not reconciliation.complete
+            or reconciliation.terminal_event_id != terminal.event_id
+            or reconciliation.terminal_state is not terminal.to_state
+            or reconciliation.observed_at != events[-1].occurred_at
+            or experiment.terminal_state is not ShadowState.RECONCILED
+            or not experiment.reconciled
+            or experiment.paper_pnl_usd is None
+            or experiment.scenario_id != scenario_id
+            or experiment.observed_at != reconciliation.observed_at
+        ):
+            raise ValueError("reconciled shadow result evidence is inconsistent")
+        return experiment.paper_pnl_usd
+
+    if reconciliation is not None:
+        if current_state not in execution_terminals:
+            raise ValueError("intermediate shadow state has reconciliation evidence")
+        terminal = events[-1]
+        if (
+            reconciliation.complete
+            or reconciliation.terminal_event_id != terminal.event_id
+            or reconciliation.terminal_state is not current_state
+            or reconciliation.observed_at != terminal.occurred_at
+        ):
+            raise ValueError("unreconciled shadow evidence is inconsistent")
+    if experiment is not None and (
+        reconciliation is None
+        or experiment.terminal_state is not current_state
+        or experiment.reconciled
+        or experiment.paper_pnl_usd is not None
+        or experiment.scenario_id != scenario_id
+        or experiment.observed_at != reconciliation.observed_at
+    ):
+        raise ValueError("unreconciled shadow experiment is inconsistent")
+    return None
 
 
 def _increment(counts: dict[str, int], key: str) -> None:

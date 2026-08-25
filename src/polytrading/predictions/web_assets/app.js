@@ -42,6 +42,13 @@ function validateSnapshot(snapshot) {
   ) {
     throw new Error("INVALID_SNAPSHOT");
   }
+  if (
+    typeof snapshot.shadow !== "object" ||
+    snapshot.shadow === null ||
+    !Array.isArray(snapshot.shadow.latest)
+  ) {
+    throw new Error("INVALID_SNAPSHOT");
+  }
   return snapshot;
 }
 
@@ -109,6 +116,7 @@ function render(snapshot) {
   renderCandidates(snapshot);
   renderProofs(snapshot);
   renderScans(snapshot);
+  renderShadow(snapshot);
 }
 
 function renderCandidates(snapshot) {
@@ -207,6 +215,49 @@ function renderScans(snapshot) {
       cell(scan.as_of),
     );
     scansBody.append(row);
+  }
+}
+
+function renderShadow(snapshot) {
+  const summary = snapshot.shadow;
+  el("shadow-summary").textContent =
+    `Total: ${summary.proposals_total} | reconciled: ${summary.reconciled_count} | ` +
+    `unreconciled: ${summary.unreconciled_count} | ` +
+    `reconciled paper P&L (USD): ${summary.reconciled_paper_pnl_usd} | ` +
+    `by current state: ${JSON.stringify(summary.by_terminal_state)} | ` +
+    `experiments by family: ${JSON.stringify(summary.experiments_by_family)}`;
+
+  const shadowBody = el("shadow-proposals").querySelector("tbody");
+  shadowBody.replaceChildren();
+
+  const hasShadowProposals = summary.latest.length > 0;
+  el("shadow-proposals").hidden = !hasShadowProposals;
+  el("shadow-empty").hidden = hasShadowProposals;
+
+  for (const shadow of summary.latest) {
+    const row = document.createElement("tr");
+    const stateCell = cell(shadow.current_state);
+    if (shadow.current_state === "unknown") {
+      const warning = document.createElement("span");
+      warning.className = "shadow-warning";
+      warning.textContent = "awaiting reconciliation — paper result invalid";
+      stateCell.append(" ", warning);
+    }
+    const isReconciled = shadow.current_state === "reconciled";
+    const paperPnl =
+      isReconciled && shadow.paper_pnl !== null
+        ? shadow.paper_pnl
+        : "not available";
+    row.append(
+      cell(shadow.proposal_id),
+      cell(shadow.candidate_id),
+      stateCell,
+      cell(shadow.scenario_id ?? "not started"),
+      cell(shadow.quantity),
+      cell(paperPnl),
+      cell(shadow.observed_at),
+    );
+    shadowBody.append(row);
   }
 }
 

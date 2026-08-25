@@ -39,6 +39,16 @@ def test_dashboard_serves_the_snapshot_at_the_json_endpoint(tmp_path: Path) -> N
         "kalshi",
         "limitless",
     }
+    assert document["shadow"] == {
+        "by_terminal_state": {},
+        "experiments_by_family": {},
+        "latest": [],
+        "proposals_total": 0,
+        "reconciled_count": 0,
+        "reconciled_paper_pnl_usd": "0",
+        "schema_version": 1,
+        "unreconciled_count": 0,
+    }
 
 
 def test_dashboard_rejects_a_non_loopback_host(tmp_path: Path) -> None:
@@ -303,3 +313,39 @@ def test_dashboard_proof_and_scan_panels_never_use_forbidden_words() -> None:
         assert forbidden not in javascript
         assert forbidden not in html
         assert forbidden not in css
+
+
+def test_dashboard_html_declares_an_accessible_shadow_results_section() -> None:
+    html = _asset("index.html")
+
+    assert 'id="shadow-summary"' in html
+    assert 'id="shadow-proposals"' in html
+    assert 'id="shadow-empty"' in html
+    assert 'aria-live="polite"' in html
+    assert "No shadow proposals observed" in html
+
+
+def test_dashboard_client_renders_shadow_states_and_gates_paper_pnl() -> None:
+    javascript = _asset("app.js")
+
+    assert "function renderShadow(snapshot)" in javascript
+    assert "renderShadow(snapshot);" in javascript
+    assert "snapshot.shadow" in javascript
+    assert 'shadow.current_state === "reconciled"' in javascript
+    assert "shadow.paper_pnl !== null" in javascript
+    assert "awaiting reconciliation — paper result invalid" in javascript
+    assert "if (shadow.paper_pnl)" not in javascript
+
+
+def test_dashboard_served_shadow_assets_never_use_forbidden_words(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    served = b"\n".join(
+        application.respond("GET", path, "127.0.0.1").body
+        for path in ("/", "/assets/app.css", "/assets/app.js")
+    ).lower()
+
+    for forbidden in _FORBIDDEN_WORDS:
+        assert forbidden.encode() not in served
