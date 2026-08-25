@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from decimal import Decimal
-from typing import Annotated, ClassVar, Literal
+from types import MappingProxyType
+from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_serializer, model_validator
 
 from polytrading.predictions.domain import PredictionRecord
 
@@ -12,6 +14,19 @@ PositiveFiniteDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeFiniteDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 PositiveFraction = Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)]
 UnitIntervalDecimal = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
+
+_POLICY_LIMIT_CEILINGS: tuple[tuple[str, Decimal | int], ...] = (
+    ("max_basket_fraction_of_equity", Decimal("0.05")),
+    ("max_event_cluster_fraction", Decimal("0.10")),
+    ("max_incomplete_loss_fraction", Decimal("0.0025")),
+    ("drawdown_halt_new_entries", Decimal("0.02")),
+    ("drawdown_halve_size", Decimal("0.05")),
+    ("drawdown_stop_all", Decimal("0.08")),
+    ("drawdown_close_nonguaranteed", Decimal("0.12")),
+    ("drawdown_capital_preservation", Decimal("0.15")),
+    ("max_live_venues", 2),
+    ("pilot_cap_usd", Decimal("250")),
+)
 
 RiskRefusalReason = Literal[
     "BASKET_TOO_LARGE",
@@ -39,22 +54,9 @@ class PredictionRiskPolicy(PredictionRecord):
     pilot_cap_usd: PositiveFiniteDecimal = Decimal("250")
     starting_equity_usd: PositiveFiniteDecimal = Decimal("10000")
 
-    _MAXIMUM_BINDING_LIMITS: ClassVar[dict[str, Decimal | int]] = {
-        "max_basket_fraction_of_equity": Decimal("0.05"),
-        "max_event_cluster_fraction": Decimal("0.10"),
-        "max_incomplete_loss_fraction": Decimal("0.0025"),
-        "drawdown_halt_new_entries": Decimal("0.02"),
-        "drawdown_halve_size": Decimal("0.05"),
-        "drawdown_stop_all": Decimal("0.08"),
-        "drawdown_close_nonguaranteed": Decimal("0.12"),
-        "drawdown_capital_preservation": Decimal("0.15"),
-        "max_live_venues": 2,
-        "pilot_cap_usd": Decimal("250"),
-    }
-
     @model_validator(mode="after")
     def _require_ordered_drawdown_limits(self) -> PredictionRiskPolicy:
-        for field_name, maximum in self._MAXIMUM_BINDING_LIMITS.items():
+        for field_name, maximum in _POLICY_LIMIT_CEILINGS:
             if getattr(self, field_name) > maximum:
                 raise ValueError(f"{field_name} cannot be less conservative than the default limit")
         if not (
@@ -71,31 +73,35 @@ class PredictionRiskPolicy(PredictionRecord):
 DEFAULT_RISK_POLICY = PredictionRiskPolicy(policy_version="shadow-risk-v1")
 
 
-class _FrozenExposureByCluster(dict[str, Decimal]):
-    """A serializable mapping that cannot be mutated after portfolio validation."""
+class _FrozenExposureByCluster(Mapping[str, Decimal]):
+    """An immutable, serializable snapshot of validated cluster exposure."""
 
-    def __init__(self, values: dict[str, Decimal]) -> None:
-        dict.__init__(self, values)
+    __slots__ = ("_values",)
 
-    @staticmethod
-    def _immutable(*args: object, **kwargs: object) -> None:
-        raise TypeError("open_exposure_usd_by_cluster is immutable")
+    def __init__(self, values: Mapping[str, Decimal]) -> None:
+        self._values = MappingProxyType(dict(values))
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __ior__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
+    def __getitem__(self, key: str) -> Decimal:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __copy__(self) -> _FrozenExposureByCluster:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenExposureByCluster:
+        return self
 
 
 class ShadowPortfolioState(PredictionRecord):
     """A validated snapshot used exclusively for pure risk-gate evaluation."""
 
     total_equity_usd: PositiveFiniteDecimal
-    open_exposure_usd_by_cluster: dict[str, NonNegativeFiniteDecimal]
+    open_exposure_usd_by_cluster: Mapping[str, NonNegativeFiniteDecimal]
     peak_equity_usd: PositiveFiniteDecimal
     equity_24h_ago_usd: PositiveFiniteDecimal
     open_proposal_count: Annotated[int, Field(ge=0)]
@@ -110,6 +116,10 @@ class ShadowPortfolioState(PredictionRecord):
             _FrozenExposureByCluster(dict(self.open_exposure_usd_by_cluster)),
         )
         return self
+
+    @field_serializer("open_exposure_usd_by_cluster", mode="plain")
+    def _serialize_exposure_by_cluster(self, value: Mapping[str, Decimal]) -> dict[str, Decimal]:
+        return dict(value)
 
 
 class RiskGateDecision(PredictionRecord):
@@ -132,6 +142,8 @@ def evaluate_risk_gate(
     Check ordering is intentionally explicit: it makes the reported reason stable when a
     portfolio breaches more than one limit simultaneously.
     """
+    policy = PredictionRiskPolicy.model_validate(policy.model_dump())
+    portfolio = ShadowPortfolioState.model_validate(portfolio.model_dump())
     _require_nonnegative_finite_decimal(basket_cost_usd, "basket_cost_usd")
     _require_nonnegative_finite_decimal(max_incomplete_loss_usd, "max_incomplete_loss_usd")
 

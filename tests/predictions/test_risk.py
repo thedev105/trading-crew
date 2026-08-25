@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import importlib
+import json
 from decimal import Decimal
 
 import pytest
@@ -107,7 +109,7 @@ def test_portfolio_rejects_invalid_risk_numerics(field: str, invalid: object) ->
 
 
 def test_portfolio_exposure_mapping_is_immutable_and_copies_caller_data() -> None:
-    """A mutable cluster map could bypass concentration checks after validation."""
+    """Mutable or copied cluster maps could bypass concentration checks after validation."""
     risk = _risk()
     caller_exposure = {"event-a": Decimal("100")}
 
@@ -116,8 +118,28 @@ def test_portfolio_exposure_mapping_is_immutable_and_copies_caller_data() -> Non
 
     assert portfolio.open_exposure_usd_by_cluster == {"event-a": Decimal("100")}
     assert portfolio.model_dump()["open_exposure_usd_by_cluster"] == {"event-a": Decimal("100")}
+    assert json.loads(portfolio.model_dump_json())["open_exposure_usd_by_cluster"] == {
+        "event-a": "100"
+    }
     with pytest.raises(TypeError):
         portfolio.open_exposure_usd_by_cluster["event-a"] = Decimal("999")
+    with pytest.raises(TypeError):
+        dict.__setitem__(portfolio.open_exposure_usd_by_cluster, "event-a", Decimal("999"))
+    assert (
+        copy.copy(portfolio.open_exposure_usd_by_cluster) is portfolio.open_exposure_usd_by_cluster
+    )
+    assert (
+        copy.deepcopy(portfolio.open_exposure_usd_by_cluster)
+        is portfolio.open_exposure_usd_by_cluster
+    )
+    assert (
+        portfolio.model_copy().open_exposure_usd_by_cluster
+        is portfolio.open_exposure_usd_by_cluster
+    )
+    assert (
+        portfolio.model_copy(deep=True).open_exposure_usd_by_cluster
+        is portfolio.open_exposure_usd_by_cluster
+    )
 
 
 def test_policy_is_frozen_so_strategy_cannot_raise_a_limit() -> None:
@@ -153,6 +175,33 @@ def test_policy_rejects_relaxed_limits_but_accepts_stricter_ones(
     policy = _policy(risk, **{field: stricter})
 
     assert getattr(policy, field) == stricter
+
+
+@pytest.mark.parametrize("copy_method", ["model_copy", "model_construct"])
+def test_gate_rejects_relaxed_unchecked_policy(copy_method: str) -> None:
+    """Using unchecked Pydantic construction must not admit a 6% basket under a 5% policy."""
+    risk = _risk()
+    safe_policy = _policy(risk)
+    values = safe_policy.model_dump() | {"max_basket_fraction_of_equity": Decimal("0.50")}
+    unchecked_policy = (
+        safe_policy.model_copy(update=values)
+        if copy_method == "model_copy"
+        else risk.PredictionRiskPolicy.model_construct(**values)
+    )
+
+    with pytest.raises(ValidationError):
+        _evaluate(risk, basket_cost_usd=Decimal("600"), policy=unchecked_policy)
+
+
+def test_gate_rejects_invalid_unchecked_portfolio_mapping() -> None:
+    """Unchecked negative cluster exposure must be rejected before it affects the gate."""
+    risk = _risk()
+    portfolio = _portfolio(risk).model_copy(
+        update={"open_exposure_usd_by_cluster": {"event-a": Decimal("-1")}}
+    )
+
+    with pytest.raises(ValidationError):
+        _evaluate(risk, portfolio=portfolio)
 
 
 @pytest.mark.parametrize(
