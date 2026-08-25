@@ -11,6 +11,7 @@ from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.economics_models import EconomicsResult
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
+from polytrading.predictions.shadow_ledger import ShadowReconciliation
 from polytrading.predictions.shadow_models import (
     ShadowEvent,
     ShadowLegPlan,
@@ -688,6 +689,92 @@ def test_trial_families_as_of_returns_every_known_version_in_deterministic_order
     assert store.trial_families_as_of(NOW - timedelta(hours=2)) == ()
 
 
+def test_verified_family_market_and_experiment_reads_reject_record_json_tamper(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    family = trial_family()
+    market = market_record()
+    experiment = shadow_experiment()
+    store.append_trial_family(family)
+    store.append_market(market)
+    store.append_shadow_experiment(experiment)
+
+    assert store.verified_trial_family_by_id(family.family_id, NOW) == family
+    assert store.verified_markets_as_of(market.venue, NOW) == (market,)
+    assert store.verified_shadow_experiments_as_of(NOW) == (experiment,)
+
+    store._connection.execute(
+        "UPDATE trial_families SET record_json = ? WHERE family_id = ?",
+        [
+            family.model_copy(update={"thresholds_json": '{"tampered":true}'}).model_dump_json(),
+            family.family_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_trial_family_by_id(family.family_id, NOW)
+
+    store._connection.execute(
+        "UPDATE markets SET record_json = ? WHERE venue = ? AND market_id = ?",
+        [
+            market.model_copy(update={"event_id": "tampered-event"}).model_dump_json(),
+            market.venue.value,
+            market.market_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_markets_as_of(market.venue, NOW)
+
+    store._connection.execute(
+        "UPDATE shadow_experiments SET record_json = ? WHERE experiment_id = ?",
+        [
+            experiment.model_copy(update={"paper_pnl_usd": Decimal("99")}).model_dump_json(),
+            experiment.experiment_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_shadow_experiments_as_of(NOW)
+
+
+def test_verified_reconciliations_return_every_row_in_order_and_reject_tamper(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    earliest = shadow_reconciliation(
+        reconciliation_id=UUID("00000000-0000-0000-0000-00000000a003"),
+        observed_at=NOW - timedelta(hours=1),
+    )
+    same_time_first = shadow_reconciliation(
+        reconciliation_id=UUID("00000000-0000-0000-0000-00000000a001")
+    )
+    same_time_second = shadow_reconciliation(
+        reconciliation_id=UUID("00000000-0000-0000-0000-00000000a002")
+    )
+    for reconciliation in (same_time_second, earliest, same_time_first):
+        store.append_reconciliation(reconciliation)
+
+    assert store.verified_shadow_reconciliations_for_proposal(
+        earliest.proposal_id, NOW - timedelta(minutes=30)
+    ) == (earliest,)
+    assert store.verified_shadow_reconciliations_for_proposal(earliest.proposal_id, NOW) == (
+        earliest,
+        same_time_first,
+        same_time_second,
+    )
+
+    store._connection.execute(
+        "UPDATE shadow_reconciliations SET record_json = ? WHERE reconciliation_id = ?",
+        [
+            same_time_second.model_copy(
+                update={"terminal_state": ShadowState.UNWOUND}
+            ).model_dump_json(),
+            same_time_second.reconciliation_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_shadow_reconciliations_for_proposal(earliest.proposal_id, NOW)
+
+
 def test_shadow_experiment_round_trip_is_idempotent_conflict_safe_and_family_agnostic(
     tmp_path: Path,
 ) -> None:
@@ -968,6 +1055,21 @@ def shadow_event(**overrides: object) -> ShadowEvent:
     }
     values.update(overrides)
     return ShadowEvent(**values)
+
+
+def shadow_reconciliation(**overrides: object) -> ShadowReconciliation:
+    values: dict[str, object] = {
+        "reconciliation_id": UUID("00000000-0000-0000-0000-00000000a001"),
+        "proposal_id": UUID("00000000-0000-0000-0000-000000008001"),
+        "terminal_event_id": UUID("00000000-0000-0000-0000-000000009099"),
+        "terminal_state": ShadowState.COMPLETE,
+        "venues_reconciled": (PredictionVenue.POLYMARKET,),
+        "complete": True,
+        "unexplained_difference_usd": Decimal("0"),
+        "observed_at": NOW,
+    }
+    values.update(overrides)
+    return ShadowReconciliation(**values)
 
 
 def trial_family(**overrides: object) -> TrialFamily:

@@ -2922,3 +2922,340 @@ def test_shadow_run_never_echoes_registered_or_missing_trial_family_ids(
     missing_output = capsys.readouterr()
     assert forbidden_phrase not in missing_output.out.lower()
     assert forbidden_phrase not in missing_output.err.lower()
+
+
+@pytest.mark.parametrize(
+    ("table", "where", "key", "updates"),
+    [
+        (
+            "trial_families",
+            "family_id = ?",
+            "shadow-cli-v1",
+            {"thresholds_json": '{"tampered":true}'},
+        ),
+        (
+            "trial_families",
+            "family_id = ?",
+            "shadow-cli-v1",
+            {"venues": ["kalshi"]},
+        ),
+        (
+            "markets",
+            "venue = ?",
+            PredictionVenue.POLYMARKET.value,
+            {"event_id": "tampered-event"},
+        ),
+    ],
+)
+def test_shadow_run_rejects_tampered_family_and_market_admission_inputs(
+    table: str,
+    where: str,
+    key: object,
+    updates: dict[str, object],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"{table}-{next(iter(updates))}.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+    store = PredictionMarketStore(database)
+    row = store._connection.execute(
+        f"SELECT record_json FROM {table} WHERE {where} LIMIT 1", [key]
+    ).fetchone()
+    payload = json.loads(row[0])
+    payload.update(updates)
+    store._connection.execute(
+        f"UPDATE {table} SET record_json = ? WHERE {where}",
+        [json.dumps(payload, sort_keys=True), key],
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert '"planned"' not in captured.out
+
+
+def _append_second_shadow_candidate_and_suppress_first(
+    store: PredictionMarketStore,
+) -> None:
+    first_candidate = store.candidate_relationship_by_id(CANDIDATE_ID, NOW)
+    first_proof = store.latest_proof_for_candidate(CANDIDATE_ID, NOW)
+    first_report = store.scan_reports_as_of(NOW)[0]
+    _append_scan_revision(
+        store,
+        first_report,
+        as_of=NOW + timedelta(seconds=1),
+        decision="REJECTED",
+    )
+    second_candidate_id = UUID("00000000-0000-0000-0000-000000003102")
+    second_proof_id = UUID("00000000-0000-0000-0000-000000006102")
+    second_candidate = first_candidate.model_copy(update={"candidate_id": second_candidate_id})
+    second_proof = first_proof.model_copy(
+        update={"proof_id": second_proof_id, "candidate_id": second_candidate_id}
+    )
+    report_as_of = NOW + timedelta(seconds=2)
+    second_report_id = deterministic_scan_report_id(
+        candidate_id=second_candidate_id,
+        proof_id=second_proof_id,
+        decision="SHADOW_CANDIDATE",
+        reason="second candidate after prior experiment",
+        economics=first_report.economics,
+        policy_id=first_report.policy_id,
+        policy_version=first_report.policy_version,
+        as_of=report_as_of,
+    )
+    second_report = ScanReport(
+        report_id=second_report_id,
+        candidate_id=second_candidate_id,
+        proof_id=second_proof_id,
+        decision="SHADOW_CANDIDATE",
+        reason="second candidate after prior experiment",
+        economics=first_report.economics,
+        policy_id=first_report.policy_id,
+        policy_version=first_report.policy_version,
+        as_of=report_as_of,
+        observed_at=report_as_of,
+    )
+    store.append_candidate_relationship(second_candidate)
+    store.append_proof_artifact(second_proof)
+    store.append_scan_report(second_report)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"paper_pnl_usd": "999"},
+        {"paper_pnl_usd": None, "reconciled": False, "terminal_state": "unknown"},
+        {"terminal_state": "complete"},
+    ],
+    ids=["pnl", "reconciled", "terminal-state"],
+)
+def test_shadow_run_rejects_tampered_prior_experiment_risk_inputs(
+    updates: dict[str, object],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"experiment-{updates.get('terminal_state', 'pnl')}.duckdb"
+    _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    _append_second_shadow_candidate_and_suppress_first(store)
+    row = store._connection.execute(
+        "SELECT experiment_id, record_json FROM shadow_experiments LIMIT 1"
+    ).fetchone()
+    payload = json.loads(row[1])
+    payload.update(updates)
+    store._connection.execute(
+        "UPDATE shadow_experiments SET record_json = ? WHERE experiment_id = ?",
+        [json.dumps(payload, sort_keys=True), row[0]],
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:02Z",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert "planned=" not in captured.out
+
+
+def test_shadow_run_rejects_duplicate_prior_experiments_instead_of_double_counting(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "duplicate-experiment.duckdb"
+    _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    _append_second_shadow_candidate_and_suppress_first(store)
+    original = store.shadow_experiments_as_of(NOW + timedelta(seconds=1))[0]
+    store.append_shadow_experiment(
+        original.model_copy(
+            update={
+                "experiment_id": UUID("00000000-0000-0000-0000-00000000e999"),
+                "observed_at": original.observed_at + timedelta(microseconds=1),
+            }
+        )
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:02Z",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert "planned=" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [{"complete": False}, {"terminal_state": "unwound"}],
+    ids=["completion", "terminal-state"],
+)
+@pytest.mark.parametrize("command", ["run", "replay"])
+def test_shadow_commands_reject_tampered_reconciliation_content(
+    updates: dict[str, object],
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"reconciliation-{command}-{next(iter(updates))}.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    row = store._connection.execute(
+        "SELECT reconciliation_id, record_json FROM shadow_reconciliations LIMIT 1"
+    ).fetchone()
+    payload = json.loads(row[1])
+    payload.update(updates)
+    store._connection.execute(
+        "UPDATE shadow_reconciliations SET record_json = ? WHERE reconciliation_id = ?",
+        [json.dumps(payload, sort_keys=True), row[0]],
+    )
+    store.close()
+
+    arguments = ["predictions", "shadow", command, "--db", str(database)]
+    if command == "run":
+        arguments.extend(
+            [
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+    else:
+        arguments.extend(["--proposal-id", str(proposal_id)])
+    assert main(arguments) == 1
+    captured = capsys.readouterr()
+    assert "MATCHES" not in captured.out
+    expected = (
+        "shadow run failed to persist atomically"
+        if command == "run"
+        else "shadow replay evidence is unavailable or inconsistent"
+    )
+    assert expected in captured.err
+
+
+@pytest.mark.parametrize("command", ["run", "replay"])
+def test_shadow_commands_reject_multiple_reconciliations_for_one_proposal(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"duplicate-reconciliation-{command}.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    original = store.latest_reconciliation_for_proposal(proposal_id, NOW)
+    store.append_reconciliation(
+        original.model_copy(
+            update={
+                "reconciliation_id": UUID("00000000-0000-0000-0000-00000000a000"),
+                "observed_at": original.observed_at - timedelta(microseconds=1),
+            }
+        )
+    )
+    store.close()
+
+    arguments = ["predictions", "shadow", command, "--db", str(database)]
+    if command == "run":
+        arguments.extend(
+            [
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+    else:
+        arguments.extend(["--proposal-id", str(proposal_id)])
+    assert main(arguments) == 1
+    captured = capsys.readouterr()
+    assert "MATCHES" not in captured.out
+    expected = (
+        "shadow run failed to persist atomically"
+        if command == "run"
+        else "shadow replay evidence is unavailable or inconsistent"
+    )
+    assert expected in captured.err
+
+
+def test_shadow_portfolio_rejects_multiple_prior_reconciliations(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "portfolio-duplicate-reconciliation.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    _append_second_shadow_candidate_and_suppress_first(store)
+    original = store.latest_reconciliation_for_proposal(proposal_id, NOW)
+    store.append_reconciliation(
+        original.model_copy(
+            update={
+                "reconciliation_id": UUID("00000000-0000-0000-0000-00000000a000"),
+                "observed_at": original.observed_at - timedelta(microseconds=1),
+            }
+        )
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:02Z",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert "planned=" not in captured.out

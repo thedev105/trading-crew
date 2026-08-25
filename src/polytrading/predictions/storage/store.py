@@ -519,6 +519,33 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(MarketRecord.model_validate_json(row[0]) for row in rows)
 
+    def verified_markets_as_of(
+        self, venue: PredictionVenue, as_of: datetime
+    ) -> tuple[MarketRecord, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM (
+                SELECT
+                    market_id,
+                    record_json,
+                    record_hash,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id ORDER BY retrieved_at DESC
+                    ) AS rank
+                FROM markets
+                WHERE venue = ? AND retrieved_at <= ?
+            )
+            WHERE rank = 1
+            ORDER BY market_id
+            """,
+            [venue.value, as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, MarketRecord, "market")) is not None
+        )
+
     def rule_version_by_id(self, rule_version_id: UUID) -> RuleVersion | None:
         row = self._connection.execute(
             "SELECT record_json FROM rule_versions WHERE rule_version_id = ?",
@@ -980,6 +1007,24 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else ShadowReconciliation.model_validate_json(row[0])
 
+    def verified_shadow_reconciliations_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[ShadowReconciliation, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM shadow_reconciliations
+            WHERE proposal_id = ? AND observed_at <= ?
+            ORDER BY observed_at, reconciliation_id
+            """,
+            [proposal_id, as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, ShadowReconciliation, "shadow reconciliation"))
+            is not None
+        )
+
     def trial_family_by_id(self, family_id: str, as_of: datetime) -> TrialFamily | None:
         row = self._connection.execute(
             """
@@ -991,6 +1036,18 @@ class PredictionMarketStore:
             [family_id, as_of],
         ).fetchone()
         return None if row is None else TrialFamily.model_validate_json(row[0])
+
+    def verified_trial_family_by_id(self, family_id: str, as_of: datetime) -> TrialFamily | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM trial_families
+            WHERE family_id = ? AND preregistered_at <= ?
+            ORDER BY preregistered_at DESC
+            LIMIT 1
+            """,
+            [family_id, as_of],
+        ).fetchone()
+        return _verified_record(row, TrialFamily, "trial family")
 
     def trial_families_as_of(self, as_of: datetime) -> tuple[TrialFamily, ...]:
         rows = self._connection.execute(
@@ -1013,6 +1070,21 @@ class PredictionMarketStore:
             [as_of, as_of],
         ).fetchall()
         return tuple(ShadowExperiment.model_validate_json(row[0]) for row in rows)
+
+    def verified_shadow_experiments_as_of(self, as_of: datetime) -> tuple[ShadowExperiment, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM shadow_experiments
+            WHERE as_of <= ? AND observed_at <= ?
+            ORDER BY observed_at, experiment_id
+            """,
+            [as_of, as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, ShadowExperiment, "shadow experiment")) is not None
+        )
 
     def verified_shadow_experiments_for_proposal(
         self, proposal_id: UUID, as_of: datetime

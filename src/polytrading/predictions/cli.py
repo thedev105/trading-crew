@@ -938,7 +938,10 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
             store = PredictionMarketStore(arguments.db)
             try:
                 with store.transaction() as transaction:
-                    if transaction.trial_family_by_id(arguments.trial_family, as_of) is None:
+                    if (
+                        transaction.verified_trial_family_by_id(arguments.trial_family, as_of)
+                        is None
+                    ):
                         raise PredictionsUsageError("trial family is not preregistered")
                     reports = _effective_shadow_candidate_reports(transaction, as_of)
                     report_ids = {report.report_id for report in reports}
@@ -1199,7 +1202,7 @@ def _event_cluster_id(
         markets_by_key.update(
             {
                 (market.venue, market.market_id): market
-                for market in store.markets_as_of(venue, as_of)
+                for market in store.verified_markets_as_of(venue, as_of)
             }
         )
     event_ids = {
@@ -1230,9 +1233,11 @@ def _shadow_portfolio_state(
     excluded = set(excluding_proposal_ids)
     if excluding_proposal_id is not None:
         excluded.add(excluding_proposal_id)
-    experiments = tuple(
-        item for item in store.shadow_experiments_as_of(as_of) if item.proposal_id not in excluded
-    )
+    all_experiments = store.verified_shadow_experiments_as_of(as_of)
+    experiment_counts = Counter(item.proposal_id for item in all_experiments)
+    if any(count != 1 for count in experiment_counts.values()):
+        raise ValueError("multiple experiments exist for one shadow proposal")
+    experiments = tuple(item for item in all_experiments if item.proposal_id not in excluded)
     running = policy.starting_equity_usd
     peak = running
     equity_24h = running
@@ -1253,7 +1258,12 @@ def _shadow_portfolio_state(
     for plan in store.verified_shadow_plans_as_of(as_of):
         if plan.proposal_id in excluded or plan.scan_report_id == excluding_scan_report_id:
             continue
-        reconciliation = store.latest_reconciliation_for_proposal(plan.proposal_id, as_of)
+        reconciliations = store.verified_shadow_reconciliations_for_proposal(
+            plan.proposal_id, as_of
+        )
+        if len(reconciliations) > 1:
+            raise ValueError("multiple reconciliations exist for one shadow proposal")
+        reconciliation = reconciliations[0] if reconciliations else None
         if reconciliation is not None and reconciliation.complete:
             continue
         candidate = store.verified_candidate_relationship_by_id(
@@ -1389,16 +1399,16 @@ def _validate_existing_shadow_bundle(
     if sorted(stored_postings, key=posting_key) != sorted(expected_postings, key=posting_key):
         raise ValueError("existing proposal postings are inconsistent")
 
-    stored_reconciliation = store.latest_reconciliation_for_proposal(plan.proposal_id, far_future)
-    if stored_reconciliation is None:
-        raise ValueError("existing proposal is missing reconciliation")
     expected_reconciliation = reconcile_proposal(
         plan,
         execution_events,
         stored_postings,
         fees,
     )
-    if stored_reconciliation != expected_reconciliation:
+    stored_reconciliations = store.verified_shadow_reconciliations_for_proposal(
+        plan.proposal_id, far_future
+    )
+    if stored_reconciliations != (expected_reconciliation,):
         raise ValueError("existing proposal reconciliation is inconsistent")
 
     trailing = tuple(event for event in stored_events if event.to_state is ShadowState.RECONCILED)
@@ -1508,11 +1518,12 @@ def _run_shadow_replay(arguments: argparse.Namespace) -> int:
             trailing = tuple(
                 event for event in stored_events if event.to_state is ShadowState.RECONCILED
             )
-            stored_reconciliation = store.latest_reconciliation_for_proposal(
+            stored_reconciliations = store.verified_shadow_reconciliations_for_proposal(
                 proposal_id, far_future
             )
-            if stored_reconciliation is None:
-                raise LookupError("stored reconciliation not found")
+            if len(stored_reconciliations) != 1:
+                raise LookupError("stored reconciliation is missing or ambiguous")
+            stored_reconciliation = stored_reconciliations[0]
             stored_postings = store.ledger_postings_for_proposal(proposal_id, far_future)
             replayed_reconciliation = reconcile_proposal(
                 plan,
