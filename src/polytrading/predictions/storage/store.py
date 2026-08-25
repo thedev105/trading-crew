@@ -28,6 +28,7 @@ from polytrading.predictions.domain import (
 from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.proofs_models import ProofArtifact
+from polytrading.predictions.shadow_ledger import LedgerPosting, ShadowReconciliation
 from polytrading.predictions.shadow_models import ShadowEvent, ShadowPlan
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
@@ -369,6 +370,37 @@ class PredictionMarketStore:
             ],
         )
 
+    def append_ledger_posting(self, record: LedgerPosting) -> bool:
+        record = LedgerPosting.model_validate(record.model_dump())
+        return self._append_keyed(
+            table="shadow_ledger_postings",
+            record=record,
+            label="shadow ledger posting",
+            where="posting_id = ?",
+            key_params=[record.posting_id],
+            insert_columns=(
+                "posting_id, proposal_id, event_id, occurred_at, record_json, record_hash"
+            ),
+            insert_params=[
+                record.posting_id,
+                record.proposal_id,
+                record.event_id,
+                record.occurred_at,
+            ],
+        )
+
+    def append_reconciliation(self, record: ShadowReconciliation) -> bool:
+        record = ShadowReconciliation.model_validate(record.model_dump())
+        return self._append_keyed(
+            table="shadow_reconciliations",
+            record=record,
+            label="shadow reconciliation",
+            where="reconciliation_id = ?",
+            key_params=[record.reconciliation_id],
+            insert_columns="reconciliation_id, proposal_id, observed_at, record_json, record_hash",
+            insert_params=[record.reconciliation_id, record.proposal_id, record.observed_at],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -660,6 +692,33 @@ class PredictionMarketStore:
             [proposal_id, as_of],
         ).fetchall()
         return tuple(ShadowEvent.model_validate_json(row[0]) for row in rows)
+
+    def ledger_postings_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[LedgerPosting, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_ledger_postings
+            WHERE proposal_id = ? AND occurred_at <= ?
+            ORDER BY occurred_at, event_id, posting_id
+            """,
+            [proposal_id, as_of],
+        ).fetchall()
+        return tuple(LedgerPosting.model_validate_json(row[0]) for row in rows)
+
+    def latest_reconciliation_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> ShadowReconciliation | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_reconciliations
+            WHERE proposal_id = ? AND observed_at <= ?
+            ORDER BY observed_at DESC, reconciliation_id DESC
+            LIMIT 1
+            """,
+            [proposal_id, as_of],
+        ).fetchone()
+        return None if row is None else ShadowReconciliation.model_validate_json(row[0])
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {
