@@ -95,3 +95,4 @@ Task 8: fix round 1/5 (5 addressed, 2 open — market/family/experiment/reconcil
 Task 8: fix round 2/5 (2 addressed, 0 open — all binding risk/reconciliation inputs verified and multiplicity rejected; commits 32dffd0..cdbd4fa)
 Task 8: complete (commits eb0cbe9..cdbd4fa, review clean)
 Task 9: fix round 1/5 (3 addressed, 0 open — paper P&L is recomputed from the canonical ledger bundle, event/posting hashes and indexed columns are verified, and plan/event cutoff leakage fails closed; starts after 9428e2d)
+Task 9: fix round 2/5 (3 addressed, 0 open — frozen fee evidence and fill-derived ledger bundles are verified exactly, reconciliation/experiment indexes cannot hide decoded records, and valid first-leg historical prefixes remain unreconciled; starts after 4b44587)

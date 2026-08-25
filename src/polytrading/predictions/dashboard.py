@@ -25,7 +25,12 @@ from polytrading.predictions.dashboard_models import (
     ShadowListing,
     ShadowSummary,
 )
-from polytrading.predictions.domain import MarketRecord, PredictionBookSnapshot, PredictionVenue
+from polytrading.predictions.domain import (
+    MarketRecord,
+    PredictionBookSnapshot,
+    PredictionFeeRate,
+    PredictionVenue,
+)
 from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.health import PredictionHealthAuditor
@@ -33,7 +38,9 @@ from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.shadow_ledger import (
     LedgerPosting,
     ShadowReconciliation,
+    postings_for_events,
     proposal_paper_pnl,
+    reconcile_proposal,
     reconciled_event_for,
 )
 from polytrading.predictions.shadow_models import (
@@ -194,11 +201,18 @@ class PredictionDashboardBuilder:
                 raise ValueError("multiple shadow reconciliations exist for one proposal")
             reconciliation = reconciliations[0] if reconciliations else None
             experiment = experiments_by_proposal.pop(plan.proposal_id, None)
+            fees = _verified_shadow_fees(self._store, plan)
             postings = self._store.verified_ledger_postings_for_proposal(plan.proposal_id, as_of)
+            expected_postings = postings_for_events(plan, events, fees)
+            if sorted(postings, key=lambda posting: posting.posting_id) != sorted(
+                expected_postings, key=lambda posting: posting.posting_id
+            ):
+                raise ValueError("shadow ledger postings do not match visible fills")
             paper_pnl = _validated_shadow_pnl(
                 plan=plan,
                 events=events,
-                postings=postings,
+                postings=expected_postings,
+                fees=fees,
                 current_state=current_state,
                 scenario_id=scenario_id,
                 reconciliation=reconciliation,
@@ -286,6 +300,7 @@ def _validated_shadow_pnl(
     plan: ShadowPlan,
     events: tuple[ShadowEvent, ...],
     postings: tuple[LedgerPosting, ...],
+    fees: dict[int, PredictionFeeRate],
     current_state: ShadowState,
     scenario_id: str | None,
     reconciliation: ShadowReconciliation | None,
@@ -315,6 +330,9 @@ def _validated_shadow_pnl(
             or experiment.observed_at != reconciliation.observed_at
         ):
             raise ValueError("reconciled shadow result evidence is inconsistent")
+        expected_reconciliation = reconcile_proposal(plan, events[:-1], postings, fees)
+        if reconciliation != expected_reconciliation:
+            raise ValueError("reconciled shadow result evidence is inconsistent")
         expected_reconciled_event = reconciled_event_for(plan, events[:-1], reconciliation)
         if events[-1] != expected_reconciled_event:
             raise ValueError("reconciled shadow event is not canonical")
@@ -334,10 +352,11 @@ def _validated_shadow_pnl(
             or reconciliation.observed_at != terminal.occurred_at
         ):
             raise ValueError("unreconciled shadow evidence is inconsistent")
+        expected_reconciliation = reconcile_proposal(plan, events, postings, fees)
+        if reconciliation != expected_reconciliation:
+            raise ValueError("unreconciled shadow evidence is inconsistent")
         if proposal_paper_pnl(postings, reconciliation, events) is not None:
             raise ValueError("unreconciled shadow proposal cannot have authoritative paper P&L")
-    elif postings:
-        raise ValueError("shadow ledger postings require reconciliation evidence")
     if experiment is not None and (
         reconciliation is None
         or experiment.terminal_state is not current_state
@@ -348,6 +367,29 @@ def _validated_shadow_pnl(
     ):
         raise ValueError("unreconciled shadow experiment is inconsistent")
     return None
+
+
+def _verified_shadow_fees(
+    store: PredictionMarketStore, plan: ShadowPlan
+) -> dict[int, PredictionFeeRate]:
+    result: dict[int, PredictionFeeRate] = {}
+    for leg in plan.legs:
+        matches: list[PredictionFeeRate] = []
+        market_ids = (leg.market_id, None) if leg.market_id is not None else (None,)
+        for source_hash in plan.frozen_hashes:
+            for market_id in market_ids:
+                fee = store.verified_fee_rate_by_source_hash(
+                    leg.venue,
+                    market_id,
+                    source_hash,
+                    plan.information_cutoff,
+                )
+                if fee is not None and fee not in matches:
+                    matches.append(fee)
+        if len(matches) != 1:
+            raise ValueError("shadow plan must cite exactly one frozen fee evidence row per leg")
+        result[leg.leg_index] = matches[0]
+    return result
 
 
 def _increment(counts: dict[str, int], key: str) -> None:

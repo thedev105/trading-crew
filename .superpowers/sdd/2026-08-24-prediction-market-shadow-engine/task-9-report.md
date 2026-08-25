@@ -14,10 +14,12 @@ pending reconciliation.
   `PredictionDashboardSnapshot`. Counts are nonnegative and internally consistent, decimals are
   finite, latest rows are unique/newest-first/capped at 20, mappings are sorted, and paper P&L is
   present exactly on reconciled listings.
-- Built the summary from immutable-hash-verified plans, events, postings, experiments, and
-  reconciliations at the requested cutoff. Event and posting reads additionally bind every decoded
-  identity, sequence, and timestamp to its indexed columns. Replay retains its deliberately raw
-  event reader; the dashboard uses the separate verified path.
+- Built the summary from immutable-hash-verified plans, frozen fee evidence, events, postings,
+  experiments, and reconciliations at the requested cutoff. Fee, event, posting, reconciliation,
+  and experiment reads additionally bind every decoded identity, state/value, sequence, and
+  timestamp to its indexed columns. Decoded-or-indexed selection prevents an index mutation from
+  hiding a cutoff-safe row. Replay retains its deliberately raw event reader; the dashboard uses
+  the separate verified path.
 - Each included plan uses its contiguous, chronological event prefix at or before the cutoff;
   current state is derived from that prefix rather than copied from another record. A decoded plan
   observation/information cutoff or decoded event timestamp after `as_of` fails closed.
@@ -25,10 +27,16 @@ pending reconciliation.
   mixed-scenario event evidence; duplicate experiments/reconciliations; orphan experiments; and
   inconsistent terminal, reconciliation, experiment, scenario, timestamp, or P&L evidence.
 - Counted every cutoff-safe experiment by family, including failed, unknown, and losing rows.
-  Aggregate P&L includes only proposals with canonical conserved postings, one canonical complete
-  reconciliation, the exact deterministic trailing `reconciled` event, and one matching verified
-  experiment. The dashboard recomputes P&L through `proposal_paper_pnl` and requires exact
-  experiment agreement; zero and negative decimal results remain visible.
+  For every visible proposal prefix, the dashboard loads exactly one plan-frozen fee record per
+  leg, regenerates postings from the visible structured fills through `postings_for_events`, and
+  requires exact persisted-journal equality. Completed result bundles additionally regenerate and
+  compare the reconciliation and deterministic trailing event. Aggregate P&L includes only those
+  canonical `reconciled` bundles with one matching verified experiment, is recomputed through
+  `proposal_paper_pnl`, and requires exact experiment agreement; zero and negative results remain
+  visible.
+- Extended ledger posting reconstruction to valid contiguous pre-terminal prefixes. A visible
+  `first_leg_simulated` prefix can therefore verify its acquisition/fee journal without requiring
+  future reconciliation evidence, while its paper P&L remains unavailable.
 - Added deterministic newest-first ordering by `(observed_at, proposal_id)`, with the proposal's
   latest event timestamp and frozen plan quantity in each listing.
 - Added copy-only `predictions shadow run` and `predictions shadow replay` recipes.
@@ -60,6 +68,13 @@ Review-hardening RED-to-GREEN regressions additionally cover:
 - arbitrary experiment P&L over a valid zero-posting terminal, missing/extra ledger postings,
   posting hash/index tamper, and a hash-valid but noncanonical trailing reconciliation event;
 - canonical negative UNWOUND and zero EXPIRED ledger bundles, with exact JSON serialization.
+- a hash-valid conserved ledger generated from fills absent from the visible event chain;
+- missing, extra, stale-hash, index-tampered, and hash-valid mutated frozen fee evidence;
+- reconciliation and experiment index mutations across identity and cutoff columns, including a
+  decoded duplicate proposal row hidden under another indexed proposal and a cutoff-safe decoded
+  experiment hidden behind future indexed timestamps;
+- a cutoff-safe `first_leg_simulated` prefix with its exact visible acquisition journal and no
+  reconciliation or paper P&L.
 
 The final tests cover strict/frozen/UTC/finite model behavior; nonnegative and coherent counts;
 sorted mappings and tuples; more-than-20 ordering with timestamp ties; empty databases; plan,
@@ -71,8 +86,8 @@ served-asset vocabulary checks.
 
 ## Fresh verification
 
-- Focused dashboard/model/server/store tests — `148 passed in 4.02s`.
-- Final prediction-market suite — `914 passed in 20.08s`.
+- Focused dashboard/model/server/store/ledger tests — `234 passed in 5.94s`.
+- Final prediction-market suite — `933 passed in 20.60s`.
 - `ruff check .` — clean.
 - `ruff format --check .` — `255 files already formatted`.
 - `git diff --check` — clean.
@@ -81,12 +96,14 @@ served-asset vocabulary checks.
 
 - `src/polytrading/predictions/dashboard.py`
 - `src/polytrading/predictions/dashboard_models.py`
+- `src/polytrading/predictions/shadow_ledger.py`
 - `src/polytrading/predictions/storage/store.py`
 - `src/polytrading/predictions/web_assets/app.css`
 - `src/polytrading/predictions/web_assets/app.js`
 - `src/polytrading/predictions/web_assets/index.html`
 - `tests/predictions/test_dashboard.py`
 - `tests/predictions/test_dashboard_models.py`
+- `tests/predictions/test_shadow_ledger.py`
 - `tests/predictions/test_store.py`
 - `.superpowers/sdd/2026-08-24-prediction-market-shadow-engine/progress.md`
 - `.superpowers/sdd/2026-08-24-prediction-market-shadow-engine/task-9-report.md`

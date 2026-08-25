@@ -110,9 +110,10 @@ def postings_for_events(
     event-time evidence supplied to this pure function.
     """
     plan = _revalidate_record(plan, ShadowPlan)
-    events = _validated_events(plan, events)
+    events = _validated_events(plan, events, require_terminal=False)
     fees = _validated_fees(plan, fees)
-    terminal = _terminal_event(events)
+    terminals = [event for event in events if event.to_state in _TERMINAL_STATES]
+    terminal = _terminal_event(events) if terminals else None
 
     postings: list[LedgerPosting] = []
     acquisition_costs: dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
@@ -180,7 +181,7 @@ def postings_for_events(
         acquisition_quantities,
         sale_quantities,
     )
-    if terminal.to_state is ShadowState.COMPLETE:
+    if terminal is not None and terminal.to_state is ShadowState.COMPLETE:
         quantity = next(iter(acquisition_quantities.values()))
         payout = quantity * plan.minimum_basket_payout
         total_cost = sum(acquisition_costs.values(), Decimal("0"))
@@ -204,7 +205,7 @@ def postings_for_events(
                 detail=f"close completed position leg {leg_index}",
             )
         _post_residual(postings, terminal, payout - total_cost)
-    elif terminal.to_state in {ShadowState.UNWOUND, ShadowState.EXPIRED}:
+    elif terminal is not None and terminal.to_state in {ShadowState.UNWOUND, ShadowState.EXPIRED}:
         aggregate_residual = Decimal("0")
         for leg_index in sorted(acquisition_costs):
             residual = acquisition_costs[leg_index] - sale_proceeds[leg_index]
@@ -436,7 +437,9 @@ def reconciled_event_for(
     return ShadowEvent(event_id=event_id, **fields)
 
 
-def _validated_events(plan: ShadowPlan, value: object) -> tuple[ShadowEvent, ...]:
+def _validated_events(
+    plan: ShadowPlan, value: object, *, require_terminal: bool = True
+) -> tuple[ShadowEvent, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
         raise ValueError("events must be a non-empty sequence")
     events = tuple(_revalidate_record(event, ShadowEvent) for event in value)
@@ -445,7 +448,8 @@ def _validated_events(plan: ShadowPlan, value: object) -> tuple[ShadowEvent, ...
     if len({event.event_id for event in events}) != len(events):
         raise ValueError("event identities must be unique")
     derive_current_state(events)
-    _terminal_event(events)
+    if require_terminal:
+        _terminal_event(events)
     return events
 
 
@@ -502,7 +506,7 @@ def _validated_fees(plan: ShadowPlan, value: object) -> dict[int, PredictionFeeR
 def _validate_fill_lifecycle(
     plan: ShadowPlan,
     events: Sequence[ShadowEvent],
-    terminal: ShadowEvent,
+    terminal: ShadowEvent | None,
     buys: Mapping[int, Decimal],
     sells: Mapping[int, Decimal],
 ) -> None:
@@ -518,7 +522,9 @@ def _validate_fill_lifecycle(
         (event for event in events if event.to_state is ShadowState.FIRST_LEG_SIMULATED), None
     )
     if first_event is None:
-        raise ValueError("event chain must contain a first-leg simulation")
+        if buys or sells:
+            raise ValueError("confirmed fills require a first-leg simulation")
+        return
     first_leg_index = min(plan.legs, key=lambda leg: leg.sequence_position).leg_index
     if any(fill.side != "buy" or fill.leg_index != first_leg_index for fill in first_event.fills):
         raise ValueError("first-leg event may only confirm a buy of the first planned leg")
@@ -532,7 +538,9 @@ def _validate_fill_lifecycle(
         or first_event.quantity_filled != first_event.fills[0].quantity
     ):
         raise ValueError("first-leg event metadata must match its structured fill")
-    if any(fill.side == "buy" and fill.leg_index == first_leg_index for fill in terminal.fills):
+    if terminal is not None and any(
+        fill.side == "buy" and fill.leg_index == first_leg_index for fill in terminal.fills
+    ):
         raise ValueError("terminal buys must be subsequent planned legs, not the first leg")
     if set(sells) - set(buys):
         raise ValueError("sell fills must reference confirmed buy inventory")
@@ -540,6 +548,8 @@ def _validate_fill_lifecycle(
     acquired_positions = {execution_positions[index] for index in buys}
     if acquired_positions and acquired_positions != set(range(max(acquired_positions) + 1)):
         raise ValueError("confirmed buys must follow a contiguous planned execution prefix")
+    if terminal is None:
+        return
     if terminal.to_state is ShadowState.COMPLETE:
         if sells or set(buys) != {leg.leg_index for leg in plan.legs}:
             raise ValueError("complete event stream must buy every leg and contain no sells")

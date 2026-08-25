@@ -325,6 +325,29 @@ def test_latest_fee_rate_as_of_handles_a_venue_wide_null_market_id(tmp_path: Pat
     assert store.latest_fee_rate_as_of(PredictionVenue.POLYMARKET, "some-market", NOW) is None
 
 
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("venue", PredictionVenue.KALSHI.value),
+        ("market_id", "tampered-market"),
+        ("observed_at", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_verified_fee_rate_rejects_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"fee-{column}.duckdb")
+    rate = fee_rate()
+    store.append_fee_rate(rate)
+    store._connection.execute(
+        f"UPDATE prediction_fee_rates SET {column} = ? WHERE record_hash IS NOT NULL",
+        [tampered],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_fee_rate_by_source_hash(rate.venue, rate.market_id, rate.source_hash, NOW)
+
+
 def test_evidence_counts_as_of_sums_every_table(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     store.append_raw(raw_envelope())
@@ -853,6 +876,29 @@ def test_verified_reconciliations_return_every_row_in_order_and_reject_tamper(
         store.verified_shadow_reconciliations_for_proposal(earliest.proposal_id, NOW)
 
 
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("reconciliation_id", UUID("00000000-0000-0000-0000-00000000afff")),
+        ("proposal_id", UUID("00000000-0000-0000-0000-000000008fff")),
+        ("observed_at", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_verified_reconciliations_reject_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"reconciliation-{column}.duckdb")
+    reconciliation = shadow_reconciliation()
+    store.append_reconciliation(reconciliation)
+    store._connection.execute(
+        f"UPDATE shadow_reconciliations SET {column} = ? WHERE record_hash IS NOT NULL",
+        [tampered],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_shadow_reconciliations_for_proposal(reconciliation.proposal_id, NOW)
+
+
 def test_shadow_experiment_round_trip_is_idempotent_conflict_safe_and_family_agnostic(
     tmp_path: Path,
 ) -> None:
@@ -937,6 +983,34 @@ def test_verified_shadow_plan_and_experiment_reads_reject_record_json_tamper(
     )
     with pytest.raises(ConflictingRecordError, match="immutable record hash"):
         store.verified_shadow_experiments_for_proposal(plan.proposal_id, NOW)
+
+
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("experiment_id", UUID("00000000-0000-0000-0000-00000000efff")),
+        ("family_id", "tampered-family"),
+        ("proposal_id", UUID("00000000-0000-0000-0000-000000008fff")),
+        ("scenario_id", "tampered-scenario"),
+        ("terminal_state", ShadowState.EXPIRED.value),
+        ("reconciled", False),
+        ("as_of", NOW + timedelta(seconds=1)),
+        ("observed_at", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_verified_experiments_reject_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"experiment-{column}.duckdb")
+    experiment = shadow_experiment()
+    store.append_shadow_experiment(experiment)
+    store._connection.execute(
+        f"UPDATE shadow_experiments SET {column} = ? WHERE experiment_id = ?",
+        [tampered, experiment.experiment_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_shadow_experiments_as_of(NOW)
 
 
 @pytest.mark.parametrize(

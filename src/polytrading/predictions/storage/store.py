@@ -73,6 +73,38 @@ def _verified_record[RecordT: BaseModel](
     return record
 
 
+def _verified_shadow_experiments(rows: list[tuple[Any, ...]]) -> tuple[ShadowExperiment, ...]:
+    records: list[ShadowExperiment] = []
+    for row in rows:
+        record = _verified_record((row[8], row[9]), ShadowExperiment, "shadow experiment")
+        if record is None:
+            continue
+        indexed = (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            _utc_from_epoch_us(row[6]),
+            _utc_from_epoch_us(row[7]),
+        )
+        decoded = (
+            record.experiment_id,
+            record.family_id,
+            record.proposal_id,
+            record.scenario_id,
+            record.terminal_state.value,
+            record.reconciled,
+            record.as_of,
+            record.observed_at,
+        )
+        if indexed != decoded:
+            raise ConflictingRecordError("stored shadow experiment indexed columns do not match")
+        records.append(record)
+    return tuple(sorted(records, key=lambda record: (record.observed_at, record.experiment_id)))
+
+
 class PredictionMarketStore:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self._connection = duckdb.connect(str(path), read_only=read_only)
@@ -724,18 +756,42 @@ class PredictionMarketStore:
         source_hash: str,
         as_of: datetime,
     ) -> PredictionFeeRate | None:
-        row = self._connection.execute(
+        rows = self._connection.execute(
             """
-            SELECT record_json, record_hash FROM prediction_fee_rates
-            WHERE venue = ? AND market_id IS NOT DISTINCT FROM ?
-              AND observed_at <= ?
+            SELECT venue, market_id, epoch_us(observed_at), record_json, record_hash
+            FROM prediction_fee_rates
+            WHERE (
+                    (venue = ? AND market_id IS NOT DISTINCT FROM ?)
+                    OR (
+                        json_extract_string(record_json, '$.venue') = ?
+                        AND json_extract_string(record_json, '$.market_id')
+                            IS NOT DISTINCT FROM ?
+                    )
+                  )
+              AND (
+                    observed_at <= ?
+                    OR CAST(
+                        json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
+                    ) <= ?
+                  )
               AND json_extract_string(record_json, '$.source_hash') = ?
             ORDER BY observed_at DESC
-            LIMIT 1
             """,
-            [venue.value, market_id, as_of, source_hash],
-        ).fetchone()
-        return _verified_record(row, PredictionFeeRate, "fee rate")
+            [venue.value, market_id, venue.value, market_id, as_of, as_of, source_hash],
+        ).fetchall()
+        records: list[PredictionFeeRate] = []
+        for row in rows:
+            record = _verified_record((row[3], row[4]), PredictionFeeRate, "fee rate")
+            if record is None:
+                continue
+            indexed = (row[0], row[1], _utc_from_epoch_us(row[2]))
+            decoded = (record.venue.value, record.market_id, record.observed_at)
+            if indexed != decoded:
+                raise ConflictingRecordError("stored fee rate indexed columns do not match")
+            records.append(record)
+        if not records:
+            return None
+        return max(records, key=lambda record: record.observed_at)
 
     def existing_candidate_ids(self) -> frozenset[UUID]:
         """Every ``candidate_id`` already persisted, with no ``as_of`` cutoff.
@@ -1118,17 +1174,43 @@ class PredictionMarketStore:
     ) -> tuple[ShadowReconciliation, ...]:
         rows = self._connection.execute(
             """
-            SELECT record_json, record_hash FROM shadow_reconciliations
-            WHERE proposal_id = ? AND observed_at <= ?
+            SELECT reconciliation_id, proposal_id, epoch_us(observed_at),
+                   record_json, record_hash
+            FROM shadow_reconciliations
+            WHERE (
+                    proposal_id = ?
+                    OR json_extract_string(record_json, '$.proposal_id') = ?
+                  )
+              AND (
+                    observed_at <= ?
+                    OR CAST(
+                        json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
+                    ) <= ?
+                  )
             ORDER BY observed_at, reconciliation_id
             """,
-            [proposal_id, as_of],
+            [proposal_id, str(proposal_id), as_of, as_of],
         ).fetchall()
+        records: list[ShadowReconciliation] = []
+        for row in rows:
+            record = _verified_record(
+                (row[3], row[4]), ShadowReconciliation, "shadow reconciliation"
+            )
+            if record is None:
+                continue
+            indexed = (row[0], row[1], _utc_from_epoch_us(row[2]))
+            decoded = (
+                record.reconciliation_id,
+                record.proposal_id,
+                record.observed_at,
+            )
+            if indexed != decoded:
+                raise ConflictingRecordError(
+                    "stored shadow reconciliation indexed columns do not match"
+                )
+            records.append(record)
         return tuple(
-            record
-            for row in rows
-            if (record := _verified_record(row, ShadowReconciliation, "shadow reconciliation"))
-            is not None
+            sorted(records, key=lambda record: (record.observed_at, record.reconciliation_id))
         )
 
     def trial_family_by_id(self, family_id: str, as_of: datetime) -> TrialFamily | None:
@@ -1180,34 +1262,48 @@ class PredictionMarketStore:
     def verified_shadow_experiments_as_of(self, as_of: datetime) -> tuple[ShadowExperiment, ...]:
         rows = self._connection.execute(
             """
-            SELECT record_json, record_hash FROM shadow_experiments
-            WHERE as_of <= ? AND observed_at <= ?
+            SELECT experiment_id, family_id, proposal_id, scenario_id, terminal_state,
+                   reconciled, epoch_us(as_of), epoch_us(observed_at), record_json, record_hash
+            FROM shadow_experiments
+            WHERE (as_of <= ? AND observed_at <= ?)
+               OR (
+                    CAST(json_extract_string(record_json, '$.as_of') AS TIMESTAMPTZ) <= ?
+                    AND CAST(
+                        json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
+                    ) <= ?
+                  )
             ORDER BY observed_at, experiment_id
             """,
-            [as_of, as_of],
+            [as_of, as_of, as_of, as_of],
         ).fetchall()
-        return tuple(
-            record
-            for row in rows
-            if (record := _verified_record(row, ShadowExperiment, "shadow experiment")) is not None
-        )
+        return _verified_shadow_experiments(rows)
 
     def verified_shadow_experiments_for_proposal(
         self, proposal_id: UUID, as_of: datetime
     ) -> tuple[ShadowExperiment, ...]:
         rows = self._connection.execute(
             """
-            SELECT record_json, record_hash FROM shadow_experiments
-            WHERE proposal_id = ? AND as_of <= ? AND observed_at <= ?
+            SELECT experiment_id, family_id, proposal_id, scenario_id, terminal_state,
+                   reconciled, epoch_us(as_of), epoch_us(observed_at), record_json, record_hash
+            FROM shadow_experiments
+            WHERE (
+                    proposal_id = ?
+                    OR json_extract_string(record_json, '$.proposal_id') = ?
+                  )
+              AND (
+                    (as_of <= ? AND observed_at <= ?)
+                    OR (
+                        CAST(json_extract_string(record_json, '$.as_of') AS TIMESTAMPTZ) <= ?
+                        AND CAST(
+                            json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
+                        ) <= ?
+                    )
+                  )
             ORDER BY observed_at, experiment_id
             """,
-            [proposal_id, as_of, as_of],
+            [proposal_id, str(proposal_id), as_of, as_of, as_of, as_of],
         ).fetchall()
-        return tuple(
-            record
-            for row in rows
-            if (record := _verified_record(row, ShadowExperiment, "shadow experiment")) is not None
-        )
+        return _verified_shadow_experiments(rows)
 
     def shadow_experiments_for_family(
         self, family_id: str, as_of: datetime

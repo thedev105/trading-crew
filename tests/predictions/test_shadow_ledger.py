@@ -226,6 +226,22 @@ def test_complete_lifecycle_posts_exact_fees_floor_and_hand_computed_pnl() -> No
     assert ledger.proposal_paper_pnl(postings, reconciliation, events) == Decimal("0.172")
 
 
+def test_postings_for_events_reconstructs_a_visible_first_leg_prefix() -> None:
+    """Dropping the future terminal must retain only the hand-derived first-leg journal."""
+    ledger = _ledger()
+    events = _events(
+        ShadowState.UNWOUND,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(0, "sell", "0.30"),),
+    )
+
+    postings = ledger.postings_for_events(_plan(), events[:5], _fees())
+
+    assert {posting.event_id for posting in postings} == {events[4].event_id}
+    assert sum((posting.debit_usd for posting in postings), Decimal("0")) == Decimal("0.808")
+    assert sum((posting.credit_usd for posting in postings), Decimal("0")) == Decimal("0.808")
+
+
 @pytest.mark.parametrize(
     ("source_state", "target_state"),
     tuple(

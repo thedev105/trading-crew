@@ -169,8 +169,13 @@ def append_plan_and_events(
     store: PredictionMarketStore,
     plan: ShadowPlan,
     events: tuple[ShadowEvent, ...],
+    *,
+    append_fees: bool = True,
 ) -> None:
     store.append_shadow_plan(plan)
+    if append_fees:
+        for fee in shadow_fees(plan).values():
+            store.append_fee_rate(fee)
     for event in events:
         store.append_shadow_event(event)
 
@@ -241,7 +246,26 @@ def reconciled_execution_events(
     terminal_at: datetime,
 ) -> tuple[ShadowEvent, ...]:
     events = list(shadow_events(plan, terminal_state, terminal_at=terminal_at))
-    if terminal_state is ShadowState.UNWOUND:
+    if terminal_state is ShadowState.COMPLETE:
+        first_buy = ShadowFill(
+            leg_index=0,
+            side="buy",
+            price_levels=((Decimal("0.40"), Decimal("2")),),
+            quantity=Decimal("2"),
+        )
+        second_buy = ShadowFill(
+            leg_index=1,
+            side="buy",
+            price_levels=((Decimal("0.50"), Decimal("2")),),
+            quantity=Decimal("2"),
+        )
+        events[4] = events[4].model_copy(
+            update={"fills": (first_buy,), "quantity_filled": Decimal("2"), "leg_index": 0}
+        )
+        events[5] = events[5].model_copy(
+            update={"fills": (second_buy,), "quantity_filled": Decimal("2"), "leg_index": 1}
+        )
+    elif terminal_state is ShadowState.UNWOUND:
         buy = ShadowFill(
             leg_index=0,
             side="buy",
@@ -302,9 +326,11 @@ def append_reconciled_bundle(
     return events, postings, reconciliation, experiment
 
 
-def persisted_event_hash(event: ShadowEvent) -> str:
+def persisted_record_hash(
+    record: PredictionFeeRate | ShadowEvent | ShadowReconciliation,
+) -> str:
     canonical = json.dumps(
-        event.model_dump(mode="json"),
+        record.model_dump(mode="json"),
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -465,16 +491,19 @@ def test_snapshot_shadow_summary_uses_each_cutoff_safe_event_derived_state(
             proposal_id=UUID(int=index),
             observed_at=NOW - timedelta(minutes=20 + index),
         )
-        append_plan_and_events(
-            store,
-            plan,
-            shadow_events(
+        events = tuple(
+            event.model_copy(update={"scenario_id": f"scenario-{index}"})
+            if event.sequence >= 4
+            else event
+            for event in reconciled_execution_events(
                 plan,
                 state,
                 terminal_at=NOW - timedelta(minutes=index),
-                scenario_id=f"scenario-{index}",
-            ),
+            )
         )
+        append_plan_and_events(store, plan, events)
+        for posting in postings_for_events(plan, events, shadow_fees(plan)):
+            store.append_ledger_posting(posting)
 
     summary = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW).shadow
 
@@ -629,6 +658,147 @@ def test_snapshot_shadow_rejects_arbitrary_experiment_pnl_with_zero_postings(
         PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
 
 
+def test_snapshot_shadow_rejects_a_hash_valid_ledger_not_derived_from_visible_fills(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    fabricated_events = list(shadow_events(plan, ShadowState.EXPIRED, terminal_at=NOW))
+    buy = ShadowFill(
+        leg_index=0,
+        side="buy",
+        price_levels=((Decimal("0.40"), Decimal("10")),),
+        quantity=Decimal("10"),
+    )
+    fabricated_events[4] = fabricated_events[4].model_copy(
+        update={"fills": (buy,), "quantity_filled": Decimal("10"), "leg_index": 0}
+    )
+    fabricated_events_tuple = tuple(fabricated_events)
+    fees = shadow_fees(plan)
+    postings = postings_for_events(plan, fabricated_events_tuple, fees)
+    reconciliation = reconcile_proposal(plan, fabricated_events_tuple, postings, fees)
+    visible_events = tuple(
+        event.model_copy(update={"fills": (), "quantity_filled": None, "leg_index": None})
+        if event.sequence == 4
+        else event
+        for event in fabricated_events_tuple
+    )
+    reconciled_event = reconciled_event_for(plan, visible_events, reconciliation)
+    append_plan_and_events(store, plan, (*visible_events, reconciled_event))
+    for posting in postings:
+        store.append_ledger_posting(posting)
+    store.append_reconciliation(reconciliation)
+    store.append_shadow_experiment(
+        shadow_experiment(
+            plan,
+            observed_at=reconciliation.observed_at,
+            terminal_state=ShadowState.RECONCILED,
+            paper_pnl_usd=proposal_paper_pnl(
+                postings, reconciliation, (*visible_events, reconciled_event)
+            ),
+            reconciled=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="ledger postings do not match visible fills"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_rejects_missing_extra_or_tampered_frozen_fee_evidence(
+    tmp_path: Path,
+) -> None:
+    missing_store = PredictionMarketStore(tmp_path / "missing.duckdb")
+    missing_plan = shadow_plan()
+    append_reconciled_bundle(missing_store, missing_plan, ShadowState.EXPIRED, terminal_at=NOW)
+    missing_store._connection.execute(
+        "DELETE FROM prediction_fee_rates WHERE venue = ?",
+        [PredictionVenue.KALSHI.value],
+    )
+    with pytest.raises(ValueError, match="frozen fee evidence"):
+        PredictionDashboardBuilder(missing_store, tmp_path / "missing.duckdb").build(NOW)
+
+    extra_store = PredictionMarketStore(tmp_path / "extra-fee.duckdb")
+    extra_plan = shadow_plan(frozen_hashes=("a" * 64, "b" * 64, "c" * 64))
+    append_reconciled_bundle(extra_store, extra_plan, ShadowState.EXPIRED, terminal_at=NOW)
+    first_leg = extra_plan.legs[0]
+    extra_store.append_fee_rate(
+        shadow_fees(extra_plan)[0].model_copy(
+            update={
+                "observed_at": extra_plan.information_cutoff - timedelta(seconds=1),
+                "source_hash": "c" * 64,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="frozen fee evidence"):
+        PredictionDashboardBuilder(extra_store, tmp_path / "extra-fee.duckdb").build(NOW)
+
+    tampered_store = PredictionMarketStore(tmp_path / "tampered-fee.duckdb")
+    tampered_plan = shadow_plan()
+    append_reconciled_bundle(tampered_store, tampered_plan, ShadowState.EXPIRED, terminal_at=NOW)
+    tampered_store._connection.execute(
+        "UPDATE prediction_fee_rates SET market_id = ? WHERE venue = ?",
+        ["other-market", first_leg.venue.value],
+    )
+    with pytest.raises(ValueError, match="indexed columns"):
+        PredictionDashboardBuilder(tampered_store, tmp_path / "tampered-fee.duckdb").build(NOW)
+
+    hash_store = PredictionMarketStore(tmp_path / "fee-hash.duckdb")
+    hash_plan = shadow_plan()
+    append_reconciled_bundle(hash_store, hash_plan, ShadowState.EXPIRED, terminal_at=NOW)
+    hash_store._connection.execute(
+        "UPDATE prediction_fee_rates SET record_json = ? WHERE venue = ?",
+        [
+            shadow_fees(hash_plan)[0]
+            .model_copy(update={"maker_rate": Decimal("0.25")})
+            .model_dump_json(),
+            PredictionVenue.POLYMARKET.value,
+        ],
+    )
+    with pytest.raises(ValueError, match="immutable record hash"):
+        PredictionDashboardBuilder(hash_store, tmp_path / "fee-hash.duckdb").build(NOW)
+
+    mutated_store = PredictionMarketStore(tmp_path / "mutated-fee.duckdb")
+    mutated_plan = shadow_plan()
+    append_reconciled_bundle(mutated_store, mutated_plan, ShadowState.UNWOUND, terminal_at=NOW)
+    mutated_fee = shadow_fees(mutated_plan)[0].model_copy(update={"taker_rate": Decimal("0.10")})
+    mutated_store._connection.execute(
+        "UPDATE prediction_fee_rates SET record_json = ?, record_hash = ? WHERE venue = ?",
+        [
+            mutated_fee.model_dump_json(),
+            persisted_record_hash(mutated_fee),
+            PredictionVenue.POLYMARKET.value,
+        ],
+    )
+    with pytest.raises(ValueError, match="ledger postings do not match visible fills"):
+        PredictionDashboardBuilder(mutated_store, tmp_path / "mutated-fee.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_accepts_a_cutoff_safe_first_leg_ledger_prefix(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan(observed_at=NOW - timedelta(minutes=10))
+    execution_events = reconciled_execution_events(
+        plan,
+        ShadowState.UNWOUND,
+        terminal_at=NOW + timedelta(seconds=1),
+    )
+    fees = shadow_fees(plan)
+    all_postings = postings_for_events(plan, execution_events, fees)
+    append_plan_and_events(store, plan, execution_events)
+    for posting in all_postings:
+        store.append_ledger_posting(posting)
+    reconciliation = reconcile_proposal(plan, execution_events, all_postings, fees)
+    store.append_reconciliation(reconciliation)
+
+    listing = (
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb")
+        .build(NOW)
+        .shadow.latest[0]
+    )
+
+    assert listing.current_state is ShadowState.FIRST_LEG_SIMULATED
+    assert listing.paper_pnl is None
+
+
 def test_snapshot_shadow_rejects_missing_or_extra_ledger_postings(tmp_path: Path) -> None:
     missing_store = PredictionMarketStore(tmp_path / "missing.duckdb")
     plan = shadow_plan()
@@ -639,7 +809,7 @@ def test_snapshot_shadow_rejects_missing_or_extra_ledger_postings(tmp_path: Path
         terminal_at=NOW,
         append_postings=False,
     )
-    with pytest.raises(ValueError, match="reconciliation identity"):
+    with pytest.raises(ValueError, match="ledger postings do not match visible fills"):
         PredictionDashboardBuilder(missing_store, tmp_path / "missing.duckdb").build(NOW)
 
     extra_store = PredictionMarketStore(tmp_path / "extra.duckdb")
@@ -653,7 +823,7 @@ def test_snapshot_shadow_rejects_missing_or_extra_ledger_postings(tmp_path: Path
     extra_store.append_ledger_posting(
         postings[0].model_copy(update={"posting_id": UUID(int=999999)})
     )
-    with pytest.raises(ValueError, match=r"not conserved|posting identity"):
+    with pytest.raises(ValueError, match="ledger postings do not match visible fills"):
         PredictionDashboardBuilder(extra_store, tmp_path / "extra.duckdb").build(NOW)
 
 
@@ -705,7 +875,7 @@ def test_snapshot_shadow_rejects_a_hash_valid_noncanonical_reconciled_event(
     reconciled = events[-1].model_copy(update={"detail": "noncanonical reconciliation detail"})
     store._connection.execute(
         "UPDATE shadow_events SET record_json = ?, record_hash = ? WHERE event_id = ?",
-        [reconciled.model_dump_json(), persisted_event_hash(reconciled), reconciled.event_id],
+        [reconciled.model_dump_json(), persisted_record_hash(reconciled), reconciled.event_id],
     )
 
     with pytest.raises(ValueError, match="not canonical"):
@@ -718,27 +888,17 @@ def test_snapshot_shadow_does_not_leak_future_reconciliation_or_experiment(
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     plan = shadow_plan(observed_at=NOW - timedelta(minutes=10))
     reconciled_at = NOW + timedelta(seconds=1)
-    events = shadow_events(
+    events, _, _, _ = append_reconciled_bundle(
+        store,
         plan,
         ShadowState.COMPLETE,
-        terminal_at=NOW,
-        reconciled_at=reconciled_at,
-    )
-    append_plan_and_events(store, plan, events)
-    store.append_reconciliation(shadow_reconciliation(plan, events[-2], observed_at=reconciled_at))
-    store.append_shadow_experiment(
-        shadow_experiment(
-            plan,
-            observed_at=reconciled_at,
-            terminal_state=ShadowState.RECONCILED,
-            paper_pnl_usd=Decimal("4.00"),
-            reconciled=True,
-        )
+        terminal_at=reconciled_at,
     )
 
     summary = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW).shadow
 
-    assert summary.by_terminal_state == {"complete": 1}
+    assert events[-2].occurred_at == reconciled_at
+    assert summary.by_terminal_state == {"first_leg_simulated": 1}
     assert summary.reconciled_count == 0
     assert summary.reconciled_paper_pnl_usd == Decimal("0")
     assert summary.latest[0].paper_pnl is None
@@ -852,26 +1012,66 @@ def test_snapshot_shadow_fails_closed_on_multiple_reconciliations_or_experiments
         PredictionDashboardBuilder(experiment_store, tmp_path / "experiments.duckdb").build(NOW)
 
 
+def test_snapshot_shadow_cannot_hide_duplicate_result_rows_with_index_tamper(
+    tmp_path: Path,
+) -> None:
+    reconciliation_store = PredictionMarketStore(tmp_path / "hidden-reconciliation.duckdb")
+    plan = shadow_plan()
+    _, _, reconciliation, _ = append_reconciled_bundle(
+        reconciliation_store,
+        plan,
+        ShadowState.EXPIRED,
+        terminal_at=NOW,
+    )
+    duplicate = reconciliation.model_copy(update={"reconciliation_id": UUID(int=777001)})
+    reconciliation_store.append_reconciliation(duplicate)
+    reconciliation_store._connection.execute(
+        "UPDATE shadow_reconciliations SET proposal_id = ? WHERE reconciliation_id = ?",
+        [UUID(int=777002), duplicate.reconciliation_id],
+    )
+    with pytest.raises(ValueError, match=r"indexed columns|multiple shadow reconciliations"):
+        PredictionDashboardBuilder(
+            reconciliation_store, tmp_path / "hidden-reconciliation.duckdb"
+        ).build(NOW)
+
+    experiment_store = PredictionMarketStore(tmp_path / "hidden-experiment.duckdb")
+    plan = shadow_plan()
+    _, _, _, experiment = append_reconciled_bundle(
+        experiment_store,
+        plan,
+        ShadowState.EXPIRED,
+        terminal_at=NOW,
+    )
+    experiment_store._connection.execute(
+        "UPDATE shadow_experiments SET as_of = ?, observed_at = ? WHERE experiment_id = ?",
+        [NOW + timedelta(seconds=1), NOW + timedelta(seconds=1), experiment.experiment_id],
+    )
+    with pytest.raises(ValueError, match="indexed columns"):
+        PredictionDashboardBuilder(experiment_store, tmp_path / "hidden-experiment.duckdb").build(
+            NOW
+        )
+
+
 def test_snapshot_shadow_fails_closed_on_inconsistent_reconciled_result_evidence(
     tmp_path: Path,
 ) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     plan = shadow_plan()
-    events = shadow_events(plan, ShadowState.COMPLETE, terminal_at=NOW, reconciled_at=NOW)
-    append_plan_and_events(store, plan, events)
-    store.append_reconciliation(
-        shadow_reconciliation(plan, events[-2], observed_at=NOW).model_copy(
-            update={"terminal_event_id": UUID(int=987)}
-        )
+    _, _, reconciliation, _ = append_reconciled_bundle(
+        store,
+        plan,
+        ShadowState.COMPLETE,
+        terminal_at=NOW,
     )
-    store.append_shadow_experiment(
-        shadow_experiment(
-            plan,
-            observed_at=NOW,
-            terminal_state=ShadowState.RECONCILED,
-            paper_pnl_usd=Decimal("12.00"),
-            reconciled=True,
-        )
+    inconsistent = reconciliation.model_copy(update={"terminal_event_id": UUID(int=987)})
+    store._connection.execute(
+        "UPDATE shadow_reconciliations SET record_json = ?, record_hash = ? "
+        "WHERE reconciliation_id = ?",
+        [
+            inconsistent.model_dump_json(),
+            persisted_record_hash(inconsistent),
+            reconciliation.reconciliation_id,
+        ],
     )
 
     with pytest.raises(ValueError, match="result evidence is inconsistent"):
@@ -914,7 +1114,7 @@ def test_snapshot_shadow_rejects_event_timestamp_index_cutoff_leakage(tmp_path: 
     future = events[-1].model_copy(update={"occurred_at": NOW + timedelta(seconds=1)})
     store._connection.execute(
         "UPDATE shadow_events SET record_json = ?, record_hash = ? WHERE event_id = ?",
-        [future.model_dump_json(), persisted_event_hash(future), future.event_id],
+        [future.model_dump_json(), persisted_record_hash(future), future.event_id],
     )
 
     with pytest.raises(ValueError, match="indexed columns"):
