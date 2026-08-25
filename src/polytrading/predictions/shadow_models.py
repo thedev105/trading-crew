@@ -10,7 +10,12 @@ from uuid import UUID, uuid5
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from polytrading.predictions.domain import PredictionRecord, PredictionVenue, Sha256
+from polytrading.predictions.domain import (
+    PredictionRecord,
+    PredictionVenue,
+    Sha256,
+    normalize_utc_timestamp,
+)
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
@@ -62,6 +67,15 @@ class ShadowLegPlan(PredictionRecord):
     limit_price_levels: tuple[tuple[Decimal, Decimal], ...]
     max_quantity: PositiveDecimal
 
+    @field_validator("limit_price_levels")
+    @classmethod
+    def _require_positive_limit_price_levels(
+        cls, value: tuple[tuple[Decimal, Decimal], ...]
+    ) -> tuple[tuple[Decimal, Decimal], ...]:
+        if not value or any(price <= 0 or size <= 0 for price, size in value):
+            raise ValueError("limit_price_levels must contain positive price and size pairs")
+        return value
+
 
 class ShadowPlan(PredictionRecord):
     schema_version: Literal[1]
@@ -97,6 +111,8 @@ class ShadowPlan(PredictionRecord):
 
     @model_validator(mode="after")
     def _require_consistent_plan(self) -> ShadowPlan:
+        if len({leg.leg_index for leg in self.legs}) != len(self.legs):
+            raise ValueError("leg_index values must be unique within a plan")
         if self.bottleneck_leg_index not in {leg.leg_index for leg in self.legs}:
             raise ValueError("bottleneck_leg_index must identify a leg in the plan")
         if {leg.sequence_position for leg in self.legs} != set(range(len(self.legs))):
@@ -136,6 +152,11 @@ class ShadowEvent(PredictionRecord):
     leg_index: int | None
     scenario_id: str | None
     fills: tuple[ShadowFill, ...] = ()
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _require_utc_occurred_at(cls, value: datetime) -> datetime:
+        return normalize_utc_timestamp(value)
 
     @model_validator(mode="after")
     def _require_valid_transition(self) -> ShadowEvent:

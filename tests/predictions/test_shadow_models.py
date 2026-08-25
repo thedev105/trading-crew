@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from itertools import product
 from uuid import UUID
@@ -155,6 +155,18 @@ def test_sequence_zero_event_must_start_discovered_without_a_previous_state() ->
         _event(to_state=ShadowState.PROOF_VALIDATED)
 
 
+def test_shadow_event_requires_a_timezone_aware_occurred_at() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        _event(occurred_at=datetime(2026, 8, 24, 12))
+
+
+def test_shadow_event_normalizes_occurred_at_to_utc() -> None:
+    event = _event(occurred_at=datetime(2026, 8, 24, 17, tzinfo=timezone(timedelta(hours=5))))
+
+    assert event.occurred_at == NOW
+    assert event.occurred_at.tzinfo is UTC
+
+
 def test_shadow_plan_freezes_required_execution_and_valuation_inputs() -> None:
     plan = _plan()
 
@@ -179,6 +191,14 @@ def test_shadow_plan_requires_leg_sequence_positions_to_be_a_permutation() -> No
         _plan(legs=(_leg(sequence_position=0), _leg(leg_index=1, sequence_position=0)))
 
 
+def test_shadow_plan_requires_unique_leg_indices() -> None:
+    with pytest.raises(ValidationError, match="leg_index"):
+        _plan(
+            bottleneck_leg_index=0,
+            legs=(_leg(leg_index=0), _leg(leg_index=0, sequence_position=1)),
+        )
+
+
 def test_shadow_plan_expires_after_observation() -> None:
     with pytest.raises(ValidationError, match="expires_at"):
         _plan(expires_at=NOW)
@@ -192,6 +212,21 @@ def test_shadow_plan_requires_sorted_unique_frozen_hashes() -> None:
 def test_shadow_plan_requires_positive_frozen_minimum_basket_payout() -> None:
     with pytest.raises(ValidationError):
         _plan(minimum_basket_payout=Decimal("0"))
+
+
+@pytest.mark.parametrize(
+    "limit_price_levels",
+    (
+        (),
+        ((Decimal("-0.40"), Decimal("1")),),
+        ((Decimal("0.40"), Decimal("-1")),),
+    ),
+)
+def test_shadow_leg_plan_rejects_empty_or_nonpositive_frozen_limit_levels(
+    limit_price_levels: tuple[tuple[Decimal, Decimal], ...],
+) -> None:
+    with pytest.raises(ValidationError, match="limit_price_levels"):
+        _leg(limit_price_levels=limit_price_levels)
 
 
 def test_shadow_fill_retains_structured_levels_and_requires_their_total_quantity() -> None:
