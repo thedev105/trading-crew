@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.economics_models import EconomicsResult
+from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.shadow_models import (
     ShadowEvent,
@@ -37,6 +38,9 @@ from tests.predictions.store_helpers import raw_envelope
 def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     tables = {row[0] for row in store._connection.execute("SHOW TABLES").fetchall()}
+    versions = store._connection.execute(
+        "SELECT version FROM schema_migrations ORDER BY version"
+    ).fetchall()
     store.close()
     assert {
         "prediction_raw_envelopes",
@@ -54,8 +58,11 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "shadow_events",
         "shadow_ledger_postings",
         "shadow_reconciliations",
+        "trial_families",
+        "shadow_experiments",
         "schema_migrations",
     } <= tables
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
     perpetual_futures_tables = {
         "raw_envelopes",
         "instrument_specs",
@@ -584,6 +591,123 @@ def test_shadow_events_enforce_proposal_sequence_integrity_and_cutoff_safe_order
         store.append_shadow_event(first.model_copy(update={"detail": "different detail"}))
 
 
+def test_trial_family_round_trip_supports_append_only_preregistration_versions(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = trial_family(preregistered_at=NOW - timedelta(hours=2))
+    late = trial_family(
+        hypothesis="The preregistered hypothesis was revised before another trial.",
+        preregistered_at=NOW,
+    )
+
+    assert store.append_trial_family(early) is True
+    assert store.append_trial_family(early) is False
+    assert store.append_trial_family(late) is True
+    assert store.trial_family_by_id(early.family_id, NOW - timedelta(hours=1)) == early
+    assert store.trial_family_by_id(early.family_id, NOW) == late
+    assert store.trial_family_by_id("missing-family", NOW) is None
+    with pytest.raises(ConflictingRecordError):
+        store.append_trial_family(early.model_copy(update={"hypothesis": "conflicting retry"}))
+
+
+def test_trial_families_as_of_returns_every_known_version_in_deterministic_order(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    second_id = trial_family(
+        family_id="z-family",
+        preregistered_at=NOW - timedelta(hours=1),
+    )
+    first_id = trial_family(
+        family_id="a-family",
+        preregistered_at=NOW - timedelta(hours=1),
+    )
+    future = trial_family(
+        family_id="future-family",
+        preregistered_at=NOW + timedelta(hours=1),
+    )
+    store.append_trial_family(second_id)
+    store.append_trial_family(future)
+    store.append_trial_family(first_id)
+
+    assert store.trial_families_as_of(NOW) == (first_id, second_id)
+    assert store.trial_families_as_of(NOW - timedelta(hours=2)) == ()
+
+
+def test_shadow_experiment_round_trip_is_idempotent_conflict_safe_and_family_agnostic(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    orphan = shadow_experiment(family_id="not-yet-registered")
+
+    assert store.append_shadow_experiment(orphan) is True
+    assert store.append_shadow_experiment(orphan) is False
+    assert store.shadow_experiments_for_family("not-yet-registered", NOW) == (orphan,)
+    with pytest.raises(ConflictingRecordError):
+        store.append_shadow_experiment(
+            orphan.model_copy(update={"scenario_id": "different-scenario"})
+        )
+
+
+def test_shadow_experiment_reads_keep_unknown_unreconciled_and_negative_pnl_rows(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    unknown = shadow_experiment(
+        experiment_id=UUID("00000000-0000-0000-0000-00000000e011"),
+        terminal_state=ShadowState.UNKNOWN,
+        paper_pnl_usd=None,
+        reconciled=False,
+        observed_at=NOW - timedelta(hours=2),
+        as_of=NOW - timedelta(hours=2),
+    )
+    losing = shadow_experiment(
+        experiment_id=UUID("00000000-0000-0000-0000-00000000e012"),
+        terminal_state=ShadowState.UNWOUND,
+        paper_pnl_usd=Decimal("-4.25"),
+        reconciled=True,
+        observed_at=NOW - timedelta(hours=1),
+        as_of=NOW - timedelta(hours=1),
+    )
+    future = shadow_experiment(
+        experiment_id=UUID("00000000-0000-0000-0000-00000000e013"),
+        terminal_state=ShadowState.EXPIRED,
+        paper_pnl_usd=Decimal("0"),
+        reconciled=True,
+        observed_at=NOW + timedelta(hours=1),
+        as_of=NOW + timedelta(hours=1),
+    )
+    future_knowledge = shadow_experiment(
+        experiment_id=UUID("00000000-0000-0000-0000-00000000e014"),
+        observed_at=NOW - timedelta(minutes=30),
+        as_of=NOW + timedelta(hours=1),
+    )
+    for experiment in (future, future_knowledge, losing, unknown):
+        store.append_shadow_experiment(experiment)
+
+    assert store.shadow_experiments_as_of(NOW) == (unknown, losing)
+    assert store.shadow_experiments_for_family(unknown.family_id, NOW) == (unknown, losing)
+    assert store.shadow_experiments_as_of(NOW - timedelta(hours=3)) == ()
+
+
+def test_experiment_registry_revalidates_unchecked_models_before_persistence(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    invalid_family = trial_family().model_copy(update={"venues": ()})
+    invalid_experiment = shadow_experiment().model_copy(
+        update={"paper_pnl_usd": Decimal("1"), "reconciled": False}
+    )
+
+    with pytest.raises(ValidationError):
+        store.append_trial_family(invalid_family)
+    with pytest.raises(ValidationError):
+        store.append_shadow_experiment(invalid_experiment)
+    assert store.trial_families_as_of(NOW) == ()
+    assert store.shadow_experiments_as_of(NOW) == ()
+
+
 def test_scan_report_shadow_candidate_requires_a_proof_id() -> None:
     with pytest.raises(ValidationError):
         scan_report(
@@ -687,3 +811,32 @@ def shadow_event(**overrides: object) -> ShadowEvent:
     }
     values.update(overrides)
     return ShadowEvent(**values)
+
+
+def trial_family(**overrides: object) -> TrialFamily:
+    values: dict[str, object] = {
+        "family_id": "cross-venue-equivalence-v1",
+        "hypothesis": "Equivalent contracts retain positive surplus after doubled costs.",
+        "preregistered_at": NOW,
+        "thresholds_json": '{"minimum_surplus_usd":"5.00","version":1}',
+        "venues": (PredictionVenue.KALSHI, PredictionVenue.POLYMARKET),
+        "registered_by": "research-operator@example.com",
+    }
+    values.update(overrides)
+    return TrialFamily(**values)
+
+
+def shadow_experiment(**overrides: object) -> ShadowExperiment:
+    values: dict[str, object] = {
+        "experiment_id": UUID("00000000-0000-0000-0000-00000000e001"),
+        "family_id": "cross-venue-equivalence-v1",
+        "proposal_id": UUID("00000000-0000-0000-0000-00000000e002"),
+        "scenario_id": "baseline",
+        "terminal_state": ShadowState.RECONCILED,
+        "paper_pnl_usd": Decimal("-2.50"),
+        "reconciled": True,
+        "as_of": NOW,
+        "observed_at": NOW,
+    }
+    values.update(overrides)
+    return ShadowExperiment(**values)

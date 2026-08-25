@@ -26,6 +26,7 @@ from polytrading.predictions.domain import (
     TradeRecord,
 )
 from polytrading.predictions.economics_models import ScanReport
+from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.shadow_ledger import LedgerPosting, ShadowReconciliation
@@ -401,6 +402,42 @@ class PredictionMarketStore:
             insert_params=[record.reconciliation_id, record.proposal_id, record.observed_at],
         )
 
+    def append_trial_family(self, record: TrialFamily) -> bool:
+        record = TrialFamily.model_validate(record.model_dump())
+        return self._append_keyed(
+            table="trial_families",
+            record=record,
+            label="trial family",
+            where="family_id = ? AND preregistered_at = ?",
+            key_params=[record.family_id, record.preregistered_at],
+            insert_columns="family_id, preregistered_at, record_json, record_hash",
+            insert_params=[record.family_id, record.preregistered_at],
+        )
+
+    def append_shadow_experiment(self, record: ShadowExperiment) -> bool:
+        record = ShadowExperiment.model_validate(record.model_dump())
+        return self._append_keyed(
+            table="shadow_experiments",
+            record=record,
+            label="shadow experiment",
+            where="experiment_id = ?",
+            key_params=[record.experiment_id],
+            insert_columns=(
+                "experiment_id, family_id, proposal_id, scenario_id, terminal_state, "
+                "reconciled, as_of, observed_at, record_json, record_hash"
+            ),
+            insert_params=[
+                record.experiment_id,
+                record.family_id,
+                record.proposal_id,
+                record.scenario_id,
+                record.terminal_state.value,
+                record.reconciled,
+                record.as_of,
+                record.observed_at,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -719,6 +756,53 @@ class PredictionMarketStore:
             [proposal_id, as_of],
         ).fetchone()
         return None if row is None else ShadowReconciliation.model_validate_json(row[0])
+
+    def trial_family_by_id(self, family_id: str, as_of: datetime) -> TrialFamily | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM trial_families
+            WHERE family_id = ? AND preregistered_at <= ?
+            ORDER BY preregistered_at DESC
+            LIMIT 1
+            """,
+            [family_id, as_of],
+        ).fetchone()
+        return None if row is None else TrialFamily.model_validate_json(row[0])
+
+    def trial_families_as_of(self, as_of: datetime) -> tuple[TrialFamily, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM trial_families
+            WHERE preregistered_at <= ?
+            ORDER BY preregistered_at, family_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(TrialFamily.model_validate_json(row[0]) for row in rows)
+
+    def shadow_experiments_as_of(self, as_of: datetime) -> tuple[ShadowExperiment, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_experiments
+            WHERE as_of <= ? AND observed_at <= ?
+            ORDER BY observed_at, experiment_id
+            """,
+            [as_of, as_of],
+        ).fetchall()
+        return tuple(ShadowExperiment.model_validate_json(row[0]) for row in rows)
+
+    def shadow_experiments_for_family(
+        self, family_id: str, as_of: datetime
+    ) -> tuple[ShadowExperiment, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_experiments
+            WHERE family_id = ? AND as_of <= ? AND observed_at <= ?
+            ORDER BY observed_at, experiment_id
+            """,
+            [family_id, as_of, as_of],
+        ).fetchall()
+        return tuple(ShadowExperiment.model_validate_json(row[0]) for row in rows)
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {
