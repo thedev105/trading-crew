@@ -90,14 +90,22 @@ dashboard summary/panel conventions (`dashboard_models.py`, `dashboard.py`, `web
   (non-empty prose from the planner), `max_incomplete_exposure_usd: Decimal (ge=0)`,
   `max_incomplete_loss_usd: Decimal (ge=0)`, `frozen_hashes: tuple[Sha256, ...]` (sorted
   unique: rule/fee/book/policy lineage), `policy_id: str`, `policy_version: str`,
-  `risk_policy_version: str`, `kill_conditions: tuple[str, ...]` (non-empty),
+  `risk_policy_version: str`, `minimum_basket_payout: Decimal (gt=0)` (the proof's frozen
+  per-unit conservative payout floor, required for deterministic ledger valuation),
+  `kill_conditions: tuple[str, ...]` (non-empty),
   `information_cutoff: datetime`, `observed_at: datetime`.
   Validators: `bottleneck_leg_index` within legs; leg `sequence_position`s are a permutation
   of 0..N-1; `expires_at > observed_at`.
+- `ShadowFill(PredictionRecord)`: immutable structured execution evidence retained for ledger and
+  replay: `leg_index: int (ge=0)`, `side: Literal["buy", "sell"]`,
+  `price_levels: tuple[tuple[Decimal, Decimal], ...]` (non-empty positive price/quantity pairs),
+  `quantity: Decimal (gt=0)`; validator requires quantity to equal the summed level quantities.
 - `ShadowEvent(PredictionRecord)`: `schema_version: Literal[1]`, `event_id: UUID`,
   `proposal_id: UUID`, `sequence: int (ge=0)`, `from_state: ShadowState | None` (None only for
   sequence 0), `to_state: ShadowState`, `occurred_at: datetime`, `detail: str`,
-  `quantity_filled: Decimal | None`, `leg_index: int | None`, `scenario_id: str | None`.
+  `quantity_filled: Decimal | None`, `leg_index: int | None`, `scenario_id: str | None`,
+  `fills: tuple[ShadowFill, ...] = ()`. Structured fills are authoritative machine-readable
+  execution evidence; `detail` remains prose and is never parsed by the ledger.
   Validator: `(from_state, to_state) in ALLOWED_TRANSITIONS` when from_state is not None;
   sequence 0 ⇒ from_state None and to_state DISCOVERED.
 - `derive_current_state(events: Sequence[ShadowEvent]) -> ShadowState` — pure; validates the
@@ -202,7 +210,8 @@ dashboard summary/panel conventions (`dashboard_models.py`, `dashboard.py`, `web
   expiry_window_seconds`, completion/cancellation/unwind prose naming the exact leg sequence,
   `max_incomplete_exposure_usd` = first-leg acquisition cost, `max_incomplete_loss_usd` =
   first-leg cost × economics_policy.partial_fill_reserve_rate + unwind spread reserve (document
-  formula), frozen_hashes = sorted unique of proof.source_hashes + book source_hashes,
+  formula), `minimum_basket_payout` = `proof.minimum_basket_payout`, frozen_hashes = sorted unique
+  of proof source hashes + book/fee source hashes + canonical economics/risk-policy hashes,
   kill_conditions ⊇ {"any participating rule_version change", "book evidence older than policy
   max age", "risk drawdown threshold breached"}.
 - Proposal id via `deterministic_proposal_id`; re-planning identical inputs is id-stable.
@@ -248,6 +257,9 @@ dashboard summary/panel conventions (`dashboard_models.py`, `dashboard.py`, `web
   - All legs filled at common quantity → COMPLETE.
   - Book provider returning None for a needed read → UNKNOWN (evidence gap is uncertainty,
     not success).
+- Every confirmed buy or unwind is captured as structured `ShadowFill` evidence on the event that
+  represents it. `FIRST_LEG_SIMULATED` contains the first acquisition; terminal events contain
+  subsequent confirmed acquisitions and any unwind sells. The ledger must never parse `detail`.
 - Determinism: identical inputs → identical event tuples (event_id = uuid5 over proposal_id +
   sequence + content).
 - [ ] TDD: baseline completes with hand-computed fills; each scenario produces its exact
@@ -269,7 +281,8 @@ dashboard summary/panel conventions (`dashboard_models.py`, `dashboard.py`, `web
   `event_id`, `venue: PredictionVenue | None`, `account: LedgerAccount`,
   `debit_usd: Decimal (ge=0)`, `credit_usd: Decimal (ge=0)` (exactly one non-zero),
   `occurred_at`, `detail: str`.
-- `postings_for_events(plan, events, fees) -> tuple[LedgerPosting, ...]` — pure translation:
+- `postings_for_events(plan, events, fees) -> tuple[LedgerPosting, ...]` — pure translation from
+  structured `ShadowEvent.fills` plus the plan's frozen `minimum_basket_payout`:
   a fill event posts position debit / cash credit (+ fee posting) on that leg's venue;
   UNWOUND posts the unwind loss; COMPLETE+resolution posts realized payout using the proof's
   minimum floor (conservative — document); every event's postings balance
