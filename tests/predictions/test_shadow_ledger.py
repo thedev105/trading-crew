@@ -156,6 +156,22 @@ def _events(
     )
 
 
+def _terminal_case(state: ShadowState) -> tuple[ShadowEvent, ...]:
+    if state is ShadowState.COMPLETE:
+        return _events(
+            state,
+            first_fills=(_fill(0, "buy", "0.40"),),
+            terminal_fills=(_fill(1, "buy", "0.50"),),
+        )
+    if state is ShadowState.UNWOUND:
+        return _events(
+            state,
+            first_fills=(_fill(0, "buy", "0.40"),),
+            terminal_fills=(_fill(0, "sell", "0.30"),),
+        )
+    return _events(state)
+
+
 def test_complete_lifecycle_posts_exact_fees_floor_and_hand_computed_pnl() -> None:
     """Wrong fill, fee, or floor arithmetic changes the hand-derived USD 0.172 result."""
     ledger = _ledger()
@@ -198,13 +214,169 @@ def test_complete_lifecycle_posts_exact_fees_floor_and_hand_computed_pnl() -> No
     assert payout[0].credit_usd == Decimal("0")
 
     reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+    assert reconciliation.terminal_event_id == events[-1].event_id
+    assert reconciliation.terminal_state is ShadowState.COMPLETE
     assert reconciliation.complete is True
     assert reconciliation.venues_reconciled == (
         PredictionVenue.KALSHI,
         PredictionVenue.POLYMARKET,
     )
     assert reconciliation.unexplained_difference_usd == Decimal("0")
-    assert ledger.proposal_paper_pnl(postings, reconciliation) == Decimal("0.172")
+    assert ledger.proposal_paper_pnl(postings, reconciliation, events) == Decimal("0.172")
+
+
+@pytest.mark.parametrize(
+    ("source_state", "target_state"),
+    tuple(
+        (source, target)
+        for source in (
+            ShadowState.COMPLETE,
+            ShadowState.UNWOUND,
+            ShadowState.EXPIRED,
+            ShadowState.UNKNOWN,
+        )
+        for target in (
+            ShadowState.COMPLETE,
+            ShadowState.UNWOUND,
+            ShadowState.EXPIRED,
+            ShadowState.UNKNOWN,
+        )
+    ),
+)
+def test_paper_pnl_binds_every_terminal_state_pair_without_cross_substitution(
+    source_state: ShadowState,
+    target_state: ShadowState,
+) -> None:
+    """Same-proposal/same-time event chains cannot substitute one terminal outcome for another."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    source_events = _terminal_case(source_state)
+    target_events = _terminal_case(target_state)
+    postings = ledger.postings_for_events(plan, source_events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, source_events, postings, fees)
+
+    if source_state is target_state:
+        expected = {
+            ShadowState.COMPLETE: Decimal("0.172"),
+            ShadowState.UNWOUND: Decimal("-0.214"),
+            ShadowState.EXPIRED: Decimal("0"),
+            ShadowState.UNKNOWN: None,
+        }[source_state]
+        assert ledger.proposal_paper_pnl(postings, reconciliation, target_events) == expected
+    else:
+        try:
+            result = ledger.proposal_paper_pnl(postings, reconciliation, target_events)
+        except ValueError:
+            pass
+        else:
+            assert result is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"terminal_event_id": UUID("70000000-0000-0000-0000-000000000088")},
+        {"terminal_state": ShadowState.EXPIRED},
+    ),
+)
+def test_paper_pnl_rejects_unchecked_terminal_reconciliation_copies(
+    update: dict[str, object],
+) -> None:
+    """Terminal binding fields participate in immutable reconciliation identity."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _terminal_case(ShadowState.COMPLETE)
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+
+    with pytest.raises((ValueError, ValidationError)):
+        ledger.proposal_paper_pnl(postings, reconciliation.model_copy(update=update), events)
+
+
+def test_reconciliation_model_rejects_nonterminal_state() -> None:
+    """A reconciliation can bind only an execution terminal, never an intermediate state."""
+    ledger = _ledger()
+    events = _terminal_case(ShadowState.EXPIRED)
+    reconciliation = ledger.reconcile_proposal(_plan(), events, (), _fees())
+
+    with pytest.raises(ValidationError, match="terminal_state"):
+        ledger.ShadowReconciliation.model_validate(
+            reconciliation.model_copy(
+                update={"terminal_state": ShadowState.FIRST_LEG_SIMULATED}
+            ).model_dump()
+        )
+
+
+@pytest.mark.parametrize("mutation", ("event_id", "occurred_at", "proposal_id"))
+def test_paper_pnl_rejects_terminal_event_identity_time_and_proposal_mismatch(
+    mutation: str,
+) -> None:
+    """Authoritative event identity, state time, and proposal must match reconciliation."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _terminal_case(ShadowState.COMPLETE)
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+    changed = list(events)
+    if mutation == "event_id":
+        changed[-1] = changed[-1].model_copy(
+            update={"event_id": UUID("70000000-0000-0000-0000-000000000087")}
+        )
+    elif mutation == "occurred_at":
+        changed[-1] = changed[-1].model_copy(
+            update={"occurred_at": changed[-1].occurred_at + timedelta(seconds=1)}
+        )
+    else:
+        changed = [
+            event.model_copy(update={"proposal_id": UUID("70000000-0000-0000-0000-000000000086")})
+            for event in changed
+        ]
+
+    with pytest.raises(ValueError):
+        ledger.proposal_paper_pnl(postings, reconciliation, tuple(changed))
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    (
+        (ShadowState.COMPLETE, Decimal("0.172")),
+        (ShadowState.UNWOUND, Decimal("-0.214")),
+        (ShadowState.EXPIRED, Decimal("0")),
+    ),
+)
+def test_paper_pnl_accepts_legal_optional_trailing_reconciled_event(
+    state: ShadowState, expected: Decimal
+) -> None:
+    """The orchestration state event may trail a matched non-UNKNOWN execution terminal."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _terminal_case(state)
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+    reconciled_event = _event(6, state, ShadowState.RECONCILED, event_id_suffix=85)
+
+    assert (
+        ledger.proposal_paper_pnl(postings, reconciliation, (*events, reconciled_event)) == expected
+    )
+
+
+def test_paper_pnl_requires_authoritative_events_and_matching_nonempty_postings() -> None:
+    """Only a no-fill reconciled terminal may legitimately calculate from an empty journal."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _terminal_case(ShadowState.COMPLETE)
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+
+    with pytest.raises(ValueError):
+        ledger.proposal_paper_pnl(postings, reconciliation, ())
+    with pytest.raises(ValueError):
+        ledger.proposal_paper_pnl((), reconciliation, events)
 
 
 def test_deterministic_identities_ignore_detail_and_event_evidence_hash_changes() -> None:
@@ -309,7 +481,7 @@ def test_unwound_lifecycle_closes_realized_loss_and_charges_both_taker_fees() ->
     assert opportunity[0].venue is None
     reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
     assert reconciliation.complete is True
-    assert ledger.proposal_paper_pnl(postings, reconciliation) == Decimal("-0.214")
+    assert ledger.proposal_paper_pnl(postings, reconciliation, events) == Decimal("-0.214")
 
 
 def test_expired_exposure_is_conservatively_closed_at_zero_payout() -> None:
@@ -330,7 +502,7 @@ def test_expired_exposure_is_conservatively_closed_at_zero_payout() -> None:
         Decimal("0"),
     ) == Decimal("0.80")
     assert reconciliation.complete is True
-    assert ledger.proposal_paper_pnl(postings, reconciliation) == Decimal("-0.808")
+    assert ledger.proposal_paper_pnl(postings, reconciliation, events) == Decimal("-0.808")
 
 
 def test_expired_without_exposure_reconciles_to_zero_without_zero_sided_postings() -> None:
@@ -349,7 +521,7 @@ def test_expired_without_exposure_reconciles_to_zero_without_zero_sided_postings
         PredictionVenue.KALSHI,
         PredictionVenue.POLYMARKET,
     )
-    assert ledger.proposal_paper_pnl(postings, reconciliation) == Decimal("0")
+    assert ledger.proposal_paper_pnl(postings, reconciliation, events) == Decimal("0")
 
 
 def test_unknown_retains_confirmed_exposure_but_never_yields_paper_pnl() -> None:
@@ -369,7 +541,7 @@ def test_unknown_retains_confirmed_exposure_but_never_yields_paper_pnl() -> None
     assert reconciliation.complete is False
     assert reconciliation.venues_reconciled == ()
     assert reconciliation.unexplained_difference_usd == Decimal("0")
-    assert ledger.proposal_paper_pnl(postings, reconciliation) is None
+    assert ledger.proposal_paper_pnl(postings, reconciliation, events) is None
 
 
 def test_conservation_is_checked_per_event_instead_of_only_globally() -> None:
@@ -470,6 +642,8 @@ def test_complete_reconciliation_model_requires_zero_unexplained_difference() ->
     values = {
         "reconciliation_id": UUID("70000000-0000-0000-0000-000000000093"),
         "proposal_id": PROPOSAL_ID,
+        "terminal_event_id": UUID("70000000-0000-0000-0000-000000000006"),
+        "terminal_state": ShadowState.COMPLETE,
         "venues_reconciled": (PredictionVenue.POLYMARKET,),
         "complete": True,
         "unexplained_difference_usd": Decimal("1"),
@@ -512,7 +686,7 @@ def test_paper_pnl_revalidates_every_reconciliation_identity_field(
     reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
 
     with pytest.raises((ValueError, ValidationError)):
-        ledger.proposal_paper_pnl(postings, reconciliation.model_copy(update=update))
+        ledger.proposal_paper_pnl(postings, reconciliation.model_copy(update=update), events)
 
 
 def test_paper_pnl_rejects_valid_balanced_postings_not_bound_to_reconciliation() -> None:
@@ -535,7 +709,7 @@ def test_paper_pnl_rejects_valid_balanced_postings_not_bound_to_reconciliation()
 
     ledger.verify_conservation(balanced_but_different)
     with pytest.raises(ValueError, match="reconciliation identity"):
-        ledger.proposal_paper_pnl(balanced_but_different, reconciliation)
+        ledger.proposal_paper_pnl(balanced_but_different, reconciliation, events)
 
 
 def test_paper_pnl_rejects_unchecked_posting_content_and_accepts_order_independence() -> None:
@@ -551,11 +725,14 @@ def test_paper_pnl_rejects_unchecked_posting_content_and_accepts_order_independe
     postings = ledger.postings_for_events(plan, events, fees)
     reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
 
-    assert ledger.proposal_paper_pnl(tuple(reversed(postings)), reconciliation) == Decimal("0.172")
+    assert ledger.proposal_paper_pnl(tuple(reversed(postings)), reconciliation, events) == Decimal(
+        "0.172"
+    )
     with pytest.raises(ValueError):
         ledger.proposal_paper_pnl(
             (postings[0].model_copy(update={"detail": "tampered"}), *postings[1:]),
             reconciliation,
+            events,
         )
 
 
@@ -610,7 +787,7 @@ def test_balanced_fee_tampering_does_not_reconcile_against_frozen_fee_evidence()
 
     assert reconciliation.complete is False
     assert reconciliation.unexplained_difference_usd == Decimal("0.016")
-    assert ledger.proposal_paper_pnl(balanced_but_wrong, reconciliation) is None
+    assert ledger.proposal_paper_pnl(balanced_but_wrong, reconciliation, events) is None
 
 
 @pytest.mark.parametrize(
@@ -856,9 +1033,19 @@ def test_reconciliation_store_returns_latest_at_cutoff_and_rejects_conflicts(
         )
         is None
     )
-    assert store.latest_reconciliation_for_proposal(plan.proposal_id, early.observed_at) == early
+    round_trip = store.latest_reconciliation_for_proposal(plan.proposal_id, early.observed_at)
+    assert round_trip == early
+    assert round_trip is not None
+    assert round_trip.terminal_event_id == events[-1].event_id
+    assert round_trip.terminal_state is ShadowState.COMPLETE
     assert store.latest_reconciliation_for_proposal(plan.proposal_id, late.observed_at) == late
     with pytest.raises(ConflictingRecordError):
         store.append_reconciliation(
             early.model_copy(update={"complete": False, "unexplained_difference_usd": Decimal("1")})
+        )
+    with pytest.raises(ConflictingRecordError):
+        store.append_reconciliation(
+            early.model_copy(
+                update={"terminal_event_id": UUID("70000000-0000-0000-0000-000000000084")}
+            )
         )

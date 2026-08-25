@@ -63,6 +63,8 @@ class LedgerPosting(PredictionRecord):
 class ShadowReconciliation(PredictionRecord):
     reconciliation_id: UUID
     proposal_id: UUID
+    terminal_event_id: UUID
+    terminal_state: ShadowState
     venues_reconciled: tuple[PredictionVenue, ...]
     complete: bool
     unexplained_difference_usd: NonNegativeDecimal
@@ -77,12 +79,21 @@ class ShadowReconciliation(PredictionRecord):
             raise ValueError("venues_reconciled must be sorted and unique")
         return value
 
+    @field_validator("terminal_state")
+    @classmethod
+    def _require_execution_terminal(cls, value: ShadowState) -> ShadowState:
+        if value not in _TERMINAL_STATES:
+            raise ValueError("terminal_state must identify an execution terminal")
+        return value
+
     @model_validator(mode="after")
     def _require_explained_completion(self) -> ShadowReconciliation:
         if self.complete and self.unexplained_difference_usd != 0:
             raise ValueError("complete reconciliation cannot have an unexplained difference")
         if self.complete and not self.venues_reconciled:
             raise ValueError("complete reconciliation must identify reconciled venues")
+        if self.complete and self.terminal_state is ShadowState.UNKNOWN:
+            raise ValueError("unknown terminal state cannot have complete reconciliation")
         return self
 
 
@@ -299,6 +310,8 @@ def reconcile_proposal(
     observed_at = terminal_event.occurred_at
     reconciliation_id = _reconciliation_id(
         proposal_id=plan.proposal_id,
+        terminal_event_id=terminal_event.event_id,
+        terminal_state=terminal,
         postings=actual,
         venues=venues,
         complete=complete,
@@ -308,6 +321,8 @@ def reconcile_proposal(
     return ShadowReconciliation(
         reconciliation_id=reconciliation_id,
         proposal_id=plan.proposal_id,
+        terminal_event_id=terminal_event.event_id,
+        terminal_state=terminal,
         venues_reconciled=venues,
         complete=complete,
         unexplained_difference_usd=unexplained,
@@ -316,16 +331,35 @@ def reconcile_proposal(
 
 
 def proposal_paper_pnl(
-    postings: Sequence[LedgerPosting], reconciliation: ShadowReconciliation
+    postings: Sequence[LedgerPosting],
+    reconciliation: ShadowReconciliation,
+    events: Sequence[ShadowEvent],
 ) -> Decimal | None:
     reconciliation = _revalidate_record(reconciliation, ShadowReconciliation)
+    validated_events = _validated_reconciliation_events(reconciliation, events)
+    terminal_event = _terminal_event(validated_events)
+    if (
+        reconciliation.terminal_event_id != terminal_event.event_id
+        or reconciliation.terminal_state is not terminal_event.to_state
+        or reconciliation.observed_at != terminal_event.occurred_at
+    ):
+        raise ValueError("reconciliation does not match authoritative terminal evidence")
     validated = tuple(_revalidate_record(posting, LedgerPosting) for posting in postings)
     if validated:
         verify_conservation(validated)
     if any(posting.proposal_id != reconciliation.proposal_id for posting in validated):
         raise ValueError("postings do not belong to the reconciliation")
+    events_by_id = {event.event_id: event for event in validated_events}
+    if any(
+        posting.event_id not in events_by_id
+        or posting.occurred_at != events_by_id[posting.event_id].occurred_at
+        for posting in validated
+    ):
+        raise ValueError("postings do not match the authoritative event chain")
     expected_id = _reconciliation_id(
         proposal_id=reconciliation.proposal_id,
+        terminal_event_id=reconciliation.terminal_event_id,
+        terminal_state=reconciliation.terminal_state,
         postings=validated,
         venues=reconciliation.venues_reconciled,
         complete=reconciliation.complete,
@@ -334,6 +368,8 @@ def proposal_paper_pnl(
     )
     if reconciliation.reconciliation_id != expected_id:
         raise ValueError("reconciliation identity does not match supplied postings and fields")
+    if terminal_event.to_state is ShadowState.UNKNOWN:
+        return None
     if not reconciliation.complete:
         return None
 
@@ -356,6 +392,21 @@ def _validated_events(plan: ShadowPlan, value: object) -> tuple[ShadowEvent, ...
     events = tuple(_revalidate_record(event, ShadowEvent) for event in value)
     if any(event.proposal_id != plan.proposal_id for event in events):
         raise ValueError("events do not belong to the plan proposal")
+    if len({event.event_id for event in events}) != len(events):
+        raise ValueError("event identities must be unique")
+    derive_current_state(events)
+    _terminal_event(events)
+    return events
+
+
+def _validated_reconciliation_events(
+    reconciliation: ShadowReconciliation, value: object
+) -> tuple[ShadowEvent, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
+        raise ValueError("events must be a non-empty sequence")
+    events = tuple(_revalidate_record(event, ShadowEvent) for event in value)
+    if any(event.proposal_id != reconciliation.proposal_id for event in events):
+        raise ValueError("events do not belong to the reconciliation proposal")
     if len({event.event_id for event in events}) != len(events):
         raise ValueError("event identities must be unique")
     derive_current_state(events)
@@ -590,6 +641,8 @@ def _posting_signature(posting: LedgerPosting) -> tuple[str, ...]:
 def _reconciliation_id(
     *,
     proposal_id: UUID,
+    terminal_event_id: UUID,
+    terminal_state: ShadowState,
     postings: Sequence[LedgerPosting],
     venues: Sequence[PredictionVenue],
     complete: bool,
@@ -598,6 +651,8 @@ def _reconciliation_id(
 ) -> UUID:
     values = [
         str(proposal_id),
+        str(terminal_event_id),
+        terminal_state.value,
         [
             _posting_signature(posting)
             for posting in sorted(postings, key=lambda item: str(item.posting_id))
