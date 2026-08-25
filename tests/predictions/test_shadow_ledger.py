@@ -16,6 +16,7 @@ from polytrading.predictions.shadow_models import (
     ShadowLegPlan,
     ShadowPlan,
     ShadowState,
+    derive_current_state,
 )
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 
@@ -362,6 +363,32 @@ def test_paper_pnl_accepts_legal_optional_trailing_reconciled_event(
     assert (
         ledger.proposal_paper_pnl(postings, reconciliation, (*events, reconciled_event)) == expected
     )
+
+
+def test_reconciled_event_is_public_deterministic_and_bound_to_reconciliation() -> None:
+    """Changing terminal evidence or reconciliation must change/reject the derived event."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _terminal_case(ShadowState.COMPLETE)
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+
+    first = ledger.reconciled_event_for(plan, events, reconciliation)
+    second = ledger.reconciled_event_for(plan, events, reconciliation)
+
+    assert first == second
+    assert first.sequence == 6
+    assert first.from_state is ShadowState.COMPLETE
+    assert first.to_state is ShadowState.RECONCILED
+    assert first.occurred_at == reconciliation.observed_at
+    assert first.fills == ()
+    assert first.evidence_hashes == ()
+    assert derive_current_state((*events, first)) is ShadowState.RECONCILED
+
+    wrong = reconciliation.model_copy(update={"terminal_event_id": UUID(int=0)})
+    with pytest.raises(ValueError, match="terminal evidence"):
+        ledger.reconciled_event_for(plan, events, wrong)
 
 
 def test_paper_pnl_requires_authoritative_events_and_matching_nonempty_postings() -> None:

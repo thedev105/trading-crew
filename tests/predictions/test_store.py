@@ -820,6 +820,59 @@ def test_scan_report_shadow_candidate_accepts_a_fully_consistent_report() -> Non
     assert report.decision == "SHADOW_CANDIDATE"
 
 
+def test_exact_shadow_lineage_getters_ignore_later_evidence(tmp_path: Path) -> None:
+    """Replay must retrieve cited records/hashes, never an unrelated newest row."""
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    candidate = candidate_relationship()
+    proof = proof_artifact(candidate_id=candidate.candidate_id)
+    report = scan_report(candidate_id=candidate.candidate_id, proof_id=proof.proof_id)
+    original_book = prediction_book_snapshot(source_hash="b" * 64)
+    later_book = prediction_book_snapshot(
+        cycle_id=UUID("00000000-0000-0000-0000-000000000b02"),
+        observed_at=NOW + timedelta(seconds=1),
+        effective_at=NOW + timedelta(seconds=1),
+        source_hash="c" * 64,
+    )
+    original_fee = fee_rate(market_id="0xcondition", source_hash="d" * 64)
+    later_fee = fee_rate(
+        market_id="0xcondition",
+        observed_at=NOW + timedelta(seconds=1),
+        source_hash="e" * 64,
+    )
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+    store.append_book_snapshot(original_book)
+    store.append_book_snapshot(later_book)
+    store.append_fee_rate(original_fee)
+    store.append_fee_rate(later_fee)
+
+    cutoff = NOW + timedelta(minutes=1)
+    assert store.candidate_relationship_by_id(candidate.candidate_id, cutoff) == candidate
+    assert store.proof_artifact_by_id(proof.proof_id, cutoff) == proof
+    assert store.scan_report_by_id(report.report_id, cutoff) == report
+    assert (
+        store.book_snapshot_by_source_hash(
+            original_book.venue,
+            original_book.market_id,
+            original_book.outcome_token_id,
+            original_book.source_hash,
+            cutoff,
+        )
+        == original_book
+    )
+    assert (
+        store.fee_rate_by_source_hash(
+            original_fee.venue,
+            original_fee.market_id,
+            original_fee.source_hash,
+            cutoff,
+        )
+        == original_fee
+    )
+    store.close()
+
+
 def shadow_plan(**overrides: object) -> ShadowPlan:
     values: dict[str, object] = {
         "schema_version": 1,

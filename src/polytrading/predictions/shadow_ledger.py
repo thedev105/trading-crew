@@ -32,6 +32,7 @@ NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 
 _POSTING_NAMESPACE = UUID("2b243b3d-1d94-4f28-a737-14bd593f59b1")
 _RECONCILIATION_NAMESPACE = UUID("6bcb978a-c932-4136-a56c-1abaad7a1820")
+_RECONCILED_EVENT_NAMESPACE = UUID("a20e622f-ec12-4d3c-b0d9-22c6a3869859")
 _TERMINAL_STATES = frozenset(
     {ShadowState.COMPLETE, ShadowState.UNWOUND, ShadowState.EXPIRED, ShadowState.UNKNOWN}
 )
@@ -384,6 +385,55 @@ def proposal_paper_pnl(
         )
 
     return net_credit("reserve") + net_credit("opportunity_cost") + net_credit("fees_paid")
+
+
+def reconciled_event_for(
+    plan: ShadowPlan,
+    events: Sequence[ShadowEvent],
+    reconciliation: ShadowReconciliation,
+) -> ShadowEvent:
+    """Derive the append-only RECONCILED transition for a complete reconciliation."""
+    plan = _revalidate_record(plan, ShadowPlan)
+    validated_events = _validated_events(plan, events)
+    reconciliation = _revalidate_record(reconciliation, ShadowReconciliation)
+    terminal = _terminal_event(validated_events)
+    if validated_events[-1] is not terminal:
+        raise ValueError("reconciled event derivation requires the execution-terminal prefix")
+    if (
+        reconciliation.proposal_id != plan.proposal_id
+        or reconciliation.terminal_event_id != terminal.event_id
+        or reconciliation.terminal_state is not terminal.to_state
+        or reconciliation.observed_at != terminal.occurred_at
+    ):
+        raise ValueError("reconciliation does not match terminal evidence")
+    if not reconciliation.complete:
+        raise ValueError("only a complete reconciliation may derive a reconciled event")
+
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "proposal_id": plan.proposal_id,
+        "sequence": terminal.sequence + 1,
+        "from_state": terminal.to_state,
+        "to_state": ShadowState.RECONCILED,
+        "occurred_at": reconciliation.observed_at,
+        "detail": "all participating venues reconciled",
+        "quantity_filled": None,
+        "leg_index": None,
+        "scenario_id": terminal.scenario_id,
+        "fills": (),
+        "evidence_hashes": (),
+    }
+    provisional = ShadowEvent(event_id=UUID(int=0), **fields)
+    event_id = uuid5(
+        _RECONCILED_EVENT_NAMESPACE,
+        _canonical(
+            [
+                str(reconciliation.reconciliation_id),
+                provisional.model_dump(mode="json", exclude={"event_id"}),
+            ]
+        ),
+    )
+    return ShadowEvent(event_id=event_id, **fields)
 
 
 def _validated_events(plan: ShadowPlan, value: object) -> tuple[ShadowEvent, ...]:

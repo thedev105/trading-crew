@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
-from datetime import UTC, datetime
+from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -23,7 +27,14 @@ from polytrading.predictions.dashboard_server import (
     serve_prediction_dashboard,
     validate_prediction_dashboard_database,
 )
-from polytrading.predictions.domain import MarketRecord, PredictionVenue, RuleVersion
+from polytrading.predictions.domain import (
+    MarketRecord,
+    PredictionBookSnapshot,
+    PredictionFeeRate,
+    PredictionRecord,
+    PredictionVenue,
+    RuleVersion,
+)
 from polytrading.predictions.economics import evaluate_basket_economics
 from polytrading.predictions.economics_models import (
     DEFAULT_RESEARCH_POLICY,
@@ -32,6 +43,7 @@ from polytrading.predictions.economics_models import (
     ScanReport,
     deterministic_scan_report_id,
 )
+from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.health import PredictionHealthAuditor, VenueEvidenceStatus
 from polytrading.predictions.health_report import (
     render_prediction_health_json,
@@ -44,6 +56,35 @@ from polytrading.predictions.polymarket import PolymarketAdapter
 from polytrading.predictions.proofs import compile_proof
 from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.registry import PredictionRegistry
+from polytrading.predictions.risk import (
+    DEFAULT_RISK_POLICY,
+    PredictionRiskPolicy,
+    ShadowPortfolioState,
+)
+from polytrading.predictions.shadow_ledger import (
+    ShadowReconciliation,
+    postings_for_events,
+    proposal_paper_pnl,
+    reconcile_proposal,
+    reconciled_event_for,
+)
+from polytrading.predictions.shadow_models import (
+    ShadowEvent,
+    ShadowLegPlan,
+    ShadowPlan,
+    ShadowState,
+)
+from polytrading.predictions.shadow_planner import PlanRefusal, plan_shadow_proposal
+from polytrading.predictions.shadow_simulator import (
+    BASELINE,
+    LATENCY_1S,
+    LATENCY_5S,
+    PARTIAL_FILL_50,
+    SECOND_LEG_REJECT,
+    UNKNOWN_AFTER_FIRST,
+    StressScenario,
+    simulate_shadow_proposal,
+)
 from polytrading.predictions.storage.store import PredictionMarketStore
 from polytrading.trial.writer_lease import database_writer_lease
 
@@ -67,6 +108,18 @@ _CROSS_VENUE_ABSTENTION_LINE = (
 # pass --review-identity explicitly.
 _DEFAULT_REVIEW_IDENTITY = "cli-operator"
 _RULE_ATTESTATIONS_ADAPTER: TypeAdapter[list[RuleAttestation]] = TypeAdapter(list[RuleAttestation])
+_SHADOW_SCENARIOS: dict[str, StressScenario] = {
+    scenario.scenario_id: scenario
+    for scenario in (
+        BASELINE,
+        LATENCY_1S,
+        LATENCY_5S,
+        PARTIAL_FILL_50,
+        SECOND_LEG_REJECT,
+        UNKNOWN_AFTER_FIRST,
+    )
+}
+_SHADOW_EXPERIMENT_NAMESPACE = UUID("f0a29b77-1936-4b83-994c-129eaeb0ee08")
 
 
 class PredictionsUsageError(ValueError):
@@ -91,6 +144,10 @@ class PredictionProveError(RuntimeError):
 
 class PredictionScanError(RuntimeError):
     """A prediction-market scan failure, sanitized for CLI output."""
+
+
+class PredictionShadowError(RuntimeError):
+    """A shadow run/replay failure, sanitized for CLI output."""
 
 
 def _utc_now() -> datetime:
@@ -170,6 +227,25 @@ def add_predictions_subcommands(
     scan.add_argument("--as-of")
     scan.add_argument("--format", choices=("text", "json"), default="text")
 
+    shadow = predictions_commands.add_parser(
+        "shadow", help="run or replay deterministic local shadow experiments"
+    )
+    shadow_commands = shadow.add_subparsers(dest="predictions_shadow_command", required=True)
+    shadow_run = shadow_commands.add_parser("run", help="run stored shadow evidence")
+    shadow_run.add_argument("--db", required=True, type=Path)
+    shadow_run.add_argument("--trial-family", required=True)
+    shadow_run.add_argument("--as-of")
+    shadow_run.add_argument("--expiry-seconds", type=int, default=30)
+    shadow_run.add_argument("--scenario", choices=tuple(_SHADOW_SCENARIOS), default="baseline")
+    shadow_run.add_argument("--format", choices=("text", "json"), default="text")
+    shadow_replay = shadow_commands.add_parser(
+        "replay", help="replay one stored shadow proposal without writes"
+    )
+    shadow_replay.add_argument("--db", required=True, type=Path)
+    shadow_replay.add_argument("--proposal-id", required=True)
+    shadow_replay.add_argument("--scenario", choices=tuple(_SHADOW_SCENARIOS))
+    shadow_replay.add_argument("--format", choices=("text", "json"), default="text")
+
     dashboard = predictions_commands.add_parser(
         "dashboard", help="serve the loopback-only prediction-market evidence console"
     )
@@ -190,6 +266,12 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
         return _run_prove(arguments)
     if arguments.predictions_command == "scan":
         return _run_scan(arguments)
+    if arguments.predictions_command == "shadow":
+        return (
+            _run_shadow_run(arguments)
+            if arguments.predictions_shadow_command == "run"
+            else _run_shadow_replay(arguments)
+        )
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
@@ -825,6 +907,708 @@ def _run_scan(arguments: argparse.Namespace) -> int:
                 f"capacity={entry['capacity_usd_at_current_depth']}"
             )
     return 0
+
+
+def _run_shadow_run(arguments: argparse.Namespace) -> int:
+    as_of = _parse_timestamp(arguments.as_of) if arguments.as_of else _utc_now()
+    if arguments.expiry_seconds <= 0:
+        raise PredictionsUsageError("--expiry-seconds must be a positive integer")
+    _require_current_shadow_database(arguments.db)
+    scenario = _SHADOW_SCENARIOS[arguments.scenario]
+    result = {
+        "as_of": _timestamp(as_of),
+        "trial_family": arguments.trial_family,
+        "scenario": scenario.scenario_id,
+        "planned": 0,
+        "existing": 0,
+        "refused": {},
+        "terminal_states": {},
+        "reconciled_paper_pnl_usd": "0",
+    }
+    refusals: Counter[str] = Counter()
+    terminals: Counter[str] = Counter()
+    run_pnl = Decimal("0")
+
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                with store.transaction() as transaction:
+                    if transaction.trial_family_by_id(arguments.trial_family, as_of) is None:
+                        raise PredictionsUsageError(
+                            f"unknown preregistered trial family {arguments.trial_family!r}"
+                        )
+                    reports = tuple(
+                        report
+                        for report in transaction.scan_reports_as_of(as_of)
+                        if report.decision == "SHADOW_CANDIDATE"
+                    )
+                    for report in reports:
+                        evidence = _run_evidence(transaction, report, as_of)
+                        if isinstance(evidence, str):
+                            refusals[evidence] += 1
+                            continue
+                        candidate, proof, books, fees = evidence
+                        if not _candidate_rules_are_current(transaction, candidate, as_of):
+                            refusals["PROOF_NOT_CURRENT"] += 1
+                            continue
+                        portfolio = _shadow_portfolio_state(
+                            transaction,
+                            as_of,
+                            DEFAULT_RISK_POLICY,
+                            excluding_scan_report_id=report.report_id,
+                        )
+                        plan_or_refusal = plan_shadow_proposal(
+                            scan_report=report,
+                            candidate=candidate,
+                            proof=proof,
+                            books=books,
+                            fees=fees,
+                            economics_policy=DEFAULT_RESEARCH_POLICY,
+                            risk_policy=DEFAULT_RISK_POLICY,
+                            portfolio=portfolio,
+                            as_of=as_of,
+                            expiry_window_seconds=arguments.expiry_seconds,
+                            event_cluster_id=_event_cluster_id(transaction, candidate, as_of),
+                        )
+                        if isinstance(plan_or_refusal, PlanRefusal):
+                            refusals[plan_or_refusal.reason] += 1
+                            continue
+                        plan = plan_or_refusal
+                        if transaction.shadow_plan_by_proposal(plan.proposal_id) is not None:
+                            result["existing"] += 1
+                            continue
+
+                        events = simulate_shadow_proposal(
+                            plan,
+                            proof=proof,
+                            candidate=candidate,
+                            fees={index: fee for index, fee in fees.items() if fee is not None},
+                            economics_policy=DEFAULT_RESEARCH_POLICY,
+                            books=lambda index, at, candidate=candidate: _runtime_book(
+                                transaction, candidate, index, at
+                            ),
+                            scenario=scenario,
+                            started_at=as_of,
+                        )
+                        postings = postings_for_events(
+                            plan,
+                            events,
+                            {index: fee for index, fee in fees.items() if fee is not None},
+                        )
+                        reconciliation = reconcile_proposal(
+                            plan,
+                            events,
+                            postings,
+                            {index: fee for index, fee in fees.items() if fee is not None},
+                        )
+                        pnl = proposal_paper_pnl(postings, reconciliation, events)
+                        persisted_events = events
+                        if reconciliation.complete:
+                            persisted_events = (
+                                *events,
+                                reconciled_event_for(plan, events, reconciliation),
+                            )
+                        experiment = _shadow_experiment(
+                            family_id=arguments.trial_family,
+                            plan=plan,
+                            scenario=scenario,
+                            reconciliation=reconciliation,
+                            pnl=pnl,
+                            as_of=as_of,
+                        )
+
+                        transaction.append_shadow_plan(plan)
+                        for event in persisted_events:
+                            transaction.append_shadow_event(event)
+                        for posting in postings:
+                            transaction.append_ledger_posting(posting)
+                        transaction.append_reconciliation(reconciliation)
+                        transaction.append_shadow_experiment(experiment)
+
+                        result["planned"] += 1
+                        terminals[reconciliation.terminal_state.value] += 1
+                        if pnl is not None:
+                            run_pnl += pnl
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionShadowError("shadow run failed to persist atomically") from error
+
+    result["refused"] = dict(sorted(refusals.items()))
+    result["terminal_states"] = dict(sorted(terminals.items()))
+    result["reconciled_paper_pnl_usd"] = str(run_pnl)
+    _render_shadow_run(result, arguments.format)
+    return 0
+
+
+def _require_current_shadow_database(path: Path) -> None:
+    if not path.is_file():
+        raise PredictionsUsageError("shadow database is unavailable or not current")
+    try:
+        store = PredictionMarketStore(path, read_only=True)
+    except Exception as error:
+        raise PredictionsUsageError("shadow database is unavailable or not current") from error
+    else:
+        store.close()
+
+
+def _run_evidence(
+    store: PredictionMarketStore,
+    report: ScanReport,
+    as_of: datetime,
+) -> (
+    tuple[
+        CandidateRelationship,
+        ProofArtifact,
+        dict[int, PredictionBookSnapshot | None],
+        dict[int, PredictionFeeRate | None],
+    ]
+    | str
+):
+    candidate = store.candidate_relationship_by_id(report.candidate_id, as_of)
+    if candidate is None or report.proof_id is None:
+        return "MISSING_EVIDENCE"
+    proof = store.proof_artifact_by_id(report.proof_id, as_of)
+    exact_report = store.scan_report_by_id(report.report_id, as_of)
+    if proof is None or exact_report != report:
+        return "MISSING_EVIDENCE"
+    books = {
+        index: store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, as_of)
+        for index, leg in enumerate(candidate.legs)
+    }
+    fees = {
+        index: store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
+        for index, leg in enumerate(candidate.legs)
+    }
+    return candidate, proof, books, fees
+
+
+def _candidate_rules_are_current(
+    store: PredictionMarketStore,
+    candidate: CandidateRelationship,
+    as_of: datetime,
+) -> bool:
+    current = _current_rule_versions_for_candidate(store, candidate, as_of)
+    return all(leg.rule_version_id in current for leg in candidate.legs)
+
+
+def _runtime_book(
+    store: PredictionMarketStore,
+    candidate: CandidateRelationship,
+    leg_index: int,
+    at: datetime,
+) -> PredictionBookSnapshot | None:
+    if leg_index < 0 or leg_index >= len(candidate.legs):
+        return None
+    leg = candidate.legs[leg_index]
+    return store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, at)
+
+
+def _event_cluster_id(
+    store: PredictionMarketStore,
+    candidate: CandidateRelationship,
+    as_of: datetime,
+) -> str:
+    markets_by_key: dict[tuple[PredictionVenue, str], MarketRecord] = {}
+    for venue in {leg.venue for leg in candidate.legs}:
+        markets_by_key.update(
+            {
+                (market.venue, market.market_id): market
+                for market in store.markets_as_of(venue, as_of)
+            }
+        )
+    event_ids = {
+        market.event_id
+        for leg in candidate.legs
+        if (market := markets_by_key.get((leg.venue, leg.market_id))) is not None
+        and market.event_id
+    }
+    if len(event_ids) == 1 and all(
+        (market := markets_by_key.get((leg.venue, leg.market_id))) is not None
+        and market.event_id in event_ids
+        for leg in candidate.legs
+    ):
+        return next(iter(event_ids))
+    return str(candidate.candidate_id)
+
+
+def _shadow_portfolio_state(
+    store: PredictionMarketStore,
+    as_of: datetime,
+    policy: PredictionRiskPolicy,
+    *,
+    excluding_proposal_id: UUID | None = None,
+    excluding_scan_report_id: UUID | None = None,
+) -> ShadowPortfolioState:
+    experiments = tuple(
+        item
+        for item in store.shadow_experiments_as_of(as_of)
+        if item.observed_at < as_of and item.proposal_id != excluding_proposal_id
+    )
+    running = policy.starting_equity_usd
+    peak = running
+    equity_24h = running
+    day_cutoff = as_of - timedelta(hours=24)
+    for experiment in sorted(experiments, key=lambda item: (item.observed_at, item.experiment_id)):
+        if experiment.reconciled and experiment.paper_pnl_usd is not None:
+            running += experiment.paper_pnl_usd
+            peak = max(peak, running)
+            if experiment.observed_at <= day_cutoff:
+                equity_24h += experiment.paper_pnl_usd
+
+    exposure: defaultdict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    open_count = 0
+    for plan in store.shadow_plans_as_of(as_of):
+        if (
+            plan.proposal_id == excluding_proposal_id
+            or plan.scan_report_id == excluding_scan_report_id
+        ):
+            continue
+        reconciliation = store.latest_reconciliation_for_proposal(plan.proposal_id, as_of)
+        if reconciliation is not None and reconciliation.complete:
+            continue
+        candidate = store.candidate_relationship_by_id(plan.candidate_id, plan.information_cutoff)
+        cluster = (
+            str(plan.candidate_id)
+            if candidate is None
+            else _event_cluster_id(store, candidate, plan.information_cutoff)
+        )
+        frozen_basket_notional = sum(
+            (price * quantity for leg in plan.legs for price, quantity in leg.limit_price_levels),
+            Decimal("0"),
+        )
+        exposure[cluster] += max(
+            plan.max_incomplete_exposure_usd,
+            frozen_basket_notional,
+        )
+        open_count += 1
+
+    return ShadowPortfolioState(
+        total_equity_usd=running,
+        open_exposure_usd_by_cluster=dict(exposure),
+        peak_equity_usd=max(peak, running),
+        equity_24h_ago_usd=equity_24h,
+        open_proposal_count=open_count,
+    )
+
+
+def _shadow_experiment(
+    *,
+    family_id: str,
+    plan: ShadowPlan,
+    scenario: StressScenario,
+    reconciliation: ShadowReconciliation,
+    pnl: Decimal | None,
+    as_of: datetime,
+) -> ShadowExperiment:
+    terminal_state = (
+        ShadowState.RECONCILED if reconciliation.complete else reconciliation.terminal_state
+    )
+    fields = [
+        family_id,
+        str(plan.proposal_id),
+        scenario.scenario_id,
+        terminal_state.value,
+        str(pnl) if pnl is not None else None,
+        reconciliation.complete,
+        as_of.isoformat(),
+        reconciliation.observed_at.isoformat(),
+    ]
+    return ShadowExperiment(
+        experiment_id=uuid5(_SHADOW_EXPERIMENT_NAMESPACE, _canonical_json_value(fields)),
+        family_id=family_id,
+        proposal_id=plan.proposal_id,
+        scenario_id=scenario.scenario_id,
+        terminal_state=terminal_state,
+        paper_pnl_usd=pnl,
+        reconciled=reconciliation.complete,
+        as_of=as_of,
+        observed_at=reconciliation.observed_at,
+    )
+
+
+def _canonical_json_value(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _render_shadow_run(result: Mapping[str, object], output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    print(
+        f"predictions shadow run | as_of={result['as_of']} | "
+        f"trial_family={result['trial_family']} | scenario={result['scenario']}"
+    )
+    print(f"planned={result['planned']} | existing={result['existing']}")
+    for reason, count in dict(result["refused"]).items():
+        print(f"refused {reason}: {count}")
+    for state, count in dict(result["terminal_states"]).items():
+        print(f"terminal {state}: {count}")
+    print(f"reconciled_paper_pnl_usd={result['reconciled_paper_pnl_usd']}")
+
+
+def _run_shadow_replay(arguments: argparse.Namespace) -> int:
+    try:
+        proposal_id = UUID(arguments.proposal_id)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise PredictionsUsageError(f"invalid --proposal-id {arguments.proposal_id!r}") from error
+    _require_current_shadow_database(arguments.db)
+
+    try:
+        store = PredictionMarketStore(arguments.db, read_only=True)
+        try:
+            plan = store.shadow_plan_by_proposal(proposal_id)
+            if plan is None:
+                raise LookupError("proposal not found")
+            report, candidate, proof, planning_books, fees = _replay_evidence(store, plan)
+            _validate_rederived_plan(
+                store,
+                plan,
+                report,
+                candidate,
+                proof,
+                planning_books,
+                fees,
+            )
+            far_future = datetime.max.replace(tzinfo=UTC)
+            stored_events = store.shadow_events_for_proposal(proposal_id, far_future)
+            if not stored_events:
+                raise LookupError("event chain not found")
+            execution_events = tuple(
+                event for event in stored_events if event.to_state is not ShadowState.RECONCILED
+            )
+            stored_scenario = _stored_scenario(execution_events)
+            what_if = arguments.scenario is not None
+            scenario = _SHADOW_SCENARIOS[arguments.scenario] if what_if else stored_scenario
+            allowed_runtime_hashes = {
+                source_hash for event in execution_events for source_hash in event.evidence_hashes
+            }
+
+            def replay_book(index: int, at: datetime) -> PredictionBookSnapshot | None:
+                if what_if:
+                    return _runtime_book(store, candidate, index, at)
+                return _runtime_book_by_hashes(
+                    store,
+                    candidate,
+                    index,
+                    at,
+                    allowed_runtime_hashes,
+                )
+
+            replayed = simulate_shadow_proposal(
+                plan,
+                proof=proof,
+                candidate=candidate,
+                fees=fees,
+                economics_policy=DEFAULT_RESEARCH_POLICY,
+                books=replay_book,
+                scenario=scenario,
+                started_at=plan.information_cutoff,
+            )
+            if what_if:
+                _render_shadow_replay_what_if(plan, scenario, replayed, arguments.format)
+                return 0
+
+            divergence = _first_event_divergence(replayed, execution_events)
+            displayed = list(replayed)
+            trailing = tuple(
+                event for event in stored_events if event.to_state is ShadowState.RECONCILED
+            )
+            stored_reconciliation = store.latest_reconciliation_for_proposal(
+                proposal_id, far_future
+            )
+            if stored_reconciliation is None:
+                raise LookupError("stored reconciliation not found")
+            stored_postings = store.ledger_postings_for_proposal(proposal_id, far_future)
+            replayed_reconciliation = reconcile_proposal(
+                plan,
+                execution_events,
+                stored_postings,
+                fees,
+            )
+            if stored_reconciliation != replayed_reconciliation and divergence is None:
+                divergence = len(execution_events)
+            if replayed_reconciliation.complete:
+                expected_reconciled = reconciled_event_for(
+                    plan, execution_events, replayed_reconciliation
+                )
+                displayed.append(expected_reconciled)
+                if (
+                    len(trailing) != 1 or expected_reconciled != trailing[0]
+                ) and divergence is None:
+                    divergence = expected_reconciled.sequence
+            elif trailing and divergence is None:
+                divergence = trailing[0].sequence
+            _render_shadow_replay_verdict(
+                plan,
+                tuple(displayed),
+                divergence,
+                arguments.format,
+            )
+            return 0 if divergence is None else 1
+        finally:
+            store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionShadowError(
+            "shadow replay evidence is unavailable or inconsistent"
+        ) from error
+
+
+def _replay_evidence(
+    store: PredictionMarketStore,
+    plan: ShadowPlan,
+) -> tuple[
+    ScanReport,
+    CandidateRelationship,
+    ProofArtifact,
+    dict[int, PredictionBookSnapshot],
+    dict[int, PredictionFeeRate],
+]:
+    cutoff = plan.information_cutoff
+    report = store.scan_report_by_id(plan.scan_report_id, cutoff)
+    candidate = store.candidate_relationship_by_id(plan.candidate_id, cutoff)
+    proof = store.proof_artifact_by_id(plan.proof_id, cutoff)
+    if report is None or candidate is None or proof is None:
+        raise LookupError("plan lineage record missing")
+    if (
+        report.candidate_id != candidate.candidate_id
+        or report.proof_id != proof.proof_id
+        or proof.candidate_id != candidate.candidate_id
+    ):
+        raise ValueError("plan lineage identities disagree")
+
+    books: dict[int, PredictionBookSnapshot] = {}
+    fees: dict[int, PredictionFeeRate] = {}
+    for leg in plan.legs:
+        book = _book_from_frozen_hashes(store, leg, plan.frozen_hashes, cutoff)
+        fee = _fee_from_frozen_hashes(store, leg, plan.frozen_hashes, cutoff)
+        if book is None or fee is None:
+            raise LookupError("frozen plan evidence missing")
+        books[leg.leg_index] = book
+        fees[leg.leg_index] = fee
+    return report, candidate, proof, books, fees
+
+
+def _book_from_frozen_hashes(
+    store: PredictionMarketStore,
+    leg: ShadowLegPlan,
+    frozen_hashes: Sequence[str],
+    cutoff: datetime,
+) -> PredictionBookSnapshot | None:
+    matches = [
+        book
+        for source_hash in frozen_hashes
+        if (
+            book := store.book_snapshot_by_source_hash(
+                leg.venue,
+                leg.market_id,
+                leg.outcome_token_id,
+                source_hash,
+                cutoff,
+            )
+        )
+        is not None
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: (item.observed_at, str(item.cycle_id)))
+
+
+def _fee_from_frozen_hashes(
+    store: PredictionMarketStore,
+    leg: ShadowLegPlan,
+    frozen_hashes: Sequence[str],
+    cutoff: datetime,
+) -> PredictionFeeRate | None:
+    matches = [
+        fee
+        for source_hash in frozen_hashes
+        if (
+            fee := store.fee_rate_by_source_hash(
+                leg.venue,
+                leg.market_id,
+                source_hash,
+                cutoff,
+            )
+        )
+        is not None
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item.observed_at)
+
+
+def _validate_rederived_plan(
+    store: PredictionMarketStore,
+    stored: ShadowPlan,
+    report: ScanReport,
+    candidate: CandidateRelationship,
+    proof: ProofArtifact,
+    books: Mapping[int, PredictionBookSnapshot],
+    fees: Mapping[int, PredictionFeeRate],
+) -> None:
+    if (
+        stored.policy_id != DEFAULT_RESEARCH_POLICY.policy_id
+        or stored.policy_version != DEFAULT_RESEARCH_POLICY.policy_version
+        or stored.risk_policy_version != DEFAULT_RISK_POLICY.policy_version
+        or _policy_hash(DEFAULT_RESEARCH_POLICY) not in stored.frozen_hashes
+        or _policy_hash(DEFAULT_RISK_POLICY) not in stored.frozen_hashes
+    ):
+        raise ValueError("stored policy lineage is not available")
+    if not _candidate_rules_are_current(store, candidate, stored.information_cutoff):
+        raise ValueError("stored candidate rules were not current at planning")
+    expiry_seconds = int((stored.expires_at - stored.information_cutoff).total_seconds())
+    portfolio = _shadow_portfolio_state(
+        store,
+        stored.information_cutoff,
+        DEFAULT_RISK_POLICY,
+        excluding_proposal_id=stored.proposal_id,
+    )
+    rederived = plan_shadow_proposal(
+        scan_report=report,
+        candidate=candidate,
+        proof=proof,
+        books=books,
+        fees=fees,
+        economics_policy=DEFAULT_RESEARCH_POLICY,
+        risk_policy=DEFAULT_RISK_POLICY,
+        portfolio=portfolio,
+        as_of=stored.information_cutoff,
+        expiry_window_seconds=expiry_seconds,
+        event_cluster_id=_event_cluster_id(store, candidate, stored.information_cutoff),
+    )
+    if not isinstance(rederived, ShadowPlan) or rederived != stored:
+        raise ValueError("stored plan does not match exact frozen lineage")
+
+
+def _stored_scenario(events: Sequence[ShadowEvent]) -> StressScenario:
+    scenario_ids = {event.scenario_id for event in events if event.scenario_id is not None}
+    if len(scenario_ids) != 1:
+        raise ValueError("stored execution does not identify one scenario")
+    scenario_id = next(iter(scenario_ids))
+    try:
+        return _SHADOW_SCENARIOS[scenario_id]
+    except KeyError as error:
+        raise ValueError("stored scenario is not supported") from error
+
+
+def _runtime_book_by_hashes(
+    store: PredictionMarketStore,
+    candidate: CandidateRelationship,
+    leg_index: int,
+    at: datetime,
+    source_hashes: set[str],
+) -> PredictionBookSnapshot | None:
+    if leg_index < 0 or leg_index >= len(candidate.legs):
+        return None
+    leg = candidate.legs[leg_index]
+    matches = [
+        book
+        for source_hash in source_hashes
+        if (
+            book := store.book_snapshot_by_source_hash(
+                leg.venue,
+                leg.market_id,
+                leg.outcome_token_id,
+                source_hash,
+                at,
+            )
+        )
+        is not None
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: (item.observed_at, str(item.cycle_id)))
+
+
+def _first_event_divergence(
+    replayed: Sequence[ShadowEvent],
+    stored: Sequence[ShadowEvent],
+) -> int | None:
+    for expected, actual in zip(replayed, stored, strict=False):
+        if expected != actual:
+            return min(expected.sequence, actual.sequence)
+    if len(replayed) != len(stored):
+        return min(len(replayed), len(stored))
+    return None
+
+
+def _render_shadow_replay_verdict(
+    plan: ShadowPlan,
+    events: Sequence[ShadowEvent],
+    divergence: int | None,
+    output_format: str,
+) -> None:
+    verdict = (
+        "replay MATCHES stored events"
+        if divergence is None
+        else f"replay DIVERGES at sequence {divergence}"
+    )
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "mode": "verification",
+                    "proposal_id": str(plan.proposal_id),
+                    "events": [event.model_dump(mode="json") for event in events],
+                    "verdict": verdict,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    print(f"predictions shadow replay | proposal_id={plan.proposal_id}")
+    for event in events:
+        print(
+            f"sequence={event.sequence} | from="
+            f"{event.from_state.value if event.from_state is not None else '-'} | "
+            f"to={event.to_state.value} | occurred_at={_timestamp(event.occurred_at)}"
+        )
+    print(verdict)
+
+
+def _render_shadow_replay_what_if(
+    plan: ShadowPlan,
+    scenario: StressScenario,
+    events: Sequence[ShadowEvent],
+    output_format: str,
+) -> None:
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "mode": "what_if",
+                    "persisted": False,
+                    "proposal_id": str(plan.proposal_id),
+                    "scenario": scenario.scenario_id,
+                    "events": [event.model_dump(mode="json") for event in events],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    print(
+        f"predictions shadow replay what-if | proposal_id={plan.proposal_id} | "
+        f"scenario={scenario.scenario_id} | persisted=false"
+    )
+    for event in events:
+        print(
+            f"sequence={event.sequence} | from="
+            f"{event.from_state.value if event.from_state is not None else '-'} | "
+            f"to={event.to_state.value} | occurred_at={_timestamp(event.occurred_at)}"
+        )
+
+
+def _policy_hash(policy: PredictionRecord) -> str:
+    canonical = _canonical_json_value(policy.model_dump(mode="json"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _timestamp(value: datetime) -> str:

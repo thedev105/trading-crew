@@ -12,7 +12,10 @@ import polytrading.predictions.cli as predictions_cli
 from polytrading.cli import build_parser, main
 from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.experiments import TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
+from polytrading.predictions.risk import PredictionRiskPolicy
+from polytrading.predictions.shadow_models import ShadowState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.candidate_helpers import (
@@ -1864,3 +1867,638 @@ def test_scan_command_never_prints_a_forbidden_promotional_word(
     output = capsys.readouterr().out.lower()
     for forbidden in ("risk-free", "guaranteed", "approved", "live eligible"):
         assert forbidden not in output
+
+
+def _seed_runnable_shadow_candidate(database: Path) -> None:
+    _seed_candidate_with_rule_and_attestation(database)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="111",
+            bids=(level("0.19", "10"),),
+            asks=(level("0.20", "10"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            outcome_token_id="222",
+            bids=(level("0.29", "8"),),
+            asks=(level("0.30", "8"),),
+            observed_at=NOW,
+        )
+    )
+    store.append_fee_rate(
+        fee_rate(market_id="0xcondition", taker_rate=Decimal("0.01"), source_hash="f" * 64)
+    )
+    store.append_trial_family(
+        TrialFamily(
+            family_id="shadow-cli-v1",
+            hypothesis="Positive proof-floor surplus persists in shadow replay.",
+            preregistered_at=NOW,
+            thresholds_json='{"version":1}',
+            venues=(PredictionVenue.POLYMARKET,),
+            registered_by="cli-test",
+        )
+    )
+    store.close()
+    assert (
+        main(
+            [
+                "predictions",
+                "prove",
+                "--db",
+                str(database),
+                "--candidate-id",
+                str(CANDIDATE_ID),
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "predictions",
+                "scan",
+                "--db",
+                str(database),
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+        == 0
+    )
+
+
+def test_shadow_command_tree_parses_run_and_replay() -> None:
+    run = build_parser().parse_args(
+        [
+            "predictions",
+            "shadow",
+            "run",
+            "--db",
+            "predictions.duckdb",
+            "--trial-family",
+            "shadow-cli-v1",
+        ]
+    )
+    replay = build_parser().parse_args(
+        [
+            "predictions",
+            "shadow",
+            "replay",
+            "--db",
+            "predictions.duckdb",
+            "--proposal-id",
+            "00000000-0000-0000-0000-000000000001",
+        ]
+    )
+
+    assert (run.predictions_command, run.predictions_shadow_command) == ("shadow", "run")
+    assert (replay.predictions_command, replay.predictions_shadow_command) == (
+        "shadow",
+        "replay",
+    )
+
+
+def test_shadow_run_persists_complete_reconciled_lifecycle_with_hand_pnl(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A changed fill, fee, payout, or transaction boundary breaks the USD 3.96 result."""
+    database = tmp_path / "predictions.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "predictions",
+            "shadow",
+            "run",
+            "--db",
+            str(database),
+            "--trial-family",
+            "shadow-cli-v1",
+            "--as-of",
+            "2026-08-15T12:00:00Z",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["planned"] == 1
+    assert output["existing"] == 0
+    assert output["refused"] == {}
+    assert output["terminal_states"] == {"complete": 1}
+    assert Decimal(output["reconciled_paper_pnl_usd"]) == Decimal("3.960")
+
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        plans = store.shadow_plans_as_of(NOW)
+        assert len(plans) == 1
+        events = store.shadow_events_for_proposal(plans[0].proposal_id, NOW)
+        postings = store.ledger_postings_for_proposal(plans[0].proposal_id, NOW)
+        reconciliation = store.latest_reconciliation_for_proposal(plans[0].proposal_id, NOW)
+        experiments = store.shadow_experiments_as_of(NOW)
+    finally:
+        store.close()
+    assert [event.to_state for event in events][-2:] == [
+        ShadowState.COMPLETE,
+        ShadowState.RECONCILED,
+    ]
+    assert postings
+    assert reconciliation is not None and reconciliation.complete
+    assert len(experiments) == 1
+    assert experiments[0].paper_pnl_usd == Decimal("3.960")
+
+
+def test_shadow_run_requires_family_positive_expiry_and_current_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "missing",
+            ]
+        )
+        == 2
+    )
+    assert "unknown preregistered trial family" in capsys.readouterr().err
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "missing",
+                "--expiry-seconds",
+                "0",
+            ]
+        )
+        == 2
+    )
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(tmp_path / "absent.duckdb"),
+                "--trial-family",
+                "missing",
+            ]
+        )
+        == 2
+    )
+
+
+def test_shadow_run_tallies_risk_and_current_rule_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    risk_database = tmp_path / "risk.duckdb"
+    _seed_runnable_shadow_candidate(risk_database)
+    capsys.readouterr()
+    monkeypatch.setattr(
+        predictions_cli,
+        "DEFAULT_RISK_POLICY",
+        PredictionRiskPolicy(policy_version="shadow-risk-v1", starting_equity_usd=Decimal("50")),
+    )
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(risk_database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["refused"] == {"RISK_REFUSED": 1}
+
+    monkeypatch.setattr(
+        predictions_cli,
+        "DEFAULT_RISK_POLICY",
+        PredictionRiskPolicy(policy_version="shadow-risk-v1"),
+    )
+    rule_database = tmp_path / "rule.duckdb"
+    _seed_runnable_shadow_candidate(rule_database)
+    capsys.readouterr()
+    store = PredictionMarketStore(rule_database)
+    store.append_rule_version(
+        rule_version(
+            rule_version_id=UUID("00000000-0000-0000-0000-00000000f001"),
+            effective_at=NOW + timedelta(seconds=1),
+            superseded_rule_version_id=RULE_VERSION_ID,
+        )
+    )
+    store.close()
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(rule_database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:01Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["refused"] == {"PROOF_NOT_CURRENT": 1}
+
+
+def test_shadow_run_runtime_gap_stays_unknown_without_pnl_or_reconciled_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--scenario",
+                "latency_5s",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["terminal_states"] == {"unknown": 1}
+    assert Decimal(output["reconciled_paper_pnl_usd"]) == 0
+
+    cutoff = NOW + timedelta(minutes=1)
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        plan = store.shadow_plans_as_of(cutoff)[0]
+        events = store.shadow_events_for_proposal(plan.proposal_id, cutoff)
+        experiment = store.shadow_experiments_as_of(cutoff)[0]
+    finally:
+        store.close()
+    assert events[-1].to_state is ShadowState.UNKNOWN
+    assert all(event.to_state is not ShadowState.RECONCILED for event in events)
+    assert experiment.reconciled is False
+    assert experiment.paper_pnl_usd is None
+
+
+def test_shadow_run_persists_failed_losing_experiment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--scenario",
+                "second_leg_reject",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["terminal_states"] == {"unwound": 1}
+    assert Decimal(output["reconciled_paper_pnl_usd"]) < 0
+
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        experiment = store.shadow_experiments_as_of(NOW)[0]
+    finally:
+        store.close()
+    assert experiment.terminal_state is ShadowState.RECONCILED
+    assert experiment.reconciled is True
+    assert experiment.paper_pnl_usd is not None and experiment.paper_pnl_usd < 0
+
+
+def test_shadow_run_is_idempotent_and_rolls_back_every_row_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "idempotent.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+    command = [
+        "predictions",
+        "shadow",
+        "run",
+        "--db",
+        str(database),
+        "--trial-family",
+        "shadow-cli-v1",
+        "--as-of",
+        "2026-08-15T12:00:00Z",
+        "--format",
+        "json",
+    ]
+    assert main(command) == 0
+    capsys.readouterr()
+    assert main(command) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["planned"] == 0
+    assert second["existing"] == 1
+    assert second["terminal_states"] == {}
+    assert Decimal(second["reconciled_paper_pnl_usd"]) == 0
+
+    unknown_database = tmp_path / "unknown-idempotent.duckdb"
+    _seed_runnable_shadow_candidate(unknown_database)
+    capsys.readouterr()
+    unknown_command = [*command]
+    unknown_command[unknown_command.index(str(database))] = str(unknown_database)
+    unknown_command.extend(["--scenario", "latency_5s"])
+    assert main(unknown_command) == 0
+    capsys.readouterr()
+    assert main(unknown_command) == 0
+    unknown_second = json.loads(capsys.readouterr().out)
+    assert unknown_second["planned"] == 0
+    assert unknown_second["existing"] == 1
+
+    rollback_database = tmp_path / "rollback.duckdb"
+    _seed_runnable_shadow_candidate(rollback_database)
+    capsys.readouterr()
+
+    def fail_experiment(self: PredictionMarketStore, record: object) -> bool:
+        raise RuntimeError("private database detail")
+
+    monkeypatch.setattr(PredictionMarketStore, "append_shadow_experiment", fail_experiment)
+    rollback_command = [*command]
+    rollback_command[rollback_command.index(str(database))] = str(rollback_database)
+    assert main(rollback_command) == 1
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert "private database detail" not in captured.err
+    store = PredictionMarketStore(rollback_database, read_only=True)
+    try:
+        assert store.shadow_plans_as_of(NOW) == ()
+    finally:
+        store.close()
+
+
+def test_shadow_run_text_and_json_outputs_never_use_promotional_vocabulary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for output_format in ("text", "json"):
+        database = tmp_path / f"{output_format}.duckdb"
+        _seed_runnable_shadow_candidate(database)
+        capsys.readouterr()
+        assert (
+            main(
+                [
+                    "predictions",
+                    "shadow",
+                    "run",
+                    "--db",
+                    str(database),
+                    "--trial-family",
+                    "shadow-cli-v1",
+                    "--as-of",
+                    "2026-08-15T12:00:00Z",
+                    "--format",
+                    output_format,
+                ]
+            )
+            == 0
+        )
+        output = capsys.readouterr().out.lower()
+        for forbidden in ("risk-free", "guaranteed", "approved", "live eligible"):
+            assert forbidden not in output
+
+
+def _seed_completed_shadow_run(database: Path, capsys: pytest.CaptureFixture[str]) -> UUID:
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        proposal_id = store.shadow_plans_as_of(NOW)[0].proposal_id
+    finally:
+        store.close()
+    return proposal_id
+
+
+def test_shadow_replay_exact_match_and_later_evidence_noninterference(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    store.append_book_snapshot(
+        prediction_book_snapshot(
+            cycle_id=UUID("00000000-0000-0000-0000-00000000b999"),
+            outcome_token_id="111",
+            bids=(level("0.10", "1"),),
+            asks=(level("0.90", "1"),),
+            observed_at=NOW + timedelta(minutes=1),
+            effective_at=NOW + timedelta(minutes=1),
+            source_hash="9" * 64,
+        )
+    )
+    store.append_fee_rate(
+        fee_rate(
+            market_id="0xcondition",
+            observed_at=NOW + timedelta(minutes=1),
+            taker_rate=Decimal("0.5"),
+            source_hash="8" * 64,
+        )
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                str(proposal_id),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert output.rstrip().endswith("replay MATCHES stored events")
+    assert "sequence=0" in output
+    assert "sequence=6" in output
+
+
+def test_shadow_replay_detects_direct_stored_event_tamper(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    terminal = store.shadow_events_for_proposal(proposal_id, NOW)[5]
+    tampered = terminal.model_copy(update={"detail": "tampered but structurally valid"})
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ? WHERE proposal_id = ? AND sequence = 5",
+        [tampered.model_dump_json(), proposal_id],
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                str(proposal_id),
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().out.rstrip().endswith("replay DIVERGES at sequence 5")
+
+
+def test_shadow_replay_what_if_is_read_only_and_not_a_corruption_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    before = database.read_bytes()
+
+    def reject_writer_lease(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("replay must not acquire a writer lease")
+
+    monkeypatch.setattr(predictions_cli, "database_writer_lease", reject_writer_lease)
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                str(proposal_id),
+                "--scenario",
+                "second_leg_reject",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["mode"] == "what_if"
+    assert output["persisted"] is False
+    assert output["scenario"] == "second_leg_reject"
+    assert "verdict" not in output
+    assert database.read_bytes() == before
+
+
+def test_shadow_replay_rejects_invalid_uuid_and_sanitizes_missing_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                "not-a-uuid",
+            ]
+        )
+        == 2
+    )
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                "00000000-0000-0000-0000-000000000001",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow replay evidence is unavailable or inconsistent" in captured.err
+    assert str(database) not in captured.err

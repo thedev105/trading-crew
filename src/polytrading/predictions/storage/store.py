@@ -544,6 +544,28 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else PredictionBookSnapshot.model_validate_json(row[0])
 
+    def book_snapshot_by_source_hash(
+        self,
+        venue: PredictionVenue,
+        market_id: str,
+        outcome_token_id: str | None,
+        source_hash: str,
+        as_of: datetime,
+    ) -> PredictionBookSnapshot | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM prediction_books
+            WHERE venue = ? AND market_id = ?
+              AND outcome_token_id IS NOT DISTINCT FROM ?
+              AND observed_at <= ?
+              AND json_extract_string(record_json, '$.source_hash') = ?
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            [venue.value, market_id, outcome_token_id, as_of, source_hash],
+        ).fetchone()
+        return None if row is None else PredictionBookSnapshot.model_validate_json(row[0])
+
     def latest_book_observed_at_for_venue(
         self, venue: PredictionVenue, as_of: datetime
     ) -> datetime | None:
@@ -596,6 +618,26 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else PredictionFeeRate.model_validate_json(row[0])
 
+    def fee_rate_by_source_hash(
+        self,
+        venue: PredictionVenue,
+        market_id: str | None,
+        source_hash: str,
+        as_of: datetime,
+    ) -> PredictionFeeRate | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM prediction_fee_rates
+            WHERE venue = ? AND market_id IS NOT DISTINCT FROM ?
+              AND observed_at <= ?
+              AND json_extract_string(record_json, '$.source_hash') = ?
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            [venue.value, market_id, as_of, source_hash],
+        ).fetchone()
+        return None if row is None else PredictionFeeRate.model_validate_json(row[0])
+
     def existing_candidate_ids(self) -> frozenset[UUID]:
         """Every ``candidate_id`` already persisted, with no ``as_of`` cutoff.
 
@@ -636,6 +678,19 @@ class PredictionMarketStore:
             [as_of],
         ).fetchall()
         return tuple(CandidateRelationship.model_validate_json(row[0]) for row in rows)
+
+    def candidate_relationship_by_id(
+        self, candidate_id: UUID, as_of: datetime
+    ) -> CandidateRelationship | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM candidate_relationships
+            WHERE candidate_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [candidate_id, as_of],
+        ).fetchone()
+        return None if row is None else CandidateRelationship.model_validate_json(row[0])
 
     def latest_attestation_for_rule_version(
         self, rule_version_id: UUID, as_of: datetime
@@ -678,6 +733,17 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else ProofArtifact.model_validate_json(row[0])
 
+    def proof_artifact_by_id(self, proof_id: UUID, as_of: datetime) -> ProofArtifact | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM proof_artifacts
+            WHERE proof_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [proof_id, as_of],
+        ).fetchone()
+        return None if row is None else ProofArtifact.model_validate_json(row[0])
+
     def proof_artifacts_as_of(self, as_of: datetime) -> tuple[ProofArtifact, ...]:
         rows = self._connection.execute(
             """
@@ -699,6 +765,17 @@ class PredictionMarketStore:
             [as_of],
         ).fetchall()
         return tuple(ScanReport.model_validate_json(row[0]) for row in rows)
+
+    def scan_report_by_id(self, report_id: UUID, as_of: datetime) -> ScanReport | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json FROM scan_reports
+            WHERE report_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [report_id, as_of],
+        ).fetchone()
+        return None if row is None else ScanReport.model_validate_json(row[0])
 
     def shadow_plans_as_of(self, as_of: datetime) -> tuple[ShadowPlan, ...]:
         rows = self._connection.execute(
