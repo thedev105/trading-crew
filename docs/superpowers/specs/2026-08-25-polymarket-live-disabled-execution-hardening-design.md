@@ -3,8 +3,8 @@
 **Date:** 2026-08-25
 **Status:** Direction approved; written specification awaiting user review
 **Scope:** Increment 5 for Polymarket only: real protocol-compatible authentication, signing,
-immediate-order lifecycle, account-state reconciliation, and kill-switch infrastructure, all
-shipped without an issuable live capability
+immediate-order lifecycle, account-state reconciliation, kill-switch infrastructure, and a
+polished read-only live operator console, all shipped without an issuable live capability
 **Authority boundary:** This specification does not authorize credentials, funding, approvals,
 transfers, deposits, withdrawals, redemption, activation, or a live order. The delivered system
 must remain unable to submit a real order while Polymarket is LIVE_DISABLED.
@@ -24,8 +24,9 @@ production capability issuer, or dashboard control.
 The implementation covers real wire formats rather than a fake-only abstraction so offline
 fixtures can prove that signing, authentication, amount encoding, status parsing, recovery, and
 reconciliation match the official protocol. The only executable operator surface added by this
-increment is offline conformance checking. Read-only dashboard output reports readiness and unmet
-gates; it cannot hold secrets or initiate execution.
+increment is offline conformance checking. A polished Market Atlas console presents live-updating
+markets, execution evidence, ledger state, protocol readiness, and unmet gates. It is strictly
+read-only: it cannot hold secrets, connect to the signer or venue, or initiate execution.
 
 New orders are restricted to fill-and-kill (FAK) and fill-or-kill (FOK). Resting GTC and GTD
 orders are deliberately excluded. Unexpected resting state is an execution fault, not an accepted
@@ -51,8 +52,10 @@ Success means an operator can:
 4. prove stable intent identity, signing, unknown-outcome recovery, cancellation, settlement
    tracking, and ledger reconciliation;
 5. inspect read-only readiness, protocol version, kill-switch state, and unmet activation gates;
-6. verify that secrets never enter DuckDB, logs, exceptions, reports, or dashboard payloads; and
-7. run an authority scan demonstrating that no CLI or production factory can issue a live
+6. monitor continuously updating market, execution, ledger, reconciliation, and evidence views
+   without exposing any mutation channel;
+7. verify that secrets never enter DuckDB, logs, exceptions, reports, or dashboard payloads; and
+8. run an authority scan demonstrating that no CLI or production factory can issue a live
    execution capability.
 
 Success does not mean that the strategy is eligible, profitable, funded, or ready to trade.
@@ -84,6 +87,8 @@ The following invariants are binding:
    orders already bound to the approved account and known execution intents.
 10. **No value-transfer authority.** The signer cannot call deposit, withdrawal, transfer,
     approval, redemption, conversion, relayer, wallet-creation, or unknown routes.
+11. **The browser is an observer.** It receives revision notifications and immutable read models
+    only. It cannot connect to Polymarket, the signer, execution IPC, or any mutation endpoint.
 
 ## 4. Protocol Snapshot and Versioning
 
@@ -178,6 +183,27 @@ for all tests and offline conformance. The core never imports a fake-only state 
 
 The coordinator owns no secret and cannot construct authenticated headers. The signer owns no
 strategy logic and cannot invent an order intent.
+
+### 5.5 Read-only live console
+
+The existing loopback-only prediction dashboard becomes a polished Market Atlas console. The
+dashboard server is a separate read-only observer: it opens DuckDB read-only, has no signer or
+authenticated-transport dependency, and exposes GET/HEAD routes only.
+
+Live delivery uses one-way server-sent events (SSE) plus immutable snapshots. The SSE endpoint
+publishes only a revision ID, event time, changed-domain names, and connection health. On each
+revision the browser fetches a complete snapshot captured at one as-of cutoff. It never applies
+financial totals from isolated stream messages. EventSource reconnect uses Last-Event-ID; an
+unknown or evicted revision causes a full snapshot reset.
+
+The alternative approaches are rejected for this increment:
+
+- fixed polling remains only a degraded fallback because it is less responsive and wastes work;
+- a browser WebSocket is unnecessary because the UI has no command channel and a bidirectional
+  transport would broaden the security surface.
+
+The browser never connects to the Polymarket public or authenticated APIs, user WebSocket, signer
+sidecar, or coordinator. All displayed facts come from the dashboard read model.
 
 ## 6. Authorization and Capability Model
 
@@ -297,6 +323,27 @@ read only reconciled live postings.
 
 ConformanceResult records fixture/source hashes, implementation revision, executed checks, result,
 and sanitized failure fingerprints.
+
+### 7.6 Dashboard revision and read models
+
+DashboardRevision is an ephemeral server record containing revision ID, as-of cutoff, emitted
+time, changed domains, and health. Its revision ID is a deterministic hash of the visible
+point-in-time record identities and hashes, not a mutable counter. It contains no raw venue event,
+credential, signature body, or geographic IP.
+
+ExecutionDashboardSnapshot contains the current revision and five strictly read-only views:
+
+- Overview: authority posture, stream health, active opportunity count, evidence freshness,
+  shadow P&L, and reconciliation;
+- Markets: opportunity cards with book depth, proof type, conservative economics, book motion,
+  capacity, and freshness;
+- Execution: plan, intent, order, trade, UNKNOWN, kill, and recovery timelines;
+- Ledger: postings, settlement progression, reconciliation differences, and whether P&L is
+  publishable; and
+- Evidence: protocol/source hashes, conformance, manifest state, and unmet activation gates.
+
+Every value carries its evidence cutoff and reconciliation state. A snapshot either validates as a
+single coherent model or fails as a whole; the client cannot combine fields from two revisions.
 
 ## 8. Storage
 
@@ -474,20 +521,47 @@ fixture/source hashes, protocol version, passing checks, and sanitized failures.
 There is no order, cancel, heartbeat, credential, signer-start, activation, or kill-clear CLI in
 this increment. Internal transport interfaces are exercised only by tests.
 
-### 13.2 Read-only dashboard
+### 13.2 Market Atlas live console
 
-The existing loopback-only prediction dashboard gains a readiness section showing:
+The existing loopback-only prediction dashboard adopts the Market Atlas direction: a dark,
+high-clarity institutional research surface built from the existing slate, cyan, amber, and coral
+tokens. A persistent status rail always shows LIVE_DISABLED, READ ONLY, kill state, connection
+quality, and the current snapshot cutoff.
 
-- venue implementation state, always LIVE_DISABLED for shipped manifests;
-- production capability issuer status, always NOT_CONFIGURED;
-- execution kill state, always ENGAGED in production;
-- unmet 45-day evidence, Class G threshold, and additional 30-day shadow gates;
-- protocol version, source review time, source hashes, and conformance status;
-- latest offline conformance result and sanitized failure codes; and
-- the statement that no live action is available.
+The five views from section 7.6 form the information architecture. The primary Markets view uses
+opportunity cards with proof, depth, economics, capacity, and freshness; the other views provide
+authority, lifecycle, ledger, reconciliation, and source detail without forcing those concerns
+onto each card.
 
-The dashboard opens DuckDB read-only and contains no forms, buttons, links, WebSocket commands, or
-API routes that mutate execution state.
+Live delivery adds:
+
+- GET /api/v1/predictions-events as an SSE notification stream;
+- the existing GET dashboard snapshot route, extended with revision and execution read models;
+- Last-Event-ID resume;
+- bounded per-client event queues;
+- rapid-commit coalescing to the newest revision;
+- a reset event for slow clients or unavailable revisions; and
+- bounded snapshot polling only when SSE is degraded.
+
+The client exposes five connection states:
+
+- CONNECTED: current snapshot and normal data-driven motion;
+- DEGRADED: SSE unavailable, bounded polling active;
+- STALE: one or more domain freshness thresholds exceeded, with affected values dimmed and
+  animation stopped;
+- DISCONNECTED: the last verified snapshot remains behind a prominent overlay; and
+- INCONSISTENT: snapshot validation failed, so financial totals and P&L are hidden.
+
+The UI uses small focused vanilla ES modules rather than a framework or build pipeline. Inline SVG
+renders book depth, sparklines, latency, and lifecycle timelines. Desktop remains information
+dense, tablet collapses secondary evidence, and mobile becomes a single-column monitoring feed.
+All timestamps show UTC and relative age. Color is never the sole state cue; keyboard navigation,
+visible focus, semantic landmarks/tables, screen-reader update summaries, accessible contrast, and
+prefers-reduced-motion are required.
+
+The dashboard contains no forms, order/cancel controls, activation controls, kill-clear controls,
+state-bearing links, browser WebSocket commands, or non-GET/HEAD routes. An SSE connection is an
+observation channel only.
 
 ## 14. Dependency and Cryptography Policy
 
@@ -563,11 +637,28 @@ An authority scan imports every production CLI and factory and proves:
 No authenticated smoke test, live network order test, or secret-bearing CI job is permitted while
 the venue is LIVE_DISABLED.
 
-### 15.6 Repository verification
+### 15.6 Live console tests
+
+Live-console tests cover:
+
+- deterministic revision identity and one-cutoff snapshot consistency;
+- SSE resume, bounded queues, rapid-update coalescing, slow-client reset, disconnect recovery, and
+  polling fallback;
+- CONNECTED, DEGRADED, STALE, DISCONNECTED, and INCONSISTENT rendering;
+- hiding financial totals and P&L when snapshot or reconciliation validation fails;
+- GET/HEAD-only server behavior and structural absence of mutation controls;
+- all five views and the persistent authority/status rail;
+- keyboard navigation, semantic structure, contrast, reduced-motion, and screen-reader summaries;
+- responsive behavior at desktop, tablet, and mobile widths;
+- forbidden copy and secret canaries in HTML, JavaScript, SSE, and snapshots; and
+- deterministic screenshot review with seeded data at all three viewport classes.
+
+### 15.7 Repository verification
 
 Acceptance requires focused unit/integration tests, the complete test suite, Ruff lint and format
 checks, clean package build/install, dependency review, migration upgrade/reopen tests, dashboard
-asset tests, protocol conformance, authority scan, and independent code review.
+asset and SSE tests, deterministic responsive browser screenshots, protocol conformance, authority
+scan, and independent code review.
 
 ## 16. Delivery Sequence
 
@@ -580,9 +671,11 @@ The implementation plan should decompose this design into reviewable tasks in th
 5. typed REST/WebSocket transports and sanitized fake transports;
 6. order/trade state machines, unknown-outcome recovery, heartbeat, and cancellation;
 7. live ledger, authoritative reconciliation, and restart recovery;
-8. offline CLI and read-only dashboard readiness;
-9. authority, secret-leak, packaging, and full-suite verification; and
-10. independent review and documentation.
+8. offline CLI and read-only dashboard readiness models;
+9. Market Atlas information architecture, SSE revision stream, degraded fallback, accessibility,
+   and responsive visual verification;
+10. authority, secret-leak, packaging, and full-suite verification; and
+11. independent review and documentation.
 
 Each task keeps production construction LIVE_DISABLED. No intermediate task may add a temporary
 live bypass for testing.
@@ -601,6 +694,9 @@ live bypass for testing.
 - Shortening the 45 continuous calendar days of synchronized evidence, fixed Class G thresholds,
   or 30 additional calendar days of queue-aware shadow execution.
 - A USD 250 pilot or any other live capital authorization.
+- Browser connections to Polymarket, the signer, execution IPC, or authenticated user streams.
+- Browser-side command transport, optimistic financial totals, or combining multiple snapshot
+  cutoffs.
 
 ## 18. Acceptance Criteria
 
@@ -620,9 +716,14 @@ This increment is complete when:
 9. the signer rejects every non-allowlisted route and every invalid capability or manifest;
 10. production factories cannot obtain or clear a live execution capability, shipped manifests
     remain LIVE_DISABLED, and the authority scan passes;
-11. the CLI exposes offline conformance only, and the dashboard is read-only with no live control;
-12. the full repository verification gates pass; and
-13. documentation states the remaining evidence, eligibility, custody, credential, activation,
+11. the CLI exposes offline conformance only, and the Market Atlas console has no live control or
+    non-GET/HEAD route;
+12. SSE resume, coalescing, reset, degraded polling, stale/disconnected/inconsistent states, and
+    one-cutoff snapshot validation pass deterministic tests;
+13. all five views meet keyboard, semantic, contrast, reduced-motion, responsive, secret-safety,
+    and seeded screenshot-review requirements;
+14. the full repository verification gates pass; and
+15. documentation states the remaining evidence, eligibility, custody, credential, activation,
     and user-approval requirements without implying that code completion satisfies them.
 
 ## 19. Deferred Activation Work
