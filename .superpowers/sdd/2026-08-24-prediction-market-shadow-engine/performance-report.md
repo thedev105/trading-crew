@@ -5,9 +5,9 @@ Date: 2026-08-25
 ## Outcome
 
 - Repository suite baseline: **1,852 passed in 525.67s** (8m45s).
-- Repository suite after review hardening: **2,360 passed in 167.62s** (2m48s; `real 168.16s`).
-- Wall-clock reduction: **358.05s / 68.1%**, or about **3.14x faster**, even though the verified suite grew by 508 tests between the recorded baseline and the final branch.
-- Focused storage/carry/trial plus bulk-helper edge suite: **566 passed in 90.90s** (`real 91.27s`). Before the bulk fixture layer, the focused command took 230.37s.
+- Repository suite after two review-hardening rounds: **2,372 passed in 177.29s** (2m57s; `real 177.93s`).
+- Wall-clock reduction: **348.38s / 66.3%**, or about **2.97x faster**, even though the verified suite grew by 520 tests between the recorded baseline and the final branch.
+- Focused storage/carry/trial plus bulk-helper adversarial suite: **578 passed in 93.87s** (`real 94.26s`). Before the bulk fixture layer, the focused command took 230.37s.
 
 ## Root-cause evidence
 
@@ -44,6 +44,11 @@ This made fixture-only scalar binds, rather than the 2,160-hour data volume or h
    - Four RED-to-GREEN edge tests cover literal `\N` in valid string/nullable fields and canonical JSON, normal nullable sequence/order count, empty and cycle-only inputs, exact duplicates, existing-row retries, and conflict rollback.
    - Isolated 2,160-hour timing after hardening: 27.54s setup + 2.71s audit (30.48s total), effectively unchanged from the pre-hardening 29.74s run.
 
+5. The second review round binds an exact snapshot retry to its complete child-level evidence, not only the header hash. A bulk preflight compares the full ordered level tuple for each existing snapshot: observed timestamp, side, level index, price, quantity, nullable order count, and record hash. Missing bid/ask rows, altered fields, changed side/index, extra duplicated content, reordered prices, and tampered hashes fail before any new batch record is written. Every COPY path also declares `HEADER FALSE`, so malformed first data rows cannot be mistaken for a header.
+
+   - Twelve additional RED-to-GREEN adversarial cases cover all child-level divergence classes and a model-valid `2**63` first-row order count. The overflow raises the same DuckDB conversion error as rowwise append and rolls back cycles, snapshot headers, all levels, and a later valid record.
+   - Isolated 2,160-hour timing after round 2: 29.66s setup + 2.84s audit (32.82s total); the full 2,372-test suite remains under three minutes.
+
 ## Preserved invariants
 
 - Full 90-day funding, 60-day book, and 2,160-hour trial datasets remain unchanged.
@@ -57,10 +62,10 @@ This made fixture-only scalar binds, rather than the 2,160-hour data volume or h
 
 ```text
 PYTHONPATH=src /Volumes/WORK/poly-trading/.venv/bin/python -m pytest tests/storage tests/carry tests/trial tests/test_book_evidence_seed.py --durations=25 -q
-# 566 passed in 90.90s
+# 578 passed in 93.87s
 
 PYTHONPATH=src /Volumes/WORK/poly-trading/.venv/bin/python -m pytest --durations=30 -q
-# 2360 passed in 167.62s
+# 2372 passed in 177.29s
 
 /Volumes/WORK/poly-trading/.venv/bin/ruff check .
 # All checks passed!
@@ -74,4 +79,4 @@ git diff --check
 
 ## Remaining hotspots
 
-The largest remaining costs are building the full 2,160-hour template (45.10s in the final suite), building the two distinct economics templates (31.25s combined), and a 4.33s venue funding-cycle property test. The health audit itself is only 3.36s, and complete economics assembly is about 1.2s under full-suite load, so further gains would primarily require a broader bulk persistence API for funding/cycle fixture records or supplying DuckDB's optional conversion dependency. Neither is necessary for the achieved reduction and both would broaden dependency or production API scope.
+The largest remaining costs are building the full 2,160-hour template (48.55s in the final suite), building the two distinct economics templates (33.12s combined), and a 4.75s venue funding-cycle property test. The health audit itself is only 3.51s, and complete economics assembly is about 1.2s under full-suite load, so further gains would primarily require a broader bulk persistence API for funding/cycle fixture records or supplying DuckDB's optional conversion dependency. Neither is necessary for the achieved reduction and both would broaden dependency or production API scope.

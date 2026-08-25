@@ -104,3 +104,4 @@ Task 10: implementation ready for independent review (base 2153c6a; registration
 Task 10: fix round 1/5 (2 addressed, 0 open — registration now verifies record JSON/hash, every indexed family identity, and decoded-identity multiplicity inside the write transaction; README describes aware-offset UTC normalization accurately; starts after 3a89334; not yet independently complete)
 Task 10: complete (commits 2153c6a..b054262, review clean)
 Performance: fix round 1/5 (2 addressed, 0 open — lossless NULL/string COPY encoding plus empty, cycle-only, idempotent, conflict-safe helper semantics; starts after f7d8a72)
+Performance: fix round 2/5 (2 addressed, 0 open — exact existing snapshot child-level integrity and explicit headerless COPY rollback; starts after 81ab13a)

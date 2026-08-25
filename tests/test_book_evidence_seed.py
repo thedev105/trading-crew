@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+import duckdb
 import pytest
 
 from polytrading.domain.models import BookLevel, Venue
@@ -133,3 +134,142 @@ def test_bulk_copy_conflicts_fail_before_writes_and_preserve_existing_rows(
     assert store._connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (1,)
     assert store._connection.execute("SELECT count(*) FROM book_levels").fetchone() == (4,)
     store.close()
+
+
+@pytest.mark.parametrize(
+    "statements",
+    (
+        ("DELETE FROM book_levels WHERE cycle_id = ? AND side = 'ask'",),
+        ("DELETE FROM book_levels WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",),
+        (
+            "UPDATE book_levels SET quantity = 999 "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET price = 1 "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET order_count = 999 "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET side = 'ask', level_index = 99 "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET level_index = 99 "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET record_hash = 'ffffffffffffffffffffffffffffffff"
+            "ffffffffffffffffffffffffffffffff' "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            "UPDATE book_levels SET observed_at = observed_at + INTERVAL 1 MICROSECOND "
+            "WHERE cycle_id = ? AND side = 'bid' AND level_index = 0",
+        ),
+        (
+            """
+            INSERT INTO book_levels
+            SELECT cycle_id, venue, symbol, observed_at, side, 99,
+                   price, quantity, order_count, record_hash
+            FROM book_levels
+            WHERE cycle_id = ? AND side = 'bid' AND level_index = 0
+            """,
+        ),
+        (
+            """
+            UPDATE book_levels
+            SET price = CASE level_index WHEN 0 THEN 64999.9 ELSE 65000.123456789123456 END
+            WHERE cycle_id = ? AND side = 'bid'
+            """,
+        ),
+    ),
+    ids=(
+        "missing-asks",
+        "missing-bid",
+        "quantity",
+        "price",
+        "order-count",
+        "side",
+        "index",
+        "hash",
+        "observed-at",
+        "extra-duplicate-content",
+        "reordered-prices",
+    ),
+)
+def test_existing_snapshot_retry_rejects_any_child_level_divergence_before_writes(
+    tmp_path: Path,
+    statements: tuple[str, ...],
+) -> None:
+    store = DuckDBStore(tmp_path / "evidence.duckdb")
+    existing_cycle = book_collection_cycle(cycle_id=UUID(int=10))
+    existing_snapshot = book_snapshot(cycle_id=existing_cycle.cycle_id)
+    bulk_append_book_evidence(store, ((existing_cycle, (existing_snapshot,)),), tmp_path)
+    for statement in statements:
+        store._connection.execute(statement, [existing_cycle.cycle_id])
+
+    new_cycle = book_collection_cycle(cycle_id=UUID(int=11))
+    new_snapshot = book_snapshot(cycle_id=new_cycle.cycle_id)
+    with pytest.raises(ConflictingRecordError, match="book snapshot levels"):
+        bulk_append_book_evidence(
+            store,
+            (
+                (new_cycle, (new_snapshot,)),
+                (existing_cycle, (existing_snapshot,)),
+            ),
+            tmp_path,
+        )
+
+    assert store._connection.execute(
+        "SELECT count(*) FROM book_collection_cycles WHERE cycle_id = ?",
+        [new_cycle.cycle_id],
+    ).fetchone() == (0,)
+    assert store._connection.execute(
+        "SELECT count(*) FROM book_snapshots WHERE cycle_id = ?",
+        [new_cycle.cycle_id],
+    ).fetchone() == (0,)
+    store.close()
+
+
+def test_bulk_copy_out_of_range_first_level_raises_and_rolls_back_all_rows(
+    tmp_path: Path,
+) -> None:
+    rowwise = DuckDBStore(tmp_path / "rowwise.duckdb")
+    cycle = book_collection_cycle(cycle_id=UUID(int=20))
+    invalid = book_snapshot(
+        cycle_id=cycle.cycle_id,
+        bids=(
+            BookLevel(
+                price=Decimal("100"),
+                quantity=Decimal("2"),
+                order_count=2**63,
+            ),
+        ),
+        asks=(BookLevel(price=Decimal("101"), quantity=Decimal("3"), order_count=1),),
+    )
+    with pytest.raises(duckdb.ConversionException):
+        rowwise.append_book_snapshot(invalid)
+    assert rowwise._connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+    assert rowwise._connection.execute("SELECT count(*) FROM book_levels").fetchone() == (0,)
+    rowwise.close()
+
+    bulk = DuckDBStore(tmp_path / "bulk.duckdb")
+    valid_cycle = book_collection_cycle(cycle_id=UUID(int=21))
+    valid = book_snapshot(cycle_id=valid_cycle.cycle_id)
+    with pytest.raises(duckdb.ConversionException):
+        bulk_append_book_evidence(
+            bulk,
+            ((cycle, (invalid,)), (valid_cycle, (valid,))),
+            tmp_path,
+        )
+
+    assert bulk._connection.execute("SELECT count(*) FROM book_collection_cycles").fetchone() == (
+        0,
+    )
+    assert bulk._connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
+    assert bulk._connection.execute("SELECT count(*) FROM book_levels").fetchone() == (0,)
+    bulk.close()

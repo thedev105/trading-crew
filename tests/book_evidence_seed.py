@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -45,12 +46,20 @@ def bulk_append_book_evidence(
         store,
         tuple({key[0] for key in snapshots}),
     )
+    existing_snapshot_levels = _existing_snapshot_level_rows(
+        store,
+        tuple({key[0] for key in snapshots}),
+    )
     for identity, record in cycles.items():
         if existing_hash := existing_cycles.get(identity):
             _ensure_exact_record("book collection cycle", record, existing_hash)
     for identity, record in snapshots.items():
         if existing_hash := existing_snapshots.get(identity):
             _ensure_exact_record("book snapshot", record, existing_hash)
+            if existing_snapshot_levels.get(identity, ()) != _snapshot_level_rows(record):
+                raise ConflictingRecordError(
+                    "conflicting book snapshot levels for immutable identity"
+                )
 
     new_cycles = tuple(
         record for identity, record in cycles.items() if identity not in existing_cycles
@@ -176,6 +185,56 @@ def _existing_snapshot_hashes(
     return {(row[0], row[1], row[2]): row[3] for row in rows}
 
 
+def _existing_snapshot_level_rows(
+    store: DuckDBStore,
+    cycle_ids: tuple[UUID, ...],
+) -> dict[tuple[UUID, str, str], tuple[tuple[object, ...], ...]]:
+    if not cycle_ids:
+        return {}
+    rows = store._connection.execute(
+        """
+        SELECT cycle_id, venue, symbol, epoch_us(observed_at), side, level_index,
+               price, quantity, order_count, record_hash
+        FROM book_levels
+        WHERE cycle_id IN (SELECT unnest(?::UUID[]))
+        ORDER BY cycle_id, venue, symbol,
+                 CASE side WHEN 'bid' THEN 0 ELSE 1 END, level_index
+        """,
+        [list(cycle_ids)],
+    ).fetchall()
+    grouped: dict[tuple[UUID, str, str], list[tuple[object, ...]]] = {}
+    for row in rows:
+        grouped.setdefault((row[0], row[1], row[2]), []).append(row[3:])
+    return {identity: tuple(levels) for identity, levels in grouped.items()}
+
+
+def _snapshot_level_rows(snapshot: Level2BookSnapshot) -> tuple[tuple[object, ...], ...]:
+    record_hash = _record_hash(snapshot)
+    observed_at_us = _epoch_us(snapshot.observed_at)
+    return tuple(
+        (
+            observed_at_us,
+            side,
+            level_index,
+            level.price,
+            level.quantity,
+            level.order_count,
+            record_hash,
+        )
+        for side, levels in (("bid", snapshot.bids), ("ask", snapshot.asks))
+        for level_index, level in enumerate(levels)
+    )
+
+
+def _epoch_us(value: datetime) -> int:
+    delta = value - datetime(1970, 1, 1, tzinfo=UTC)
+    return (
+        delta.days * int(timedelta(days=1).total_seconds()) * 1_000_000
+        + delta.seconds * 1_000_000
+        + delta.microseconds
+    )
+
+
 def _copy_rows(
     store: DuckDBStore,
     table: str,
@@ -198,6 +257,7 @@ def _copy_rows(
             QUOTE '"',
             ESCAPE '"',
             NULL '\\N',
+            HEADER FALSE,
             ALLOW_QUOTED_NULLS FALSE
         )
         """
