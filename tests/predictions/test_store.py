@@ -1,5 +1,7 @@
+import json
 from datetime import timedelta
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
 
@@ -346,6 +348,59 @@ def test_verified_fee_rate_rejects_indexed_column_tamper(
 
     with pytest.raises(ConflictingRecordError, match="indexed columns"):
         store.verified_fee_rate_by_source_hash(rate.venue, rate.market_id, rate.source_hash, NOW)
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_verified_fee_rate_rejects_repeated_logical_identity(
+    conflicting: bool, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"fee-duplicate-{conflicting}.duckdb")
+    rate = fee_rate()
+    store.append_fee_rate(rate)
+    repeated = rate.model_copy(update={"taker_rate": Decimal("0.25")}) if conflicting else rate
+    canonical = json.dumps(
+        repeated.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    store._connection.execute(
+        "INSERT INTO prediction_fee_rates VALUES (?, ?, ?, ?, ?)",
+        [
+            repeated.venue.value,
+            repeated.market_id,
+            repeated.observed_at,
+            repeated.model_dump_json(),
+            sha256(canonical.encode()).hexdigest(),
+        ],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="logical identity"):
+        store.verified_fee_rate_by_source_hash(rate.venue, rate.market_id, rate.source_hash, NOW)
+
+
+def test_verified_fee_rate_allows_history_and_selects_latest_cutoff_safe_version(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "fee-history.duckdb")
+    early = fee_rate(observed_at=NOW - timedelta(hours=1))
+    late = early.model_copy(update={"observed_at": NOW, "taker_rate": Decimal("0.25")})
+    store.append_fee_rate(late)
+    store.append_fee_rate(early)
+
+    assert (
+        store.verified_fee_rate_by_source_hash(
+            early.venue,
+            early.market_id,
+            early.source_hash,
+            NOW - timedelta(minutes=30),
+        )
+        == early
+    )
+    assert (
+        store.verified_fee_rate_by_source_hash(early.venue, early.market_id, early.source_hash, NOW)
+        == late
+    )
 
 
 def test_evidence_counts_as_of_sums_every_table(tmp_path: Path) -> None:

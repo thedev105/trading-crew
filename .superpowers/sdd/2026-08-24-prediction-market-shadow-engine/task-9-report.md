@@ -37,6 +37,13 @@ pending reconciliation.
 - Extended ledger posting reconstruction to valid contiguous pre-terminal prefixes. A visible
   `first_leg_simulated` prefix can therefore verify its acquisition/fee journal without requiring
   future reconciliation evidence, while its paper P&L remains unavailable.
+- Rejected repeated fee records sharing one logical `(venue, market_id, observed_at)` identity,
+  whether byte-identical or hash-valid with conflicting normalized rates. Every selected row is
+  verified before multiplicity is assessed, and distinct historical observations still resolve to
+  the latest cutoff-safe version deterministically.
+- Enforced `proposal_id` uniqueness across the complete verified cutoff-safe plan collection before
+  any shadow aggregation or latest-20 capping, so an exact or conflicting duplicate cannot inflate
+  totals while remaining outside the visible listing window.
 - Added deterministic newest-first ordering by `(observed_at, proposal_id)`, with the proposal's
   latest event timestamp and frozen plan quantity in each listing.
 - Added copy-only `predictions shadow run` and `predictions shadow replay` recipes.
@@ -75,6 +82,10 @@ Review-hardening RED-to-GREEN regressions additionally cover:
   experiment hidden behind future indexed timestamps;
 - a cutoff-safe `first_leg_simulated` prefix with its exact visible acquisition journal and no
   reconciliation or paper P&L.
+- exact and conflicting repeated fee logical identities at both the verified store and rendered
+  dashboard boundary, plus a distinct-history control for deterministic latest-as-of selection;
+- exact and hash-valid conflicting duplicate proposal identities placed outside `latest[:20]`,
+  proving full-set uniqueness rather than display-slice validation.
 
 The final tests cover strict/frozen/UTC/finite model behavior; nonnegative and coherent counts;
 sorted mappings and tuples; more-than-20 ordering with timestamp ties; empty databases; plan,
@@ -86,8 +97,8 @@ served-asset vocabulary checks.
 
 ## Fresh verification
 
-- Focused dashboard/model/server/store/ledger tests — `234 passed in 5.94s`.
-- Final prediction-market suite — `933 passed in 20.60s`.
+- Focused dashboard/model/server/store/ledger tests — `241 passed in 6.76s`.
+- Final prediction-market suite — `940 passed in 22.58s`.
 - `ruff check .` — clean.
 - `ruff format --check .` — `255 files already formatted`.
 - `git diff --check` — clean.

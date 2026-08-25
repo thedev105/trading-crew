@@ -791,6 +791,11 @@ class PredictionMarketStore:
             records.append(record)
         if not records:
             return None
+        logical_identities = [
+            (record.venue, record.market_id, record.observed_at) for record in records
+        ]
+        if len(set(logical_identities)) != len(logical_identities):
+            raise ConflictingRecordError("multiple fee rates share one logical identity")
         return max(records, key=lambda record: record.observed_at)
 
     def existing_candidate_ids(self) -> frozenset[UUID]:

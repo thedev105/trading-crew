@@ -166,6 +166,11 @@ class PredictionDashboardBuilder:
         )
 
     def _shadow_summary(self, as_of: datetime) -> ShadowSummary:
+        plans = self._store.verified_shadow_plans_as_of(as_of)
+        proposal_ids = [plan.proposal_id for plan in plans]
+        if len(set(proposal_ids)) != len(proposal_ids):
+            raise ValueError("duplicate shadow plan proposal identity")
+
         experiments = self._store.verified_shadow_experiments_as_of(as_of)
         experiments_by_proposal: dict[UUID, ShadowExperiment] = {}
         experiments_by_family: dict[str, int] = {}
@@ -178,7 +183,7 @@ class PredictionDashboardBuilder:
         listings: list[ShadowListing] = []
         by_current_state: dict[str, int] = {}
         reconciled_pnl = Decimal("0")
-        for plan in self._store.verified_shadow_plans_as_of(as_of):
+        for plan in plans:
             if plan.observed_at > as_of or plan.information_cutoff > as_of:
                 raise ValueError("shadow plan exceeds the dashboard information cutoff")
             events = self._store.verified_shadow_events_for_proposal(plan.proposal_id, as_of)

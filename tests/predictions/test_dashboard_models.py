@@ -327,7 +327,7 @@ def append_reconciled_bundle(
 
 
 def persisted_record_hash(
-    record: PredictionFeeRate | ShadowEvent | ShadowReconciliation,
+    record: PredictionFeeRate | ShadowEvent | ShadowPlan | ShadowReconciliation,
 ) -> str:
     canonical = json.dumps(
         record.model_dump(mode="json"),
@@ -773,6 +773,31 @@ def test_snapshot_shadow_rejects_missing_extra_or_tampered_frozen_fee_evidence(
         PredictionDashboardBuilder(mutated_store, tmp_path / "mutated-fee.duckdb").build(NOW)
 
 
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_snapshot_shadow_rejects_repeated_frozen_fee_logical_identity(
+    conflicting: bool, tmp_path: Path
+) -> None:
+    database = tmp_path / f"fee-duplicate-{conflicting}.duckdb"
+    store = PredictionMarketStore(database)
+    plan = shadow_plan()
+    append_reconciled_bundle(store, plan, ShadowState.EXPIRED, terminal_at=NOW)
+    fee = shadow_fees(plan)[0]
+    repeated = fee.model_copy(update={"taker_rate": Decimal("0.25")}) if conflicting else fee
+    store._connection.execute(
+        "INSERT INTO prediction_fee_rates VALUES (?, ?, ?, ?, ?)",
+        [
+            repeated.venue.value,
+            repeated.market_id,
+            repeated.observed_at,
+            repeated.model_dump_json(),
+            persisted_record_hash(repeated),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="logical identity"):
+        PredictionDashboardBuilder(store, database).build(NOW)
+
+
 def test_snapshot_shadow_accepts_a_cutoff_safe_first_leg_ledger_prefix(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     plan = shadow_plan(observed_at=NOW - timedelta(minutes=10))
@@ -924,6 +949,48 @@ def test_snapshot_shadow_latest_is_newest_first_capped_at_twenty_with_uuid_ties(
     assert [item.proposal_id for item in summary.latest] == [
         UUID(int=index) for index in range(25, 5, -1)
     ]
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_snapshot_shadow_rejects_duplicate_plan_identity_outside_latest_cap(
+    conflicting: bool, tmp_path: Path
+) -> None:
+    database = tmp_path / f"duplicate-plan-{conflicting}.duckdb"
+    store = PredictionMarketStore(database)
+    oldest: ShadowPlan | None = None
+    for index in range(1, 22):
+        plan = shadow_plan(proposal_id=UUID(int=index), observed_at=NOW - timedelta(minutes=30))
+        append_plan_and_events(
+            store,
+            plan,
+            shadow_events(
+                plan,
+                ShadowState.UNKNOWN,
+                terminal_at=NOW - timedelta(minutes=21 - index),
+            ),
+        )
+        if index == 1:
+            oldest = plan
+    assert oldest is not None
+    repeated = (
+        oldest.model_copy(update={"completion_path": "conflicting duplicate"})
+        if conflicting
+        else oldest
+    )
+    store._connection.execute(
+        "INSERT INTO shadow_plans VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            repeated.proposal_id,
+            repeated.candidate_id,
+            repeated.observed_at,
+            repeated.information_cutoff,
+            repeated.model_dump_json(),
+            persisted_record_hash(repeated),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="duplicate shadow plan proposal identity"):
+        PredictionDashboardBuilder(store, database).build(NOW)
 
 
 def test_snapshot_shadow_fails_closed_on_missing_or_noncontiguous_event_chains(
