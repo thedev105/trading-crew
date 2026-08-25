@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 
@@ -16,6 +17,7 @@ from polytrading.predictions.shadow_models import (
     ShadowState,
 )
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
+from polytrading.storage.store import DuckDBStore
 from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.candidate_helpers import candidate_relationship
 from tests.predictions.domain_helpers import (
@@ -94,6 +96,23 @@ def test_read_only_open_rejects_a_stale_schema(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="current schema"):
         PredictionMarketStore(path, read_only=True)
+
+
+def test_read_write_open_rejects_a_core_store_database_without_mutating_it(tmp_path: Path) -> None:
+    path = tmp_path / "forward.duckdb"
+    DuckDBStore(path).close()
+
+    with pytest.raises(RuntimeError, match="prediction-market database"):
+        PredictionMarketStore(path)
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert "raw_envelopes" in tables
+    assert "prediction_raw_envelopes" not in tables
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
 
 
 def test_venue_manifest_round_trip_and_conflict(tmp_path: Path) -> None:

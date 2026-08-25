@@ -22,6 +22,7 @@ from polytrading.domain.models import (
     RawEnvelope,
     Venue,
 )
+from polytrading.predictions.storage.store import PredictionMarketStore
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
 from polytrading.trial.funding_models import (
     TRIAL_FUNDING_PROTOCOL_VERSION,
@@ -421,6 +422,25 @@ def test_read_only_store_requires_the_exact_current_schema(tmp_path: Path) -> No
 
     with pytest.raises(RuntimeError, match="read-only store requires current schema"):
         DuckDBStore(path, read_only=True)
+
+
+def test_read_write_open_rejects_a_prediction_store_database_without_mutating_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(path).close()
+
+    with pytest.raises(RuntimeError, match="core store database"):
+        DuckDBStore(path)
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert "prediction_raw_envelopes" in tables
+    assert "raw_envelopes" not in tables
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
 
 
 def test_migration_sql_is_available_as_packaged_data() -> None:

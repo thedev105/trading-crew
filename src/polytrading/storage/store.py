@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_FAMILY_SENTINEL_TABLE = "raw_envelopes"
 
 
 class ConflictingRecordError(ValueError):
@@ -1497,6 +1498,7 @@ class DuckDBStore:
 
         self._connection.execute("BEGIN TRANSACTION")
         try:
+            self._require_core_store_database()
             applied = self._applied_migration_versions(versions)
             for version, migration in migrations[len(applied) :]:
                 self._connection.execute(migration.read_text(encoding="utf-8"))
@@ -1510,6 +1512,7 @@ class DuckDBStore:
 
     def _verify_current_schema(self) -> None:
         versions = [version for version, _ in self._migration_entries()]
+        self._require_core_store_database()
         applied = self._applied_migration_versions(versions)
         if applied != versions:
             raise RuntimeError(
@@ -1531,15 +1534,7 @@ class DuckDBStore:
         return migrations
 
     def _applied_migration_versions(self, known_versions: list[int]) -> list[int]:
-        has_migration_table = bool(
-            self._connection.execute(
-                """
-                SELECT count(*)
-                FROM information_schema.tables
-                WHERE table_schema = 'main' AND table_name = 'schema_migrations'
-                """
-            ).fetchone()[0]
-        )
+        has_migration_table = self._has_table("schema_migrations")
         applied = (
             [
                 row[0]
@@ -1557,3 +1552,19 @@ class DuckDBStore:
         ):
             raise RuntimeError(f"applied migration versions are not a known prefix: {applied}")
         return applied
+
+    def _require_core_store_database(self) -> None:
+        if self._has_table("schema_migrations") and not self._has_table(_FAMILY_SENTINEL_TABLE):
+            raise RuntimeError("core store cannot open a non-core store database")
+
+    def _has_table(self, table_name: str) -> bool:
+        return bool(
+            self._connection.execute(
+                """
+                SELECT count(*)
+                FROM information_schema.tables
+                WHERE table_schema = 'main' AND table_name = ?
+                """,
+                [table_name],
+            ).fetchone()[0]
+        )
