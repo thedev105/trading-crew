@@ -105,3 +105,4 @@ Task 10: fix round 1/5 (2 addressed, 0 open — registration now verifies record
 Task 10: complete (commits 2153c6a..b054262, review clean)
 Performance: fix round 1/5 (2 addressed, 0 open — lossless NULL/string COPY encoding plus empty, cycle-only, idempotent, conflict-safe helper semantics; starts after f7d8a72)
 Performance: fix round 2/5 (2 addressed, 0 open — exact existing snapshot child-level integrity and explicit headerless COPY rollback; starts after 81ab13a)
+Performance: fix round 3/5 (1 addressed, 0 open — explicit LF row boundaries preserve CR/CRLF and the full valid string/control-character domain; starts after cb18d67)

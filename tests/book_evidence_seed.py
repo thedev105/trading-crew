@@ -258,6 +258,7 @@ def _copy_rows(
             ESCAPE '"',
             NULL '\\N',
             HEADER FALSE,
+            NEW_LINE '\\n',
             ALLOW_QUOTED_NULLS FALSE
         )
         """

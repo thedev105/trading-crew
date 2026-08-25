@@ -273,3 +273,69 @@ def test_bulk_copy_out_of_range_first_level_raises_and_rolls_back_all_rows(
     assert bulk._connection.execute("SELECT count(*) FROM book_snapshots").fetchone() == (0,)
     assert bulk._connection.execute("SELECT count(*) FROM book_levels").fetchone() == (0,)
     bulk.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("cr", "symbol\rvalue"),
+        ("crlf", "symbol\r\nvalue"),
+        ("lf", "symbol\nvalue"),
+        ("tab", "symbol\tvalue"),
+        ("quotes-commas", 'symbol,"quoted",value'),
+        ("unicode", "東京💹"),
+        ("null-marker", "\\N"),
+        ("nul", "symbol\x00value"),
+    ),
+    ids=("cr", "crlf", "lf", "tab", "quotes-commas", "unicode", "null-marker", "nul"),
+)
+def test_bulk_copy_matches_rowwise_for_every_valid_string_control_character(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    del name
+    cycle = book_collection_cycle(
+        cycle_id=UUID(int=30),
+        status="failed",
+        failure_codes=(value,),
+    )
+    snapshot = book_snapshot(
+        cycle_id=cycle.cycle_id,
+        symbol=value,
+        sequence=value,
+    )
+    rowwise = DuckDBStore(tmp_path / "rowwise-strings.duckdb")
+    with rowwise.transaction():
+        rowwise.append_book_collection_cycle(cycle)
+        rowwise.append_book_snapshot(snapshot)
+    bulk = DuckDBStore(tmp_path / "bulk-strings.duckdb")
+
+    bulk_append_book_evidence(bulk, ((cycle, (snapshot,)),), tmp_path)
+    bulk_append_book_evidence(bulk, ((cycle, (snapshot,)),), tmp_path)
+
+    assert (
+        bulk.books_for_cycle(cycle.cycle_id)
+        == rowwise.books_for_cycle(cycle.cycle_id)
+        == (snapshot,)
+    )
+    assert (
+        bulk._connection.execute(
+            "SELECT CAST(record_json AS VARCHAR), record_hash FROM book_collection_cycles"
+        ).fetchone()
+        == rowwise._connection.execute(
+            "SELECT CAST(record_json AS VARCHAR), record_hash FROM book_collection_cycles"
+        ).fetchone()
+        == (_canonical_json(cycle), _record_hash(cycle))
+    )
+    assert (
+        bulk._connection.execute(
+            "SELECT symbol, sequence, record_hash FROM book_snapshots"
+        ).fetchone()
+        == rowwise._connection.execute(
+            "SELECT symbol, sequence, record_hash FROM book_snapshots"
+        ).fetchone()
+        == (value, value, _record_hash(snapshot))
+    )
+    bulk.close()
+    rowwise.close()
