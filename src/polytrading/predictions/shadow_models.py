@@ -152,11 +152,21 @@ class ShadowEvent(PredictionRecord):
     leg_index: int | None
     scenario_id: str | None
     fills: tuple[ShadowFill, ...] = ()
+    evidence_hashes: tuple[Sha256, ...] = ()
 
     @field_validator("occurred_at")
     @classmethod
     def _require_utc_occurred_at(cls, value: datetime) -> datetime:
         return normalize_utc_timestamp(value)
+
+    @field_validator("evidence_hashes")
+    @classmethod
+    def _require_sorted_unique_evidence_hashes(
+        cls, value: tuple[Sha256, ...]
+    ) -> tuple[Sha256, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("evidence_hashes must be sorted and unique")
+        return value
 
     @model_validator(mode="after")
     def _require_valid_transition(self) -> ShadowEvent:

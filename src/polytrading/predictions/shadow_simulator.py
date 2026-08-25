@@ -112,54 +112,49 @@ def simulate_shadow_proposal(
     _validate_scenario_indices(scenario, len(ordered_legs))
 
     events = _provenance_events(plan)
-    book_cache: dict[tuple[int, datetime], PredictionBookSnapshot | None] = {}
+    book_cache: dict[tuple[int, datetime], tuple[PredictionBookSnapshot | None, bool]] = {}
 
-    def read_book(leg: ShadowLegPlan, at: datetime) -> PredictionBookSnapshot | None:
+    def read_book(
+        leg: ShadowLegPlan,
+        at: datetime,
+        evidence_hashes: set[str],
+    ) -> PredictionBookSnapshot | None:
         key = (leg.leg_index, at)
         if key not in book_cache:
             supplied = books(leg.leg_index, at)
             if supplied is None:
-                book_cache[key] = None
+                book_cache[key] = (None, False)
             else:
                 validated = _revalidate_record(supplied, PredictionBookSnapshot)
-                _validate_book(plan, candidate, leg, validated, at)
-                if at - validated.observed_at > timedelta(
+                _validate_book(candidate, leg, validated, at)
+                usable = at - validated.observed_at <= timedelta(
                     seconds=economics_policy.max_book_age_seconds
-                ):
-                    book_cache[key] = None
-                else:
-                    book_cache[key] = validated
-        return book_cache[key]
+                )
+                book_cache[key] = (validated, usable)
+        snapshot, usable = book_cache[key]
+        if snapshot is not None:
+            evidence_hashes.add(snapshot.source_hash)
+        return snapshot if usable else None
 
     legs_by_index = {leg.leg_index: leg for leg in ordered_legs}
     acquisitions: list[ShadowFill] = []
     terminal_buys: list[ShadowFill] = []
+    first_evidence_hashes: set[str] = set()
+    terminal_evidence_hashes: set[str] = set()
     first_leg = ordered_legs[0]
-    first_submit_at = _submit_at(started_at, 0, scenario)
     first_fill_at = _fill_at(started_at, 0, scenario)
 
-    if scenario.unknown_after_leg == 0:
-        _append_first_attempt(events, plan, scenario, first_leg, first_submit_at, None)
+    first_timing_stop = _timing_stop(plan, scenario, started_at, 0)
+    if first_timing_stop is not None:
+        state, occurred_at, detail = first_timing_stop
+        _append_first_attempt(events, plan, scenario, first_leg, occurred_at, None)
         return _append_terminal(
             events,
             plan=plan,
             scenario=scenario,
-            state=ShadowState.UNKNOWN,
-            occurred_at=first_submit_at,
-            detail="first order state became unknown after submission",
-            quantity_filled=None,
-            leg_index=first_leg.leg_index,
-            fills=(),
-        )
-    if first_fill_at > plan.expires_at:
-        _append_first_attempt(events, plan, scenario, first_leg, first_fill_at, None)
-        return _append_terminal(
-            events,
-            plan=plan,
-            scenario=scenario,
-            state=ShadowState.EXPIRED,
-            occurred_at=first_fill_at,
-            detail="proposal expired before the first fill could be confirmed",
+            state=state,
+            occurred_at=occurred_at,
+            detail=detail,
             quantity_filled=None,
             leg_index=first_leg.leg_index,
             fills=(),
@@ -178,9 +173,17 @@ def simulate_shadow_proposal(
             fills=(),
         )
 
-    first_book = read_book(first_leg, first_fill_at)
+    first_book = read_book(first_leg, first_fill_at, first_evidence_hashes)
     if first_book is None:
-        _append_first_attempt(events, plan, scenario, first_leg, first_fill_at, None)
+        _append_first_attempt(
+            events,
+            plan,
+            scenario,
+            first_leg,
+            first_fill_at,
+            None,
+            first_evidence_hashes,
+        )
         return _append_terminal(
             events,
             plan=plan,
@@ -200,7 +203,15 @@ def simulate_shadow_proposal(
     )
     common_quantity = sum((size for _, size in first_levels), Decimal("0"))
     if common_quantity <= 0:
-        _append_first_attempt(events, plan, scenario, first_leg, first_fill_at, None)
+        _append_first_attempt(
+            events,
+            plan,
+            scenario,
+            first_leg,
+            first_fill_at,
+            None,
+            first_evidence_hashes,
+        )
         return _append_terminal(
             events,
             plan=plan,
@@ -219,7 +230,15 @@ def simulate_shadow_proposal(
         quantity=common_quantity,
     )
     acquisitions.append(first_fill)
-    _append_first_attempt(events, plan, scenario, first_leg, first_fill_at, first_fill)
+    _append_first_attempt(
+        events,
+        plan,
+        scenario,
+        first_leg,
+        first_fill_at,
+        first_fill,
+        first_evidence_hashes,
+    )
 
     if common_quantity < plan.max_quantity:
         economics_books: dict[int, PredictionBookSnapshot] = {
@@ -227,30 +246,20 @@ def simulate_shadow_proposal(
         }
         for position, leg in enumerate(ordered_legs[1:], start=1):
             fill_at = _fill_at(started_at, position, scenario)
-            submit_at = _submit_at(started_at, position, scenario)
-            if fill_at > plan.expires_at:
+            timing_stop = _timing_stop(plan, scenario, started_at, position)
+            if timing_stop is not None:
+                state, occurred_at, detail = timing_stop
                 return _append_terminal(
                     events,
                     plan=plan,
                     scenario=scenario,
-                    state=ShadowState.EXPIRED,
-                    occurred_at=fill_at,
-                    detail="proposal expired before reduced-quantity continuation",
+                    state=state,
+                    occurred_at=occurred_at,
+                    detail=detail,
                     quantity_filled=None,
                     leg_index=leg.leg_index,
                     fills=tuple(terminal_buys),
-                )
-            if scenario.unknown_after_leg == position:
-                return _append_terminal(
-                    events,
-                    plan=plan,
-                    scenario=scenario,
-                    state=ShadowState.UNKNOWN,
-                    occurred_at=submit_at,
-                    detail="order state became unknown during reduced-quantity continuation",
-                    quantity_filled=None,
-                    leg_index=leg.leg_index,
-                    fills=tuple(terminal_buys),
+                    evidence_hashes=terminal_evidence_hashes,
                 )
             if scenario.failing_leg_index == position:
                 return _unwind_or_unknown(
@@ -262,11 +271,12 @@ def simulate_shadow_proposal(
                     failed_quantity=None,
                     acquisitions=acquisitions,
                     terminal_buys=terminal_buys,
+                    terminal_evidence_hashes=terminal_evidence_hashes,
                     legs_by_index=legs_by_index,
                     read_book=read_book,
                     reason="venue rejected the reduced-quantity continuation",
                 )
-            book = read_book(leg, fill_at)
+            book = read_book(leg, fill_at, terminal_evidence_hashes)
             if book is None:
                 return _append_terminal(
                     events,
@@ -278,6 +288,7 @@ def simulate_shadow_proposal(
                     quantity_filled=None,
                     leg_index=leg.leg_index,
                     fills=tuple(terminal_buys),
+                    evidence_hashes=terminal_evidence_hashes,
                 )
             levels = _walk_current_asks(
                 leg,
@@ -295,6 +306,7 @@ def simulate_shadow_proposal(
                     failed_quantity=None,
                     acquisitions=acquisitions,
                     terminal_buys=terminal_buys,
+                    terminal_evidence_hashes=terminal_evidence_hashes,
                     legs_by_index=legs_by_index,
                     read_book=read_book,
                     reason="later leg could not fill the reduced common quantity",
@@ -319,6 +331,7 @@ def simulate_shadow_proposal(
                 failed_quantity=None,
                 acquisitions=acquisitions,
                 terminal_buys=terminal_buys,
+                terminal_evidence_hashes=terminal_evidence_hashes,
                 legs_by_index=legs_by_index,
                 read_book=read_book,
                 reason="recomputed reduced-quantity economics were not positive",
@@ -329,29 +342,20 @@ def simulate_shadow_proposal(
     for position, leg in enumerate(ordered_legs[1:], start=1):
         terminal_at = _fill_at(started_at, position, scenario)
         last_leg_index = leg.leg_index
-        if terminal_at > plan.expires_at:
+        timing_stop = _timing_stop(plan, scenario, started_at, position)
+        if timing_stop is not None:
+            state, occurred_at, detail = timing_stop
             return _append_terminal(
                 events,
                 plan=plan,
                 scenario=scenario,
-                state=ShadowState.EXPIRED,
-                occurred_at=terminal_at,
-                detail="proposal expired before the next leg could fill",
+                state=state,
+                occurred_at=occurred_at,
+                detail=detail,
                 quantity_filled=None,
                 leg_index=leg.leg_index,
                 fills=tuple(terminal_buys),
-            )
-        if scenario.unknown_after_leg == position:
-            return _append_terminal(
-                events,
-                plan=plan,
-                scenario=scenario,
-                state=ShadowState.UNKNOWN,
-                occurred_at=_submit_at(started_at, position, scenario),
-                detail="order state became unknown after submission; simulation halted",
-                quantity_filled=None,
-                leg_index=leg.leg_index,
-                fills=tuple(terminal_buys),
+                evidence_hashes=terminal_evidence_hashes,
             )
         if scenario.failing_leg_index == position:
             return _unwind_or_unknown(
@@ -363,11 +367,12 @@ def simulate_shadow_proposal(
                 failed_quantity=None,
                 acquisitions=acquisitions,
                 terminal_buys=terminal_buys,
+                terminal_evidence_hashes=terminal_evidence_hashes,
                 legs_by_index=legs_by_index,
                 read_book=read_book,
                 reason="venue rejected the planned leg",
             )
-        book = read_book(leg, terminal_at)
+        book = read_book(leg, terminal_at, terminal_evidence_hashes)
         if book is None:
             return _append_terminal(
                 events,
@@ -379,6 +384,7 @@ def simulate_shadow_proposal(
                 quantity_filled=None,
                 leg_index=leg.leg_index,
                 fills=tuple(terminal_buys),
+                evidence_hashes=terminal_evidence_hashes,
             )
         levels = _walk_current_asks(
             leg,
@@ -406,6 +412,7 @@ def simulate_shadow_proposal(
                 failed_quantity=quantity,
                 acquisitions=acquisitions,
                 terminal_buys=terminal_buys,
+                terminal_evidence_hashes=terminal_evidence_hashes,
                 legs_by_index=legs_by_index,
                 read_book=read_book,
                 reason="planned leg filled short of the common quantity",
@@ -421,6 +428,7 @@ def simulate_shadow_proposal(
         quantity_filled=common_quantity,
         leg_index=last_leg_index,
         fills=tuple(terminal_buys),
+        evidence_hashes=terminal_evidence_hashes,
     )
 
 
@@ -505,7 +513,6 @@ def _validate_scenario_indices(scenario: StressScenario, leg_count: int) -> None
 
 
 def _validate_book(
-    plan: ShadowPlan,
     candidate: CandidateRelationship,
     leg: ShadowLegPlan,
     book: PredictionBookSnapshot,
@@ -518,8 +525,6 @@ def _validate_book(
         or book.outcome_token_id != candidate_leg.outcome_token_id
     ):
         raise ValueError("provider book does not match the requested candidate leg")
-    if book.source_hash not in plan.frozen_hashes:
-        raise ValueError("provider book hash is not frozen in the plan")
     if book.observed_at > requested_at or book.effective_at > requested_at:
         raise ValueError("provider book contains evidence from after its requested time")
 
@@ -562,6 +567,35 @@ def _submit_at(started_at: datetime, position: int, scenario: StressScenario) ->
     return started_at + timedelta(seconds=position * scenario.latency_seconds)
 
 
+def _timing_stop(
+    plan: ShadowPlan,
+    scenario: StressScenario,
+    started_at: datetime,
+    position: int,
+) -> tuple[ShadowState, datetime, str] | None:
+    submit_at = _submit_at(started_at, position, scenario)
+    fill_at = _fill_at(started_at, position, scenario)
+    if submit_at > plan.expires_at:
+        return (
+            ShadowState.EXPIRED,
+            submit_at,
+            "proposal expired before the leg could be submitted",
+        )
+    if scenario.unknown_after_leg == position:
+        return (
+            ShadowState.UNKNOWN,
+            submit_at,
+            "order state became unknown after submission; simulation halted",
+        )
+    if fill_at > plan.expires_at:
+        return (
+            ShadowState.EXPIRED,
+            fill_at,
+            "proposal expired before the leg fill could be confirmed",
+        )
+    return None
+
+
 def _append_first_attempt(
     events: list[ShadowEvent],
     plan: ShadowPlan,
@@ -569,6 +603,7 @@ def _append_first_attempt(
     leg: ShadowLegPlan,
     occurred_at: datetime,
     fill: ShadowFill | None,
+    evidence_hashes: Sequence[str] = (),
 ) -> None:
     events.append(
         _event(
@@ -586,6 +621,7 @@ def _append_first_attempt(
             leg_index=leg.leg_index,
             scenario_id=scenario.scenario_id,
             fills=(fill,) if fill is not None else (),
+            evidence_hashes=tuple(sorted(set(evidence_hashes))),
         )
     )
 
@@ -601,6 +637,7 @@ def _append_terminal(
     quantity_filled: Decimal | None,
     leg_index: int | None,
     fills: tuple[ShadowFill, ...],
+    evidence_hashes: Sequence[str] = (),
 ) -> tuple[ShadowEvent, ...]:
     events.append(
         _event(
@@ -614,6 +651,7 @@ def _append_terminal(
             leg_index=leg_index,
             scenario_id=scenario.scenario_id,
             fills=fills,
+            evidence_hashes=tuple(sorted(set(evidence_hashes))),
         )
     )
     return tuple(events)
@@ -629,8 +667,9 @@ def _unwind_or_unknown(
     failed_quantity: Decimal | None,
     acquisitions: Sequence[ShadowFill],
     terminal_buys: Sequence[ShadowFill],
+    terminal_evidence_hashes: set[str],
     legs_by_index: Mapping[int, ShadowLegPlan],
-    read_book: Callable[[ShadowLegPlan, datetime], PredictionBookSnapshot | None],
+    read_book: Callable[[ShadowLegPlan, datetime, set[str]], PredictionBookSnapshot | None],
     reason: str,
 ) -> tuple[ShadowEvent, ...]:
     sells: list[ShadowFill] = []
@@ -642,7 +681,7 @@ def _unwind_or_unknown(
 
     for acquisition in reversed(acquisitions):
         leg = legs_by_index[acquisition.leg_index]
-        book = read_book(leg, at)
+        book = read_book(leg, at, terminal_evidence_hashes)
         if book is None:
             return _append_terminal(
                 events,
@@ -654,6 +693,7 @@ def _unwind_or_unknown(
                 quantity_filled=failed_quantity,
                 leg_index=failed_leg_index,
                 fills=tuple((*terminal_buys, *sells)),
+                evidence_hashes=terminal_evidence_hashes,
             )
         levels = _walk_current_bids(
             book,
@@ -683,6 +723,7 @@ def _unwind_or_unknown(
                 quantity_filled=failed_quantity,
                 leg_index=failed_leg_index,
                 fills=tuple((*terminal_buys, *sells)),
+                evidence_hashes=terminal_evidence_hashes,
             )
 
     loss = max(acquisition_cost - unwind_proceeds, Decimal("0"))
@@ -696,6 +737,7 @@ def _unwind_or_unknown(
         quantity_filled=failed_quantity,
         leg_index=failed_leg_index,
         fills=tuple((*terminal_buys, *sells)),
+        evidence_hashes=terminal_evidence_hashes,
     )
 
 
@@ -761,6 +803,7 @@ def _provenance_events(plan: ShadowPlan) -> list[ShadowEvent]:
             leg_index=None,
             scenario_id=None,
             fills=(),
+            evidence_hashes=(),
         )
         for sequence, (from_state, to_state, detail) in enumerate(specifications)
     ]
@@ -778,6 +821,7 @@ def _event(
     leg_index: int | None,
     scenario_id: str | None,
     fills: tuple[ShadowFill, ...],
+    evidence_hashes: tuple[str, ...],
 ) -> ShadowEvent:
     fields: dict[str, object] = {
         "schema_version": 1,
@@ -791,6 +835,7 @@ def _event(
         "leg_index": leg_index,
         "scenario_id": scenario_id,
         "fills": fills,
+        "evidence_hashes": evidence_hashes,
     }
     provisional = ShadowEvent(event_id=UUID(int=0), **fields)
     canonical = json.dumps(

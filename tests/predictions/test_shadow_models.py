@@ -288,6 +288,16 @@ def test_shadow_event_fills_are_machine_readable_evidence() -> None:
     assert event.fills == (fill,)
 
 
+def test_shadow_event_retains_sorted_unique_runtime_evidence_hashes() -> None:
+    """Runtime book lineage must be canonical before it enters content-derived identity."""
+    event = _event(evidence_hashes=(HASH_A, HASH_B))
+
+    assert event.evidence_hashes == (HASH_A, HASH_B)
+
+    with pytest.raises(ValidationError, match="evidence_hashes"):
+        _event(evidence_hashes=(HASH_B, HASH_A, HASH_A))
+
+
 def test_derive_current_state_returns_the_last_state_for_a_contiguous_event_chain() -> None:
     events = (
         _event(),

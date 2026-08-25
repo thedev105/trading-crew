@@ -38,6 +38,7 @@ CANDIDATE_ID = UUID("10000000-0000-0000-0000-000000000001")
 PROOF_ID = UUID("20000000-0000-0000-0000-000000000001")
 RULE_A = UUID("30000000-0000-0000-0000-000000000001")
 RULE_B = UUID("30000000-0000-0000-0000-000000000002")
+RULE_C = UUID("30000000-0000-0000-0000-000000000003")
 CYCLE_ID = UUID("40000000-0000-0000-0000-000000000001")
 HASH_A = "a" * 64
 HASH_B = "b" * 64
@@ -45,6 +46,8 @@ HASH_C = "c" * 64
 HASH_D = "d" * 64
 HASH_E = "e" * 64
 HASH_F = "f" * 64
+THREE_CANDIDATE_ID = UUID("10000000-0000-0000-0000-000000000003")
+THREE_PROOF_ID = UUID("20000000-0000-0000-0000-000000000003")
 
 
 def _simulator() -> object:
@@ -264,6 +267,135 @@ def _plan(
     )
     assert isinstance(plan, ShadowPlan)
     return plan
+
+
+def _three_leg_inputs() -> tuple[
+    ShadowPlan,
+    ProofArtifact,
+    CandidateRelationship,
+    dict[int, PredictionFeeRate],
+]:
+    third_rule_hash = "3" * 64
+    candidate_values = _candidate().model_dump()
+    candidate_values.update(
+        {
+            "candidate_id": THREE_CANDIDATE_ID,
+            "relationship_type": RelationshipType.EXHAUSTIVE_OUTCOME_SET,
+            "legs": (
+                *_candidate().legs,
+                CandidateLeg(
+                    venue=PredictionVenue.POLYMARKET,
+                    market_id="market-c",
+                    outcome_index=2,
+                    outcome_token_id="token-c",
+                    rule_version_id=RULE_C,
+                    rule_source_hash=third_rule_hash,
+                ),
+            ),
+        }
+    )
+    candidate = CandidateRelationship.model_validate(candidate_values)
+    proof_values = _proof().model_dump()
+    proof_values.update(
+        {
+            "proof_id": THREE_PROOF_ID,
+            "candidate_id": THREE_CANDIDATE_ID,
+            "template": "exhaustive_outcome_set@1",
+            "terminal_states": (
+                TerminalState(
+                    state_id="a-wins",
+                    description="A pays",
+                    leg_payouts=(Decimal("1"), Decimal("0"), Decimal("0")),
+                ),
+                TerminalState(
+                    state_id="b-wins",
+                    description="B pays",
+                    leg_payouts=(Decimal("0"), Decimal("1"), Decimal("0")),
+                ),
+                TerminalState(
+                    state_id="c-wins",
+                    description="C pays",
+                    leg_payouts=(Decimal("0"), Decimal("0"), Decimal("1")),
+                ),
+            ),
+            "rule_version_ids": (RULE_A, RULE_B, RULE_C),
+            "source_hashes": (third_rule_hash, HASH_A, HASH_B),
+        }
+    )
+    proof = ProofArtifact.model_validate(proof_values)
+    books = {
+        **_books(),
+        2: PredictionBookSnapshot(
+            schema_version=1,
+            cycle_id=CYCLE_ID,
+            venue=PredictionVenue.POLYMARKET,
+            market_id="market-c",
+            outcome_token_id="token-c",
+            bids=(_level("0.05", "5"),),
+            asks=(_level("0.10", "5"),),
+            sequence="2",
+            effective_at=NOW,
+            observed_at=NOW,
+            source_hash="7" * 64,
+        ),
+    }
+    fees = {
+        **_fees(),
+        2: PredictionFeeRate(
+            schema_version=1,
+            venue=PredictionVenue.POLYMARKET,
+            market_id="market-c",
+            maker_rate=Decimal("0"),
+            taker_rate=Decimal("0"),
+            observed_at=NOW,
+            source_hash="8" * 64,
+        ),
+    }
+    policy = _policy()
+    economics = evaluate_basket_economics(
+        proof, candidate, books=books, fees=fees, policy=policy, as_of=NOW
+    )
+    scan = ScanReport(
+        report_id=deterministic_scan_report_id(
+            candidate_id=THREE_CANDIDATE_ID,
+            proof_id=THREE_PROOF_ID,
+            decision="SHADOW_CANDIDATE",
+            reason="positive three-leg basket",
+            economics=economics,
+            policy_id=policy.policy_id,
+            policy_version=policy.policy_version,
+            as_of=NOW,
+        ),
+        candidate_id=THREE_CANDIDATE_ID,
+        proof_id=THREE_PROOF_ID,
+        decision="SHADOW_CANDIDATE",
+        reason="positive three-leg basket",
+        economics=economics,
+        policy_id=policy.policy_id,
+        policy_version=policy.policy_version,
+        as_of=NOW,
+        observed_at=NOW,
+    )
+    plan = plan_shadow_proposal(
+        scan_report=scan,
+        candidate=candidate,
+        proof=proof,
+        books=books,
+        fees=fees,
+        economics_policy=policy,
+        risk_policy=PredictionRiskPolicy(policy_version="risk-test"),
+        portfolio=ShadowPortfolioState(
+            total_equity_usd=Decimal("10000"),
+            open_exposure_usd_by_cluster={},
+            peak_equity_usd=Decimal("10000"),
+            equity_24h_ago_usd=Decimal("10000"),
+            open_proposal_count=0,
+        ),
+        as_of=NOW,
+        expiry_window_seconds=5,
+    )
+    assert isinstance(plan, ShadowPlan)
+    return plan, proof, candidate, fees
 
 
 def _simulate(
@@ -709,11 +841,10 @@ def test_simulator_revalidates_and_hash_checks_all_frozen_inputs(case: str) -> N
         )
 
 
-def test_provider_book_is_revalidated_and_must_be_frozen_and_point_in_time() -> None:
-    """Malformed, unfrozen, or future evidence must never become a confirmed fill."""
+def test_provider_book_is_revalidated_and_must_be_point_in_time() -> None:
+    """Malformed or future runtime evidence must never become a confirmed fill."""
     bad_books = (
         _book(0).model_copy(update={"asks": ()}),
-        _book(0, source_hash="9" * 64),
         _book(0, observed_at=NOW + timedelta(seconds=1)),
     )
 
@@ -760,3 +891,291 @@ def test_simulation_cannot_start_before_the_frozen_information_cutoff() -> None:
     """Starting before planning would make the append-only event timestamps run backward."""
     with pytest.raises(ValueError, match="information cutoff"):
         _simulate(started_at=NOW - timedelta(microseconds=1))
+
+
+def test_changed_event_time_books_are_accepted_and_attributed_to_exact_events() -> None:
+    """Latency snapshots belong to event lineage and cannot be required on the earlier plan."""
+    module = _simulator()
+    first_hash = "1" * 64
+    second_hash = "2" * 64
+    runtime = {
+        (0, NOW + timedelta(seconds=1)): _book(
+            0,
+            asks=(_level("0.19", "2"), _level("0.29", "3")),
+            source_hash=first_hash,
+            observed_at=NOW + timedelta(seconds=1),
+        ),
+        (1, NOW + timedelta(seconds=2)): _book(
+            1,
+            asks=(_level("0.39", "1"), _level("0.49", "4")),
+            source_hash=second_hash,
+            observed_at=NOW + timedelta(seconds=2),
+        ),
+    }
+
+    events = _simulate(
+        provider=lambda leg_index, at: runtime[(leg_index, at)], scenario=module.LATENCY_1S
+    )
+
+    assert tuple(event.evidence_hashes for event in events[:4]) == ((), (), (), ())
+    assert events[4].evidence_hashes == (first_hash,)
+    assert events[5].evidence_hashes == (second_hash,)
+    assert events[4].fills[0].price_levels[0][0] == Decimal("0.19")
+    assert events[5].fills[0].price_levels[0][0] == Decimal("0.39")
+
+
+def test_five_second_runtime_books_may_change_content_and_lineage_after_planning() -> None:
+    """The five-second stress replay must cite its actual snapshots, not planning-time hashes."""
+    module = _simulator()
+    runtime = {
+        0: _book(
+            0,
+            asks=(_level("0.18", "2"), _level("0.28", "3")),
+            source_hash="4" * 64,
+            observed_at=NOW + timedelta(seconds=5),
+        ),
+        1: _book(
+            1,
+            asks=(_level("0.38", "1"), _level("0.48", "4")),
+            source_hash="5" * 64,
+            observed_at=NOW + timedelta(seconds=10),
+        ),
+    }
+
+    events = _simulate(
+        provider=lambda leg_index, _at: runtime[leg_index],
+        scenario=module.LATENCY_5S,
+    )
+
+    assert events[-1].to_state is ShadowState.COMPLETE
+    assert events[4].evidence_hashes == ("4" * 64,)
+    assert events[5].evidence_hashes == ("5" * 64,)
+    assert events[4].fills[0].price_levels[0][0] == Decimal("0.18")
+    assert events[5].fills[0].price_levels[0][0] == Decimal("0.38")
+
+
+def test_partial_prefetch_cache_preserves_terminal_runtime_hash_once() -> None:
+    """A prefetched continuation book must retain lineage when its cached copy later fills."""
+    module = _simulator()
+    first_hash = "1" * 64
+    second_hash = "2" * 64
+    runtime = {
+        0: _book(0, source_hash=first_hash),
+        1: _book(1, source_hash=second_hash),
+    }
+    calls: list[tuple[int, datetime]] = []
+
+    def provider(leg_index: int, at: datetime) -> PredictionBookSnapshot:
+        calls.append((leg_index, at))
+        return runtime[leg_index]
+
+    events = _simulate(provider=provider, scenario=module.PARTIAL_FILL_50)
+
+    assert calls == [(0, NOW), (1, NOW)]
+    assert events[4].evidence_hashes == (first_hash,)
+    assert events[5].evidence_hashes == (second_hash,)
+
+
+def test_unwind_and_unknown_terminal_retain_every_successful_runtime_read_hash() -> None:
+    """Cached or pre-failure books must not disappear when a later unwind read is missing."""
+    first_hash = "1" * 64
+    later_hash = "2" * 64
+    first = _book(0, source_hash=first_hash, observed_at=NOW + timedelta(seconds=1))
+    short_later = _book(
+        1,
+        asks=(_level("0.40", "1"),),
+        source_hash=later_hash,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    module = _simulator()
+
+    def provider(leg_index: int, at: datetime) -> PredictionBookSnapshot | None:
+        if (leg_index, at) == (0, NOW + timedelta(seconds=1)):
+            return first
+        if (leg_index, at) == (1, NOW + timedelta(seconds=2)):
+            return short_later
+        return None
+
+    events = _simulate(provider=provider, scenario=module.LATENCY_1S)
+
+    assert events[4].evidence_hashes == (first_hash,)
+    assert events[5].to_state is ShadowState.UNKNOWN
+    assert events[5].evidence_hashes == (later_hash,)
+
+
+def test_successful_unwind_cites_fill_cache_and_exit_books_sorted_once() -> None:
+    """Terminal unwind lineage includes both the short fill and every point-in-time exit book."""
+    module = _simulator()
+    first = _book(0, source_hash="1" * 64, observed_at=NOW + timedelta(seconds=1))
+    short_later = _book(
+        1,
+        asks=(_level("0.40", "1"),),
+        source_hash="2" * 64,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    first_exit = _book(0, source_hash="3" * 64, observed_at=NOW + timedelta(seconds=2))
+
+    def provider(leg_index: int, at: datetime) -> PredictionBookSnapshot:
+        if (leg_index, at) == (0, NOW + timedelta(seconds=1)):
+            return first
+        if leg_index == 1:
+            return short_later
+        return first_exit
+
+    events = _simulate(provider=provider, scenario=module.LATENCY_1S)
+
+    assert events[-1].to_state is ShadowState.UNWOUND
+    assert events[4].evidence_hashes == ("1" * 64,)
+    assert events[5].evidence_hashes == ("2" * 64, "3" * 64)
+
+
+def test_event_identity_changes_when_only_runtime_evidence_hash_changes() -> None:
+    """Runtime evidence lineage must participate in deterministic event UUID content."""
+    module = _simulator()
+    second = _book(1, source_hash="2" * 64, observed_at=NOW + timedelta(seconds=2))
+
+    def run(first_hash: str) -> tuple[object, ...]:
+        first = _book(0, source_hash=first_hash, observed_at=NOW + timedelta(seconds=1))
+        return _simulate(
+            provider=lambda leg_index, _at: first if leg_index == 0 else second,
+            scenario=module.LATENCY_1S,
+        )
+
+    first = run("1" * 64)
+    changed = run("3" * 64)
+
+    assert first[4].fills == changed[4].fills
+    assert first[4].event_id != changed[4].event_id
+    assert first[5].event_id == changed[5].event_id
+
+
+@pytest.mark.parametrize(
+    (
+        "expiry_seconds",
+        "started_offset",
+        "unknown_position",
+        "expected_state",
+        "expected_offset",
+    ),
+    (
+        (1, 2, 0, ShadowState.EXPIRED, 2),
+        (1, 0, 0, ShadowState.UNKNOWN, 0),
+        (1, 1, 0, ShadowState.UNKNOWN, 1),
+        (5, 0, 1, ShadowState.UNKNOWN, 5),
+        (6, 0, 1, ShadowState.UNKNOWN, 5),
+    ),
+)
+def test_expiry_and_unknown_precedence_follows_submit_then_confirmation_time(
+    expiry_seconds: int,
+    started_offset: int,
+    unknown_position: int,
+    expected_state: ShadowState,
+    expected_offset: int,
+) -> None:
+    """UNKNOWN cannot outrank an already-expired submit or lose to a later fill expiry."""
+    module = _simulator()
+    plan = _plan().model_copy(update={"expires_at": NOW + timedelta(seconds=expiry_seconds)})
+    scenario = module.StressScenario(
+        scenario_id="combined-expiry-unknown",
+        latency_seconds=5,
+        fill_fraction=Decimal("1"),
+        failing_leg_index=None,
+        unknown_after_leg=unknown_position,
+    )
+    calls: list[tuple[int, datetime]] = []
+    runtime = {
+        0: _book(0, observed_at=NOW + timedelta(seconds=5)),
+        1: _book(1, observed_at=NOW + timedelta(seconds=10)),
+    }
+
+    events = _simulate(
+        plan=plan,
+        scenario=scenario,
+        started_at=NOW + timedelta(seconds=started_offset),
+        provider=lambda leg_index, at: calls.append((leg_index, at)) or runtime[leg_index],
+    )
+
+    assert events[-1].to_state is expected_state
+    assert events[-1].occurred_at == NOW + timedelta(seconds=expected_offset)
+    if unknown_position == 0:
+        assert calls == []
+    else:
+        assert calls == [(0, NOW + timedelta(seconds=5))]
+
+
+def test_unknown_precedence_uses_sequence_position_after_plan_reordering() -> None:
+    """Scenario position must follow frozen execution order rather than candidate leg index."""
+    module = _simulator()
+    original = _plan(expiry_window_seconds=5)
+    reordered = original.model_copy(
+        update={
+            "legs": (
+                original.legs[0].model_copy(update={"sequence_position": 1}),
+                original.legs[1].model_copy(update={"sequence_position": 0}),
+            )
+        }
+    )
+    scenario = module.StressScenario(
+        scenario_id="reordered-boundary",
+        latency_seconds=5,
+        fill_fraction=Decimal("1"),
+        failing_leg_index=None,
+        unknown_after_leg=1,
+    )
+    calls: list[tuple[int, datetime]] = []
+    runtime_first = _book(1, observed_at=NOW + timedelta(seconds=5))
+
+    events = _simulate(
+        plan=reordered,
+        scenario=scenario,
+        provider=lambda leg_index, at: calls.append((leg_index, at)) or runtime_first,
+    )
+
+    assert calls == [(1, NOW + timedelta(seconds=5))]
+    assert events[4].leg_index == 1
+    assert events[-1].to_state is ShadowState.UNKNOWN
+    assert events[-1].leg_index == 0
+    assert events[-1].occurred_at == reordered.expires_at
+
+
+def test_three_leg_unknown_at_submit_precedes_later_fill_expiry_and_halts_reads() -> None:
+    """Chronological precedence must hold beyond two legs without reading past UNKNOWN."""
+    module = _simulator()
+    plan, proof, candidate, fees = _three_leg_inputs()
+    scenario = module.StressScenario(
+        scenario_id="three-leg-boundary",
+        latency_seconds=2,
+        fill_fraction=Decimal("1"),
+        failing_leg_index=None,
+        unknown_after_leg=2,
+    )
+    calls: list[tuple[int, datetime]] = []
+    runtime = {
+        0: _book(0, source_hash="4" * 64, observed_at=NOW + timedelta(seconds=2)),
+        1: _book(1, source_hash="5" * 64, observed_at=NOW + timedelta(seconds=4)),
+    }
+
+    def provider(leg_index: int, at: datetime) -> PredictionBookSnapshot:
+        calls.append((leg_index, at))
+        return runtime[leg_index]
+
+    events = module.simulate_shadow_proposal(
+        plan,
+        proof=proof,
+        candidate=candidate,
+        fees=fees,
+        economics_policy=_policy(),
+        books=provider,
+        scenario=scenario,
+        started_at=NOW,
+    )
+
+    assert calls == [
+        (0, NOW + timedelta(seconds=2)),
+        (1, NOW + timedelta(seconds=4)),
+    ]
+    assert events[-1].to_state is ShadowState.UNKNOWN
+    assert events[-1].leg_index == 2
+    assert events[-1].occurred_at == NOW + timedelta(seconds=4)
+    assert events[4].evidence_hashes == ("4" * 64,)
+    assert events[5].evidence_hashes == ("5" * 64,)
