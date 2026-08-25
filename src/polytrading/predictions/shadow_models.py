@@ -53,7 +53,6 @@ ALLOWED_TRANSITIONS: frozenset[tuple[ShadowState, ShadowState]] = frozenset(
         (ShadowState.COMPLETE, ShadowState.RECONCILED),
         (ShadowState.UNWOUND, ShadowState.RECONCILED),
         (ShadowState.EXPIRED, ShadowState.RECONCILED),
-        (ShadowState.UNKNOWN, ShadowState.RECONCILED),
     }
 )
 
@@ -117,6 +116,8 @@ class ShadowPlan(PredictionRecord):
             raise ValueError("bottleneck_leg_index must identify a leg in the plan")
         if {leg.sequence_position for leg in self.legs} != set(range(len(self.legs))):
             raise ValueError("leg sequence_positions must be a permutation of 0..N-1")
+        if any(leg.max_quantity != self.max_quantity for leg in self.legs):
+            raise ValueError("every leg max_quantity must equal the plan max_quantity")
         if self.expires_at <= self.observed_at:
             raise ValueError("expires_at must be after observed_at")
         return self

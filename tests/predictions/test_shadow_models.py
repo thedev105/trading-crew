@@ -53,7 +53,6 @@ _LEGAL_TRANSITIONS = {
     ("complete", "reconciled"),
     ("unwound", "reconciled"),
     ("expired", "reconciled"),
-    ("unknown", "reconciled"),
 }
 _ILLEGAL_TRANSITIONS = tuple(
     (from_state, to_state)
@@ -135,6 +134,15 @@ def test_allowed_transitions_accept_each_v1_edge() -> None:
     assert expected == ALLOWED_TRANSITIONS
 
 
+def test_unknown_state_cannot_transition_to_reconciled() -> None:
+    with pytest.raises(ValidationError, match="transition"):
+        _event(
+            sequence=1,
+            from_state=ShadowState.UNKNOWN,
+            to_state=ShadowState.RECONCILED,
+        )
+
+
 @pytest.mark.parametrize(("from_state", "to_state"), _ILLEGAL_TRANSITIONS)
 def test_shadow_event_rejects_every_illegal_transition_direction(
     from_state: str, to_state: str
@@ -196,6 +204,24 @@ def test_shadow_plan_requires_unique_leg_indices() -> None:
         _plan(
             bottleneck_leg_index=0,
             legs=(_leg(leg_index=0), _leg(leg_index=0, sequence_position=1)),
+        )
+
+
+def test_shadow_plan_requires_every_leg_maximum_to_equal_the_global_maximum() -> None:
+    with pytest.raises(ValidationError, match="max_quantity"):
+        _plan(max_quantity=Decimal("9"))
+
+    with pytest.raises(ValidationError, match="max_quantity"):
+        _plan(
+            legs=(
+                _leg(max_quantity=Decimal("10")),
+                _leg(
+                    leg_index=1,
+                    market_id="market-b",
+                    sequence_position=1,
+                    max_quantity=Decimal("9"),
+                ),
+            )
         )
 
 

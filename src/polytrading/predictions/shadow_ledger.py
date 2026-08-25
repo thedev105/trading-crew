@@ -14,6 +14,7 @@ from polytrading.predictions.domain import (
     PredictionFeeRate,
     PredictionRecord,
     PredictionVenue,
+    normalize_utc_timestamp,
 )
 from polytrading.predictions.shadow_models import (
     ShadowEvent,
@@ -47,6 +48,11 @@ class LedgerPosting(PredictionRecord):
     occurred_at: datetime
     detail: NonEmptyString
 
+    @field_validator("occurred_at")
+    @classmethod
+    def _require_utc_occurred_at(cls, value: datetime) -> datetime:
+        return normalize_utc_timestamp(value)
+
     @model_validator(mode="after")
     def _require_exactly_one_nonzero_side(self) -> LedgerPosting:
         if (self.debit_usd > 0) == (self.credit_usd > 0):
@@ -75,6 +81,8 @@ class ShadowReconciliation(PredictionRecord):
     def _require_explained_completion(self) -> ShadowReconciliation:
         if self.complete and self.unexplained_difference_usd != 0:
             raise ValueError("complete reconciliation cannot have an unexplained difference")
+        if self.complete and not self.venues_reconciled:
+            raise ValueError("complete reconciliation must identify reconciled venues")
         return self
 
 
@@ -289,19 +297,14 @@ def reconcile_proposal(
         else ()
     )
     observed_at = terminal_event.occurred_at
-    values = [
-        str(plan.proposal_id),
-        [str(event.event_id) for event in execution_events],
-        [
-            _posting_signature(posting)
-            for posting in sorted(actual, key=lambda item: str(item.posting_id))
-        ],
-        [venue.value for venue in venues],
-        complete,
-        str(unexplained),
-        observed_at.isoformat(),
-    ]
-    reconciliation_id = uuid5(_RECONCILIATION_NAMESPACE, _canonical(values))
+    reconciliation_id = _reconciliation_id(
+        proposal_id=plan.proposal_id,
+        postings=actual,
+        venues=venues,
+        complete=complete,
+        unexplained=unexplained,
+        observed_at=observed_at,
+    )
     return ShadowReconciliation(
         reconciliation_id=reconciliation_id,
         proposal_id=plan.proposal_id,
@@ -316,13 +319,23 @@ def proposal_paper_pnl(
     postings: Sequence[LedgerPosting], reconciliation: ShadowReconciliation
 ) -> Decimal | None:
     reconciliation = _revalidate_record(reconciliation, ShadowReconciliation)
-    if not reconciliation.complete:
-        return None
     validated = tuple(_revalidate_record(posting, LedgerPosting) for posting in postings)
     if validated:
         verify_conservation(validated)
     if any(posting.proposal_id != reconciliation.proposal_id for posting in validated):
         raise ValueError("postings do not belong to the reconciliation")
+    expected_id = _reconciliation_id(
+        proposal_id=reconciliation.proposal_id,
+        postings=validated,
+        venues=reconciliation.venues_reconciled,
+        complete=reconciliation.complete,
+        unexplained=reconciliation.unexplained_difference_usd,
+        observed_at=reconciliation.observed_at,
+    )
+    if reconciliation.reconciliation_id != expected_id:
+        raise ValueError("reconciliation identity does not match supplied postings and fields")
+    if not reconciliation.complete:
+        return None
 
     def net_credit(account: LedgerAccount) -> Decimal:
         return sum(
@@ -398,6 +411,8 @@ def _validate_fill_lifecycle(
             *tuple(_TERMINAL_STATES),
         }:
             raise ValueError("fills may only appear on simulated or terminal events")
+        if event is not terminal and any(fill.side == "sell" for fill in event.fills):
+            raise ValueError("sell fills may only appear on the execution terminal")
     first_event = next(
         (event for event in events if event.to_state is ShadowState.FIRST_LEG_SIMULATED), None
     )
@@ -406,12 +421,20 @@ def _validate_fill_lifecycle(
     first_leg_index = min(plan.legs, key=lambda leg: leg.sequence_position).leg_index
     if any(fill.side != "buy" or fill.leg_index != first_leg_index for fill in first_event.fills):
         raise ValueError("first-leg event may only confirm a buy of the first planned leg")
+    if not first_event.fills and first_event.quantity_filled is not None:
+        raise ValueError("empty first-leg event metadata must not claim filled quantity")
+    if buys and not first_event.fills:
+        raise ValueError("confirmed buys require a first-leg acquisition on the first-leg event")
     if first_event.fills and (
         len(first_event.fills) != 1
         or first_event.leg_index != first_event.fills[0].leg_index
         or first_event.quantity_filled != first_event.fills[0].quantity
     ):
         raise ValueError("first-leg event metadata must match its structured fill")
+    if any(fill.side == "buy" and fill.leg_index == first_leg_index for fill in terminal.fills):
+        raise ValueError("terminal buys must be subsequent planned legs, not the first leg")
+    if set(sells) - set(buys):
+        raise ValueError("sell fills must reference confirmed buy inventory")
     execution_positions = {leg.leg_index: leg.sequence_position for leg in plan.legs}
     acquired_positions = {execution_positions[index] for index in buys}
     if acquired_positions and acquired_positions != set(range(max(acquired_positions) + 1)):
@@ -425,8 +448,6 @@ def _validate_fill_lifecycle(
     elif terminal.to_state is ShadowState.UNWOUND:
         if any(sells.get(index, Decimal("0")) != quantity for index, quantity in buys.items()):
             raise ValueError("unwound event stream must sell every confirmed acquisition")
-        if set(sells) - set(buys):
-            raise ValueError("unwind cannot sell a leg that was not acquired")
     elif terminal.to_state is ShadowState.EXPIRED:
         if sells:
             raise ValueError("expired event stream cannot contain confirmed sells")
@@ -564,6 +585,29 @@ def _posting_signature(posting: LedgerPosting) -> tuple[str, ...]:
         posting.occurred_at.isoformat(),
         posting.detail,
     )
+
+
+def _reconciliation_id(
+    *,
+    proposal_id: UUID,
+    postings: Sequence[LedgerPosting],
+    venues: Sequence[PredictionVenue],
+    complete: bool,
+    unexplained: Decimal,
+    observed_at: datetime,
+) -> UUID:
+    values = [
+        str(proposal_id),
+        [
+            _posting_signature(posting)
+            for posting in sorted(postings, key=lambda item: str(item.posting_id))
+        ],
+        [venue.value for venue in venues],
+        complete,
+        str(unexplained),
+        observed_at.isoformat(),
+    ]
+    return uuid5(_RECONCILIATION_NAMESPACE, _canonical(values))
 
 
 def _unexplained_difference(

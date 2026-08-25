@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -263,6 +263,26 @@ def test_reconciliation_is_stable_when_its_derived_state_event_is_replayed() -> 
     assert after == before
 
 
+def test_ledger_rejects_unchecked_unknown_to_reconciled_chain() -> None:
+    """Unknown order state remains unreconciled until external evidence changes the model."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _events(
+        ShadowState.UNKNOWN,
+        first_fills=(_fill(0, "buy", "0.40"),),
+    )
+    forged = _event(
+        6,
+        ShadowState.COMPLETE,
+        ShadowState.RECONCILED,
+        event_id_suffix=89,
+    ).model_copy(update={"from_state": ShadowState.UNKNOWN})
+
+    with pytest.raises(ValidationError, match="transition"):
+        ledger.postings_for_events(plan, (*events, forged), fees)
+
+
 def test_unwound_lifecycle_closes_realized_loss_and_charges_both_taker_fees() -> None:
     """Dropping exit fees or leaving the cost/proceeds residual open overstates unwind P&L."""
     ledger = _ledger()
@@ -405,6 +425,45 @@ def test_ledger_posting_rejects_zero_dual_and_inexact_float_sides() -> None:
         ledger.LedgerPosting(**{**values, "debit_usd": 1.0})
 
 
+def test_ledger_posting_requires_aware_time_and_normalizes_offsets_to_utc() -> None:
+    """Posting identity and cutoff ordering require one canonical UTC timestamp basis."""
+    ledger = _ledger()
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+    posting = ledger.postings_for_events(_plan(), events, _fees())[0]
+    values = posting.model_dump()
+
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        ledger.LedgerPosting(**{**values, "occurred_at": posting.occurred_at.replace(tzinfo=None)})
+
+    offset = timezone(timedelta(hours=-5))
+    normalized = ledger.LedgerPosting(
+        **{**values, "occurred_at": posting.occurred_at.astimezone(offset)}
+    )
+    assert normalized.occurred_at == posting.occurred_at
+    assert normalized.occurred_at.tzinfo is UTC
+
+
+def test_conservation_revalidates_unchecked_naive_posting_copy() -> None:
+    """Pydantic model_copy cannot bypass the posting timestamp boundary."""
+    ledger = _ledger()
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+    postings = ledger.postings_for_events(_plan(), events, _fees())
+    unchecked = postings[0].model_copy(
+        update={"occurred_at": postings[0].occurred_at.replace(tzinfo=None)}
+    )
+
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        ledger.verify_conservation((unchecked, *postings[1:]))
+
+
 def test_complete_reconciliation_model_requires_zero_unexplained_difference() -> None:
     """A caller cannot flip an unexplained reconciliation to complete via an unchecked copy."""
     ledger = _ledger()
@@ -419,6 +478,85 @@ def test_complete_reconciliation_model_requires_zero_unexplained_difference() ->
 
     with pytest.raises(ValidationError, match="unexplained"):
         ledger.ShadowReconciliation(**values)
+
+    with pytest.raises(ValidationError, match="venues"):
+        ledger.ShadowReconciliation(
+            **{**values, "unexplained_difference_usd": Decimal("0"), "venues_reconciled": ()}
+        )
+
+
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"complete": False},
+        {"venues_reconciled": (PredictionVenue.POLYMARKET,)},
+        {"unexplained_difference_usd": Decimal("1")},
+        {"observed_at": NOW + timedelta(minutes=2)},
+        {"proposal_id": UUID("70000000-0000-0000-0000-000000000092")},
+        {"reconciliation_id": UUID("70000000-0000-0000-0000-000000000091")},
+    ),
+)
+def test_paper_pnl_revalidates_every_reconciliation_identity_field(
+    update: dict[str, object],
+) -> None:
+    """Unchecked reconciliation copies cannot authorize or alter a paper result."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+
+    with pytest.raises((ValueError, ValidationError)):
+        ledger.proposal_paper_pnl(postings, reconciliation.model_copy(update=update))
+
+
+def test_paper_pnl_rejects_valid_balanced_postings_not_bound_to_reconciliation() -> None:
+    """Balanced canonical posting content must still match the reconciliation identity."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+    changed_fees = {
+        **fees,
+        0: fees[0].model_copy(update={"taker_rate": Decimal("0.03")}),
+    }
+    balanced_but_different = ledger.postings_for_events(plan, events, changed_fees)
+
+    ledger.verify_conservation(balanced_but_different)
+    with pytest.raises(ValueError, match="reconciliation identity"):
+        ledger.proposal_paper_pnl(balanced_but_different, reconciliation)
+
+
+def test_paper_pnl_rejects_unchecked_posting_content_and_accepts_order_independence() -> None:
+    """Posting mutation must fail, while storage/read ordering must not affect identity."""
+    ledger = _ledger()
+    plan = _plan()
+    fees = _fees()
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+    postings = ledger.postings_for_events(plan, events, fees)
+    reconciliation = ledger.reconcile_proposal(plan, events, postings, fees)
+
+    assert ledger.proposal_paper_pnl(tuple(reversed(postings)), reconciliation) == Decimal("0.172")
+    with pytest.raises(ValueError):
+        ledger.proposal_paper_pnl(
+            (postings[0].model_copy(update={"detail": "tampered"}), *postings[1:]),
+            reconciliation,
+        )
 
 
 def test_empty_mixed_proposal_and_identity_tampered_posting_groups_are_rejected() -> None:
@@ -562,6 +700,20 @@ def test_buy_fills_cannot_exceed_frozen_price_or_quantity_limits(
         ledger.postings_for_events(_plan(), events, _fees())
 
 
+def test_ledger_revalidates_global_plan_quantity_against_every_leg_cap() -> None:
+    """An unchecked plan copy cannot broaden a leg beyond the proposal-wide quantity cap."""
+    ledger = _ledger()
+    plan = _plan().model_copy(update={"max_quantity": Decimal("1")})
+    events = _events(
+        ShadowState.COMPLETE,
+        first_fills=(_fill(0, "buy", "0.40"),),
+        terminal_fills=(_fill(1, "buy", "0.50"),),
+    )
+
+    with pytest.raises(ValidationError, match="max_quantity"):
+        ledger.postings_for_events(plan, events, _fees())
+
+
 @pytest.mark.parametrize(("leg_index", "quantity"), ((1, Decimal("2")), (0, Decimal("1"))))
 def test_first_fill_event_metadata_must_match_its_structured_fill(
     leg_index: int, quantity: Decimal
@@ -577,6 +729,67 @@ def test_first_fill_event_metadata_must_match_its_structured_fill(
     events[4] = events[4].model_copy(update={"leg_index": leg_index, "quantity_filled": quantity})
 
     with pytest.raises(ValueError, match="metadata"):
+        ledger.postings_for_events(_plan(), tuple(events), _fees())
+
+
+def test_empty_first_leg_event_cannot_defer_the_first_acquisition_to_terminal() -> None:
+    """A later first-leg buy would contradict the simulator's confirmed execution order."""
+    ledger = _ledger()
+    events = _events(
+        ShadowState.UNKNOWN,
+        terminal_fills=(_fill(0, "buy", "0.40"),),
+    )
+
+    with pytest.raises(ValueError, match="first-leg"):
+        ledger.postings_for_events(_plan(), events, _fees())
+
+
+def test_empty_first_leg_event_requires_absent_quantity_metadata() -> None:
+    """A no-fill first attempt cannot claim a scalar confirmed quantity."""
+    ledger = _ledger()
+    events = list(_events(ShadowState.EXPIRED))
+    events[4] = events[4].model_copy(update={"quantity_filled": Decimal("0")})
+
+    with pytest.raises(ValueError, match="metadata"):
+        ledger.postings_for_events(_plan(), tuple(events), _fees())
+
+
+@pytest.mark.parametrize(
+    "events",
+    (
+        _events(
+            ShadowState.UNKNOWN,
+            terminal_fills=(_fill(0, "sell", "0.30"),),
+        ),
+        _events(
+            ShadowState.UNKNOWN,
+            first_fills=(_fill(0, "buy", "0.40"),),
+            terminal_fills=(_fill(1, "sell", "0.30"),),
+        ),
+    ),
+)
+def test_unknown_terminal_cannot_introduce_naked_sells(
+    events: tuple[ShadowEvent, ...],
+) -> None:
+    """UNKNOWN may retain confirmed exits, but may never manufacture inventory to sell."""
+    ledger = _ledger()
+
+    with pytest.raises(ValueError, match="sell"):
+        ledger.postings_for_events(_plan(), events, _fees())
+
+
+def test_sell_fill_cannot_appear_before_the_execution_terminal() -> None:
+    """Only the terminal unwind/unknown evidence may contain an exit fill."""
+    ledger = _ledger()
+    events = list(
+        _events(
+            ShadowState.UNKNOWN,
+            first_fills=(_fill(0, "buy", "0.40"),),
+        )
+    )
+    events[3] = events[3].model_copy(update={"fills": (_fill(0, "sell", "0.30"),)})
+
+    with pytest.raises(ValueError, match="terminal"):
         ledger.postings_for_events(_plan(), tuple(events), _fees())
 
 
