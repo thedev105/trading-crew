@@ -60,6 +60,19 @@ def _record_hash(record: BaseModel) -> str:
     return sha256(_canonical_json(record).encode()).hexdigest()
 
 
+def _verified_record[RecordT: BaseModel](
+    row: tuple[Any, ...] | None,
+    record_type: type[RecordT],
+    label: str,
+) -> RecordT | None:
+    if row is None:
+        return None
+    record = record_type.model_validate_json(row[0])
+    if _record_hash(record) != row[1]:
+        raise ConflictingRecordError(f"stored {label} failed its immutable record hash")
+    return record
+
+
 class PredictionMarketStore:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self._connection = duckdb.connect(str(path), read_only=read_only)
@@ -524,6 +537,23 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(RuleVersion.model_validate_json(row[0]) for row in rows)
 
+    def verified_rule_versions_for_market(
+        self, market_id: str, as_of: datetime
+    ) -> tuple[RuleVersion, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM rule_versions
+            WHERE market_id = ? AND effective_at <= ?
+            ORDER BY effective_at
+            """,
+            [market_id, as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, RuleVersion, "rule version")) is not None
+        )
+
     def latest_book_as_of(
         self,
         venue: PredictionVenue,
@@ -565,6 +595,28 @@ class PredictionMarketStore:
             [venue.value, market_id, outcome_token_id, as_of, source_hash],
         ).fetchone()
         return None if row is None else PredictionBookSnapshot.model_validate_json(row[0])
+
+    def verified_book_snapshot_by_source_hash(
+        self,
+        venue: PredictionVenue,
+        market_id: str,
+        outcome_token_id: str | None,
+        source_hash: str,
+        as_of: datetime,
+    ) -> PredictionBookSnapshot | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM prediction_books
+            WHERE venue = ? AND market_id = ?
+              AND outcome_token_id IS NOT DISTINCT FROM ?
+              AND observed_at <= ?
+              AND json_extract_string(record_json, '$.source_hash') = ?
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            [venue.value, market_id, outcome_token_id, as_of, source_hash],
+        ).fetchone()
+        return _verified_record(row, PredictionBookSnapshot, "book snapshot")
 
     def latest_book_observed_at_for_venue(
         self, venue: PredictionVenue, as_of: datetime
@@ -638,6 +690,26 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else PredictionFeeRate.model_validate_json(row[0])
 
+    def verified_fee_rate_by_source_hash(
+        self,
+        venue: PredictionVenue,
+        market_id: str | None,
+        source_hash: str,
+        as_of: datetime,
+    ) -> PredictionFeeRate | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM prediction_fee_rates
+            WHERE venue = ? AND market_id IS NOT DISTINCT FROM ?
+              AND observed_at <= ?
+              AND json_extract_string(record_json, '$.source_hash') = ?
+            ORDER BY observed_at DESC
+            LIMIT 1
+            """,
+            [venue.value, market_id, as_of, source_hash],
+        ).fetchone()
+        return _verified_record(row, PredictionFeeRate, "fee rate")
+
     def existing_candidate_ids(self) -> frozenset[UUID]:
         """Every ``candidate_id`` already persisted, with no ``as_of`` cutoff.
 
@@ -692,6 +764,19 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else CandidateRelationship.model_validate_json(row[0])
 
+    def verified_candidate_relationship_by_id(
+        self, candidate_id: UUID, as_of: datetime
+    ) -> CandidateRelationship | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM candidate_relationships
+            WHERE candidate_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [candidate_id, as_of],
+        ).fetchone()
+        return _verified_record(row, CandidateRelationship, "candidate relationship")
+
     def latest_attestation_for_rule_version(
         self, rule_version_id: UUID, as_of: datetime
     ) -> RuleAttestation | None:
@@ -744,6 +829,19 @@ class PredictionMarketStore:
         ).fetchone()
         return None if row is None else ProofArtifact.model_validate_json(row[0])
 
+    def verified_proof_artifact_by_id(
+        self, proof_id: UUID, as_of: datetime
+    ) -> ProofArtifact | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM proof_artifacts
+            WHERE proof_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [proof_id, as_of],
+        ).fetchone()
+        return _verified_record(row, ProofArtifact, "proof artifact")
+
     def proof_artifacts_as_of(self, as_of: datetime) -> tuple[ProofArtifact, ...]:
         rows = self._connection.execute(
             """
@@ -766,6 +864,21 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(ScanReport.model_validate_json(row[0]) for row in rows)
 
+    def verified_scan_reports_as_of(self, as_of: datetime) -> tuple[ScanReport, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM scan_reports
+            WHERE observed_at <= ?
+            ORDER BY observed_at, report_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, ScanReport, "scan report")) is not None
+        )
+
     def scan_report_by_id(self, report_id: UUID, as_of: datetime) -> ScanReport | None:
         row = self._connection.execute(
             """
@@ -776,6 +889,17 @@ class PredictionMarketStore:
             [report_id, as_of],
         ).fetchone()
         return None if row is None else ScanReport.model_validate_json(row[0])
+
+    def verified_scan_report_by_id(self, report_id: UUID, as_of: datetime) -> ScanReport | None:
+        row = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM scan_reports
+            WHERE report_id = ? AND observed_at <= ?
+            LIMIT 1
+            """,
+            [report_id, as_of],
+        ).fetchone()
+        return _verified_record(row, ScanReport, "scan report")
 
     def shadow_plans_as_of(self, as_of: datetime) -> tuple[ShadowPlan, ...]:
         rows = self._connection.execute(
@@ -788,11 +912,33 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(ShadowPlan.model_validate_json(row[0]) for row in rows)
 
+    def verified_shadow_plans_as_of(self, as_of: datetime) -> tuple[ShadowPlan, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM shadow_plans
+            WHERE observed_at <= ?
+            ORDER BY observed_at, proposal_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, ShadowPlan, "shadow plan")) is not None
+        )
+
     def shadow_plan_by_proposal(self, proposal_id: UUID) -> ShadowPlan | None:
         row = self._connection.execute(
             "SELECT record_json FROM shadow_plans WHERE proposal_id = ?", [proposal_id]
         ).fetchone()
         return None if row is None else ShadowPlan.model_validate_json(row[0])
+
+    def verified_shadow_plan_by_proposal(self, proposal_id: UUID) -> ShadowPlan | None:
+        row = self._connection.execute(
+            "SELECT record_json, record_hash FROM shadow_plans WHERE proposal_id = ?",
+            [proposal_id],
+        ).fetchone()
+        return _verified_record(row, ShadowPlan, "shadow plan")
 
     def shadow_events_for_proposal(
         self, proposal_id: UUID, as_of: datetime
@@ -867,6 +1013,23 @@ class PredictionMarketStore:
             [as_of, as_of],
         ).fetchall()
         return tuple(ShadowExperiment.model_validate_json(row[0]) for row in rows)
+
+    def verified_shadow_experiments_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[ShadowExperiment, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json, record_hash FROM shadow_experiments
+            WHERE proposal_id = ? AND as_of <= ? AND observed_at <= ?
+            ORDER BY observed_at, experiment_id
+            """,
+            [proposal_id, as_of, as_of],
+        ).fetchall()
+        return tuple(
+            record
+            for row in rows
+            if (record := _verified_record(row, ShadowExperiment, "shadow experiment")) is not None
+        )
 
     def shadow_experiments_for_family(
         self, family_id: str, as_of: datetime

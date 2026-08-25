@@ -22,7 +22,11 @@ from polytrading.predictions.candidates import (
     propose_binary_complements,
     propose_venue_native_outcome_sets,
 )
-from polytrading.predictions.candidates_models import CandidateRelationship, RelationshipType
+from polytrading.predictions.candidates_models import (
+    CandidateLeg,
+    CandidateRelationship,
+    RelationshipType,
+)
 from polytrading.predictions.dashboard_server import (
     serve_prediction_dashboard,
     validate_prediction_dashboard_database,
@@ -62,6 +66,7 @@ from polytrading.predictions.risk import (
     ShadowPortfolioState,
 )
 from polytrading.predictions.shadow_ledger import (
+    LedgerPosting,
     ShadowReconciliation,
     postings_for_events,
     proposal_paper_pnl,
@@ -657,7 +662,7 @@ def _current_rule_versions_for_candidate(
         seen_markets.add(market_key)
         venue_versions = tuple(
             version
-            for version in store.rule_versions_for_market(leg.market_id, as_of)
+            for version in store.verified_rule_versions_for_market(leg.market_id, as_of)
             if version.venue is leg.venue
         )
         if venue_versions:
@@ -917,7 +922,6 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
     scenario = _SHADOW_SCENARIOS[arguments.scenario]
     result = {
         "as_of": _timestamp(as_of),
-        "trial_family": arguments.trial_family,
         "scenario": scenario.scenario_id,
         "planned": 0,
         "existing": 0,
@@ -935,14 +939,17 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
             try:
                 with store.transaction() as transaction:
                     if transaction.trial_family_by_id(arguments.trial_family, as_of) is None:
-                        raise PredictionsUsageError(
-                            f"unknown preregistered trial family {arguments.trial_family!r}"
-                        )
-                    reports = tuple(
-                        report
-                        for report in transaction.scan_reports_as_of(as_of)
-                        if report.decision == "SHADOW_CANDIDATE"
-                    )
+                        raise PredictionsUsageError("trial family is not preregistered")
+                    reports = _effective_shadow_candidate_reports(transaction, as_of)
+                    report_ids = {report.report_id for report in reports}
+                    batch_proposal_ids = {
+                        plan.proposal_id
+                        for plan in transaction.verified_shadow_plans_as_of(as_of)
+                        if plan.scan_report_id in report_ids
+                    }
+                    batch_results: list[
+                        tuple[ShadowPlan, ShadowReconciliation, Decimal | None]
+                    ] = []
                     for report in reports:
                         evidence = _run_evidence(transaction, report, as_of)
                         if isinstance(evidence, str):
@@ -957,6 +964,8 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
                             as_of,
                             DEFAULT_RISK_POLICY,
                             excluding_scan_report_id=report.report_id,
+                            excluding_proposal_ids=frozenset(batch_proposal_ids),
+                            batch_results=tuple(batch_results),
                         )
                         plan_or_refusal = plan_shadow_proposal(
                             scan_report=report,
@@ -975,7 +984,29 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
                             refusals[plan_or_refusal.reason] += 1
                             continue
                         plan = plan_or_refusal
-                        if transaction.shadow_plan_by_proposal(plan.proposal_id) is not None:
+                        existing_plan = transaction.verified_shadow_plan_by_proposal(
+                            plan.proposal_id
+                        )
+                        if existing_plan is not None:
+                            if existing_plan != plan:
+                                raise ValueError(
+                                    "existing proposal does not match deterministic plan"
+                                )
+                            existing_reconciliation, existing_pnl = (
+                                _validate_existing_shadow_bundle(
+                                    transaction,
+                                    plan=existing_plan,
+                                    candidate=candidate,
+                                    proof=proof,
+                                    fees=fees,
+                                    scenario=scenario,
+                                    family_id=arguments.trial_family,
+                                    as_of=as_of,
+                                )
+                            )
+                            batch_results.append(
+                                (existing_plan, existing_reconciliation, existing_pnl)
+                            )
                             result["existing"] += 1
                             continue
 
@@ -1026,6 +1057,8 @@ def _run_shadow_run(arguments: argparse.Namespace) -> int:
                         transaction.append_reconciliation(reconciliation)
                         transaction.append_shadow_experiment(experiment)
 
+                        batch_proposal_ids.add(plan.proposal_id)
+                        batch_results.append((plan, reconciliation, pnl))
                         result["planned"] += 1
                         terminals[reconciliation.terminal_state.value] += 1
                         if pnl is not None:
@@ -1068,22 +1101,71 @@ def _run_evidence(
     ]
     | str
 ):
-    candidate = store.candidate_relationship_by_id(report.candidate_id, as_of)
+    candidate = store.verified_candidate_relationship_by_id(report.candidate_id, as_of)
     if candidate is None or report.proof_id is None:
         return "MISSING_EVIDENCE"
-    proof = store.proof_artifact_by_id(report.proof_id, as_of)
-    exact_report = store.scan_report_by_id(report.report_id, as_of)
+    proof = store.verified_proof_artifact_by_id(report.proof_id, as_of)
+    exact_report = store.verified_scan_report_by_id(report.report_id, as_of)
     if proof is None or exact_report != report:
         return "MISSING_EVIDENCE"
     books = {
-        index: store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, as_of)
-        for index, leg in enumerate(candidate.legs)
+        index: _verified_latest_book(store, leg, as_of) for index, leg in enumerate(candidate.legs)
     }
     fees = {
-        index: store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
-        for index, leg in enumerate(candidate.legs)
+        index: _verified_latest_fee(store, leg, as_of) for index, leg in enumerate(candidate.legs)
     }
     return candidate, proof, books, fees
+
+
+def _effective_shadow_candidate_reports(
+    store: PredictionMarketStore, as_of: datetime
+) -> tuple[ScanReport, ...]:
+    latest: dict[UUID, ScanReport] = {}
+    for report in store.verified_scan_reports_as_of(as_of):
+        current = latest.get(report.candidate_id)
+        if current is None or (report.observed_at, str(report.report_id)) > (
+            current.observed_at,
+            str(current.report_id),
+        ):
+            latest[report.candidate_id] = report
+    return tuple(
+        report
+        for _, report in sorted(latest.items(), key=lambda item: str(item[0]))
+        if report.decision == "SHADOW_CANDIDATE"
+    )
+
+
+def _verified_latest_book(
+    store: PredictionMarketStore,
+    leg: CandidateLeg,
+    as_of: datetime,
+) -> PredictionBookSnapshot | None:
+    latest = store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, as_of)
+    if latest is None:
+        return None
+    return store.verified_book_snapshot_by_source_hash(
+        leg.venue,
+        leg.market_id,
+        leg.outcome_token_id,
+        latest.source_hash,
+        as_of,
+    )
+
+
+def _verified_latest_fee(
+    store: PredictionMarketStore,
+    leg: CandidateLeg,
+    as_of: datetime,
+) -> PredictionFeeRate | None:
+    latest = store.latest_fee_rate_as_of(leg.venue, leg.market_id, as_of)
+    if latest is None:
+        return None
+    return store.verified_fee_rate_by_source_hash(
+        leg.venue,
+        leg.market_id,
+        latest.source_hash,
+        as_of,
+    )
 
 
 def _candidate_rules_are_current(
@@ -1104,7 +1186,7 @@ def _runtime_book(
     if leg_index < 0 or leg_index >= len(candidate.legs):
         return None
     leg = candidate.legs[leg_index]
-    return store.latest_book_as_of(leg.venue, leg.market_id, leg.outcome_token_id, at)
+    return _verified_latest_book(store, leg, at)
 
 
 def _event_cluster_id(
@@ -1142,11 +1224,14 @@ def _shadow_portfolio_state(
     *,
     excluding_proposal_id: UUID | None = None,
     excluding_scan_report_id: UUID | None = None,
+    excluding_proposal_ids: frozenset[UUID] = frozenset(),
+    batch_results: Sequence[tuple[ShadowPlan, ShadowReconciliation, Decimal | None]] = (),
 ) -> ShadowPortfolioState:
+    excluded = set(excluding_proposal_ids)
+    if excluding_proposal_id is not None:
+        excluded.add(excluding_proposal_id)
     experiments = tuple(
-        item
-        for item in store.shadow_experiments_as_of(as_of)
-        if item.observed_at < as_of and item.proposal_id != excluding_proposal_id
+        item for item in store.shadow_experiments_as_of(as_of) if item.proposal_id not in excluded
     )
     running = policy.starting_equity_usd
     peak = running
@@ -1158,19 +1243,42 @@ def _shadow_portfolio_state(
             peak = max(peak, running)
             if experiment.observed_at <= day_cutoff:
                 equity_24h += experiment.paper_pnl_usd
+    for _, _, pnl in batch_results:
+        if pnl is not None:
+            running += pnl
+            peak = max(peak, running)
 
     exposure: defaultdict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     open_count = 0
-    for plan in store.shadow_plans_as_of(as_of):
-        if (
-            plan.proposal_id == excluding_proposal_id
-            or plan.scan_report_id == excluding_scan_report_id
-        ):
+    for plan in store.verified_shadow_plans_as_of(as_of):
+        if plan.proposal_id in excluded or plan.scan_report_id == excluding_scan_report_id:
             continue
         reconciliation = store.latest_reconciliation_for_proposal(plan.proposal_id, as_of)
         if reconciliation is not None and reconciliation.complete:
             continue
-        candidate = store.candidate_relationship_by_id(plan.candidate_id, plan.information_cutoff)
+        candidate = store.verified_candidate_relationship_by_id(
+            plan.candidate_id, plan.information_cutoff
+        )
+        cluster = (
+            str(plan.candidate_id)
+            if candidate is None
+            else _event_cluster_id(store, candidate, plan.information_cutoff)
+        )
+        frozen_basket_notional = sum(
+            (price * quantity for leg in plan.legs for price, quantity in leg.limit_price_levels),
+            Decimal("0"),
+        )
+        exposure[cluster] += max(
+            plan.max_incomplete_exposure_usd,
+            frozen_basket_notional,
+        )
+        open_count += 1
+    for plan, reconciliation, _ in batch_results:
+        if reconciliation.complete:
+            continue
+        candidate = store.verified_candidate_relationship_by_id(
+            plan.candidate_id, plan.information_cutoff
+        )
         cluster = (
             str(plan.candidate_id)
             if candidate is None
@@ -1230,6 +1338,92 @@ def _shadow_experiment(
     )
 
 
+def _validate_existing_shadow_bundle(
+    store: PredictionMarketStore,
+    *,
+    plan: ShadowPlan,
+    candidate: CandidateRelationship,
+    proof: ProofArtifact,
+    fees: Mapping[int, PredictionFeeRate],
+    scenario: StressScenario,
+    family_id: str,
+    as_of: datetime,
+) -> tuple[ShadowReconciliation, Decimal | None]:
+    far_future = datetime.max.replace(tzinfo=UTC)
+    stored_events = store.shadow_events_for_proposal(plan.proposal_id, far_future)
+    if not stored_events:
+        raise ValueError("existing proposal is missing its event chain")
+    execution_events = tuple(
+        event for event in stored_events if event.to_state is not ShadowState.RECONCILED
+    )
+    if _stored_scenario(execution_events) != scenario:
+        raise ValueError("existing proposal scenario is inconsistent")
+    allowed_runtime_hashes = {
+        source_hash for event in execution_events for source_hash in event.evidence_hashes
+    }
+    replayed = simulate_shadow_proposal(
+        plan,
+        proof=proof,
+        candidate=candidate,
+        fees=fees,
+        economics_policy=DEFAULT_RESEARCH_POLICY,
+        books=lambda index, at: _runtime_book_by_hashes(
+            store,
+            candidate,
+            index,
+            at,
+            allowed_runtime_hashes,
+        ),
+        scenario=scenario,
+        started_at=plan.information_cutoff,
+    )
+    if _first_event_divergence(replayed, execution_events) is not None:
+        raise ValueError("existing proposal event chain is inconsistent")
+
+    stored_postings = store.ledger_postings_for_proposal(plan.proposal_id, far_future)
+    expected_postings = postings_for_events(plan, execution_events, fees)
+
+    def posting_key(posting: LedgerPosting) -> str:
+        return str(posting.posting_id)
+
+    if sorted(stored_postings, key=posting_key) != sorted(expected_postings, key=posting_key):
+        raise ValueError("existing proposal postings are inconsistent")
+
+    stored_reconciliation = store.latest_reconciliation_for_proposal(plan.proposal_id, far_future)
+    if stored_reconciliation is None:
+        raise ValueError("existing proposal is missing reconciliation")
+    expected_reconciliation = reconcile_proposal(
+        plan,
+        execution_events,
+        stored_postings,
+        fees,
+    )
+    if stored_reconciliation != expected_reconciliation:
+        raise ValueError("existing proposal reconciliation is inconsistent")
+
+    trailing = tuple(event for event in stored_events if event.to_state is ShadowState.RECONCILED)
+    if expected_reconciliation.complete:
+        expected_terminal = reconciled_event_for(plan, execution_events, expected_reconciliation)
+        if trailing != (expected_terminal,):
+            raise ValueError("existing proposal reconciliation event is inconsistent")
+    elif trailing:
+        raise ValueError("incomplete proposal has a reconciliation event")
+
+    pnl = proposal_paper_pnl(stored_postings, expected_reconciliation, stored_events)
+    expected_experiment = _shadow_experiment(
+        family_id=family_id,
+        plan=plan,
+        scenario=scenario,
+        reconciliation=expected_reconciliation,
+        pnl=pnl,
+        as_of=as_of,
+    )
+    experiments = store.verified_shadow_experiments_for_proposal(plan.proposal_id, far_future)
+    if experiments != (expected_experiment,):
+        raise ValueError("existing proposal experiment is inconsistent")
+    return expected_reconciliation, pnl
+
+
 def _canonical_json_value(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -1238,10 +1432,7 @@ def _render_shadow_run(result: Mapping[str, object], output_format: str) -> None
     if output_format == "json":
         print(json.dumps(result, indent=2, sort_keys=True))
         return
-    print(
-        f"predictions shadow run | as_of={result['as_of']} | "
-        f"trial_family={result['trial_family']} | scenario={result['scenario']}"
-    )
+    print(f"predictions shadow run | as_of={result['as_of']} | scenario={result['scenario']}")
     print(f"planned={result['planned']} | existing={result['existing']}")
     for reason, count in dict(result["refused"]).items():
         print(f"refused {reason}: {count}")
@@ -1260,7 +1451,7 @@ def _run_shadow_replay(arguments: argparse.Namespace) -> int:
     try:
         store = PredictionMarketStore(arguments.db, read_only=True)
         try:
-            plan = store.shadow_plan_by_proposal(proposal_id)
+            plan = store.verified_shadow_plan_by_proposal(proposal_id)
             if plan is None:
                 raise LookupError("proposal not found")
             report, candidate, proof, planning_books, fees = _replay_evidence(store, plan)
@@ -1370,9 +1561,9 @@ def _replay_evidence(
     dict[int, PredictionFeeRate],
 ]:
     cutoff = plan.information_cutoff
-    report = store.scan_report_by_id(plan.scan_report_id, cutoff)
-    candidate = store.candidate_relationship_by_id(plan.candidate_id, cutoff)
-    proof = store.proof_artifact_by_id(plan.proof_id, cutoff)
+    report = store.verified_scan_report_by_id(plan.scan_report_id, cutoff)
+    candidate = store.verified_candidate_relationship_by_id(plan.candidate_id, cutoff)
+    proof = store.verified_proof_artifact_by_id(plan.proof_id, cutoff)
     if report is None or candidate is None or proof is None:
         raise LookupError("plan lineage record missing")
     if (
@@ -1404,7 +1595,7 @@ def _book_from_frozen_hashes(
         book
         for source_hash in frozen_hashes
         if (
-            book := store.book_snapshot_by_source_hash(
+            book := store.verified_book_snapshot_by_source_hash(
                 leg.venue,
                 leg.market_id,
                 leg.outcome_token_id,
@@ -1429,7 +1620,7 @@ def _fee_from_frozen_hashes(
         fee
         for source_hash in frozen_hashes
         if (
-            fee := store.fee_rate_by_source_hash(
+            fee := store.verified_fee_rate_by_source_hash(
                 leg.venue,
                 leg.market_id,
                 source_hash,
@@ -1511,7 +1702,7 @@ def _runtime_book_by_hashes(
         book
         for source_hash in source_hashes
         if (
-            book := store.book_snapshot_by_source_hash(
+            book := store.verified_book_snapshot_by_source_hash(
                 leg.venue,
                 leg.market_id,
                 leg.outcome_token_id,

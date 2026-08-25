@@ -744,6 +744,36 @@ def test_shadow_experiment_reads_keep_unknown_unreconciled_and_negative_pnl_rows
     assert store.shadow_experiments_as_of(NOW - timedelta(hours=3)) == ()
 
 
+def test_verified_shadow_plan_and_experiment_reads_reject_record_json_tamper(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    experiment = shadow_experiment(proposal_id=plan.proposal_id)
+    store.append_shadow_plan(plan)
+    store.append_shadow_experiment(experiment)
+
+    store._connection.execute(
+        "UPDATE shadow_plans SET record_json = ? WHERE proposal_id = ?",
+        [
+            plan.model_copy(update={"completion_path": "tampered"}).model_dump_json(),
+            plan.proposal_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_shadow_plan_by_proposal(plan.proposal_id)
+
+    store._connection.execute(
+        "UPDATE shadow_experiments SET record_json = ? WHERE experiment_id = ?",
+        [
+            experiment.model_copy(update={"scenario_id": "tampered"}).model_dump_json(),
+            experiment.experiment_id,
+        ],
+    )
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_shadow_experiments_for_proposal(plan.proposal_id, NOW)
+
+
 def test_experiment_registry_revalidates_unchecked_models_before_persistence(
     tmp_path: Path,
 ) -> None:

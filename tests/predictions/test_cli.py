@@ -12,6 +12,7 @@ import polytrading.predictions.cli as predictions_cli
 from polytrading.cli import build_parser, main
 from polytrading.predictions.candidates_models import RelationshipType
 from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.economics_models import ScanReport, deterministic_scan_report_id
 from polytrading.predictions.experiments import TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.risk import PredictionRiskPolicy
@@ -2035,7 +2036,7 @@ def test_shadow_run_requires_family_positive_expiry_and_current_schema(
         )
         == 2
     )
-    assert "unknown preregistered trial family" in capsys.readouterr().err
+    assert "trial family is not preregistered" in capsys.readouterr().err
     assert (
         main(
             [
@@ -2502,3 +2503,422 @@ def test_shadow_replay_rejects_invalid_uuid_and_sanitizes_missing_evidence(
     captured = capsys.readouterr()
     assert "shadow replay evidence is unavailable or inconsistent" in captured.err
     assert str(database) not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("table", "key_column", "field", "value"),
+    [
+        ("scan_reports", "report_id", "reason", "tampered scan metadata"),
+        (
+            "candidate_relationships",
+            "candidate_id",
+            "provenance",
+            {
+                "kind": "deterministic",
+                "generator": "tampered",
+                "generator_version": "1",
+                "code_revision": "tampered",
+            },
+        ),
+        ("proof_artifacts", "proof_id", "review_identity", "tampered-reviewer"),
+        ("rule_versions", "rule_version_id", "description", "tampered rules"),
+        ("prediction_books", "cycle_id", "sequence", "tampered-sequence"),
+        ("prediction_fee_rates", "venue", "maker_rate", "0.123"),
+        ("shadow_plans", "proposal_id", "completion_path", "tampered path"),
+    ],
+)
+def test_shadow_replay_rejects_exact_lineage_record_json_tamper(
+    table: str,
+    key_column: str,
+    field: str,
+    value: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"{table}.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    if table == "shadow_plans":
+        key: object = proposal_id
+    elif table == "candidate_relationships":
+        key = CANDIDATE_ID
+    elif table == "proof_artifacts":
+        key = store.shadow_plan_by_proposal(proposal_id).proof_id
+    elif table == "scan_reports":
+        key = store.shadow_plan_by_proposal(proposal_id).scan_report_id
+    elif table == "rule_versions":
+        key = RULE_VERSION_ID
+    elif table == "prediction_books":
+        key = store.latest_book_as_of(
+            PredictionVenue.POLYMARKET, "0xcondition", "111", NOW
+        ).cycle_id
+    else:
+        key = PredictionVenue.POLYMARKET.value
+    row = store._connection.execute(
+        f"SELECT record_json FROM {table} WHERE {key_column} = ? LIMIT 1", [key]
+    ).fetchone()
+    payload = json.loads(row[0])
+    payload[field] = value
+    store._connection.execute(
+        f"UPDATE {table} SET record_json = ? WHERE {key_column} = ?",
+        [json.dumps(payload, sort_keys=True), key],
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                str(proposal_id),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "MATCHES" not in captured.out
+    assert "shadow replay evidence is unavailable or inconsistent" in captured.err
+
+
+@pytest.mark.parametrize("sequence", [0, 6])
+def test_shadow_replay_reports_provenance_and_reconciliation_event_tamper_as_divergence(
+    sequence: int,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"event-{sequence}.duckdb"
+    proposal_id = _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    event = store.shadow_events_for_proposal(proposal_id, NOW)[sequence]
+    tampered = event.model_copy(update={"detail": f"tampered sequence {sequence}"})
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ? WHERE proposal_id = ? AND sequence = ?",
+        [tampered.model_dump_json(), proposal_id, sequence],
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "replay",
+                "--db",
+                str(database),
+                "--proposal-id",
+                str(proposal_id),
+            ]
+        )
+        == 1
+    )
+    assert capsys.readouterr().out.rstrip().endswith(f"replay DIVERGES at sequence {sequence}")
+
+
+def _append_scan_revision(
+    store: PredictionMarketStore,
+    source: ScanReport,
+    *,
+    as_of: datetime,
+    decision: str = "SHADOW_CANDIDATE",
+) -> ScanReport:
+    economics = source.economics if decision == "SHADOW_CANDIDATE" else None
+    proof_id = source.proof_id
+    reason = "later positive" if decision == "SHADOW_CANDIDATE" else "later rejection"
+    report_id = deterministic_scan_report_id(
+        candidate_id=source.candidate_id,
+        proof_id=proof_id,
+        decision=decision,
+        reason=reason,
+        economics=economics,
+        policy_id=source.policy_id,
+        policy_version=source.policy_version,
+        as_of=as_of,
+    )
+    report = ScanReport(
+        report_id=report_id,
+        candidate_id=source.candidate_id,
+        proof_id=proof_id,
+        decision=decision,
+        reason=reason,
+        economics=economics,
+        policy_id=source.policy_id,
+        policy_version=source.policy_version,
+        as_of=as_of,
+        observed_at=as_of,
+    )
+    store.append_scan_report(report)
+    return report
+
+
+@pytest.mark.parametrize(
+    ("latest_decision", "planned", "pnl"),
+    [("SHADOW_CANDIDATE", 1, Decimal("3.960")), ("REJECTED", 0, Decimal("0"))],
+)
+def test_shadow_run_uses_only_each_candidates_latest_effective_scan(
+    latest_decision: str,
+    planned: int,
+    pnl: Decimal,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"{latest_decision}.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+    store = PredictionMarketStore(database)
+    source = store.scan_reports_as_of(NOW)[0]
+    _append_scan_revision(
+        store,
+        source,
+        as_of=NOW + timedelta(seconds=1),
+        decision=latest_decision,
+    )
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:01Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["planned"] == planned
+    assert Decimal(output["reconciled_paper_pnl_usd"]) == pnl
+
+
+def test_shadow_run_applies_first_batch_loss_before_risk_gating_second_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "sequential-risk.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    capsys.readouterr()
+    store = PredictionMarketStore(database)
+    first_candidate = store.candidate_relationship_by_id(CANDIDATE_ID, NOW)
+    first_proof = store.latest_proof_for_candidate(CANDIDATE_ID, NOW)
+    first_report = store.scan_reports_as_of(NOW)[0]
+    second_candidate_id = UUID("00000000-0000-0000-0000-000000003002")
+    second_proof_id = UUID("00000000-0000-0000-0000-000000006002")
+    second_candidate = first_candidate.model_copy(update={"candidate_id": second_candidate_id})
+    second_proof = first_proof.model_copy(
+        update={"proof_id": second_proof_id, "candidate_id": second_candidate_id}
+    )
+    second_report_id = deterministic_scan_report_id(
+        candidate_id=second_candidate_id,
+        proof_id=second_proof_id,
+        decision="SHADOW_CANDIDATE",
+        reason="second candidate",
+        economics=first_report.economics,
+        policy_id=first_report.policy_id,
+        policy_version=first_report.policy_version,
+        as_of=NOW,
+    )
+    second_report = ScanReport(
+        report_id=second_report_id,
+        candidate_id=second_candidate_id,
+        proof_id=second_proof_id,
+        decision="SHADOW_CANDIDATE",
+        reason="second candidate",
+        economics=first_report.economics,
+        policy_id=first_report.policy_id,
+        policy_version=first_report.policy_version,
+        as_of=NOW,
+        observed_at=NOW,
+    )
+    store.append_candidate_relationship(second_candidate)
+    store.append_proof_artifact(second_proof)
+    store.append_scan_report(second_report)
+    store.close()
+    monkeypatch.setattr(
+        predictions_cli,
+        "DEFAULT_RISK_POLICY",
+        PredictionRiskPolicy(policy_version="shadow-risk-v1", starting_equity_usd=Decimal("151.1")),
+    )
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--scenario",
+                "second_leg_reject",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["planned"] == 1
+    assert output["refused"] == {"RISK_REFUSED": 1}
+    assert output["terminal_states"] == {"unwound": 1}
+    assert Decimal(output["reconciled_paper_pnl_usd"]) == Decimal("-0.1272")
+
+
+@pytest.mark.parametrize(
+    "missing_phase",
+    ["plan_only", "events", "postings", "reconciliation", "experiment"],
+)
+def test_shadow_run_rejects_partial_existing_lifecycle_without_mutation(
+    missing_phase: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"{missing_phase}.duckdb"
+    _seed_completed_shadow_run(database, capsys)
+    store = PredictionMarketStore(database)
+    if missing_phase in {"plan_only", "events"}:
+        store._connection.execute("DELETE FROM shadow_events")
+    if missing_phase in {"plan_only", "postings"}:
+        store._connection.execute("DELETE FROM shadow_ledger_postings")
+    if missing_phase in {"plan_only", "reconciliation"}:
+        store._connection.execute("DELETE FROM shadow_reconciliations")
+    if missing_phase in {"plan_only", "experiment"}:
+        store._connection.execute("DELETE FROM shadow_experiments")
+    tables = (
+        "shadow_plans",
+        "shadow_events",
+        "shadow_ledger_postings",
+        "shadow_reconciliations",
+        "shadow_experiments",
+    )
+    before = {
+        table: tuple(
+            row[0]
+            for row in store._connection.execute(
+                f"SELECT record_json FROM {table} ORDER BY record_json"
+            ).fetchall()
+        )
+        for table in tables
+    }
+    store.close()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                "shadow-cli-v1",
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "shadow run failed to persist atomically" in captured.err
+    assert "existing" not in captured.out
+
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        after = {
+            table: tuple(
+                row[0]
+                for row in store._connection.execute(
+                    f"SELECT record_json FROM {table} ORDER BY record_json"
+                ).fetchall()
+            )
+            for table in tables
+        }
+    finally:
+        store.close()
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "forbidden_phrase",
+    ["risk-free", "guaranteed", "approved", "live eligible"],
+)
+def test_shadow_run_never_echoes_registered_or_missing_trial_family_ids(
+    forbidden_phrase: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / f"family-{forbidden_phrase.replace(' ', '-')}.duckdb"
+    _seed_runnable_shadow_candidate(database)
+    family_id = f"adversarial {forbidden_phrase} family"
+    store = PredictionMarketStore(database)
+    store.append_trial_family(
+        TrialFamily(
+            family_id=family_id,
+            hypothesis="A deliberately adversarial identifier is never rendered.",
+            preregistered_at=NOW,
+            thresholds_json='{"version":1}',
+            venues=(PredictionVenue.POLYMARKET,),
+            registered_by="cli-test",
+        )
+    )
+    store.close()
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                family_id,
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    registered_output = capsys.readouterr()
+    assert forbidden_phrase not in registered_output.out.lower()
+    assert forbidden_phrase not in registered_output.err.lower()
+
+    missing_family_id = f"missing {forbidden_phrase} family"
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "run",
+                "--db",
+                str(database),
+                "--trial-family",
+                missing_family_id,
+                "--as-of",
+                "2026-08-15T12:00:00Z",
+            ]
+        )
+        == 2
+    )
+    missing_output = capsys.readouterr()
+    assert forbidden_phrase not in missing_output.out.lower()
+    assert forbidden_phrase not in missing_output.err.lower()
