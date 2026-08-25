@@ -30,8 +30,18 @@ from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.health import PredictionHealthAuditor
 from polytrading.predictions.proofs_models import ProofArtifact
-from polytrading.predictions.shadow_ledger import ShadowReconciliation
-from polytrading.predictions.shadow_models import ShadowEvent, ShadowState, derive_current_state
+from polytrading.predictions.shadow_ledger import (
+    LedgerPosting,
+    ShadowReconciliation,
+    proposal_paper_pnl,
+    reconciled_event_for,
+)
+from polytrading.predictions.shadow_models import (
+    ShadowEvent,
+    ShadowPlan,
+    ShadowState,
+    derive_current_state,
+)
 from polytrading.predictions.storage.store import PredictionMarketStore
 
 _MAX_MARKETS_SHOWN = 200
@@ -162,9 +172,13 @@ class PredictionDashboardBuilder:
         by_current_state: dict[str, int] = {}
         reconciled_pnl = Decimal("0")
         for plan in self._store.verified_shadow_plans_as_of(as_of):
-            events = self._store.shadow_events_for_proposal(plan.proposal_id, as_of)
+            if plan.observed_at > as_of or plan.information_cutoff > as_of:
+                raise ValueError("shadow plan exceeds the dashboard information cutoff")
+            events = self._store.verified_shadow_events_for_proposal(plan.proposal_id, as_of)
             if not events:
                 raise ValueError("shadow plan is missing its event chain")
+            if any(event.occurred_at > as_of for event in events):
+                raise ValueError("shadow event exceeds the dashboard information cutoff")
             if any(event.proposal_id != plan.proposal_id for event in events):
                 raise ValueError("shadow events do not belong to their plan")
             if len({event.event_id for event in events}) != len(events):
@@ -180,8 +194,11 @@ class PredictionDashboardBuilder:
                 raise ValueError("multiple shadow reconciliations exist for one proposal")
             reconciliation = reconciliations[0] if reconciliations else None
             experiment = experiments_by_proposal.pop(plan.proposal_id, None)
+            postings = self._store.verified_ledger_postings_for_proposal(plan.proposal_id, as_of)
             paper_pnl = _validated_shadow_pnl(
+                plan=plan,
                 events=events,
+                postings=postings,
                 current_state=current_state,
                 scenario_id=scenario_id,
                 reconciliation=reconciliation,
@@ -266,7 +283,9 @@ def _scenario_from_execution_events(events: tuple[ShadowEvent, ...]) -> str | No
 
 def _validated_shadow_pnl(
     *,
+    plan: ShadowPlan,
     events: tuple[ShadowEvent, ...],
+    postings: tuple[LedgerPosting, ...],
     current_state: ShadowState,
     scenario_id: str | None,
     reconciliation: ShadowReconciliation | None,
@@ -296,7 +315,13 @@ def _validated_shadow_pnl(
             or experiment.observed_at != reconciliation.observed_at
         ):
             raise ValueError("reconciled shadow result evidence is inconsistent")
-        return experiment.paper_pnl_usd
+        expected_reconciled_event = reconciled_event_for(plan, events[:-1], reconciliation)
+        if events[-1] != expected_reconciled_event:
+            raise ValueError("reconciled shadow event is not canonical")
+        authoritative_pnl = proposal_paper_pnl(postings, reconciliation, events)
+        if authoritative_pnl is None or experiment.paper_pnl_usd != authoritative_pnl:
+            raise ValueError("shadow experiment paper P&L does not match the reconciled ledger")
+        return authoritative_pnl
 
     if reconciliation is not None:
         if current_state not in execution_terminals:
@@ -309,6 +334,10 @@ def _validated_shadow_pnl(
             or reconciliation.observed_at != terminal.occurred_at
         ):
             raise ValueError("unreconciled shadow evidence is inconsistent")
+        if proposal_paper_pnl(postings, reconciliation, events) is not None:
+            raise ValueError("unreconciled shadow proposal cannot have authoritative paper P&L")
+    elif postings:
+        raise ValueError("shadow ledger postings require reconciliation evidence")
     if experiment is not None and (
         reconciliation is None
         or experiment.terminal_state is not current_state

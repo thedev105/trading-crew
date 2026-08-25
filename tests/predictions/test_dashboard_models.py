@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -14,12 +15,20 @@ from polytrading.predictions.dashboard import (
     render_prediction_dashboard_json,
 )
 from polytrading.predictions.dashboard_models import ShadowListing, ShadowSummary
-from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.domain import PredictionFeeRate, PredictionVenue
 from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.manifest import AdapterImplementationState
-from polytrading.predictions.shadow_ledger import ShadowReconciliation
+from polytrading.predictions.shadow_ledger import (
+    LedgerPosting,
+    ShadowReconciliation,
+    postings_for_events,
+    proposal_paper_pnl,
+    reconcile_proposal,
+    reconciled_event_for,
+)
 from polytrading.predictions.shadow_models import (
     ShadowEvent,
+    ShadowFill,
     ShadowLegPlan,
     ShadowPlan,
     ShadowState,
@@ -100,7 +109,7 @@ def shadow_plan(**overrides: object) -> ShadowPlan:
         "unwind_path": "sell acquired inventory",
         "max_incomplete_exposure_usd": Decimal("10"),
         "max_incomplete_loss_usd": Decimal("2"),
-        "frozen_hashes": ("a" * 64,),
+        "frozen_hashes": ("a" * 64, "b" * 64),
         "policy_id": "economics-v1",
         "policy_version": "1",
         "risk_policy_version": "1",
@@ -207,6 +216,100 @@ def shadow_experiment(
         as_of=observed_at,
         observed_at=observed_at,
     )
+
+
+def shadow_fees(plan: ShadowPlan) -> dict[int, PredictionFeeRate]:
+    hashes = ("a" * 64, "b" * 64)
+    return {
+        leg.leg_index: PredictionFeeRate(
+            schema_version=1,
+            venue=leg.venue,
+            market_id=leg.market_id,
+            maker_rate=Decimal("0"),
+            taker_rate=Decimal("0"),
+            observed_at=plan.information_cutoff,
+            source_hash=hashes[leg.leg_index],
+        )
+        for leg in plan.legs
+    }
+
+
+def reconciled_execution_events(
+    plan: ShadowPlan,
+    terminal_state: ShadowState,
+    *,
+    terminal_at: datetime,
+) -> tuple[ShadowEvent, ...]:
+    events = list(shadow_events(plan, terminal_state, terminal_at=terminal_at))
+    if terminal_state is ShadowState.UNWOUND:
+        buy = ShadowFill(
+            leg_index=0,
+            side="buy",
+            price_levels=((Decimal("0.40"), Decimal("2")),),
+            quantity=Decimal("2"),
+        )
+        sell = ShadowFill(
+            leg_index=0,
+            side="sell",
+            price_levels=((Decimal("0.30"), Decimal("2")),),
+            quantity=Decimal("2"),
+        )
+        events[4] = events[4].model_copy(
+            update={"fills": (buy,), "quantity_filled": Decimal("2"), "leg_index": 0}
+        )
+        events[5] = events[5].model_copy(
+            update={"fills": (sell,), "quantity_filled": Decimal("2"), "leg_index": 0}
+        )
+    return tuple(events)
+
+
+def append_reconciled_bundle(
+    store: PredictionMarketStore,
+    plan: ShadowPlan,
+    terminal_state: ShadowState,
+    *,
+    terminal_at: datetime,
+    family_id: str = "cross-venue-equivalence-v1",
+    experiment_pnl: Decimal | None = None,
+    append_postings: bool = True,
+) -> tuple[
+    tuple[ShadowEvent, ...],
+    tuple[LedgerPosting, ...],
+    ShadowReconciliation,
+    ShadowExperiment,
+]:
+    execution_events = reconciled_execution_events(plan, terminal_state, terminal_at=terminal_at)
+    fees = shadow_fees(plan)
+    postings = postings_for_events(plan, execution_events, fees)
+    reconciliation = reconcile_proposal(plan, execution_events, postings, fees)
+    reconciled_event = reconciled_event_for(plan, execution_events, reconciliation)
+    events = (*execution_events, reconciled_event)
+    pnl = proposal_paper_pnl(postings, reconciliation, events)
+    experiment = shadow_experiment(
+        plan,
+        observed_at=reconciliation.observed_at,
+        terminal_state=ShadowState.RECONCILED,
+        paper_pnl_usd=pnl if experiment_pnl is None else experiment_pnl,
+        reconciled=True,
+        family_id=family_id,
+    )
+    append_plan_and_events(store, plan, events)
+    if append_postings:
+        for posting in postings:
+            store.append_ledger_posting(posting)
+    store.append_reconciliation(reconciliation)
+    store.append_shadow_experiment(experiment)
+    return events, postings, reconciliation, experiment
+
+
+def persisted_event_hash(event: ShadowEvent) -> str:
+    canonical = json.dumps(
+        event.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(canonical.encode()).hexdigest()
 
 
 def test_shadow_summary_accepts_a_strict_consistent_reconciled_snapshot() -> None:
@@ -423,54 +526,62 @@ def test_snapshot_shadow_omits_plans_not_known_by_the_cutoff(tmp_path: Path) -> 
     assert snapshot.shadow.latest == ()
 
 
+def test_snapshot_shadow_fails_closed_when_plan_information_cutoff_is_in_the_future(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan(
+        observed_at=NOW - timedelta(minutes=10),
+        information_cutoff=NOW + timedelta(seconds=1),
+    )
+    append_plan_and_events(
+        store,
+        plan,
+        shadow_events(plan, ShadowState.UNKNOWN, terminal_at=NOW),
+    )
+
+    with pytest.raises(ValueError, match="information cutoff"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
 def test_snapshot_shadow_exposes_pnl_only_from_complete_reconciled_evidence(
     tmp_path: Path,
 ) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
-    expected_pnls = (Decimal("-2.50"), Decimal("0"))
-    for index, pnl in enumerate(expected_pnls, start=1):
+    expected = (
+        (ShadowState.UNWOUND, Decimal("-0.20")),
+        (ShadowState.EXPIRED, Decimal("0")),
+    )
+    for index, (terminal_state, pnl) in enumerate(expected, start=1):
         plan = shadow_plan(
             proposal_id=UUID(int=index),
             observed_at=NOW - timedelta(minutes=20 + index),
         )
         reconciled_at = NOW - timedelta(minutes=index)
-        events = shadow_events(
+        _, _, _, experiment = append_reconciled_bundle(
+            store,
             plan,
-            ShadowState.COMPLETE if index == 1 else ShadowState.UNWOUND,
+            terminal_state,
             terminal_at=reconciled_at,
-            reconciled_at=reconciled_at,
         )
-        append_plan_and_events(store, plan, events)
-        store.append_reconciliation(
-            shadow_reconciliation(plan, events[-2], observed_at=reconciled_at)
-        )
-        store.append_shadow_experiment(
-            shadow_experiment(
-                plan,
-                observed_at=reconciled_at,
-                terminal_state=ShadowState.RECONCILED,
-                paper_pnl_usd=pnl,
-                reconciled=True,
-            )
-        )
+        assert experiment.paper_pnl_usd == pnl
 
     unknown_plan = shadow_plan(proposal_id=UUID(int=3), observed_at=NOW - timedelta(minutes=23))
     unknown_events = shadow_events(
         unknown_plan, ShadowState.UNKNOWN, terminal_at=NOW - timedelta(minutes=3)
     )
     append_plan_and_events(store, unknown_plan, unknown_events)
-    store.append_reconciliation(
-        shadow_reconciliation(
-            unknown_plan,
-            unknown_events[-1],
-            observed_at=unknown_events[-1].occurred_at,
-            complete=False,
-        )
+    unknown_reconciliation = reconcile_proposal(
+        unknown_plan,
+        unknown_events,
+        (),
+        shadow_fees(unknown_plan),
     )
+    store.append_reconciliation(unknown_reconciliation)
     store.append_shadow_experiment(
         shadow_experiment(
             unknown_plan,
-            observed_at=unknown_events[-1].occurred_at,
+            observed_at=unknown_reconciliation.observed_at,
             terminal_state=ShadowState.UNKNOWN,
             paper_pnl_usd=None,
             reconciled=False,
@@ -483,21 +594,122 @@ def test_snapshot_shadow_exposes_pnl_only_from_complete_reconciled_evidence(
 
     assert summary.reconciled_count == 2
     assert summary.unreconciled_count == 1
-    assert summary.reconciled_paper_pnl_usd == Decimal("-2.50")
+    assert summary.reconciled_paper_pnl_usd == Decimal("-0.20")
     assert summary.experiments_by_family == {
         "cross-venue-equivalence-v1": 2,
         "unknown-outcomes-v1": 1,
     }
     listings = {item.proposal_id: item for item in summary.latest}
-    assert listings[UUID(int=1)].paper_pnl == Decimal("-2.50")
+    assert listings[UUID(int=1)].paper_pnl == Decimal("-0.20")
     assert listings[UUID(int=2)].paper_pnl == Decimal("0")
     assert listings[UUID(int=3)].current_state is ShadowState.UNKNOWN
     assert listings[UUID(int=3)].paper_pnl is None
     document = json.loads(render_prediction_dashboard_json(snapshot))
     serialized = {item["proposal_id"]: item for item in document["shadow"]["latest"]}
-    assert serialized[str(UUID(int=1))]["paper_pnl"] == "-2.50"
+    assert serialized[str(UUID(int=1))]["paper_pnl"] == "-0.20"
     assert serialized[str(UUID(int=2))]["paper_pnl"] == "0"
     assert serialized[str(UUID(int=3))]["paper_pnl"] is None
+
+
+def test_snapshot_shadow_rejects_arbitrary_experiment_pnl_with_zero_postings(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    _, postings, _, _ = append_reconciled_bundle(
+        store,
+        plan,
+        ShadowState.EXPIRED,
+        terminal_at=NOW,
+        experiment_pnl=Decimal("12.00"),
+    )
+    assert postings == ()
+
+    with pytest.raises(ValueError, match="paper P&L"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_rejects_missing_or_extra_ledger_postings(tmp_path: Path) -> None:
+    missing_store = PredictionMarketStore(tmp_path / "missing.duckdb")
+    plan = shadow_plan()
+    append_reconciled_bundle(
+        missing_store,
+        plan,
+        ShadowState.UNWOUND,
+        terminal_at=NOW,
+        append_postings=False,
+    )
+    with pytest.raises(ValueError, match="reconciliation identity"):
+        PredictionDashboardBuilder(missing_store, tmp_path / "missing.duckdb").build(NOW)
+
+    extra_store = PredictionMarketStore(tmp_path / "extra.duckdb")
+    plan = shadow_plan()
+    _, postings, _, _ = append_reconciled_bundle(
+        extra_store,
+        plan,
+        ShadowState.UNWOUND,
+        terminal_at=NOW,
+    )
+    extra_store.append_ledger_posting(
+        postings[0].model_copy(update={"posting_id": UUID(int=999999)})
+    )
+    with pytest.raises(ValueError, match=r"not conserved|posting identity"):
+        PredictionDashboardBuilder(extra_store, tmp_path / "extra.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_rejects_tampered_posting_hash_or_index_identity(tmp_path: Path) -> None:
+    hash_store = PredictionMarketStore(tmp_path / "hash.duckdb")
+    plan = shadow_plan()
+    _, postings, _, _ = append_reconciled_bundle(
+        hash_store,
+        plan,
+        ShadowState.UNWOUND,
+        terminal_at=NOW,
+    )
+    posting = postings[0]
+    hash_store._connection.execute(
+        "UPDATE shadow_ledger_postings SET record_json = ? WHERE posting_id = ?",
+        [posting.model_copy(update={"detail": "tampered"}).model_dump_json(), posting.posting_id],
+    )
+    with pytest.raises(ValueError, match="immutable record hash"):
+        PredictionDashboardBuilder(hash_store, tmp_path / "hash.duckdb").build(NOW)
+
+    index_store = PredictionMarketStore(tmp_path / "index.duckdb")
+    plan = shadow_plan()
+    _, postings, _, _ = append_reconciled_bundle(
+        index_store,
+        plan,
+        ShadowState.UNWOUND,
+        terminal_at=NOW,
+    )
+    posting = postings[0]
+    index_store._connection.execute(
+        "UPDATE shadow_ledger_postings SET event_id = ? WHERE posting_id = ?",
+        [UUID(int=888888), posting.posting_id],
+    )
+    with pytest.raises(ValueError, match="indexed columns"):
+        PredictionDashboardBuilder(index_store, tmp_path / "index.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_rejects_a_hash_valid_noncanonical_reconciled_event(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    events, _, _, _ = append_reconciled_bundle(
+        store,
+        plan,
+        ShadowState.EXPIRED,
+        terminal_at=NOW,
+    )
+    reconciled = events[-1].model_copy(update={"detail": "noncanonical reconciliation detail"})
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ?, record_hash = ? WHERE event_id = ?",
+        [reconciled.model_dump_json(), persisted_event_hash(reconciled), reconciled.event_id],
+    )
+
+    with pytest.raises(ValueError, match="not canonical"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
 
 
 def test_snapshot_shadow_does_not_leak_future_reconciliation_or_experiment(
@@ -676,6 +888,36 @@ def test_snapshot_shadow_uses_verified_plan_and_experiment_records(tmp_path: Pat
     )
 
     with pytest.raises(ValueError, match="immutable record hash"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_uses_verified_event_records(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    events = shadow_events(plan, ShadowState.UNKNOWN, terminal_at=NOW)
+    append_plan_and_events(store, plan, events)
+    event = events[2]
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ? WHERE event_id = ?",
+        [event.model_copy(update={"detail": "tampered"}).model_dump_json(), event.event_id],
+    )
+
+    with pytest.raises(ValueError, match="immutable record hash"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_snapshot_shadow_rejects_event_timestamp_index_cutoff_leakage(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+    events = shadow_events(plan, ShadowState.UNKNOWN, terminal_at=NOW)
+    append_plan_and_events(store, plan, events)
+    future = events[-1].model_copy(update={"occurred_at": NOW + timedelta(seconds=1)})
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ?, record_hash = ? WHERE event_id = ?",
+        [future.model_dump_json(), persisted_event_hash(future), future.event_id],
+    )
+
+    with pytest.raises(ValueError, match="indexed columns"):
         PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
 
 

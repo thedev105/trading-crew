@@ -11,7 +11,7 @@ from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.economics_models import EconomicsResult
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
-from polytrading.predictions.shadow_ledger import ShadowReconciliation
+from polytrading.predictions.shadow_ledger import LedgerPosting, ShadowReconciliation
 from polytrading.predictions.shadow_models import (
     ShadowEvent,
     ShadowLegPlan,
@@ -645,6 +645,84 @@ def test_shadow_events_enforce_proposal_sequence_integrity_and_cutoff_safe_order
         store.append_shadow_event(first.model_copy(update={"detail": "different detail"}))
 
 
+def test_verified_shadow_events_reject_stale_record_json_hash(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    event = shadow_event()
+    store.append_shadow_event(event)
+
+    assert store.verified_shadow_events_for_proposal(event.proposal_id, NOW) == (event,)
+    store._connection.execute(
+        "UPDATE shadow_events SET record_json = ? WHERE event_id = ?",
+        [event.model_copy(update={"detail": "tampered"}).model_dump_json(), event.event_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_shadow_events_for_proposal(event.proposal_id, NOW)
+
+
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("event_id", UUID("00000000-0000-0000-0000-000000009999")),
+        ("proposal_id", UUID("00000000-0000-0000-0000-000000008999")),
+        ("sequence", 7),
+        ("occurred_at", NOW - timedelta(seconds=1)),
+    ],
+)
+def test_verified_shadow_events_reject_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"event-{column}.duckdb")
+    event = shadow_event()
+    store.append_shadow_event(event)
+    store._connection.execute(
+        f"UPDATE shadow_events SET {column} = ? WHERE event_id = ?",
+        [tampered, event.event_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_shadow_events_for_proposal(event.proposal_id, NOW)
+
+
+def test_verified_ledger_postings_reject_stale_record_json_hash(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    posting = ledger_posting()
+    store.append_ledger_posting(posting)
+
+    assert store.verified_ledger_postings_for_proposal(posting.proposal_id, NOW) == (posting,)
+    store._connection.execute(
+        "UPDATE shadow_ledger_postings SET record_json = ? WHERE posting_id = ?",
+        [posting.model_copy(update={"detail": "tampered"}).model_dump_json(), posting.posting_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="immutable record hash"):
+        store.verified_ledger_postings_for_proposal(posting.proposal_id, NOW)
+
+
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("posting_id", UUID("00000000-0000-0000-0000-00000000b999")),
+        ("proposal_id", UUID("00000000-0000-0000-0000-000000008999")),
+        ("event_id", UUID("00000000-0000-0000-0000-000000009999")),
+        ("occurred_at", NOW - timedelta(seconds=1)),
+    ],
+)
+def test_verified_ledger_postings_reject_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"posting-{column}.duckdb")
+    posting = ledger_posting()
+    store.append_ledger_posting(posting)
+    store._connection.execute(
+        f"UPDATE shadow_ledger_postings SET {column} = ? WHERE posting_id = ?",
+        [tampered, posting.posting_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_ledger_postings_for_proposal(posting.proposal_id, NOW)
+
+
 def test_trial_family_round_trip_supports_append_only_preregistration_versions(
     tmp_path: Path,
 ) -> None:
@@ -861,6 +939,30 @@ def test_verified_shadow_plan_and_experiment_reads_reject_record_json_tamper(
         store.verified_shadow_experiments_for_proposal(plan.proposal_id, NOW)
 
 
+@pytest.mark.parametrize(
+    ("column", "tampered"),
+    [
+        ("proposal_id", UUID("00000000-0000-0000-0000-000000008999")),
+        ("candidate_id", UUID("00000000-0000-0000-0000-000000008998")),
+        ("observed_at", NOW - timedelta(seconds=1)),
+        ("information_cutoff", NOW - timedelta(seconds=1)),
+    ],
+)
+def test_verified_shadow_plans_reject_indexed_column_tamper(
+    column: str, tampered: object, tmp_path: Path
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"plan-{column}.duckdb")
+    plan = shadow_plan()
+    store.append_shadow_plan(plan)
+    store._connection.execute(
+        f"UPDATE shadow_plans SET {column} = ? WHERE proposal_id = ?",
+        [tampered, plan.proposal_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_shadow_plans_as_of(NOW)
+
+
 def test_experiment_registry_revalidates_unchecked_models_before_persistence(
     tmp_path: Path,
 ) -> None:
@@ -1070,6 +1172,22 @@ def shadow_reconciliation(**overrides: object) -> ShadowReconciliation:
     }
     values.update(overrides)
     return ShadowReconciliation(**values)
+
+
+def ledger_posting(**overrides: object) -> LedgerPosting:
+    values: dict[str, object] = {
+        "posting_id": UUID("00000000-0000-0000-0000-00000000b001"),
+        "proposal_id": UUID("00000000-0000-0000-0000-000000008001"),
+        "event_id": UUID("00000000-0000-0000-0000-000000009001"),
+        "venue": PredictionVenue.POLYMARKET,
+        "account": "reserve",
+        "debit_usd": Decimal("1"),
+        "credit_usd": Decimal("0"),
+        "occurred_at": NOW,
+        "detail": "verified posting fixture",
+    }
+    values.update(overrides)
+    return LedgerPosting(**values)
 
 
 def trial_family(**overrides: object) -> TrialFamily:

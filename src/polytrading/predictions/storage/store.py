@@ -942,17 +942,38 @@ class PredictionMarketStore:
     def verified_shadow_plans_as_of(self, as_of: datetime) -> tuple[ShadowPlan, ...]:
         rows = self._connection.execute(
             """
-            SELECT record_json, record_hash FROM shadow_plans
+            SELECT proposal_id, candidate_id, epoch_us(observed_at),
+                   epoch_us(information_cutoff), record_json, record_hash
+            FROM shadow_plans
             WHERE observed_at <= ?
+               OR CAST(
+                    json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ
+                  ) <= ?
             ORDER BY observed_at, proposal_id
             """,
-            [as_of],
+            [as_of, as_of],
         ).fetchall()
-        return tuple(
-            record
-            for row in rows
-            if (record := _verified_record(row, ShadowPlan, "shadow plan")) is not None
-        )
+        records: list[ShadowPlan] = []
+        for row in rows:
+            record = _verified_record((row[4], row[5]), ShadowPlan, "shadow plan")
+            if record is None:
+                continue
+            indexed = (
+                row[0],
+                row[1],
+                _utc_from_epoch_us(row[2]),
+                _utc_from_epoch_us(row[3]),
+            )
+            decoded = (
+                record.proposal_id,
+                record.candidate_id,
+                record.observed_at,
+                record.information_cutoff,
+            )
+            if indexed != decoded:
+                raise ConflictingRecordError("stored shadow plan indexed columns do not match")
+            records.append(record)
+        return tuple(sorted(records, key=lambda record: (record.observed_at, record.proposal_id)))
 
     def shadow_plan_by_proposal(self, proposal_id: UUID) -> ShadowPlan | None:
         row = self._connection.execute(
@@ -980,6 +1001,45 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(ShadowEvent.model_validate_json(row[0]) for row in rows)
 
+    def verified_shadow_events_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[ShadowEvent, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT event_id, proposal_id, sequence, epoch_us(occurred_at),
+                   record_json, record_hash
+            FROM shadow_events
+            WHERE (
+                    proposal_id = ?
+                    OR json_extract_string(record_json, '$.proposal_id') = ?
+                  )
+              AND (
+                    occurred_at <= ?
+                    OR CAST(
+                        json_extract_string(record_json, '$.occurred_at') AS TIMESTAMPTZ
+                    ) <= ?
+                  )
+            ORDER BY sequence
+            """,
+            [proposal_id, str(proposal_id), as_of, as_of],
+        ).fetchall()
+        records: list[ShadowEvent] = []
+        for row in rows:
+            record = _verified_record((row[4], row[5]), ShadowEvent, "shadow event")
+            if record is None:
+                continue
+            indexed = (row[0], row[1], row[2], _utc_from_epoch_us(row[3]))
+            decoded = (
+                record.event_id,
+                record.proposal_id,
+                record.sequence,
+                record.occurred_at,
+            )
+            if indexed != decoded:
+                raise ConflictingRecordError("stored shadow event indexed columns do not match")
+            records.append(record)
+        return tuple(sorted(records, key=lambda record: record.sequence))
+
     def ledger_postings_for_proposal(
         self, proposal_id: UUID, as_of: datetime
     ) -> tuple[LedgerPosting, ...]:
@@ -992,6 +1052,52 @@ class PredictionMarketStore:
             [proposal_id, as_of],
         ).fetchall()
         return tuple(LedgerPosting.model_validate_json(row[0]) for row in rows)
+
+    def verified_ledger_postings_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[LedgerPosting, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT posting_id, proposal_id, event_id, epoch_us(occurred_at),
+                   record_json, record_hash
+            FROM shadow_ledger_postings
+            WHERE (
+                    proposal_id = ?
+                    OR json_extract_string(record_json, '$.proposal_id') = ?
+                  )
+              AND (
+                    occurred_at <= ?
+                    OR CAST(
+                        json_extract_string(record_json, '$.occurred_at') AS TIMESTAMPTZ
+                    ) <= ?
+                  )
+            ORDER BY occurred_at, event_id, posting_id
+            """,
+            [proposal_id, str(proposal_id), as_of, as_of],
+        ).fetchall()
+        records: list[LedgerPosting] = []
+        for row in rows:
+            record = _verified_record((row[4], row[5]), LedgerPosting, "shadow ledger posting")
+            if record is None:
+                continue
+            indexed = (row[0], row[1], row[2], _utc_from_epoch_us(row[3]))
+            decoded = (
+                record.posting_id,
+                record.proposal_id,
+                record.event_id,
+                record.occurred_at,
+            )
+            if indexed != decoded:
+                raise ConflictingRecordError(
+                    "stored shadow ledger posting indexed columns do not match"
+                )
+            records.append(record)
+        return tuple(
+            sorted(
+                records,
+                key=lambda record: (record.occurred_at, record.event_id, record.posting_id),
+            )
+        )
 
     def latest_reconciliation_for_proposal(
         self, proposal_id: UUID, as_of: datetime
