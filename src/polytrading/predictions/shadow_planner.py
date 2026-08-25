@@ -287,6 +287,10 @@ def _evidence_identity_matches(
     books: Mapping[int, PredictionBookSnapshot | None],
     fees: Mapping[int, PredictionFeeRate | None],
 ) -> bool:
+    expected_indices = set(range(len(candidate.legs)))
+    if set(books) != expected_indices or set(fees) != expected_indices:
+        return False
+
     for index, leg in enumerate(candidate.legs):
         book = books.get(index)
         if book is not None and (

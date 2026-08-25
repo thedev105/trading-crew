@@ -524,6 +524,49 @@ def test_mismatched_evidence_identity_is_refused(evidence_case: str) -> None:
     assert refusal.detail == "invalid or mismatched planner evidence"
 
 
+def test_extra_unrelated_book_key_is_refused_before_lineage_hashing() -> None:
+    """A valid surplus book must not alter a candidate plan's frozen lineage."""
+    books = _books()
+    books[2] = books[0].model_copy(
+        update={
+            "market_id": "unrelated-market",
+            "outcome_token_id": "unrelated-token",
+            "source_hash": "7" * 64,
+        }
+    )
+
+    refusal = _plan(books=books)
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
+def test_extra_unrelated_fee_key_is_refused_before_lineage_hashing() -> None:
+    """A valid surplus fee must not alter a candidate plan's frozen lineage."""
+    fees = _fees()
+    fees[2] = fees[0].model_copy(update={"market_id": "unrelated-market", "source_hash": "8" * 64})
+
+    refusal = _plan(fees=fees)
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
+@pytest.mark.parametrize("mapping_name", ["books", "fees"])
+def test_extra_none_evidence_key_is_refused(mapping_name: str) -> None:
+    """A surplus index is malformed even when it carries no evidence or lineage hash."""
+    evidence = _books() if mapping_name == "books" else _fees()
+    evidence[2] = None
+
+    refusal = _plan(**{mapping_name: evidence})
+
+    assert refusal.reason == "MISSING_EVIDENCE"
+    assert refusal.risk is None
+    assert refusal.detail == "invalid or mismatched planner evidence"
+
+
 def test_venue_default_fee_identity_is_accepted() -> None:
     """A fee with no market ID is the venue default and remains valid for either market."""
     fees = _fees()
