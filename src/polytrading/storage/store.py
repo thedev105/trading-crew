@@ -631,6 +631,12 @@ class DuckDBStore:
             """,
             [row[0], row[1], row[2], row[7]],
         ).fetchall()
+        return self._book_snapshot_from_row_and_levels(row, levels)
+
+    @staticmethod
+    def _book_snapshot_from_row_and_levels(
+        row: tuple[Any, ...], levels: list[tuple[Any, ...]]
+    ) -> Level2BookSnapshot:
         bids = tuple(
             BookLevel(price=level[1], quantity=level[2], order_count=level[3])
             for level in levels
@@ -726,6 +732,51 @@ class DuckDBStore:
         ).fetchall()
         return tuple(
             snapshot for row in rows if (snapshot := self._book_snapshot_from_row(row)) is not None
+        )
+
+    def book_snapshots_for_cycles(
+        self,
+        cycle_ids: tuple[UUID, ...],
+        known_as_of: datetime,
+    ) -> tuple[Level2BookSnapshot, ...]:
+        """Bulk-load complete books for the requested cycles at a knowledge cutoff."""
+        normalized_known_as_of = normalize_utc_timestamp(known_as_of)
+        if not cycle_ids:
+            return ()
+        cycle_id_values = list(cycle_ids)
+        rows = self._connection.execute(
+            """
+            SELECT cycle_id, venue, symbol, asset, depth_limit, sequence,
+                   epoch_us(effective_at), epoch_us(observed_at), source_hash, schema_version
+            FROM book_snapshots
+            WHERE cycle_id IN (SELECT unnest(?::UUID[]))
+              AND effective_at <= ?
+              AND observed_at <= ?
+            ORDER BY cycle_id, venue, symbol
+            """,
+            [cycle_id_values, normalized_known_as_of, normalized_known_as_of],
+        ).fetchall()
+        level_rows = self._connection.execute(
+            """
+            SELECT cycle_id, venue, symbol, epoch_us(observed_at),
+                   side, price, quantity, order_count
+            FROM book_levels
+            WHERE cycle_id IN (SELECT unnest(?::UUID[]))
+              AND observed_at <= ?
+            ORDER BY cycle_id, venue, symbol,
+                     CASE side WHEN 'bid' THEN 0 ELSE 1 END, level_index
+            """,
+            [cycle_id_values, normalized_known_as_of],
+        ).fetchall()
+        levels_by_snapshot: dict[tuple[Any, ...], list[tuple[Any, ...]]] = {}
+        for level in level_rows:
+            levels_by_snapshot.setdefault(level[:4], []).append(level[4:])
+        return tuple(
+            self._book_snapshot_from_row_and_levels(
+                row,
+                levels_by_snapshot.get((row[0], row[1], row[2], row[7]), []),
+            )
+            for row in rows
         )
 
     def book_snapshot_headers_for_cycles(
@@ -1270,23 +1321,28 @@ class DuckDBStore:
                 record_hash,
             ],
         )
-        for side, side_levels in (("bid", record.bids), ("ask", record.asks)):
-            for index, level in enumerate(side_levels):
-                self._connection.execute(
-                    "INSERT INTO book_levels VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        record.cycle_id,
-                        record.venue.value,
-                        record.symbol,
-                        record.observed_at,
-                        side,
-                        index,
-                        level.price,
-                        level.quantity,
-                        level.order_count,
-                        record_hash,
-                    ],
-                )
+        level_rows = [
+            [
+                record.cycle_id,
+                record.venue.value,
+                record.symbol,
+                record.observed_at,
+                side,
+                index,
+                level.price,
+                level.quantity,
+                level.order_count,
+                record_hash,
+            ]
+            for side, side_levels in (("bid", record.bids), ("ask", record.asks))
+            for index, level in enumerate(side_levels)
+        ]
+        if level_rows:
+            placeholders = ", ".join("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in level_rows)
+            self._connection.execute(
+                f"INSERT INTO book_levels VALUES {placeholders}",
+                [value for row in level_rows for value in row],
+            )
         return True
 
     def _append_economic_evaluation(self, record: CandidateEconomicsReport) -> bool:

@@ -1,3 +1,4 @@
+import shutil
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -16,8 +17,14 @@ from polytrading.trial.health import (
     project_earliest_evaluation_end,
 )
 from polytrading.trial.health_models import TrialCollectionStatus, TrialEvidenceStatus
+from tests.book_evidence_seed import bulk_append_book_evidence
 from tests.trial.funding_helpers import trial_funding_cycle
-from tests.trial.test_book_evidence import DYDX_HASH, LIGHTER_HASH, append_pair
+from tests.trial.test_book_evidence import (
+    DYDX_HASH,
+    LIGHTER_HASH,
+    append_pair,
+    book_pair_records,
+)
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 AS_OF = datetime(2026, 8, 14, 7, 6, tzinfo=UTC)
@@ -165,9 +172,11 @@ def seed_complete_trial_hours(
     *,
     hours: int,
     missing_book_hours: frozenset[datetime] = frozenset(),
+    bulk_book_evidence: bool = True,
 ) -> DuckDBStore:
     store = DuckDBStore(tmp_path / "trial.duckdb")
     first = AS_OF_HOUR - timedelta(hours=hours - 1)
+    book_evidence = []
     with store.transaction():
         for index in range(hours):
             boundary = first + timedelta(hours=index)
@@ -175,13 +184,80 @@ def seed_complete_trial_hours(
             for offset, asset in enumerate(Asset, start=1):
                 if asset is Asset.BTC and boundary in missing_book_hours:
                     continue
-                append_pair(
-                    store,
-                    10_000 + index * 10 + offset,
-                    boundary,
-                    asset=asset,
-                )
+                identity = 10_000 + index * 10 + offset
+                if not bulk_book_evidence:
+                    append_pair(store, identity, boundary, asset=asset)
+                    continue
+                cycle, snapshots = book_pair_records(identity, boundary, asset=asset)
+                book_evidence.append((cycle, snapshots))
+        if bulk_book_evidence:
+            bulk_append_book_evidence(store, book_evidence, tmp_path)
     return store
+
+
+@pytest.fixture(scope="module")
+def complete_24_hour_trial_database(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("complete-24-hour-trial")
+    store = seed_complete_trial_hours(directory, hours=24)
+    path = directory / "trial.duckdb"
+    store.close()
+    return path
+
+
+@pytest.fixture(scope="module")
+def complete_2160_hour_trial_database(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("complete-2160-hour-trial")
+    store = seed_complete_trial_hours(directory, hours=2_160)
+    path = directory / "trial.duckdb"
+    store.close()
+    return path
+
+
+def copied_trial_store(tmp_path: Path, template: Path) -> DuckDBStore:
+    path = tmp_path / "trial.duckdb"
+    shutil.copyfile(template, path)
+    return DuckDBStore(path)
+
+
+def test_bulk_book_template_seed_matches_rowwise_evidence(tmp_path: Path) -> None:
+    rowwise_directory = tmp_path / "rowwise"
+    bulk_directory = tmp_path / "bulk"
+    rowwise_directory.mkdir()
+    bulk_directory.mkdir()
+    rowwise = seed_complete_trial_hours(
+        rowwise_directory,
+        hours=2,
+        bulk_book_evidence=False,
+    )
+    bulk = seed_complete_trial_hours(bulk_directory, hours=2)
+
+    assert LighterDydxTrialHealthAuditor(bulk).audit(AS_OF, 2) == (
+        LighterDydxTrialHealthAuditor(rowwise).audit(AS_OF, 2)
+    )
+    for query in (
+        """
+        SELECT cycle_id, epoch_us(request_completed_at), status,
+               CAST(record_json AS VARCHAR), record_hash
+        FROM book_collection_cycles ORDER BY cycle_id
+        """,
+        """
+        SELECT cycle_id, venue, symbol, asset, depth_limit, sequence,
+               epoch_us(effective_at), epoch_us(observed_at), source_hash,
+               schema_version, record_hash
+        FROM book_snapshots ORDER BY cycle_id, venue, symbol
+        """,
+        """
+        SELECT cycle_id, venue, symbol, epoch_us(observed_at), side, level_index,
+               price, quantity, order_count, record_hash
+        FROM book_levels ORDER BY cycle_id, venue, symbol, side, level_index
+        """,
+    ):
+        assert (
+            bulk._connection.execute(query).fetchall()
+            == rowwise._connection.execute(query).fetchall()
+        )
+    bulk.close()
+    rowwise.close()
 
 
 def test_empty_trial_is_not_started(tmp_path: Path) -> None:
@@ -278,8 +354,10 @@ def test_trial_book_evidence_requires_completion_at_or_after_prospective_start(
     store.close()
 
 
-def test_calendar_immaturity_is_collecting_not_degraded(tmp_path: Path) -> None:
-    store = seed_complete_trial_hours(tmp_path, hours=24)
+def test_calendar_immaturity_is_collecting_not_degraded(
+    tmp_path: Path, complete_24_hour_trial_database: Path
+) -> None:
+    store = copied_trial_store(tmp_path, complete_24_hour_trial_database)
     report = LighterDydxTrialHealthAuditor(store).audit(AS_OF, 24)
     assert report.status is TrialCollectionStatus.COLLECTING
     assert all(item.status is TrialEvidenceStatus.COMPLETE for item in report.recent_boundaries)
@@ -287,9 +365,11 @@ def test_calendar_immaturity_is_collecting_not_degraded(tmp_path: Path) -> None:
 
 
 def test_health_bulk_loads_book_headers_once_without_reconstructing_levels(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    complete_24_hour_trial_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = seed_complete_trial_hours(tmp_path, hours=24)
+    store = copied_trial_store(tmp_path, complete_24_hour_trial_database)
     cycle_reads = 0
     header_reads = 0
     real_cycle_reader = store.book_collection_cycles_completed_between
@@ -673,8 +753,10 @@ def test_health_represents_legacy_economics_without_inventing_policy_or_decision
     store.close()
 
 
-def test_complete_2160_hour_trial_is_ready_for_economics_evaluation(tmp_path: Path) -> None:
-    store = seed_complete_trial_hours(tmp_path, hours=2_160)
+def test_complete_2160_hour_trial_is_ready_for_economics_evaluation(
+    tmp_path: Path, complete_2160_hour_trial_database: Path
+) -> None:
+    store = copied_trial_store(tmp_path, complete_2160_hour_trial_database)
     with store.transaction():
         for offset, asset in enumerate(Asset, start=1):
             append_pair(store, 90_000 + offset, AS_OF - timedelta(seconds=10), asset=asset)

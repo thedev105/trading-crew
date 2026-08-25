@@ -440,7 +440,7 @@ def test_read_write_open_rejects_a_prediction_store_database_without_mutating_it
         ).fetchall()
     assert "prediction_raw_envelopes" in tables
     assert "raw_envelopes" not in tables
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
 
 
 def test_migration_sql_is_available_as_packaged_data() -> None:
@@ -1207,6 +1207,11 @@ def test_book_cycle_range_and_cycle_books_are_canonical_and_point_in_time(
         OTHER_SOURCE_HASH,
         SOURCE_HASH,
     )
+    assert store.book_snapshots_for_cycles((future.cycle_id, cycle_id), NOW) == (
+        dydx,
+        lighter,
+    )
+    assert store.book_snapshots_for_cycles((), NOW) == ()
     with pytest.raises(ValueError, match="start must be less than or equal to end"):
         store.book_collection_cycles_between(NOW, effective_at, NOW)
     with pytest.raises(ValueError, match="knowledge cutoff"):

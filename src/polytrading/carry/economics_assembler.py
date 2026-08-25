@@ -20,8 +20,8 @@ from polytrading.domain.models import (
 from polytrading.storage.store import DuckDBStore
 from polytrading.trial.book_evidence import (
     EligibleTrialBookPair,
-    eligible_lighter_dydx_book_pair,
-    select_hourly_trial_books,
+    _select_hourly_trial_books_from_eligible,
+    eligible_lighter_dydx_book_pairs,
 )
 from polytrading.trial.funding_lineage import select_prospective_funding
 
@@ -319,29 +319,24 @@ class EconomicsEvidenceAssembler:
             policy.known_as_of,
             policy.known_as_of,
         )
-        eligible: list[EligibleTrialBookPair] = []
-        for cycle in cycles:
-            item = eligible_lighter_dydx_book_pair(
+        eligible = list(
+            eligible_lighter_dydx_book_pairs(
                 self._store,
-                cycle,
+                cycles,
                 policy.asset,
                 policy.known_as_of,
                 policy.maximum_cycle_skew_ms,
             )
-            if item is None:
-                continue
-            eligible.append(item)
-            source_hashes.update(cycle.source_hashes)
+        )
+        for item in eligible:
+            source_hashes.update(item.cycle.source_hashes)
             source_hashes.update((item.pair.dydx.source_hash, item.pair.lighter.source_hash))
         eligible.sort(key=lambda item: (item.cycle.request_completed_at, item.cycle.cycle_id))
-        hourly = select_hourly_trial_books(
-            self._store,
-            policy.asset,
+        hourly = _select_hourly_trial_books_from_eligible(
+            tuple(eligible),
             evaluation_start,
             policy.study_end,
-            policy.known_as_of,
             policy.maximum_hourly_book_age_seconds,
-            policy.maximum_cycle_skew_ms,
         )
         dense = tuple(
             item.pair

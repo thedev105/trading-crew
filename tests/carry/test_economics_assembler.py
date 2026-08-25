@@ -9,10 +9,17 @@ import pytest
 
 from polytrading.carry.dossier_models import DossierStatus
 from polytrading.carry.economics_assembler import EconomicsEvidenceAssembler
-from polytrading.carry.economics_models import EconomicsPolicy
-from polytrading.domain.models import Asset, FeeSchedule, FundingObservation, Venue
+from polytrading.domain.models import (
+    Asset,
+    FeeSchedule,
+    FundingObservation,
+    Level2BookSnapshot,
+    Venue,
+)
 from polytrading.storage.store import DuckDBStore
 from polytrading.trial.funding_models import LighterDydxFundingCycle
+from polytrading.venues.synchronized import BookCollectionCycle
+from tests.book_evidence_seed import bulk_append_book_evidence
 from tests.carry.test_economics_models import KNOWN_AS_OF, STUDY_END, policy
 from tests.domain.factories import (
     book_collection_cycle,
@@ -35,6 +42,7 @@ def seed_complete_database(path: Path, *, link_trial_funding: bool = True) -> No
     store = DuckDBStore(path)
     training_start = item.study_end - timedelta(days=90)
     evaluation_start = item.study_end - timedelta(days=60)
+    book_evidence = []
     with store.transaction():
         store.append_instrument(
             instrument_spec(
@@ -138,9 +146,10 @@ def seed_complete_database(path: Path, *, link_trial_funding: bool = True) -> No
                 )
         for hour in range(1, 60 * 24 + 1):
             boundary = evaluation_start + timedelta(hours=hour)
-            append_book_pair(store, 10_000 + hour, boundary - timedelta(minutes=1))
-        append_book_pair(store, 20_001, KNOWN_AS_OF - timedelta(seconds=10))
-        append_book_pair(store, 20_002, KNOWN_AS_OF - timedelta(seconds=5))
+            book_evidence.append(book_pair_records(10_000 + hour, boundary - timedelta(minutes=1)))
+        book_evidence.append(book_pair_records(20_001, KNOWN_AS_OF - timedelta(seconds=10)))
+        book_evidence.append(book_pair_records(20_002, KNOWN_AS_OF - timedelta(seconds=5)))
+        bulk_append_book_evidence(store, book_evidence, path.parent)
     store.close()
 
 
@@ -210,15 +219,16 @@ def append_conflicting_trial_revision(
     return conflicting
 
 
-def seeded_economics_store(
-    tmp_path: Path, *, link_trial_funding: bool = True
-) -> tuple[DuckDBStore, EconomicsPolicy]:
-    path = tmp_path / "economics.duckdb"
-    seed_complete_database(path, link_trial_funding=link_trial_funding)
-    return DuckDBStore(path), policy()
+def append_book_pair(store: DuckDBStore, identity: int, completed_at: datetime) -> None:
+    cycle, snapshots = book_pair_records(identity, completed_at)
+    store.append_book_collection_cycle(cycle)
+    for snapshot in snapshots:
+        store.append_book_snapshot(snapshot)
 
 
-def append_book_pair(store: DuckDBStore, identity: int, completed_at) -> None:
+def book_pair_records(
+    identity: int, completed_at: datetime
+) -> tuple[BookCollectionCycle, tuple[Level2BookSnapshot, Level2BookSnapshot]]:
     cycle_id = UUID(int=identity)
     dydx_effective = completed_at - timedelta(milliseconds=200)
     lighter_effective = completed_at - timedelta(milliseconds=100)
@@ -232,29 +242,25 @@ def append_book_pair(store: DuckDBStore, identity: int, completed_at) -> None:
         max_effective_skew_ms=Decimal("100"),
         source_hashes=(DYDX_BOOK_HASH, LIGHTER_BOOK_HASH),
     )
-    store.append_book_collection_cycle(cycle)
-    store.append_book_snapshot(
-        book_snapshot(
-            cycle_id=cycle_id,
-            venue=Venue.DYDX,
-            symbol="BTC-USD",
-            asset=Asset.BTC,
-            effective_at=dydx_effective,
-            observed_at=completed_at,
-            source_hash=DYDX_BOOK_HASH,
-        )
+    dydx = book_snapshot(
+        cycle_id=cycle_id,
+        venue=Venue.DYDX,
+        symbol="BTC-USD",
+        asset=Asset.BTC,
+        effective_at=dydx_effective,
+        observed_at=completed_at,
+        source_hash=DYDX_BOOK_HASH,
     )
-    store.append_book_snapshot(
-        book_snapshot(
-            cycle_id=cycle_id,
-            venue=Venue.LIGHTER,
-            symbol="BTC",
-            asset=Asset.BTC,
-            effective_at=lighter_effective,
-            observed_at=completed_at,
-            source_hash=LIGHTER_BOOK_HASH,
-        )
+    lighter = book_snapshot(
+        cycle_id=cycle_id,
+        venue=Venue.LIGHTER,
+        symbol="BTC",
+        asset=Asset.BTC,
+        effective_at=lighter_effective,
+        observed_at=completed_at,
+        source_hash=LIGHTER_BOOK_HASH,
     )
+    return cycle, (dydx, lighter)
 
 
 @pytest.fixture(scope="module")
@@ -264,24 +270,38 @@ def complete_database(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
+@pytest.fixture(scope="module")
+def complete_unlinked_database(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("economics-assembler-unlinked") / "complete.duckdb"
+    seed_complete_database(path, link_trial_funding=False)
+    return path
+
+
 def copied_database(tmp_path: Path, complete_database: Path) -> Path:
     path = tmp_path / "research.duckdb"
     shutil.copyfile(complete_database, path)
     return path
 
 
-def test_economics_ignores_complete_unlinked_historical_funding(tmp_path: Path) -> None:
-    store, policy = seeded_economics_store(tmp_path, link_trial_funding=False)
-    result = EconomicsEvidenceAssembler(store).assemble(policy)
+def test_economics_ignores_complete_unlinked_historical_funding(
+    tmp_path: Path, complete_unlinked_database: Path
+) -> None:
+    path = copied_database(tmp_path, complete_unlinked_database)
+    store = DuckDBStore(path)
+    result = EconomicsEvidenceAssembler(store).assemble(policy())
     assert result.bundle is None
     assert "FUNDING_COVERAGE_INSUFFICIENT" in result.reason_codes
     store.close()
 
 
-def test_economics_fails_closed_on_linked_revision_conflict(tmp_path: Path) -> None:
-    store, policy = seeded_economics_store(tmp_path)
-    append_conflicting_trial_revision(store, policy.asset, policy.study_end)
-    result = EconomicsEvidenceAssembler(store).assemble(policy)
+def test_economics_fails_closed_on_linked_revision_conflict(
+    tmp_path: Path, complete_database: Path
+) -> None:
+    path = copied_database(tmp_path, complete_database)
+    store = DuckDBStore(path)
+    item = policy()
+    append_conflicting_trial_revision(store, item.asset, item.study_end)
+    result = EconomicsEvidenceAssembler(store).assemble(item)
     assert result.bundle is None
     assert "FUNDING_REVISION_CONFLICT" in result.reason_codes
     store.close()
@@ -323,6 +343,48 @@ def test_complete_assembly_uses_exact_windows_tiers_books_and_lineage(
     assert result.coverage.latency_sample_count == 1
     assert result.source_hashes == tuple(sorted(set(result.source_hashes)))
     assert result.source_hashes == result.bundle.source_hashes
+    store.close()
+
+
+def test_complete_assembly_bulk_loads_the_book_window_once(
+    tmp_path: Path,
+    complete_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = copied_database(tmp_path, complete_database)
+    store = DuckDBStore(path, read_only=True)
+    cycle_reads = 0
+    bulk_book_reads = 0
+    real_cycle_reader = store.book_collection_cycles_between
+    real_bulk_reader = store.book_snapshots_for_cycles
+
+    def cycles(*args: object, **kwargs: object) -> object:
+        nonlocal cycle_reads
+        cycle_reads += 1
+        return real_cycle_reader(*args, **kwargs)  # type: ignore[arg-type]
+
+    def books(*args: object, **kwargs: object) -> object:
+        nonlocal bulk_book_reads
+        bulk_book_reads += 1
+        return real_bulk_reader(*args, **kwargs)  # type: ignore[arg-type]
+
+    def reject_duplicate_reader(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("economics repeated book selection")
+
+    monkeypatch.setattr(store, "book_collection_cycles_between", cycles)
+    monkeypatch.setattr(store, "book_snapshots_for_cycles", books)
+    monkeypatch.setattr(store, "books_for_cycle", reject_duplicate_reader)
+    monkeypatch.setattr(
+        store,
+        "book_collection_cycles_completed_between",
+        reject_duplicate_reader,
+    )
+
+    result = EconomicsEvidenceAssembler(store).assemble(policy())
+
+    assert result.bundle is not None
+    assert cycle_reads == 1
+    assert bulk_book_reads == 1
     store.close()
 
 

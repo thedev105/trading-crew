@@ -5,12 +5,13 @@ from uuid import UUID
 
 import pytest
 
-from polytrading.domain.models import Asset, Venue
+from polytrading.domain.models import Asset, Level2BookSnapshot, Venue
 from polytrading.storage.store import DuckDBStore
 from polytrading.trial.book_evidence import (
     eligible_lighter_dydx_book_pair,
     select_hourly_trial_books,
 )
+from polytrading.venues.synchronized import BookCollectionCycle
 from tests.domain.factories import book_collection_cycle, book_snapshot
 
 BOUNDARY = datetime(2026, 8, 14, 7, tzinfo=UTC)
@@ -34,28 +35,61 @@ def append_pair(
     snapshot_effective_at: datetime | None = None,
     duplicate_dydx: bool = False,
 ) -> None:
+    cycle, snapshots = book_pair_records(
+        identity,
+        completed_at,
+        asset=asset,
+        skew_ms=skew_ms,
+        status=status,
+        venues=venues,
+        cycle_hashes=cycle_hashes,
+        dydx_symbol=dydx_symbol,
+        lighter_symbol=lighter_symbol,
+        snapshot_observed_at=snapshot_observed_at,
+        snapshot_effective_at=snapshot_effective_at,
+        duplicate_dydx=duplicate_dydx,
+    )
+    store.append_book_collection_cycle(cycle)
+    for snapshot in snapshots:
+        store.append_book_snapshot(snapshot)
+
+
+def book_pair_records(
+    identity: int,
+    completed_at: datetime,
+    *,
+    asset: Asset = Asset.BTC,
+    skew_ms: Decimal = Decimal("100"),
+    status: str = "complete",
+    venues: tuple[Venue, ...] = (Venue.DYDX, Venue.LIGHTER),
+    cycle_hashes: tuple[str, ...] = (DYDX_HASH, LIGHTER_HASH),
+    dydx_symbol: str | None = None,
+    lighter_symbol: str | None = None,
+    snapshot_observed_at: datetime | None = None,
+    snapshot_effective_at: datetime | None = None,
+    duplicate_dydx: bool = False,
+) -> tuple[BookCollectionCycle, tuple[Level2BookSnapshot, ...]]:
     cycle_id = UUID(int=identity)
     dydx_effective = snapshot_effective_at or completed_at - timedelta(
         microseconds=int(skew_ms * 1_000)
     )
     lighter_effective = snapshot_effective_at or completed_at
     observed_at = snapshot_observed_at or completed_at
-    store.append_book_collection_cycle(
-        book_collection_cycle(
-            cycle_id=cycle_id,
-            assets=(asset,),
-            venues=venues,
-            request_started_at=completed_at - timedelta(seconds=1),
-            request_completed_at=completed_at,
-            effective_timestamps=(dydx_effective, lighter_effective),
-            max_effective_skew_ms=skew_ms,
-            status=status,
-            failure_codes=() if status == "complete" else ("FAILED",),
-            source_hashes=cycle_hashes,
-        )
+    cycle = book_collection_cycle(
+        cycle_id=cycle_id,
+        assets=(asset,),
+        venues=venues,
+        request_started_at=completed_at - timedelta(seconds=1),
+        request_completed_at=completed_at,
+        effective_timestamps=(dydx_effective, lighter_effective),
+        max_effective_skew_ms=skew_ms,
+        status=status,
+        failure_codes=() if status == "complete" else ("FAILED",),
+        source_hashes=cycle_hashes,
     )
+    snapshots: list[Level2BookSnapshot] = []
     if Venue.DYDX in venues:
-        store.append_book_snapshot(
+        snapshots.append(
             book_snapshot(
                 cycle_id=cycle_id,
                 venue=Venue.DYDX,
@@ -67,7 +101,7 @@ def append_pair(
             )
         )
         if duplicate_dydx:
-            store.append_book_snapshot(
+            snapshots.append(
                 book_snapshot(
                     cycle_id=cycle_id,
                     venue=Venue.DYDX,
@@ -79,7 +113,7 @@ def append_pair(
                 )
             )
     if Venue.LIGHTER in venues:
-        store.append_book_snapshot(
+        snapshots.append(
             book_snapshot(
                 cycle_id=cycle_id,
                 venue=Venue.LIGHTER,
@@ -90,6 +124,7 @@ def append_pair(
                 source_hash=LIGHTER_HASH,
             )
         )
+    return cycle, tuple(snapshots)
 
 
 def seeded_book_store(tmp_path: Path, completions: tuple[datetime, ...]) -> DuckDBStore:
@@ -238,4 +273,42 @@ def test_hourly_window_is_start_exclusive_and_end_inclusive(tmp_path: Path) -> N
         BOUNDARY - timedelta(hours=1),
         BOUNDARY,
     )
+    store.close()
+
+
+def test_hourly_selection_bulk_loads_books_once_and_ignores_unrelated_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DuckDBStore(tmp_path / "books.duckdb")
+    selected_at = BOUNDARY - timedelta(seconds=1)
+    append_pair(store, 1, selected_at)
+    append_pair(store, 2, selected_at, asset=Asset.ETH)
+    append_pair(store, 3, selected_at, venues=(Venue.DYDX,))
+    bulk_reads = 0
+    real_bulk_reader = store.book_snapshots_for_cycles
+
+    def bulk_reader(*args: object, **kwargs: object) -> object:
+        nonlocal bulk_reads
+        bulk_reads += 1
+        return real_bulk_reader(*args, **kwargs)  # type: ignore[arg-type]
+
+    def reject_single_cycle_reader(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("hourly selection performed a per-cycle book read")
+
+    monkeypatch.setattr(store, "book_snapshots_for_cycles", bulk_reader)
+    monkeypatch.setattr(store, "books_for_cycle", reject_single_cycle_reader)
+
+    selected = select_hourly_trial_books(
+        store,
+        Asset.BTC,
+        BOUNDARY - timedelta(hours=1),
+        BOUNDARY,
+        BOUNDARY + timedelta(minutes=5),
+        maximum_age_seconds=Decimal("300"),
+        maximum_skew_ms=Decimal("1000"),
+    )
+
+    assert bulk_reads == 1
+    assert len(selected) == 1
+    assert selected[0].cycle.cycle_id == UUID(int=1)
     store.close()

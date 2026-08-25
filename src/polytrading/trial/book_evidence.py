@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
+from uuid import UUID
 
 from polytrading.carry.economics_execution import PairedBookObservation
-from polytrading.domain.models import Asset, Venue, normalize_utc_timestamp
+from polytrading.domain.models import Asset, Level2BookSnapshot, Venue, normalize_utc_timestamp
 from polytrading.storage.store import DuckDBStore
 from polytrading.venues.synchronized import BookCollectionCycle
 
@@ -102,6 +103,50 @@ def eligible_lighter_dydx_book_pair(
     """Return an exact detached Lighter/dYdX pair known by the cutoff."""
     normalized_cutoff = normalize_utc_timestamp(known_as_of)
     skew_limit = _require_limit(maximum_skew_ms, "maximum skew")
+    books = store.books_for_cycle(cycle.cycle_id)
+    return _eligible_lighter_dydx_book_pair_from_books(
+        cycle, asset, books, normalized_cutoff, skew_limit
+    )
+
+
+def eligible_lighter_dydx_book_pairs(
+    store: DuckDBStore,
+    cycles: tuple[BookCollectionCycle, ...],
+    asset: Asset,
+    known_as_of: datetime,
+    maximum_skew_ms: Decimal,
+) -> tuple[EligibleTrialBookPair, ...]:
+    """Bulk-load and validate exact detached Lighter/dYdX pairs."""
+    normalized_cutoff = normalize_utc_timestamp(known_as_of)
+    skew_limit = _require_limit(maximum_skew_ms, "maximum skew")
+    books_by_cycle: dict[UUID, list[Level2BookSnapshot]] = {}
+    for book in store.book_snapshots_for_cycles(
+        tuple(cycle.cycle_id for cycle in cycles), normalized_cutoff
+    ):
+        books_by_cycle.setdefault(book.cycle_id, []).append(book)
+    return tuple(
+        item
+        for cycle in cycles
+        if (
+            item := _eligible_lighter_dydx_book_pair_from_books(
+                cycle,
+                asset,
+                tuple(books_by_cycle.get(cycle.cycle_id, ())),
+                normalized_cutoff,
+                skew_limit,
+            )
+        )
+        is not None
+    )
+
+
+def _eligible_lighter_dydx_book_pair_from_books(
+    cycle: BookCollectionCycle,
+    asset: Asset,
+    books: tuple[Level2BookSnapshot, ...],
+    normalized_cutoff: datetime,
+    skew_limit: Decimal,
+) -> EligibleTrialBookPair | None:
     if (
         cycle.status != "complete"
         or asset not in cycle.assets
@@ -111,8 +156,6 @@ def eligible_lighter_dydx_book_pair(
         or cycle.request_completed_at > normalized_cutoff
     ):
         return None
-
-    books = store.books_for_cycle(cycle.cycle_id)
     selected = {
         venue: tuple(item for item in books if item.venue is venue and item.asset is asset)
         for venue in _VENUES
@@ -178,15 +221,12 @@ def select_hourly_trial_books(
         normalized_end,
         normalized_cutoff,
     )
-    eligible = tuple(
-        item
-        for cycle in cycles
-        if (
-            item := eligible_lighter_dydx_book_pair(
-                store, cycle, asset, normalized_cutoff, skew_limit
-            )
-        )
-        is not None
+    eligible = eligible_lighter_dydx_book_pairs(
+        store,
+        cycles,
+        asset,
+        normalized_cutoff,
+        skew_limit,
     )
     return _select_hourly_trial_books_from_eligible(
         eligible,
