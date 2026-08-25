@@ -9,6 +9,12 @@ from pydantic import ValidationError
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.economics_models import EconomicsResult
 from polytrading.predictions.manifest import AdapterImplementationState
+from polytrading.predictions.shadow_models import (
+    ShadowEvent,
+    ShadowLegPlan,
+    ShadowPlan,
+    ShadowState,
+)
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.attestation_helpers import rule_attestation
 from tests.predictions.candidate_helpers import candidate_relationship
@@ -42,6 +48,10 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "rule_attestations",
         "proof_artifacts",
         "scan_reports",
+        "shadow_plans",
+        "shadow_events",
+        "shadow_ledger_postings",
+        "shadow_reconciliations",
         "schema_migrations",
     } <= tables
     perpetual_futures_tables = {
@@ -496,6 +506,65 @@ def test_scan_reports_as_of_respects_the_cutoff(tmp_path: Path) -> None:
     assert store.scan_reports_as_of(NOW - timedelta(hours=2)) == ()
 
 
+def test_shadow_plan_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan = shadow_plan()
+
+    assert store.append_shadow_plan(plan) is True
+    assert store.append_shadow_plan(plan) is False
+    assert store.shadow_plan_by_proposal(plan.proposal_id) == plan
+    assert store.shadow_plan_by_proposal(UUID("00000000-0000-0000-0000-000000008099")) is None
+    with pytest.raises(ConflictingRecordError):
+        store.append_shadow_plan(plan.model_copy(update={"policy_version": "different"}))
+
+
+def test_shadow_plans_as_of_is_ordered_and_cutoff_safe(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    early = shadow_plan(
+        proposal_id=UUID("00000000-0000-0000-0000-000000008101"),
+        candidate_id=UUID("00000000-0000-0000-0000-000000008201"),
+        observed_at=NOW - timedelta(hours=1),
+        information_cutoff=NOW - timedelta(hours=1),
+    )
+    late = shadow_plan(
+        proposal_id=UUID("00000000-0000-0000-0000-000000008102"),
+        candidate_id=UUID("00000000-0000-0000-0000-000000008202"),
+    )
+    store.append_shadow_plan(late)
+    store.append_shadow_plan(early)
+
+    assert store.shadow_plans_as_of(NOW - timedelta(minutes=30)) == (early,)
+    assert store.shadow_plans_as_of(NOW) == (early, late)
+    assert store.shadow_plans_as_of(NOW - timedelta(hours=2)) == ()
+
+
+def test_shadow_events_enforce_proposal_sequence_integrity_and_cutoff_safe_ordering(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    first = shadow_event(occurred_at=NOW - timedelta(hours=1))
+    second = shadow_event(
+        event_id=UUID("00000000-0000-0000-0000-000000009002"),
+        sequence=1,
+        from_state=ShadowState.DISCOVERED,
+        to_state=ShadowState.PROOF_VALIDATED,
+    )
+
+    assert store.append_shadow_event(second) is True
+    assert store.append_shadow_event(first) is True
+    assert store.append_shadow_event(first) is False
+    assert store.shadow_events_for_proposal(first.proposal_id, NOW - timedelta(minutes=30)) == (
+        first,
+    )
+    assert store.shadow_events_for_proposal(first.proposal_id, NOW) == (first, second)
+    with pytest.raises(ConflictingRecordError):
+        store.append_shadow_event(
+            shadow_event(event_id=UUID("00000000-0000-0000-0000-000000009003"))
+        )
+    with pytest.raises(ConflictingRecordError):
+        store.append_shadow_event(first.model_copy(update={"detail": "different detail"}))
+
+
 def test_scan_report_shadow_candidate_requires_a_proof_id() -> None:
     with pytest.raises(ValidationError):
         scan_report(
@@ -532,3 +601,70 @@ def test_scan_report_shadow_candidate_accepts_a_fully_consistent_report() -> Non
         economics=_economics_result(surplus=Decimal("10")),
     )
     assert report.decision == "SHADOW_CANDIDATE"
+
+
+def shadow_plan(**overrides: object) -> ShadowPlan:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "proposal_id": UUID("00000000-0000-0000-0000-000000008001"),
+        "candidate_id": UUID("00000000-0000-0000-0000-000000008002"),
+        "proof_id": UUID("00000000-0000-0000-0000-000000008003"),
+        "scan_report_id": UUID("00000000-0000-0000-0000-000000008004"),
+        "legs": (
+            ShadowLegPlan(
+                leg_index=0,
+                venue=PredictionVenue.POLYMARKET,
+                market_id="market-a",
+                outcome_token_id="token-a",
+                sequence_position=0,
+                limit_price_levels=((Decimal("0.40"), Decimal("10")),),
+                max_quantity=Decimal("10"),
+            ),
+            ShadowLegPlan(
+                leg_index=1,
+                venue=PredictionVenue.POLYMARKET,
+                market_id="market-b",
+                outcome_token_id="token-b",
+                sequence_position=1,
+                limit_price_levels=((Decimal("0.60"), Decimal("10")),),
+                max_quantity=Decimal("10"),
+            ),
+        ),
+        "bottleneck_leg_index": 1,
+        "max_quantity": Decimal("10"),
+        "order_policy": "taker_cross_only",
+        "expires_at": NOW + timedelta(minutes=5),
+        "completion_path": "Buy remaining legs after the first fill.",
+        "cancellation_path": "Cancel unfilled orders before expiry.",
+        "unwind_path": "Sell filled inventory at the best available bids.",
+        "max_incomplete_exposure_usd": Decimal("15"),
+        "max_incomplete_loss_usd": Decimal("5"),
+        "frozen_hashes": ("a" * 64, "b" * 64),
+        "policy_id": "research-v1",
+        "policy_version": "1",
+        "risk_policy_version": "1",
+        "minimum_basket_payout": Decimal("1.00"),
+        "kill_conditions": ("book becomes stale",),
+        "information_cutoff": NOW,
+        "observed_at": NOW,
+    }
+    values.update(overrides)
+    return ShadowPlan(**values)
+
+
+def shadow_event(**overrides: object) -> ShadowEvent:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "event_id": UUID("00000000-0000-0000-0000-000000009001"),
+        "proposal_id": UUID("00000000-0000-0000-0000-000000008001"),
+        "sequence": 0,
+        "from_state": None,
+        "to_state": ShadowState.DISCOVERED,
+        "occurred_at": NOW,
+        "detail": "candidate admitted to shadow tracking",
+        "quantity_filled": None,
+        "leg_index": None,
+        "scenario_id": None,
+    }
+    values.update(overrides)
+    return ShadowEvent(**values)

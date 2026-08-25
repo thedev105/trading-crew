@@ -28,6 +28,7 @@ from polytrading.predictions.domain import (
 from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.proofs_models import ProofArtifact
+from polytrading.predictions.shadow_models import ShadowEvent, ShadowPlan
 
 _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -323,6 +324,50 @@ class PredictionMarketStore:
             ],
         )
 
+    def append_shadow_plan(self, record: ShadowPlan) -> bool:
+        return self._append_keyed(
+            table="shadow_plans",
+            record=record,
+            label="shadow plan",
+            where="proposal_id = ?",
+            key_params=[record.proposal_id],
+            insert_columns=(
+                "proposal_id, candidate_id, observed_at, information_cutoff, "
+                "record_json, record_hash"
+            ),
+            insert_params=[
+                record.proposal_id,
+                record.candidate_id,
+                record.observed_at,
+                record.information_cutoff,
+            ],
+        )
+
+    def append_shadow_event(self, record: ShadowEvent) -> bool:
+        existing_sequence = self._connection.execute(
+            """
+            SELECT event_id FROM shadow_events
+            WHERE proposal_id = ? AND sequence = ?
+            """,
+            [record.proposal_id, record.sequence],
+        ).fetchone()
+        if existing_sequence is not None and existing_sequence[0] != record.event_id:
+            raise ConflictingRecordError("conflicting shadow event for proposal sequence")
+        return self._append_keyed(
+            table="shadow_events",
+            record=record,
+            label="shadow event",
+            where="event_id = ?",
+            key_params=[record.event_id],
+            insert_columns="event_id, proposal_id, sequence, occurred_at, record_json, record_hash",
+            insert_params=[
+                record.event_id,
+                record.proposal_id,
+                record.sequence,
+                record.occurred_at,
+            ],
+        )
+
     def _append_keyed(
         self,
         *,
@@ -584,6 +629,36 @@ class PredictionMarketStore:
             [as_of],
         ).fetchall()
         return tuple(ScanReport.model_validate_json(row[0]) for row in rows)
+
+    def shadow_plans_as_of(self, as_of: datetime) -> tuple[ShadowPlan, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_plans
+            WHERE observed_at <= ?
+            ORDER BY observed_at, proposal_id
+            """,
+            [as_of],
+        ).fetchall()
+        return tuple(ShadowPlan.model_validate_json(row[0]) for row in rows)
+
+    def shadow_plan_by_proposal(self, proposal_id: UUID) -> ShadowPlan | None:
+        row = self._connection.execute(
+            "SELECT record_json FROM shadow_plans WHERE proposal_id = ?", [proposal_id]
+        ).fetchone()
+        return None if row is None else ShadowPlan.model_validate_json(row[0])
+
+    def shadow_events_for_proposal(
+        self, proposal_id: UUID, as_of: datetime
+    ) -> tuple[ShadowEvent, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT record_json FROM shadow_events
+            WHERE proposal_id = ? AND occurred_at <= ?
+            ORDER BY sequence
+            """,
+            [proposal_id, as_of],
+        ).fetchall()
+        return tuple(ShadowEvent.model_validate_json(row[0]) for row in rows)
 
     def evidence_counts_as_of(self, as_of: datetime) -> dict[str, int]:
         counts: dict[str, tuple[str, str]] = {
