@@ -106,6 +106,20 @@ def test_portfolio_rejects_invalid_risk_numerics(field: str, invalid: object) ->
         _portfolio(risk, **{field: invalid})
 
 
+def test_portfolio_exposure_mapping_is_immutable_and_copies_caller_data() -> None:
+    """A mutable cluster map could bypass concentration checks after validation."""
+    risk = _risk()
+    caller_exposure = {"event-a": Decimal("100")}
+
+    portfolio = _portfolio(risk, open_exposure_usd_by_cluster=caller_exposure)
+    caller_exposure["event-a"] = Decimal("999")
+
+    assert portfolio.open_exposure_usd_by_cluster == {"event-a": Decimal("100")}
+    assert portfolio.model_dump()["open_exposure_usd_by_cluster"] == {"event-a": Decimal("100")}
+    with pytest.raises(TypeError):
+        portfolio.open_exposure_usd_by_cluster["event-a"] = Decimal("999")
+
+
 def test_policy_is_frozen_so_strategy_cannot_raise_a_limit() -> None:
     """A mutable policy would let strategy code bypass a conservative risk gate."""
     risk = _risk()
@@ -113,6 +127,32 @@ def test_policy_is_frozen_so_strategy_cannot_raise_a_limit() -> None:
 
     with pytest.raises(ValidationError):
         policy.max_basket_fraction_of_equity = Decimal("1")
+
+
+@pytest.mark.parametrize(
+    ("field", "more_permissive", "stricter"),
+    [
+        (
+            "max_basket_fraction_of_equity",
+            Decimal("0.0501"),
+            Decimal("0.0499"),
+        ),
+        ("max_live_venues", 3, 1),
+        ("pilot_cap_usd", Decimal("250.01"), Decimal("249.99")),
+    ],
+)
+def test_policy_rejects_relaxed_limits_but_accepts_stricter_ones(
+    field: str, more_permissive: object, stricter: object
+) -> None:
+    """Constructing a relaxed policy would let strategy code raise a binding limit."""
+    risk = _risk()
+
+    with pytest.raises(ValidationError):
+        _policy(risk, **{field: more_permissive})
+
+    policy = _policy(risk, **{field: stricter})
+
+    assert getattr(policy, field) == stricter
 
 
 @pytest.mark.parametrize(
@@ -311,3 +351,17 @@ def test_normal_risk_state_allows_full_size() -> None:
     assert decision.reason is None
     assert decision.size_multiplier == Decimal("1")
     assert decision.policy_version == "risk-v1"
+
+
+@pytest.mark.parametrize("invalid", [Decimal("NaN"), Decimal("-0.01"), Decimal("1.01")])
+def test_risk_decision_rejects_invalid_size_multiplier(invalid: Decimal) -> None:
+    """An invalid multiplier could create a negative or enlarged shadow order."""
+    risk = _risk()
+
+    with pytest.raises(ValidationError):
+        risk.RiskGateDecision(
+            allowed=True,
+            reason=None,
+            size_multiplier=invalid,
+            policy_version="risk-v1",
+        )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -11,6 +11,7 @@ NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 PositiveFiniteDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeFiniteDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 PositiveFraction = Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)]
+UnitIntervalDecimal = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
 
 RiskRefusalReason = Literal[
     "BASKET_TOO_LARGE",
@@ -38,8 +39,24 @@ class PredictionRiskPolicy(PredictionRecord):
     pilot_cap_usd: PositiveFiniteDecimal = Decimal("250")
     starting_equity_usd: PositiveFiniteDecimal = Decimal("10000")
 
+    _MAXIMUM_BINDING_LIMITS: ClassVar[dict[str, Decimal | int]] = {
+        "max_basket_fraction_of_equity": Decimal("0.05"),
+        "max_event_cluster_fraction": Decimal("0.10"),
+        "max_incomplete_loss_fraction": Decimal("0.0025"),
+        "drawdown_halt_new_entries": Decimal("0.02"),
+        "drawdown_halve_size": Decimal("0.05"),
+        "drawdown_stop_all": Decimal("0.08"),
+        "drawdown_close_nonguaranteed": Decimal("0.12"),
+        "drawdown_capital_preservation": Decimal("0.15"),
+        "max_live_venues": 2,
+        "pilot_cap_usd": Decimal("250"),
+    }
+
     @model_validator(mode="after")
     def _require_ordered_drawdown_limits(self) -> PredictionRiskPolicy:
+        for field_name, maximum in self._MAXIMUM_BINDING_LIMITS.items():
+            if getattr(self, field_name) > maximum:
+                raise ValueError(f"{field_name} cannot be less conservative than the default limit")
         if not (
             self.drawdown_halt_new_entries
             < self.drawdown_halve_size
@@ -52,6 +69,26 @@ class PredictionRiskPolicy(PredictionRecord):
 
 
 DEFAULT_RISK_POLICY = PredictionRiskPolicy(policy_version="shadow-risk-v1")
+
+
+class _FrozenExposureByCluster(dict[str, Decimal]):
+    """A serializable mapping that cannot be mutated after portfolio validation."""
+
+    def __init__(self, values: dict[str, Decimal]) -> None:
+        dict.__init__(self, values)
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("open_exposure_usd_by_cluster is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
 
 
 class ShadowPortfolioState(PredictionRecord):
@@ -67,13 +104,18 @@ class ShadowPortfolioState(PredictionRecord):
     def _require_peak_to_include_current_equity(self) -> ShadowPortfolioState:
         if self.peak_equity_usd < self.total_equity_usd:
             raise ValueError("peak_equity_usd must be at least total_equity_usd")
+        object.__setattr__(
+            self,
+            "open_exposure_usd_by_cluster",
+            _FrozenExposureByCluster(dict(self.open_exposure_usd_by_cluster)),
+        )
         return self
 
 
 class RiskGateDecision(PredictionRecord):
     allowed: bool
     reason: RiskRefusalReason | None
-    size_multiplier: Decimal
+    size_multiplier: UnitIntervalDecimal
     policy_version: str
 
 
