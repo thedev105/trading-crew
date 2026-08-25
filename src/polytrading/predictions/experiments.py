@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import StringConstraints, field_validator, model_validator
@@ -16,6 +16,13 @@ from polytrading.predictions.domain import (
 from polytrading.predictions.shadow_models import ShadowState
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+ExperimentTerminalState = Literal[
+    ShadowState.COMPLETE,
+    ShadowState.UNWOUND,
+    ShadowState.EXPIRED,
+    ShadowState.UNKNOWN,
+    ShadowState.RECONCILED,
+]
 
 
 def _reject_nonstandard_json_constant(value: str) -> None:
@@ -68,7 +75,7 @@ class ShadowExperiment(PredictionRecord):
     family_id: NonEmptyString
     proposal_id: UUID
     scenario_id: NonEmptyString
-    terminal_state: ShadowState
+    terminal_state: ExperimentTerminalState
     paper_pnl_usd: Decimal | None
     reconciled: bool
     as_of: datetime

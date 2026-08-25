@@ -73,6 +73,59 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
     assert not (perpetual_futures_tables & tables)
 
 
+def test_experiment_registry_schema_declares_both_primary_keys(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+
+    primary_keys = {
+        row[0]: tuple(row[1])
+        for row in store._connection.execute(
+            """
+            SELECT table_name, constraint_column_names
+            FROM duckdb_constraints()
+            WHERE table_name IN ('trial_families', 'shadow_experiments')
+              AND constraint_type = 'PRIMARY KEY'
+            """
+        ).fetchall()
+    }
+
+    assert primary_keys == {
+        "trial_families": ("family_id", "preregistered_at"),
+        "shadow_experiments": ("experiment_id",),
+    }
+
+
+def test_trial_family_table_rejects_a_direct_duplicate_key(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    family = trial_family()
+    store.append_trial_family(family)
+
+    with pytest.raises(duckdb.ConstraintException):
+        store._connection.execute(
+            """
+            INSERT INTO trial_families
+            SELECT * FROM trial_families
+            WHERE family_id = ? AND preregistered_at = ?
+            """,
+            [family.family_id, family.preregistered_at],
+        )
+
+
+def test_shadow_experiment_table_rejects_a_direct_duplicate_key(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    experiment = shadow_experiment()
+    store.append_shadow_experiment(experiment)
+
+    with pytest.raises(duckdb.ConstraintException):
+        store._connection.execute(
+            """
+            INSERT INTO shadow_experiments
+            SELECT * FROM shadow_experiments
+            WHERE experiment_id = ?
+            """,
+            [experiment.experiment_id],
+        )
+
+
 def test_raw_envelope_round_trip_is_idempotent_and_conflict_safe(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     envelope = raw_envelope()
@@ -705,6 +758,27 @@ def test_experiment_registry_revalidates_unchecked_models_before_persistence(
     with pytest.raises(ValidationError):
         store.append_shadow_experiment(invalid_experiment)
     assert store.trial_families_as_of(NOW) == ()
+    assert store.shadow_experiments_as_of(NOW) == ()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ShadowState.DISCOVERED,
+        ShadowState.PROOF_VALIDATED,
+        ShadowState.ECONOMICS_VALIDATED,
+        ShadowState.SHADOW_PLANNED,
+        ShadowState.FIRST_LEG_SIMULATED,
+    ],
+)
+def test_experiment_store_revalidates_unchecked_intermediate_states(
+    tmp_path: Path, state: ShadowState
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    unchecked = shadow_experiment().model_copy(update={"terminal_state": state})
+
+    with pytest.raises(ValidationError):
+        store.append_shadow_experiment(unchecked)
     assert store.shadow_experiments_as_of(NOW) == ()
 
 

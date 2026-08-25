@@ -96,6 +96,35 @@ def test_shadow_experiment_requires_reconciliation_before_paper_pnl() -> None:
         shadow_experiment(paper_pnl_usd=Decimal("1.00"), reconciled=False)
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        ShadowState.DISCOVERED,
+        ShadowState.PROOF_VALIDATED,
+        ShadowState.ECONOMICS_VALIDATED,
+        ShadowState.SHADOW_PLANNED,
+        ShadowState.FIRST_LEG_SIMULATED,
+    ],
+)
+def test_shadow_experiment_rejects_intermediate_states(state: ShadowState) -> None:
+    with pytest.raises(ValidationError):
+        shadow_experiment(terminal_state=state)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ShadowState.COMPLETE,
+        ShadowState.UNWOUND,
+        ShadowState.EXPIRED,
+        ShadowState.UNKNOWN,
+        ShadowState.RECONCILED,
+    ],
+)
+def test_shadow_experiment_accepts_terminal_and_reconciled_states(state: ShadowState) -> None:
+    assert shadow_experiment(terminal_state=state).terminal_state is state
+
+
 def test_shadow_experiment_keeps_unknown_unreconciled_and_losing_rows() -> None:
     unknown = shadow_experiment(
         experiment_id=UUID("00000000-0000-0000-0000-00000000e003"),

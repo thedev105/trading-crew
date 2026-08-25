@@ -2,7 +2,8 @@ CREATE TABLE trial_families (
     family_id VARCHAR NOT NULL,
     preregistered_at TIMESTAMPTZ NOT NULL,
     record_json VARCHAR NOT NULL,
-    record_hash VARCHAR NOT NULL
+    record_hash VARCHAR NOT NULL,
+    PRIMARY KEY (family_id, preregistered_at)
 );
 
 CREATE TABLE shadow_experiments (
@@ -15,5 +16,6 @@ CREATE TABLE shadow_experiments (
     as_of TIMESTAMPTZ NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     record_json VARCHAR NOT NULL,
-    record_hash VARCHAR NOT NULL
+    record_hash VARCHAR NOT NULL,
+    PRIMARY KEY (experiment_id)
 );
