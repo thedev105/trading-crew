@@ -103,3 +103,4 @@ Task 10: Ruling: the repository-wide pytest gate is sequenced after the separate
 Task 10: implementation ready for independent review (base 2153c6a; registration CLI, strict trial-family JSON, and README §20; not yet complete)
 Task 10: fix round 1/5 (2 addressed, 0 open — registration now verifies record JSON/hash, every indexed family identity, and decoded-identity multiplicity inside the write transaction; README describes aware-offset UTC normalization accurately; starts after 3a89334; not yet independently complete)
 Task 10: complete (commits 2153c6a..b054262, review clean)
+Performance: fix round 1/5 (2 addressed, 0 open — lossless NULL/string COPY encoding plus empty, cycle-only, idempotent, conflict-safe helper semantics; starts after f7d8a72)

@@ -5,9 +5,9 @@ Date: 2026-08-25
 ## Outcome
 
 - Repository suite baseline: **1,852 passed in 525.67s** (8m45s).
-- Repository suite after the changes: **2,356 passed in 167.99s** (2m48s; `real 168.57s`).
-- Wall-clock reduction: **357.68s / 68.0%**, or about **3.13x faster**, even though the verified suite grew by 504 tests between the recorded baseline and the final branch.
-- Focused storage/carry/trial suite: **562 passed in 88.00s** (`real 88.37s`). Before the bulk fixture layer, the same focused command took 230.37s.
+- Repository suite after review hardening: **2,360 passed in 167.62s** (2m48s; `real 168.16s`).
+- Wall-clock reduction: **358.05s / 68.1%**, or about **3.14x faster**, even though the verified suite grew by 508 tests between the recorded baseline and the final branch.
+- Focused storage/carry/trial plus bulk-helper edge suite: **566 passed in 90.90s** (`real 91.27s`). Before the bulk fixture layer, the focused command took 230.37s.
 
 ## Root-cause evidence
 
@@ -39,6 +39,11 @@ This made fixture-only scalar binds, rather than the 2,160-hour data volume or h
    - Complete 2,160-hour health test: 128.44s before, 26.74s setup + 2.77s audit in the isolated after-run (29.74s total, about 4.3x faster). In the final full suite it used 43.97s setup + 3.51s audit.
    - Two semantically identical 24-hour health tests share one template; linked and unlinked economics histories retain separate templates.
 
+4. Review hardening made the COPY helper lossless and rowwise-compatible at its supported boundary. Every non-null field is RFC4180-quoted, true SQL NULL alone is the unquoted null token, and DuckDB parses with `ALLOW_QUOTED_NULLS FALSE`. Literal `\N`, empty strings, and NULL therefore remain distinct without a collidable sentinel. The helper preflights immutable identities, collapses exact duplicates within and across calls, rejects conflicting cycles or snapshots before writes, no-ops on empty input, permits cycle-only evidence, skips empty child-table COPY operations, and owns a transaction when its caller does not already have one.
+
+   - Four RED-to-GREEN edge tests cover literal `\N` in valid string/nullable fields and canonical JSON, normal nullable sequence/order count, empty and cycle-only inputs, exact duplicates, existing-row retries, and conflict rollback.
+   - Isolated 2,160-hour timing after hardening: 27.54s setup + 2.71s audit (30.48s total), effectively unchanged from the pre-hardening 29.74s run.
+
 ## Preserved invariants
 
 - Full 90-day funding, 60-day book, and 2,160-hour trial datasets remain unchanged.
@@ -51,11 +56,11 @@ This made fixture-only scalar binds, rather than the 2,160-hour data volume or h
 ## Verification commands
 
 ```text
-PYTHONPATH=src /Volumes/WORK/poly-trading/.venv/bin/python -m pytest tests/storage tests/carry tests/trial --durations=25 -q
-# 562 passed in 88.00s
+PYTHONPATH=src /Volumes/WORK/poly-trading/.venv/bin/python -m pytest tests/storage tests/carry tests/trial tests/test_book_evidence_seed.py --durations=25 -q
+# 566 passed in 90.90s
 
 PYTHONPATH=src /Volumes/WORK/poly-trading/.venv/bin/python -m pytest --durations=30 -q
-# 2356 passed in 167.99s
+# 2360 passed in 167.62s
 
 /Volumes/WORK/poly-trading/.venv/bin/ruff check .
 # All checks passed!
@@ -69,4 +74,4 @@ git diff --check
 
 ## Remaining hotspots
 
-The largest remaining costs are building the full 2,160-hour template (43.97s in the final suite), building the two distinct economics templates (30.43s combined), and a 4.24s venue funding-cycle property test. The health audit itself is only 3.51s, and complete economics assembly is about 1.2s under full-suite load, so further gains would primarily require a broader bulk persistence API for funding/cycle fixture records or supplying DuckDB's optional conversion dependency. Neither is necessary for the achieved reduction and both would broaden dependency or production API scope.
+The largest remaining costs are building the full 2,160-hour template (45.10s in the final suite), building the two distinct economics templates (31.25s combined), and a 4.33s venue funding-cycle property test. The health audit itself is only 3.36s, and complete economics assembly is about 1.2s under full-suite load, so further gains would primarily require a broader bulk persistence API for funding/cycle fixture records or supplying DuckDB's optional conversion dependency. Neither is necessary for the achieved reduction and both would broaden dependency or production API scope.
