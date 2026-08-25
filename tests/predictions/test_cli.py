@@ -1964,6 +1964,229 @@ def test_shadow_command_tree_parses_run_and_replay() -> None:
     )
 
 
+def test_shadow_register_family_parser_and_help_expose_only_local_inputs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parsed = build_parser().parse_args(
+        [
+            "predictions",
+            "shadow",
+            "register-family",
+            "--db",
+            "predictions.duckdb",
+            "--input",
+            "family.json",
+        ]
+    )
+
+    assert (parsed.predictions_command, parsed.predictions_shadow_command) == (
+        "shadow",
+        "register-family",
+    )
+    assert parsed.db == Path("predictions.duckdb")
+    assert parsed.input == Path("family.json")
+
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["predictions", "shadow", "register-family", "--help"])
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--db" in help_text
+    assert "--input" in help_text
+    assert "--format" not in help_text
+
+
+def test_shadow_register_family_appends_once_and_exact_replay_is_idempotent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    input_path = tmp_path / "family.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "family_id": "shadow-operator-v1",
+                "hypothesis": "Conservative basket surplus persists under shadow stress.",
+                "preregistered_at": "2026-08-15T12:00:00Z",
+                "thresholds_json": '{"minimum_complete":30,"minimum_days":30}',
+                "venues": ["kalshi", "polymarket"],
+                "registered_by": "research-operator",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        "predictions",
+        "shadow",
+        "register-family",
+        "--db",
+        str(database),
+        "--input",
+        str(input_path),
+    ]
+    assert main(command) == 0
+    assert capsys.readouterr().out == "appended 1 trial family, already_known=0\n"
+    assert main(command) == 0
+    assert capsys.readouterr().out == "appended 0 trial families, already_known=1\n"
+
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        families = store.trial_families_as_of(NOW)
+        assert len(families) == 1
+        assert families[0].family_id == "shadow-operator-v1"
+        assert store.shadow_plans_as_of(NOW) == ()
+        assert store.shadow_experiments_as_of(NOW) == ()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        '{"family_id":"private-family","family_id":"duplicate",'
+        '"hypothesis":"h","preregistered_at":"2026-08-15T12:00:00Z",'
+        '"thresholds_json":"{}","venues":["polymarket"],"registered_by":"operator"}',
+        '{"family_id":"private-family","hypothesis":"h",'
+        '"preregistered_at":"2026-08-15T12:00:00Z","thresholds_json":"{}",'
+        '"venues":["polymarket"],"registered_by":"operator","unknown":true}',
+        '{"family_id":"private-family","hypothesis":"h",'
+        '"preregistered_at":"2026-08-15T12:00:00Z","thresholds_json":"{}",'
+        '"registered_by":"operator"}',
+        '{"family_id":"private-family","hypothesis":"h",'
+        '"preregistered_at":"2026-08-15T12:00:00Z","thresholds_json":"{}",'
+        '"venues":"polymarket","registered_by":"operator"}',
+        '{"family_id":"private-family","hypothesis":"h",'
+        '"preregistered_at":"2026-08-15T12:00:00Z",'
+        '"thresholds_json":"{\\"minimum_days\\":30,\\"minimum_days\\":45}",'
+        '"venues":["polymarket"],"registered_by":"operator"}',
+    ],
+)
+def test_shadow_register_family_rejects_non_strict_json_without_echoing_family_id(
+    raw_input: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    input_path = tmp_path / "family.json"
+    input_path.write_text(raw_input, encoding="utf-8")
+
+    exit_code = main(
+        [
+            "predictions",
+            "shadow",
+            "register-family",
+            "--db",
+            str(database),
+            "--input",
+            str(input_path),
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "trial-family input is not valid" in captured.err
+    assert "private-family" not in captured.err
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        assert store.trial_families_as_of(NOW) == ()
+    finally:
+        store.close()
+
+
+def test_shadow_register_family_rejects_unavailable_or_noncurrent_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    input_path = tmp_path / "family.json"
+    input_path.write_text("{}", encoding="utf-8")
+    unavailable = tmp_path / "missing.duckdb"
+
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "register-family",
+                "--db",
+                str(unavailable),
+                "--input",
+                str(input_path),
+            ]
+        )
+        == 2
+    )
+    assert "shadow database is unavailable or not current" in capsys.readouterr().err
+    assert not unavailable.exists()
+
+    noncurrent = tmp_path / "noncurrent.duckdb"
+    noncurrent.write_bytes(b"not a current prediction database")
+    assert (
+        main(
+            [
+                "predictions",
+                "shadow",
+                "register-family",
+                "--db",
+                str(noncurrent),
+                "--input",
+                str(input_path),
+            ]
+        )
+        == 2
+    )
+    assert "shadow database is unavailable or not current" in capsys.readouterr().err
+
+
+def test_shadow_register_family_conflict_is_atomic_and_sanitized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(database)
+    existing = TrialFamily(
+        family_id="private-family",
+        hypothesis="Original preregistered hypothesis.",
+        preregistered_at=NOW,
+        thresholds_json='{"minimum_days":30}',
+        venues=(PredictionVenue.POLYMARKET,),
+        registered_by="research-operator",
+    )
+    store.append_trial_family(existing)
+    store.close()
+    input_path = tmp_path / "family.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                **existing.model_dump(mode="json"),
+                "hypothesis": "Conflicting retry must fail closed.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "predictions",
+            "shadow",
+            "register-family",
+            "--db",
+            str(database),
+            "--input",
+            str(input_path),
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "trial-family registration failed to persist atomically" in captured.err
+    assert "private-family" not in captured.err
+    assert "Conflicting retry" not in captured.err
+    verify = PredictionMarketStore(database, read_only=True)
+    try:
+        assert verify.trial_families_as_of(NOW) == (existing,)
+    finally:
+        verify.close()
+
+
 def test_shadow_run_persists_complete_reconciled_lifecycle_with_hand_pnl(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

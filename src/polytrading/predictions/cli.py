@@ -47,7 +47,7 @@ from polytrading.predictions.economics_models import (
     ScanReport,
     deterministic_scan_report_id,
 )
-from polytrading.predictions.experiments import ShadowExperiment
+from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.health import PredictionHealthAuditor, VenueEvidenceStatus
 from polytrading.predictions.health_report import (
     render_prediction_health_json,
@@ -236,6 +236,11 @@ def add_predictions_subcommands(
         "shadow", help="run or replay deterministic local shadow experiments"
     )
     shadow_commands = shadow.add_subparsers(dest="predictions_shadow_command", required=True)
+    shadow_register = shadow_commands.add_parser(
+        "register-family", help="preregister one operator-authored trial family"
+    )
+    shadow_register.add_argument("--db", required=True, type=Path)
+    shadow_register.add_argument("--input", required=True, type=Path)
     shadow_run = shadow_commands.add_parser("run", help="run stored shadow evidence")
     shadow_run.add_argument("--db", required=True, type=Path)
     shadow_run.add_argument("--trial-family", required=True)
@@ -272,11 +277,11 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
     if arguments.predictions_command == "scan":
         return _run_scan(arguments)
     if arguments.predictions_command == "shadow":
-        return (
-            _run_shadow_run(arguments)
-            if arguments.predictions_shadow_command == "run"
-            else _run_shadow_replay(arguments)
-        )
+        if arguments.predictions_shadow_command == "register-family":
+            return _run_shadow_register_family(arguments)
+        if arguments.predictions_shadow_command == "run":
+            return _run_shadow_run(arguments)
+        return _run_shadow_replay(arguments)
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
@@ -1089,6 +1094,58 @@ def _require_current_shadow_database(path: Path) -> None:
         raise PredictionsUsageError("shadow database is unavailable or not current") from error
     else:
         store.close()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _run_shadow_register_family(arguments: argparse.Namespace) -> int:
+    _require_current_shadow_database(arguments.db)
+    try:
+        raw_bytes = arguments.input.read_bytes()
+    except OSError as error:
+        raise PredictionsUsageError("trial-family input file is unavailable") from error
+    try:
+        json.loads(
+            raw_bytes,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        family = TrialFamily.model_validate_json(raw_bytes)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise PredictionsUsageError("trial-family input is not valid") from error
+
+    appended = False
+    try:
+        with database_writer_lease(arguments.db, timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS):
+            store = PredictionMarketStore(arguments.db)
+            try:
+                with store.transaction() as transaction:
+                    appended = transaction.append_trial_family(family)
+            finally:
+                store.close()
+    except PredictionsUsageError:
+        raise
+    except Exception as error:
+        raise PredictionShadowError(
+            "trial-family registration failed to persist atomically"
+        ) from error
+
+    print(
+        f"appended {int(appended)} trial famil{'y' if appended else 'ies'}, "
+        f"already_known={int(not appended)}"
+    )
+    return 0
 
 
 def _run_evidence(

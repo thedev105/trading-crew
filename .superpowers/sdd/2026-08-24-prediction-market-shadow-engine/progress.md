@@ -99,3 +99,5 @@ Task 9: fix round 2/5 (3 addressed, 0 open — frozen fee evidence and fill-deri
 Task 9: fix round 3/5 (2 addressed, 0 open — repeated fee logical identities fail closed without row-order dependence, and proposal identity uniqueness is enforced across the full cutoff-safe plan set; starts after 350b774)
 Task 9: fix round 4/5 (1 addressed, 0 open — all cutoff-safe venue/market fee siblings are verified for append-identity conflicts and tamper before frozen source-hash selection; starts after eb2320d)
 Task 9: complete (commits cdbd4fa..24845da, review clean)
+Task 10: Ruling: the repository-wide pytest gate is sequenced after the separately approved performance changes — the parent measured the pre-optimization suite at about 8m45s and explicitly reserved that final run for the optimized branch; Task 10 instead ran its focused and complete prediction suites without weakening coverage — if wrong, the final repository-wide tally is delayed to the parent verification pass rather than duplicated here.
+Task 10: implementation ready for independent review (base 2153c6a; registration CLI, strict trial-family JSON, and README §20; not yet complete)

@@ -1208,3 +1208,117 @@ recent `SHADOW_CANDIDATE` findings with their conservative surplus and capacity)
 recipes list now includes `--books`, `attest`, `prove`, and `scan`. Both panels are read-only,
 loopback-only, and present exactly what is already persisted — the dashboard compiles nothing and
 scans nothing itself.
+
+## 20. Prediction-market shadow engine and event-time replay (increment 4)
+
+Shadow results are simulations against recorded public evidence; nothing here trades. This
+increment has no authenticated venue client, wallet, signer, order submission, or automatic
+capital-transfer path. Its append-only plans, state transitions, ledger postings, reconciliations,
+and experiment rows are local research evidence.
+
+### Preregister a trial family
+
+Before a shadow run, write one operator-authored trial-family object. For example,
+`shadow-family.json` can contain:
+
+```json
+{
+  "family_id": "structural-shadow-2026-08",
+  "hypothesis": "Positive conservative basket surplus persists across the named stress scenarios.",
+  "preregistered_at": "2026-08-25T14:00:00Z",
+  "thresholds_json": "{\"minimum_complete\":30,\"minimum_days\":30}",
+  "venues": ["kalshi", "polymarket"],
+  "registered_by": "research-operator"
+}
+```
+
+The venue list must be nonempty, sorted, and unique. `thresholds_json` is itself a JSON object
+encoded as a string so the exact preregistered threshold document remains immutable. The importer
+rejects duplicate keys, non-standard JSON constants, missing or extra fields, wrong JSON types,
+non-UTC timestamps, blank text, and malformed threshold objects.
+
+Register it into an existing, current prediction-market database:
+
+```bash
+.venv/bin/polytrading predictions shadow register-family \
+  --db var/prediction-markets.duckdb \
+  --input shadow-family.json
+```
+
+Registration appends one `TrialFamily` atomically. Repeating the exact same file reports it as
+already known and adds no row; different content with the same `family_id` and
+`preregistered_at` identity fails closed.
+
+### Run recorded evidence through the shadow state machine
+
+```bash
+.venv/bin/polytrading predictions shadow run \
+  --db var/prediction-markets.duckdb \
+  --trial-family structural-shadow-2026-08 \
+  --as-of 2026-08-25T14:00:00Z \
+  --expiry-seconds 30 \
+  --scenario baseline \
+  --format json
+```
+
+`--as-of` is an optional UTC evidence cutoff, `--expiry-seconds` defaults to `30`, and
+`--scenario` accepts `baseline`, `latency_1s`, `latency_5s`, `partial_fill_50`,
+`second_leg_reject`, or `unknown_after_first`. The run considers the latest effective
+`SHADOW_CANDIDATE` scan per candidate at that cutoff, verifies the complete recorded lineage,
+freezes the plan, applies the shadow risk gates, and simulates each leg in venue-qualified order.
+The risk gates include basket-size, event-cluster concentration, incomplete-leg loss, daily-loss,
+drawdown, and capital-preservation limits. A refused proposal is counted by its typed reason and
+is not simulated.
+
+Every attempted proposal follows the deterministic non-atomic state machine and records the
+simulated acknowledgements/fills, point-in-time book hashes, fees, collateral and payout postings,
+terminal state, and reconciliation. A complete reconciliation balances the double-entry ledger
+and binds its result to the terminal event. Paper P&L is shown only for that reconciled bundle. A
+partial fill triggers a fresh conservative economics check against the remaining recorded books;
+missing or ambiguous venue evidence fails toward `UNKNOWN` rather than being inferred.
+
+The dashboard's shadow panel reports proposal state counts, reconciled and unreconciled totals,
+reconciled paper P&L, recent proposal rows, and experiment counts by trial family. For `UNKNOWN`,
+the operator meaning is exactly: **awaiting reconciliation — paper result invalid**. More
+generally, a paper result is invalid until every participating venue reconciles completely.
+
+### Verify exact replay or run a read-only what-if
+
+Replay the stored scenario without `--scenario` to perform the reproducibility check:
+
+```bash
+.venv/bin/polytrading predictions shadow replay \
+  --db var/prediction-markets.duckdb \
+  --proposal-id <proposal-id> \
+  --format json
+```
+
+Exact replay is read-only. It verifies the frozen scan, candidate, proof, policy, risk policy,
+books, fees, event chain, ledger reconciliation, and deterministic plan identity at their original
+event-time cutoffs. It reports `MATCHES` only when the regenerated execution and reconciliation
+equal the stored records; otherwise it reports the first divergent sequence and exits nonzero.
+
+Passing a scenario selects read-only what-if mode:
+
+```bash
+.venv/bin/polytrading predictions shadow replay \
+  --db var/prediction-markets.duckdb \
+  --proposal-id <proposal-id> \
+  --scenario latency_5s \
+  --format json
+```
+
+What-if replay keeps the frozen proposal and original event-time cutoff, substitutes the named
+stress scenario, reads the available recorded point-in-time books, and prints
+`"persisted": false`; it never changes the stored proposal, events, ledger, reconciliation, or
+experiment registry. A what-if result is a sensitivity result, not the exact reproducibility
+verdict for the stored run.
+
+### Calendar gates remain outside the code path
+
+The forward-activation clock has no code shortcut: first collect at least **45 continuous calendar
+days** of synchronized rules and executable books and satisfy the fixed evidence thresholds; then
+run at least **30 additional calendar days** of queue-aware shadow execution with complete
+reconciliation. A dense fixture, repeated replay, more proposals in one day, or a favorable paper
+result cannot compress either elapsed-time gate. Any later execution work remains a separate
+increment requiring its own evidence checkpoint and explicit authorization.

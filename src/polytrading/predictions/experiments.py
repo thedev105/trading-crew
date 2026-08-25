@@ -29,6 +29,15 @@ def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON objects must not contain duplicate keys")
+        result[key] = value
+    return result
+
+
 class TrialFamily(PredictionRecord):
     family_id: NonEmptyString
     hypothesis: NonEmptyString
@@ -53,7 +62,11 @@ class TrialFamily(PredictionRecord):
     @classmethod
     def _require_json_object(cls, value: str) -> str:
         try:
-            thresholds = json.loads(value, parse_constant=_reject_nonstandard_json_constant)
+            thresholds = json.loads(
+                value,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_unique_json_object,
+            )
         except (TypeError, ValueError) as error:
             raise ValueError("thresholds_json must contain a JSON object") from error
         if not isinstance(thresholds, dict):
