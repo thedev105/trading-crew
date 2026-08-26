@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import copy
 import io
 import pickle
 from collections.abc import Callable
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils.exceptions import ValidationError as EthValidationError
 
 from polytrading.predictions.execution.models import PredictionRecord
 from polytrading.predictions.polymarket_execution import auth as auth_module
@@ -43,6 +46,18 @@ _SECRET_ASSERTION_FAILED = "SECRET_CANARY_DETECTED"
 
 class _TextSubclass(str):
     pass
+
+
+class _BytesSubclass(bytes):
+    pass
+
+
+class _FailingSignatureConversion:
+    def __init__(self, failure: Exception) -> None:
+        self._failure = failure
+
+    def __bytes__(self) -> bytes:
+        raise self._failure
 
 
 def _assert_canaries_absent(
@@ -356,6 +371,18 @@ def test_l2_headers_remain_an_exact_httpx_compatible_mapping() -> None:
         _assert_sensitive_equal(request.headers[name], value)
 
 
+def test_direct_l2_headers_accept_and_preserve_interior_spaces() -> None:
+    headers = fixture_l2_headers(
+        api_key="task 6 api key",
+        passphrase="task 6 passphrase",
+    )
+
+    request = httpx.Request("GET", "https://example.invalid/", headers=headers)
+
+    _assert_sensitive_equal(request.headers["POLY_API_KEY"], "task 6 api key")
+    _assert_sensitive_equal(request.headers["POLY_PASSPHRASE"], "task 6 passphrase")
+
+
 _INVALID_L2_HEADER_CASES: dict[str, tuple[str, object, str]] = {
     "address-type": ("address", b"not-text", "L2_HEADER_ADDRESS_INVALID"),
     "address-subclass": ("address", _TextSubclass(ADDRESS), "L2_HEADER_ADDRESS_INVALID"),
@@ -465,6 +492,21 @@ def test_direct_l2_header_construction_accepts_the_resource_safety_boundary() ->
     assert len(headers["POLY_PASSPHRASE"]) == 4096
 
 
+@pytest.mark.parametrize("control", (*range(0x20), 0x7F))
+def test_direct_l2_headers_reject_every_ascii_control_byte(control: int) -> None:
+    character = chr(control)
+
+    for field, error_code in (
+        ("api_key", "L2_HEADER_API_KEY_INVALID"),
+        ("passphrase", "L2_HEADER_PASSPHRASE_INVALID"),
+    ):
+        error = _captured_auth_error(
+            lambda field=field: fixture_l2_headers(**{field: f"before{character}after"})
+        )
+        _assert_sensitive_equal(str(error), error_code)
+        _assert_context_free(error)
+
+
 @pytest.mark.parametrize(
     ("body", "error_code"),
     (
@@ -497,17 +539,33 @@ _INVALID_CREDENTIAL_CASES: dict[str, tuple[str, object, str]] = {
     "address-type": ("address", b"not-text", "CREDENTIAL_ADDRESS_INVALID"),
     "address-shape": ("address", "0x1234", "CREDENTIAL_ADDRESS_INVALID"),
     "api-key-type": ("api_key", "not-bytes", "CREDENTIAL_API_KEY_INVALID"),
+    "api-key-subclass": (
+        "api_key",
+        _BytesSubclass(API_KEY),
+        "CREDENTIAL_API_KEY_INVALID",
+    ),
     "api-key-empty": ("api_key", b"", "CREDENTIAL_API_KEY_INVALID"),
     "api-key-control": ("api_key", b"line\nbreak", "CREDENTIAL_API_KEY_INVALID"),
+    "api-key-oversized": ("api_key", b"a" * 4097, "CREDENTIAL_API_KEY_INVALID"),
     "secret-type": ("secret", "not-bytes", "CREDENTIAL_SECRET_INVALID"),
     "secret-standard-base64": ("secret", b"not+url/safe", "CREDENTIAL_SECRET_INVALID"),
     "secret-padding": ("secret", b"a===", "CREDENTIAL_SECRET_INVALID"),
     "secret-empty": ("secret", b"", "CREDENTIAL_SECRET_INVALID"),
     "passphrase-type": ("passphrase", "not-bytes", "CREDENTIAL_PASSPHRASE_INVALID"),
+    "passphrase-subclass": (
+        "passphrase",
+        _BytesSubclass(PASSPHRASE),
+        "CREDENTIAL_PASSPHRASE_INVALID",
+    ),
     "passphrase-empty": ("passphrase", b"", "CREDENTIAL_PASSPHRASE_INVALID"),
     "passphrase-control": (
         "passphrase",
         b"control\x00byte",
+        "CREDENTIAL_PASSPHRASE_INVALID",
+    ),
+    "passphrase-oversized": (
+        "passphrase",
+        b"p" * 4097,
         "CREDENTIAL_PASSPHRASE_INVALID",
     ),
 }
@@ -534,6 +592,39 @@ def test_credentials_fail_closed_with_stable_sanitized_errors(
     _assert_context_free(error)
 
 
+def test_credentials_accept_and_preserve_interior_spaces() -> None:
+    credentials = fixture_clob_credentials(
+        api_key=b"task 6 api key",
+        passphrase=b"task 6 passphrase",
+    )
+
+    _assert_sensitive_equal(credentials.api_key, b"task 6 api key")
+    _assert_sensitive_equal(credentials.passphrase, b"task 6 passphrase")
+
+
+def test_credentials_accept_the_resource_safety_boundary() -> None:
+    credentials = fixture_clob_credentials(
+        api_key=b"a" * 4096,
+        passphrase=b"p" * 4096,
+    )
+
+    assert len(credentials.api_key) == 4096
+    assert len(credentials.passphrase) == 4096
+
+
+@pytest.mark.parametrize("control", (*range(0x20), 0x7F))
+def test_credentials_reject_every_ascii_control_byte(control: int) -> None:
+    value = b"before" + bytes((control,)) + b"after"
+
+    for field, error_code in (
+        ("api_key", "CREDENTIAL_API_KEY_INVALID"),
+        ("passphrase", "CREDENTIAL_PASSPHRASE_INVALID"),
+    ):
+        error = _captured_auth_error(lambda field=field: fixture_clob_credentials(**{field: value}))
+        _assert_sensitive_equal(str(error), error_code)
+        _assert_context_free(error)
+
+
 def test_private_key_and_credential_canaries_never_escape_errors_or_chains() -> None:
     private_canary = b"private-key-canary-never-render"
     secret_canary = b"secret-canary!not-base64"
@@ -558,42 +649,101 @@ def test_private_key_and_credential_canaries_never_escape_errors_or_chains() -> 
         _assert_context_free(error)
 
 
-def test_library_failures_are_translated_without_secret_context(
+def _exercise_library_seam(
+    seam: str,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    private_key = bytes(32)
-    signature_canary = "signature-library-canary"
-    base64_canary = "base64-library-canary"
-
-    private_error = _captured_auth_error(
-        lambda: sign_clob_auth(private_key, TIMESTAMP, load_protocol_snapshot())
-    )
-
-    def raise_signature_error(*args: object, **kwargs: object) -> object:
+    failure: Exception,
+) -> object:
+    def fail(*args: object, **kwargs: object) -> object:
         del args, kwargs
-        raise ValueError(signature_canary)
+        raise failure
 
-    with monkeypatch.context() as patch:
-        patch.setattr(auth_module.Account, "sign_typed_data", raise_signature_error)
-        signature_error = _captured_auth_error(
-            lambda: sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    if seam == "credential-base64":
+        monkeypatch.setattr(auth_module.base64, "urlsafe_b64decode", fail)
+        return fixture_clob_credentials(secret=SECRET)
+    if seam == "header-base64":
+        monkeypatch.setattr(auth_module.base64, "urlsafe_b64decode", fail)
+        return fixture_l2_headers()
+    if seam == "private-key-load":
+        monkeypatch.setattr(auth_module.Account, "from_key", fail)
+        return sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    if seam == "typed-data-sign":
+        monkeypatch.setattr(auth_module.Account, "sign_typed_data", fail)
+        return sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    if seam == "signature-conversion":
+        monkeypatch.setattr(
+            auth_module.Account,
+            "sign_typed_data",
+            lambda *args, **kwargs: SimpleNamespace(signature=_FailingSignatureConversion(failure)),
         )
+        return sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    if seam == "typed-data-encode":
+        monkeypatch.setattr(auth_module, "encode_typed_data", fail)
+        return sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    if seam == "signer-recovery":
+        monkeypatch.setattr(auth_module.Account, "recover_message", fail)
+        return sign_clob_auth(PRIVATE_KEY, TIMESTAMP, load_protocol_snapshot())
+    raise AssertionError("UNKNOWN_LIBRARY_SEAM") from None
 
-    def raise_base64_error(value: object) -> bytes:
-        del value
-        raise ValueError(base64_canary)
 
-    with monkeypatch.context() as patch:
-        patch.setattr(auth_module.base64, "urlsafe_b64decode", raise_base64_error)
-        base64_error = _captured_auth_error(lambda: fixture_clob_credentials(secret=SECRET))
-        header_base64_error = _captured_auth_error(fixture_l2_headers)
+_UNEXPECTED_LIBRARY_FAULTS = (
+    *(
+        (seam, error_type)
+        for seam in (
+            "credential-base64",
+            "header-base64",
+            "private-key-load",
+            "typed-data-sign",
+            "signature-conversion",
+            "typed-data-encode",
+            "signer-recovery",
+        )
+        for error_type in (TypeError, AssertionError, RuntimeError)
+    ),
+    ("credential-base64", ValueError),
+    ("header-base64", ValueError),
+    ("signature-conversion", ValueError),
+)
 
-    for error, error_code, canary in (
-        (private_error, "PRIVATE_KEY_INVALID", private_key),
-        (signature_error, "CLOB_AUTH_SIGNING_FAILED", signature_canary),
-        (base64_error, "CREDENTIAL_SECRET_INVALID", base64_canary),
-        (header_base64_error, "L2_HEADER_SIGNATURE_INVALID", base64_canary),
-    ):
-        _assert_sensitive_equal(str(error), error_code)
-        _assert_canaries_absent(_error_observable(error), canary)
-        _assert_context_free(error)
+_KNOWN_LIBRARY_FAILURES = (
+    ("credential-base64", binascii.Error, "CREDENTIAL_SECRET_INVALID"),
+    ("header-base64", binascii.Error, "L2_HEADER_SIGNATURE_INVALID"),
+    ("private-key-load", ValueError, "PRIVATE_KEY_INVALID"),
+    ("typed-data-sign", ValueError, "CLOB_AUTH_SIGNING_FAILED"),
+    ("typed-data-sign", EthValidationError, "CLOB_AUTH_SIGNING_FAILED"),
+    ("typed-data-encode", ValueError, "CLOB_AUTH_SIGNING_FAILED"),
+    ("typed-data-encode", EthValidationError, "CLOB_AUTH_SIGNING_FAILED"),
+    ("signer-recovery", ValueError, "CLOB_AUTH_SIGNING_FAILED"),
+    ("signer-recovery", EthValidationError, "CLOB_AUTH_SIGNING_FAILED"),
+)
+
+
+@pytest.mark.parametrize(("seam", "error_type", "error_code"), _KNOWN_LIBRARY_FAILURES)
+def test_known_invalid_input_failures_are_translated_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+    seam: str,
+    error_type: type[Exception],
+    error_code: str,
+) -> None:
+    canary = "known-invalid-input-canary"
+    failure = error_type(canary)
+
+    error = _captured_auth_error(lambda: _exercise_library_seam(seam, monkeypatch, failure))
+
+    _assert_sensitive_equal(str(error), error_code)
+    _assert_canaries_absent(_error_observable(error), canary)
+    _assert_context_free(error)
+
+
+@pytest.mark.parametrize(("seam", "error_type"), _UNEXPECTED_LIBRARY_FAULTS)
+def test_unexpected_library_faults_propagate_unchanged_from_every_seam(
+    monkeypatch: pytest.MonkeyPatch,
+    seam: str,
+    error_type: type[Exception],
+) -> None:
+    failure = error_type("unexpected-library-fault")
+
+    with pytest.raises(error_type) as rejected:
+        _exercise_library_seam(seam, monkeypatch, failure)
+
+    _assert_sensitive_equal(rejected.value, failure)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import re
@@ -12,6 +13,7 @@ from typing import Final
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils.exceptions import ValidationError as EthValidationError
 
 from polytrading.predictions.polymarket_execution.protocol import PolymarketProtocolSnapshot
 
@@ -195,7 +197,7 @@ def _validated_header_bytes(value: object, error_code: str) -> bytes:
     if (
         type(value) is not bytes
         or not 0 < len(value) <= _MAX_HEADER_VALUE_BYTES
-        or any(byte < 0x21 or byte > 0x7E for byte in value)
+        or any(byte < 0x20 or byte > 0x7E for byte in value)
     ):
         raise ClobAuthError(error_code) from None
     return value
@@ -206,7 +208,7 @@ def _validated_header_text(value: object, error_code: str) -> str:
         type(value) is not str
         or not 0 < len(value) <= _MAX_HEADER_VALUE_BYTES
         or not value.isascii()
-        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
     ):
         raise ClobAuthError(error_code) from None
     return value
@@ -219,7 +221,7 @@ def _validated_l2_signature(value: object) -> str:
     if _CANONICAL_URLSAFE_BASE64.fullmatch(encoded) is None:
         raise ClobAuthError("L2_HEADER_SIGNATURE_INVALID") from None
     decoded: bytes | None = None
-    with suppress(Exception):
+    with suppress(binascii.Error):
         decoded = base64.urlsafe_b64decode(encoded)
     if (
         decoded is None
@@ -238,7 +240,7 @@ def _decode_secret(value: object) -> bytes:
     ):
         raise ClobAuthError("CREDENTIAL_SECRET_INVALID") from None
     decoded: bytes | None = None
-    with suppress(Exception):
+    with suppress(binascii.Error):
         decoded = base64.urlsafe_b64decode(value)
     if (
         decoded is None
@@ -300,23 +302,29 @@ def sign_clob_auth(
     if type(private_key) is not bytes or len(private_key) != 32:
         raise ClobAuthError("PRIVATE_KEY_INVALID") from None
     account = None
-    with suppress(Exception):
+    with suppress(ValueError):
         account = Account.from_key(private_key)
     if account is None:
         raise ClobAuthError("PRIVATE_KEY_INVALID") from None
     typed_data = clob_auth_typed_data(account.address, timestamp, snapshot, nonce=nonce)
-    signature: str | None = None
-    recovered: str | None = None
-    try:
+    signed = None
+    with suppress(ValueError, EthValidationError):
         signed = Account.sign_typed_data(private_key, full_message=typed_data)
-        signature = "0x" + bytes(signed.signature).hex()
+    if signed is None:
+        raise ClobAuthError("CLOB_AUTH_SIGNING_FAILED") from None
+    signature = "0x" + bytes(signed.signature).hex()
+    signable_message = None
+    with suppress(ValueError, EthValidationError):
+        signable_message = encode_typed_data(full_message=typed_data)
+    if signable_message is None:
+        raise ClobAuthError("CLOB_AUTH_SIGNING_FAILED") from None
+    recovered: str | None = None
+    with suppress(ValueError, EthValidationError):
         recovered = Account.recover_message(
-            encode_typed_data(full_message=typed_data),
+            signable_message,
             signature=signature,
         )
-    except Exception:
-        pass
-    if signature is None or recovered is None:
+    if recovered is None:
         raise ClobAuthError("CLOB_AUTH_SIGNING_FAILED") from None
     if type(recovered) is not str or recovered.casefold() != account.address.casefold():
         raise ClobAuthError("CLOB_AUTH_RECOVERY_FAILED") from None
