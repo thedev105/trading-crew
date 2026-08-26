@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from polytrading.predictions.domain import PredictionRecord, PredictionVenue, Sha256
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
@@ -101,6 +101,7 @@ class _CapabilityFields(PredictionRecord):
     protocol_fixture_hash: Sha256
     allowed_operations: tuple[ExecutionOperation, ...]
     route_set_version: NonEmptyString
+    route_set_hash: Sha256
     maximum_capital: NonNegativeDecimal
     maximum_per_intent_notional: NonNegativeDecimal
     maximum_position: NonNegativeDecimal
@@ -147,7 +148,21 @@ class ExecutionCapability(_CapabilityFields):
     log this model or the raw signed bundle.
     """
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     detached_signature: NonEmptyBytes
+
+    @model_validator(mode="before")
+    @classmethod
+    def _redact_malformed_signature_input(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "detached_signature" not in value:
+            return value
+        signature = value["detached_signature"]
+        if isinstance(signature, bytes) and signature:
+            return value
+        sanitized = dict(value)
+        sanitized["detached_signature"] = b""
+        return sanitized
 
     @property
     def canonical_unsigned_bundle(self) -> bytes:
@@ -229,6 +244,7 @@ class AuthorityContext(PredictionRecord):
     economics_policy_hash: Sha256
     protocol_fixture_hash: Sha256
     route_set_version: NonEmptyString
+    route_set_hash: Sha256
     requested_notional: NonNegativeDecimal
     capital_after: NonNegativeDecimal
     position_after: NonNegativeDecimal
@@ -318,7 +334,10 @@ def _verify_capability_fields(
         return _deny(context, "CAPABILITY_ECONOMICS_POLICY_MISMATCH")
     if capability.protocol_fixture_hash != context.protocol_fixture_hash:
         return _deny(context, "CAPABILITY_PROTOCOL_MISMATCH")
-    if capability.route_set_version != context.route_set_version:
+    if (
+        capability.route_set_version != context.route_set_version
+        or capability.route_set_hash != context.route_set_hash
+    ):
         return _deny(context, "CAPABILITY_ROUTE_SET_MISMATCH")
     if operation not in _MUTATING_OPERATIONS or operation not in capability.allowed_operations:
         return _deny(context, "CAPABILITY_OPERATION_NOT_ALLOWED")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -30,7 +31,7 @@ ELIGIBLE_MANIFEST = venue_manifest(
 MANIFEST_HASH = canonical_execution_hash(ELIGIBLE_MANIFEST)
 
 
-def execution_capability(**overrides: object) -> ExecutionCapability:
+def execution_capability_fields(**overrides: object) -> dict[str, object]:
     fields: dict[str, object] = {
         "capability_version": 1,
         "capability_id": UUID("11111111-1111-4111-8111-111111111111"),
@@ -50,6 +51,7 @@ def execution_capability(**overrides: object) -> ExecutionCapability:
             ExecutionOperation.SUBMIT_ORDER,
         ),
         "route_set_version": "polymarket-mutations-v1",
+        "route_set_hash": HASHES[12],
         "maximum_capital": Decimal("100"),
         "maximum_per_intent_notional": Decimal("10"),
         "maximum_position": Decimal("50"),
@@ -61,7 +63,11 @@ def execution_capability(**overrides: object) -> ExecutionCapability:
         "detached_signature": b"fixture-signature-canary",
     }
     fields.update(overrides)
-    return ExecutionCapability.model_validate(fields)
+    return fields
+
+
+def execution_capability(**overrides: object) -> ExecutionCapability:
+    return ExecutionCapability.model_validate(execution_capability_fields(**overrides))
 
 
 def verified_capability(**overrides: object) -> VerifiedExecutionCapability:
@@ -94,6 +100,7 @@ def authority_context(**overrides: object) -> AuthorityContext:
         "economics_policy_hash": HASHES[6],
         "protocol_fixture_hash": HASHES[7],
         "route_set_version": "polymarket-mutations-v1",
+        "route_set_hash": HASHES[12],
         "requested_notional": Decimal("10"),
         "capital_after": Decimal("100"),
         "position_after": Decimal("50"),
@@ -125,13 +132,97 @@ def test_production_verifier_always_rejects_without_a_configured_key() -> None:
     assert b"fixture" not in repr(decision).encode()
 
 
+def test_same_route_version_with_a_different_hash_is_rejected() -> None:
+    capability = verified_capability(route_set_hash=HASHES[11])
+    context = authority_context(verified_capability=capability)
+    assert (
+        verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).reason
+        == "CAPABILITY_ROUTE_SET_MISMATCH"
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed_signature",
+    ["private-signature-canary", bytearray(b"private-signature-canary")],
+)
+def test_malformed_signature_validation_never_echoes_raw_input(
+    malformed_signature: object,
+) -> None:
+    fields = execution_capability_fields(detached_signature=malformed_signature)
+    constructors = (
+        lambda: ExecutionCapability.model_validate(fields),
+        lambda: ExecutionCapability(**fields),
+    )
+    for construct in constructors:
+        with pytest.raises(ValidationError) as raised:
+            construct()
+        assert "private-signature-canary" not in str(raised.value)
+        assert "private-signature-canary" not in repr(raised.value)
+        assert "private-signature-canary" not in str(raised.value.errors())
+        assert "private-signature-canary" not in raised.value.json()
+
+
+def test_malformed_signature_in_json_validation_never_echoes_raw_input() -> None:
+    fields = execution_capability().model_dump(mode="json")
+    fields["detached_signature"] = "private-signature-canary"
+    with pytest.raises(ValidationError) as raised:
+        ExecutionCapability.model_validate_json(json.dumps(fields))
+    assert "private-signature-canary" not in str(raised.value)
+    assert "private-signature-canary" not in repr(raised.value)
+    assert "private-signature-canary" not in str(raised.value.errors())
+    assert "private-signature-canary" not in raised.value.json()
+
+
+def test_signature_canary_never_reaches_dumps_decisions_or_gate_rejections() -> None:
+    canary = "private-signature-canary"
+    capability = execution_capability(detached_signature=canary.encode())
+    unavailable = UnavailableProductionCapabilityVerifier().verify(
+        capability_bundle=canary.encode(), now=NOW
+    )
+    rejected = verify_mutation_authority(
+        authority_context(verified_capability=verified_capability(signature_valid=False)),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+    surfaces = (
+        repr(capability),
+        str(capability.model_dump()),
+        capability.model_dump_json(),
+        repr(unavailable),
+        str(unavailable),
+        repr(rejected),
+        str(rejected.model_dump()),
+        rejected.model_dump_json(),
+    )
+    assert all(canary not in surface for surface in surfaces)
+
+
 def test_capability_exposes_deterministic_unsigned_bytes_without_signature_material() -> None:
-    first = execution_capability()
-    second = execution_capability()
-    assert first.canonical_unsigned_bundle == second.canonical_unsigned_bundle
-    assert b"fixture-signature-canary" not in first.canonical_unsigned_bundle
-    assert "fixture-signature-canary" not in repr(first)
+    first = execution_capability(detached_signature=b"first-signature-canary")
+    second = execution_capability(detached_signature=b"second-signature-canary")
+    expected = (
+        b'{"account_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111",'
+        b'"activation_nonce":"activation-1","allowed_operations":["CANCEL_ORDER","HEARTBEAT",'
+        b'"SIGN_ORDER","SUBMIT_ORDER"],"capability_id":"11111111-1111-4111-8111-111111111111",'
+        b'"capability_version":1,"economics_policy_hash":"77777777777777777777777777777777777'
+        b'77777777777777777777777777777","eligibility_evidence_hashes":["4444444444444444444'
+        b'444444444444444444444444444444444444444444444"],"expires_at":"2026-08-25T16:01:00Z",'
+        b'"issuer_key_id":"fixture-key-1","manifest_record_hash":"363581cc4bba87b6df4473faa3bb95'
+        b'f7a262de4cf34089a6f71f52a9a91de391","manifest_source_hashes":["3333333333333333333'
+        b'333333333333333333333333333333333333333333333"],"maximum_capital":"100","maximum_loss":'
+        b'"5","maximum_per_intent_notional":"10","maximum_position":"50","not_before":"2026-08-'
+        b'25T15:59:00Z","proof_policy_hash":"66666666666666666666666666666666666666666666666666'
+        b'66666666666666","protocol_fixture_hash":"8888888888888888888888888888888888888888888888'
+        b'888888888888888888","route_set_hash":"dddddddddddddddddddddddddddddddddddddddddddddddd'
+        b'dddddddddddddddd","route_set_version":"polymarket-mutations-v1","strategy_policy_hash":"5'
+        b'555555555555555555555555555555555555555555555555555555555555555","venue":"polymarket"}'
+    )
+    assert first.canonical_unsigned_bundle == expected
+    assert second.canonical_unsigned_bundle == expected
+    assert b"first-signature-canary" not in first.canonical_unsigned_bundle
+    assert "first-signature-canary" not in repr(first)
+    assert "second-signature-canary" not in repr(second)
     assert "detached_signature" not in first.model_dump()
+    assert "detached_signature" not in second.model_dump(mode="json")
 
 
 def test_capability_requires_signature_and_a_nonempty_time_window() -> None:
@@ -235,6 +326,10 @@ def test_non_polymarket_manifest_cannot_cross_the_authority_boundary() -> None:
             "CAPABILITY_ROUTE_SET_MISMATCH",
         ),
         (
+            {"verified_capability": verified_capability(route_set_hash=HASHES[11])},
+            "CAPABILITY_ROUTE_SET_MISMATCH",
+        ),
+        (
             {
                 "verified_capability": verified_capability(
                     allowed_operations=(ExecutionOperation.CANCEL_ORDER,)
@@ -283,8 +378,17 @@ def test_mutation_authority_rejects_each_fail_closed_condition(
     ("manifest_override", "reason"),
     [
         (None, "MANIFEST_NOT_FOUND"),
+        (
+            {"implementation_state": AdapterImplementationState.WATCHLIST},
+            "COLLECTION_NOT_PERMITTED",
+        ),
+        ({"automated_use_status": "restricted"}, "AUTOMATED_USE_RESTRICTED"),
         ({"jurisdiction_review_status": "BLOCKED"}, "JURISDICTION_BLOCKED"),
         ({"jurisdiction_review_status": "UNREVIEWED"}, "JURISDICTION_UNREVIEWED"),
+        (
+            {"implementation_state": AdapterImplementationState.LIVE_DISABLED},
+            "LIVE_NOT_ELIGIBLE",
+        ),
     ],
 )
 def test_manifest_rejections_precede_capability_rejections(
@@ -293,11 +397,13 @@ def test_manifest_rejections_precede_capability_rejections(
     if manifest_override is None:
         manifest = None
     else:
-        manifest = venue_manifest(
-            implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
-            source_hashes=(HASHES[2],),
-            **manifest_override,
-        )
+        fields: dict[str, object] = {
+            "implementation_state": AdapterImplementationState.LIVE_ELIGIBLE,
+            "jurisdiction_review_status": "ELIGIBILITY_REVIEWED",
+            "source_hashes": (HASHES[2],),
+        }
+        fields.update(manifest_override)
+        manifest = venue_manifest(**fields)
     context = authority_context(manifest=manifest, verified_capability=None)
     assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).reason == reason
 
@@ -308,53 +414,111 @@ def test_boundaries_are_half_open_for_time_and_inclusive_for_skew_and_limits() -
     assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).allowed is True
 
 
-@pytest.mark.parametrize(
-    ("updates", "reason"),
-    [
+def test_complete_capability_failure_order_is_stable() -> None:
+    capability = verified_capability().model_copy(
+        update={
+            "signature_valid": False,
+            "canonical_bytes_valid": False,
+            "not_before": NOW + timedelta(seconds=1),
+            "expires_at": NOW,
+            "venue": PredictionVenue.KALSHI,
+            "account_fingerprint": HASHES[11],
+            "manifest_record_hash": HASHES[11],
+            "manifest_source_hashes": (HASHES[11],),
+            "strategy_policy_hash": HASHES[11],
+            "proof_policy_hash": HASHES[11],
+            "economics_policy_hash": HASHES[11],
+            "protocol_fixture_hash": HASHES[11],
+            "route_set_version": "wrong-routes",
+            "route_set_hash": HASHES[11],
+            "allowed_operations": (ExecutionOperation.CANCEL_ORDER,),
+            "maximum_capital": Decimal("0"),
+            "maximum_per_intent_notional": Decimal("0"),
+            "maximum_position": Decimal("0"),
+            "maximum_loss": Decimal("0"),
+        }
+    )
+    context = authority_context(
+        observed_clock_skew=timedelta(seconds=3),
+        activation_nonce="different",
+        used_activation_nonces=frozenset({"activation-1"}),
+        revoked_capability_ids=frozenset({capability.capability_id}),
+        geoblock_allowed=False,
+        geoblock_evidence_hash=None,
+        geoblock_expires_at=NOW,
+        account_scope_account_fingerprint=HASHES[11],
+        account_scope_evidence_hash=None,
+        account_scope_expires_at=NOW,
+        kill_engaged=True,
+    ).model_copy(update={"verified_capability": capability})
+    missing = context.model_copy(update={"verified_capability": None})
+    assert verify_mutation_authority(missing, ExecutionOperation.SUBMIT_ORDER).reason == (
+        "CAPABILITY_MISSING"
+    )
+
+    repairs: tuple[tuple[str, dict[str, object], dict[str, object]], ...] = (
+        ("CAPABILITY_SIGNATURE_INVALID", {"signature_valid": True}, {}),
+        ("CAPABILITY_CANONICAL_BYTES_INVALID", {"canonical_bytes_valid": True}, {}),
+        ("CAPABILITY_NOT_YET_VALID", {"not_before": NOW}, {}),
+        ("CAPABILITY_EXPIRED", {"expires_at": NOW + timedelta(seconds=1)}, {}),
+        ("CAPABILITY_CLOCK_SKEW", {}, {"observed_clock_skew": timedelta(seconds=2)}),
+        ("CAPABILITY_VENUE_MISMATCH", {"venue": PredictionVenue.POLYMARKET}, {}),
+        ("CAPABILITY_ACCOUNT_MISMATCH", {"account_fingerprint": HASHES[0]}, {}),
+        ("CAPABILITY_MANIFEST_MISMATCH", {"manifest_record_hash": MANIFEST_HASH}, {}),
+        ("CAPABILITY_SOURCE_HASH_MISMATCH", {"manifest_source_hashes": (HASHES[2],)}, {}),
+        ("CAPABILITY_STRATEGY_POLICY_MISMATCH", {"strategy_policy_hash": HASHES[4]}, {}),
+        ("CAPABILITY_PROOF_POLICY_MISMATCH", {"proof_policy_hash": HASHES[5]}, {}),
+        ("CAPABILITY_ECONOMICS_POLICY_MISMATCH", {"economics_policy_hash": HASHES[6]}, {}),
+        ("CAPABILITY_PROTOCOL_MISMATCH", {"protocol_fixture_hash": HASHES[7]}, {}),
+        ("CAPABILITY_ROUTE_SET_MISMATCH", {"route_set_version": "polymarket-mutations-v1"}, {}),
+        ("CAPABILITY_ROUTE_SET_MISMATCH", {"route_set_hash": HASHES[12]}, {}),
         (
-            {
-                "verified_capability": verified_capability(
-                    signature_valid=False, canonical_bytes_valid=False
-                ),
-                "kill_engaged": True,
-            },
-            "CAPABILITY_SIGNATURE_INVALID",
+            "CAPABILITY_OPERATION_NOT_ALLOWED",
+            {"allowed_operations": (ExecutionOperation.SUBMIT_ORDER,)},
+            {},
         ),
+        ("CAPABILITY_CAPITAL_LIMIT_EXCEEDED", {"maximum_capital": Decimal("100")}, {}),
         (
-            {
-                "verified_capability": verified_capability(
-                    manifest_source_hashes=(HASHES[11],), strategy_policy_hash=HASHES[11]
-                )
-            },
-            "CAPABILITY_SOURCE_HASH_MISMATCH",
+            "CAPABILITY_NOTIONAL_LIMIT_EXCEEDED",
+            {"maximum_per_intent_notional": Decimal("10")},
+            {},
         ),
+        ("CAPABILITY_POSITION_LIMIT_EXCEEDED", {"maximum_position": Decimal("50")}, {}),
+        ("CAPABILITY_LOSS_LIMIT_EXCEEDED", {"maximum_loss": Decimal("5")}, {}),
+        ("CAPABILITY_NONCE_MISMATCH", {}, {"activation_nonce": "activation-1"}),
+        ("CAPABILITY_NONCE_REPLAYED", {}, {"used_activation_nonces": frozenset()}),
+        ("CAPABILITY_REVOKED", {}, {"revoked_capability_ids": frozenset()}),
+        ("GEOBLOCK_EVIDENCE_MISSING", {}, {"geoblock_evidence_hash": HASHES[9]}),
         (
-            {
-                "used_activation_nonces": frozenset({"activation-1"}),
-                "revoked_capability_ids": frozenset(
-                    {UUID("11111111-1111-4111-8111-111111111111")}
-                ),
-            },
-            "CAPABILITY_NONCE_REPLAYED",
+            "GEOBLOCK_EVIDENCE_STALE",
+            {},
+            {"geoblock_expires_at": NOW + timedelta(seconds=1)},
         ),
+        ("GEOBLOCK_BLOCKED", {}, {"geoblock_allowed": True}),
         (
-            {
-                "geoblock_evidence_hash": None,
-                "geoblock_expires_at": NOW,
-                "geoblock_allowed": False,
-                "kill_engaged": True,
-            },
-            "GEOBLOCK_EVIDENCE_MISSING",
-        ),
-        (
-            {"account_scope_evidence_hash": None, "kill_engaged": True},
             "ACCOUNT_SCOPE_EVIDENCE_MISSING",
+            {},
+            {"account_scope_evidence_hash": HASHES[10]},
         ),
-    ],
-)
-def test_first_failure_order_is_stable(updates: dict[str, object], reason: str) -> None:
-    context = authority_context(**updates)
-    assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).reason == reason
+        (
+            "ACCOUNT_SCOPE_EVIDENCE_STALE",
+            {},
+            {"account_scope_expires_at": NOW + timedelta(seconds=1)},
+        ),
+        (
+            "ACCOUNT_SCOPE_MISMATCH",
+            {},
+            {"account_scope_account_fingerprint": HASHES[0]},
+        ),
+        ("EXECUTION_KILL_ENGAGED", {}, {"kill_engaged": False}),
+    )
+    for reason, capability_repair, context_repair in repairs:
+        assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).reason == reason
+        capability = capability.model_copy(update=capability_repair)
+        context = context.model_copy(
+            update={"verified_capability": capability, **context_repair}
+        )
+    assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).allowed is True
 
 
 def test_malformed_evidence_is_sanitized_to_the_stable_missing_code() -> None:
@@ -365,9 +529,15 @@ def test_malformed_evidence_is_sanitized_to_the_stable_missing_code() -> None:
 
 
 @pytest.mark.parametrize(
-    "operation", [ExecutionOperation.CANCEL_ORDER, ExecutionOperation.HEARTBEAT]
+    "operation",
+    [
+        ExecutionOperation.SIGN_ORDER,
+        ExecutionOperation.SUBMIT_ORDER,
+        ExecutionOperation.CANCEL_ORDER,
+        ExecutionOperation.HEARTBEAT,
+    ],
 )
-def test_cancel_and_heartbeat_require_the_full_gate_with_zero_notional(
+def test_every_mutation_operation_requires_the_full_gate_with_zero_notional(
     operation: ExecutionOperation,
 ) -> None:
     context = authority_context(requested_notional=Decimal("0"))
@@ -378,13 +548,23 @@ def test_cancel_and_heartbeat_require_the_full_gate_with_zero_notional(
 
 
 def test_each_boundary_evaluates_the_snapshot_without_a_cached_pass() -> None:
-    context = authority_context()
-    coordinator = verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER)
-    signer = verify_mutation_authority(
-        context.model_copy(update={"kill_engaged": True}), ExecutionOperation.SUBMIT_ORDER
+    coordinator_context = authority_context()
+    signer_context = authority_context()
+    assert coordinator_context == signer_context
+    assert coordinator_context is not signer_context
+
+    coordinator = verify_mutation_authority(
+        coordinator_context, ExecutionOperation.SUBMIT_ORDER
     )
+    signer = verify_mutation_authority(signer_context, ExecutionOperation.SUBMIT_ORDER)
     assert coordinator.allowed is True
-    assert signer.reason == "EXECUTION_KILL_ENGAGED"
+    assert signer.allowed is True
+
+    fresh_signer_context = authority_context(kill_engaged=True)
+    fresh_signer = verify_mutation_authority(
+        fresh_signer_context, ExecutionOperation.SUBMIT_ORDER
+    )
+    assert fresh_signer.reason == "EXECUTION_KILL_ENGAGED"
 
 
 def test_manifest_hash_is_bound_to_the_current_manifest() -> None:
