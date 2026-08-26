@@ -1348,6 +1348,75 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
     service.close()
 
 
+@pytest.mark.parametrize(
+    ("secret_name", "escape_character"),
+    (
+        ("api_key", '"'),
+        ("api_key", "\\"),
+        ("passphrase", '"'),
+        ("passphrase", "\\"),
+    ),
+    ids=("api-key-quote", "api-key-backslash", "passphrase-quote", "passphrase-backslash"),
+)
+def test_json_escaped_owned_secret_in_submit_result_is_rejected_before_binding(
+    secret_name: str,
+    escape_character: str,
+) -> None:
+    canary = f"task-7-{secret_name}-{escape_character}-canary".encode()
+    handler_calls = 0
+    cancel_calls = 0
+
+    def leak(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code="SUBMIT_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=canary.decode(),
+        )
+
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.CANCEL_ORDER,
+            result_code="CANCEL_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=payload.venue_order_id,
+        )
+
+    service = _service(
+        handlers=_handlers(submit_order=leak, cancel_order=cancel),
+        **{secret_name: canary},  # type: ignore[arg-type]
+    )
+    request = _request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4())
+
+    first = service._handle_bytes(request)
+    retry = service._handle_bytes(request)
+    submitted = SignerResponse.model_validate_json(first, strict=True)
+    cancelled = service.handle(
+        _request(
+            ExecutionOperation.CANCEL_ORDER,
+            request_id=uuid4(),
+            payload=CancelOrderPayload(
+                operation=ExecutionOperation.CANCEL_ORDER,
+                venue_order_id=canary.decode(),
+            ),
+        )
+    )
+
+    assert submitted.error_code == "SECRET_OUTPUT_DETECTED"
+    assert submitted.result is None
+    assert first == retry
+    assert handler_calls == 1
+    assert cancelled.error_code == "CANCEL_ORDER_UNKNOWN"
+    assert cancel_calls == 0
+    _assert_canaries_absent(first + retry + cancelled.model_dump_json().encode(), canary)
+    service.close()
+
+
 def test_authority_factory_failure_is_sanitized_without_dispatch(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

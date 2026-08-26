@@ -75,6 +75,32 @@ _READ_OPERATIONS = frozenset(
 )
 
 
+def _known_value_contains_secret(
+    value: object,
+    secret: bytes,
+    secret_text: str | None,
+) -> bool:
+    if type(value) is str:
+        return secret in value.encode("utf-8") or (secret_text is not None and secret_text in value)
+    if type(value) is bytes:
+        if secret in value:
+            return True
+        if secret_text is None:
+            return False
+        try:
+            value_text = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        return secret_text in value_text
+    if type(value) is dict:
+        return any(
+            _known_value_contains_secret(item, secret, secret_text) for item in value.values()
+        )
+    if type(value) in (list, tuple):
+        return any(_known_value_contains_secret(item, secret, secret_text) for item in value)
+    return False
+
+
 class SubmitOrderHandler(Protocol):
     def __call__(self, payload: SubmitOrderPayload) -> SanitizedOperationResult: ...
 
@@ -443,11 +469,10 @@ class SignerService:
         self,
         response: SignerResponse,
     ) -> tuple[SignerResponse, bytes]:
-        try:
-            response_bytes = canonical_response_bytes(response)
-        except Exception:
-            sanitized = SignerResponse.rejected(response.request_id, "HANDLER_FAILED")
+        if type(response) is not SignerResponse:
+            sanitized = SignerResponse.rejected(None, "HANDLER_FAILED")
             return sanitized, canonical_response_bytes(sanitized)
+        secrets: list[tuple[bytes, str | None]] = []
         for value in (
             self._secrets.private_key,
             self._secrets.api_key,
@@ -455,7 +480,30 @@ class SignerService:
             self._secrets.passphrase,
         ):
             secret = bytes(value)
-            if secret and secret in response_bytes:
+            if not secret:
+                continue
+            try:
+                secret_text = secret.decode("utf-8")
+            except UnicodeDecodeError:
+                secret_text = None
+            secrets.append((secret, secret_text))
+        try:
+            response_value = response.model_dump(mode="python")
+            if any(
+                _known_value_contains_secret(response_value, secret, secret_text)
+                for secret, secret_text in secrets
+            ):
+                sanitized = SignerResponse.rejected(
+                    response.request_id,
+                    "SECRET_OUTPUT_DETECTED",
+                )
+                return sanitized, canonical_response_bytes(sanitized)
+            response_bytes = canonical_response_bytes(response)
+        except Exception:
+            sanitized = SignerResponse.rejected(response.request_id, "HANDLER_FAILED")
+            return sanitized, canonical_response_bytes(sanitized)
+        for secret, _ in secrets:
+            if secret in response_bytes:
                 sanitized = SignerResponse.rejected(
                     response.request_id,
                     "SECRET_OUTPUT_DETECTED",
