@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Self
@@ -64,6 +65,22 @@ class LiveLedgerError(ValueError):
 
 class _ExactArithmeticError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassifiedTradeHistory:
+    """One validated trade history; tied nonterminal events carry no invented order."""
+
+    venue_trade_id: str
+    validated_events: frozenset[VenueTradeEvent]
+    raw_event_hashes: tuple[Sha256, ...]
+    intent_id: UUID | None
+    venue_order_id: str | None
+    protocol_version: str
+    confirmed_terminal: VenueTradeEvent | None
+    failed_terminal: VenueTradeEvent | None
+    latest_unresolved_state: VenueTradeState | None
+    unresolved_ambiguous: bool
 
 
 class AuthoritativeTradeEconomics(BaseModel):
@@ -403,6 +420,111 @@ def _dedupe_records[ModelT: BaseModel](
     return tuple(item[1] for item in by_identity.values())
 
 
+def _snapshot_trade_event_records(
+    trades: Sequence[VenueTradeEvent],
+) -> tuple[VenueTradeEvent, ...]:
+    return _snapshot_sequence(trades, VenueTradeEvent, "TRADE_EVENT_INVALID")
+
+
+def _snapshot_trade_events(
+    trades: Sequence[VenueTradeEvent],
+) -> tuple[VenueTradeEvent, ...]:
+    return _dedupe_records(
+        _snapshot_trade_event_records(trades),
+        identity=lambda item: item.trade_event_id,
+        conflict_code="TRADE_EVENT_CONFLICT",
+    )
+
+
+def _classify_trade_histories(
+    trades: Sequence[VenueTradeEvent],
+) -> tuple[_ClassifiedTradeHistory, ...]:
+    """Validate and classify immutable histories using only evidence-derived chronology."""
+    trade_values = _snapshot_trade_events(trades)
+    event_by_raw_hash: dict[Sha256, UUID] = {}
+    grouped: dict[str, list[VenueTradeEvent]] = defaultdict(list)
+    for trade in trade_values:
+        existing_event_id = event_by_raw_hash.setdefault(trade.raw_event_hash, trade.trade_event_id)
+        if existing_event_id != trade.trade_event_id:
+            raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+        grouped[trade.venue_trade_id].append(trade)
+
+    classified: list[_ClassifiedTradeHistory] = []
+    terminal_states = {VenueTradeState.CONFIRMED, VenueTradeState.FAILED}
+    for trade_id in sorted(grouped):
+        history = grouped[trade_id]
+        intent_ids = {event.intent_id for event in history if event.intent_id is not None}
+        order_ids = {event.venue_order_id for event in history if event.venue_order_id is not None}
+        protocol_versions = {event.protocol_version for event in history}
+        if len(intent_ids) > 1 or len(order_ids) > 1 or len(protocol_versions) != 1:
+            raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+
+        receipt_groups: dict[datetime, list[VenueTradeEvent]] = defaultdict(list)
+        for event in history:
+            receipt_groups[event.received_at].append(event)
+
+        confirmed_terminal: VenueTradeEvent | None = None
+        failed_terminal: VenueTradeEvent | None = None
+        terminal_seen = False
+        prior_sequence: int | None = None
+        final_group: tuple[VenueTradeEvent, ...] = ()
+        for received_at in sorted(receipt_groups):
+            group = receipt_groups[received_at]
+            if terminal_seen:
+                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+            supplied_sequences = tuple(
+                event.sequence_number for event in group if event.sequence_number is not None
+            )
+            if prior_sequence is not None and any(
+                sequence <= prior_sequence for sequence in supplied_sequences
+            ):
+                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+            contains_terminal = any(event.normalized_state in terminal_states for event in group)
+            if contains_terminal and len(group) > 1:
+                if len(supplied_sequences) != len(group) or len(set(supplied_sequences)) != len(
+                    supplied_sequences
+                ):
+                    raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+                evidence_order = sorted(group, key=lambda event: event.sequence_number)  # type: ignore[arg-type]
+            else:
+                # Iteration order is semantically irrelevant here: a tied group with
+                # no terminal contributes no inferred state chronology.
+                evidence_order = group
+            for event in evidence_order:
+                if terminal_seen:
+                    raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+                if event.normalized_state is VenueTradeState.CONFIRMED:
+                    confirmed_terminal = event
+                    terminal_seen = True
+                elif event.normalized_state is VenueTradeState.FAILED:
+                    failed_terminal = event
+                    terminal_seen = True
+            if supplied_sequences:
+                prior_sequence = max(supplied_sequences)
+            final_group = tuple(evidence_order)
+
+        unresolved = confirmed_terminal is None and failed_terminal is None
+        ambiguous = unresolved and len(final_group) > 1
+        latest_state = (
+            final_group[0].normalized_state if unresolved and len(final_group) == 1 else None
+        )
+        classified.append(
+            _ClassifiedTradeHistory(
+                venue_trade_id=trade_id,
+                validated_events=frozenset(history),
+                raw_event_hashes=tuple(sorted(event.raw_event_hash for event in history)),
+                intent_id=next(iter(intent_ids), None),
+                venue_order_id=next(iter(order_ids), None),
+                protocol_version=next(iter(protocol_versions)),
+                confirmed_terminal=confirmed_terminal,
+                failed_terminal=failed_terminal,
+                latest_unresolved_state=latest_state,
+                unresolved_ambiguous=ambiguous,
+            )
+        )
+    return tuple(classified)
+
+
 def _account(base: str, asset_id: str) -> str:
     return f"{base}:{asset_id}"
 
@@ -538,11 +660,7 @@ def postings_for_confirmed_trades(
         identity=lambda item: item.intent_id,
         conflict_code="INTENT_EVIDENCE_CONFLICT",
     )
-    trade_values = _dedupe_records(
-        _snapshot_sequence(trades, VenueTradeEvent, "TRADE_EVENT_INVALID"),
-        identity=lambda item: item.trade_event_id,
-        conflict_code="TRADE_EVENT_CONFLICT",
-    )
+    trade_histories = _classify_trade_histories(trades)
     economics_values = _dedupe_records(
         _snapshot_sequence(
             economics,
@@ -554,29 +672,11 @@ def postings_for_confirmed_trades(
     )
     intent_by_id = {item.intent_id: item for item in intent_values}
     economics_by_trade = {item.venue_trade_id: item for item in economics_values}
-    confirmed_by_trade: dict[str, VenueTradeEvent] = {}
-    terminal_by_trade: dict[str, VenueTradeEvent] = {}
-    last_sequence_by_trade: dict[str, int] = {}
-    for trade in sorted(trade_values, key=lambda item: (item.received_at, item.trade_event_id)):
-        prior_sequence = last_sequence_by_trade.get(trade.venue_trade_id)
-        if trade.sequence_number is not None:
-            if prior_sequence is not None and trade.sequence_number <= prior_sequence:
-                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
-            last_sequence_by_trade[trade.venue_trade_id] = trade.sequence_number
-        if trade.venue_trade_id in terminal_by_trade:
-            raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
-        existing = confirmed_by_trade.get(trade.venue_trade_id)
-        if trade.normalized_state in {
-            VenueTradeState.CONFIRMED,
-            VenueTradeState.FAILED,
-        }:
-            terminal_by_trade[trade.venue_trade_id] = trade
-        if trade.normalized_state is VenueTradeState.CONFIRMED:
-            if existing is not None and canonical_execution_hash(
-                existing
-            ) != canonical_execution_hash(trade):
-                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
-            confirmed_by_trade[trade.venue_trade_id] = trade
+    confirmed_by_trade = {
+        history.venue_trade_id: history.confirmed_terminal
+        for history in trade_histories
+        if history.confirmed_terminal is not None
+    }
     if set(economics_by_trade) != set(confirmed_by_trade):
         raise LiveLedgerError("TRADE_ECONOMICS_MISMATCH") from None
 

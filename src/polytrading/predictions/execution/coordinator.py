@@ -11,7 +11,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from hashlib import sha256
-from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal, Protocol, Self
 from uuid import UUID, uuid5
@@ -26,6 +25,7 @@ from polytrading.predictions.execution.authority import (
 from polytrading.predictions.execution.kill_switch import KillState
 from polytrading.predictions.execution.ledger import (
     LiveLedgerError,
+    _classify_trade_histories,
     postings_for_confirmed_trades,
 )
 from polytrading.predictions.execution.models import (
@@ -1971,35 +1971,35 @@ class ExecutionCoordinator:
                 ):
                     forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                     continue
-            unresolved_trade = next(
+            try:
+                classified_histories = _classify_trade_histories(trade_history)
+            except LiveLedgerError:
+                forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
+                continue
+            failed_history = next(
                 (
-                    event
-                    for event in trade_history
-                    if event.normalized_state
-                    in {
-                        VenueTradeState.MATCHED_NOT_BROADCASTED,
-                        VenueTradeState.MATCHED,
-                        VenueTradeState.MINED,
-                        VenueTradeState.RETRYING,
-                        VenueTradeState.FAILED,
-                    }
+                    history
+                    for history in classified_histories
+                    if history.failed_terminal is not None
                 ),
                 None,
             )
-            trade_identities = [event.venue_trade_id for event in trade_history]
-            trade_sequences = [
-                event.sequence_number
-                for event in trade_history
-                if event.sequence_number is not None
-            ]
-            trade_contradiction = len(trade_identities) != len(set(trade_identities)) or any(
-                current <= previous for previous, current in pairwise(trade_sequences)
+            unresolved_history = next(
+                (
+                    history
+                    for history in classified_histories
+                    if history.confirmed_terminal is None and history.failed_terminal is None
+                ),
+                None,
             )
-            if trade_contradiction:
-                forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
-            elif unresolved_trade is not None:
+            if failed_history is not None:
+                forced_reasons[intent.intent_id] = "SETTLEMENT_FAILED"
+            elif unresolved_history is not None:
+                unresolved_state = unresolved_history.latest_unresolved_state
                 forced_reasons[intent.intent_id] = (
-                    f"SETTLEMENT_{unresolved_trade.normalized_state.value}"
+                    CoordinatorCode.RECOVERY_BLOCKED.value
+                    if unresolved_state is None
+                    else f"SETTLEMENT_{unresolved_state.value}"
                 )
             elif uncertainty_reason is not None:
                 try:
@@ -2133,12 +2133,20 @@ class ExecutionCoordinator:
                         for evidence_hash in exact.balance_evidence_hashes
                     }
                     try:
+                        classified_histories = _classify_trade_histories(bounded_trade_events)
+                        classified_trade_hashes = {
+                            event_hash
+                            for history in classified_histories
+                            for event_hash in history.raw_event_hashes
+                        }
                         canonical_postings = postings_for_confirmed_trades(
                             bounded_intents,
                             bounded_trade_events,
                             bounded_economics,
                         )
                     except LiveLedgerError:
+                        classified_histories = ()
+                        classified_trade_hashes = set()
                         canonical_postings = ()
                         relationally_closed = False
                     supplied_postings = tuple(
@@ -2157,8 +2165,12 @@ class ExecutionCoordinator:
                         reconciliation.account_fingerprint != account_fingerprint
                         or set(reconciliation.expected_posting_ids) != bounded_posting_ids
                         or supplied_postings != canonical_postings
+                        or any(
+                            history.confirmed_terminal is None for history in classified_histories
+                        )
                         or not set(reconciliation.venue_order_hashes) <= bounded_order_hashes
-                        or set(reconciliation.venue_trade_hashes) != exact_trade_hashes
+                        or set(reconciliation.venue_trade_hashes) != classified_trade_hashes
+                        or not exact_trade_hashes <= classified_trade_hashes
                         or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
                         or not exact_balance_hashes <= set(reconciliation.balance_hashes)
                         or set(reconciliation.evidence_hashes) & known_raw_hashes

@@ -1608,6 +1608,130 @@ def test_startup_blocks_settlement_retry_or_failure_boundaries(
     assert report.kill_reason == f"SETTLEMENT_{trade_state.value}"
 
 
+@pytest.mark.parametrize(
+    ("history_shape", "expected_reason"),
+    [
+        ("ambiguous_nonterminal_tie", CoordinatorCode.RECOVERY_BLOCKED.value),
+        ("post_terminal", CoordinatorCode.RECOVERY_BLOCKED.value),
+    ],
+)
+def test_startup_kills_ambiguous_or_contradictory_trade_history(
+    store: PredictionMarketStore,
+    history_shape: str,
+    expected_reason: str,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    first_state = (
+        VenueTradeState.MATCHED
+        if history_shape == "ambiguous_nonterminal_tie"
+        else VenueTradeState.CONFIRMED
+    )
+    second_state = (
+        VenueTradeState.MATCHED if history_shape == "post_terminal" else (VenueTradeState.RETRYING)
+    )
+    for index, (state, received_ms) in enumerate(
+        (
+            (first_state, 100),
+            (second_state, 200 if history_shape == "post_terminal" else 100),
+        )
+    ):
+        store.append_venue_trade_event(
+            VenueTradeEvent(
+                schema_version=1,
+                trade_event_id=UUID(f"42b33848-ff46-4c45-b9ab-0c74510687f{index}"),
+                venue="polymarket",
+                raw_event_hash=f"{111 + index:064x}",
+                source_channel="recovery_read",
+                venue_trade_id="trade-history-1",
+                venue_order_id="venue-order-1",
+                intent_id=intent.intent_id,
+                original_venue_state=state.value,
+                normalized_state=state,
+                terminal=state in {VenueTradeState.CONFIRMED, VenueTradeState.FAILED},
+                venue_timestamp=NOW + timedelta(milliseconds=received_ms),
+                received_at=NOW + timedelta(milliseconds=received_ms),
+                sequence_number=None,
+                protocol_version=intent.protocol_version,
+            )
+        )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert report.kill_reason == expected_reason
+
+
+def test_startup_keeps_sequence_monotonicity_independent_across_trade_ids(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    for index in range(2):
+        store.append_venue_trade_event(
+            VenueTradeEvent(
+                schema_version=1,
+                trade_event_id=UUID(f"42b33848-ff46-4c45-b9ab-0c74510687f{index}"),
+                venue="polymarket",
+                raw_event_hash=f"{111 + index:064x}",
+                source_channel="recovery_read",
+                venue_trade_id=f"trade-independent-{index}",
+                venue_order_id="venue-order-1",
+                intent_id=intent.intent_id,
+                original_venue_state=VenueTradeState.MATCHED.value,
+                normalized_state=VenueTradeState.MATCHED,
+                terminal=False,
+                venue_timestamp=NOW + timedelta(milliseconds=100 + index),
+                received_at=NOW + timedelta(milliseconds=100 + index),
+                sequence_number=1,
+                protocol_version=intent.protocol_version,
+            )
+        )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert report.kill_reason == "SETTLEMENT_MATCHED"
+
+
 def test_startup_blocks_account_with_incomplete_reconciliation_even_without_intents(
     store: PredictionMarketStore,
 ) -> None:
@@ -2052,6 +2176,8 @@ def _checkpoint_asset(
 
 def _persist_honest_task11_checkpoint(
     store: PredictionMarketStore,
+    *,
+    history_shape: str = "single",
 ) -> tuple[
     LiveExecutionPlan,
     ExecutionIntent,
@@ -2066,25 +2192,103 @@ def _persist_honest_task11_checkpoint(
         VenueOrderState.RECONCILED,
         received_at=NOW + timedelta(milliseconds=50),
     ).model_copy(update={"intent_id": source_intent.intent_id})
-    trade_event = VenueTradeEvent(
-        schema_version=1,
-        trade_event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
-        venue="polymarket",
-        raw_event_hash=HASHES[11],
-        source_channel="recovery_read",
-        venue_trade_id="trade-1",
-        venue_order_id="venue-order-1",
-        intent_id=source_intent.intent_id,
-        original_venue_state=VenueTradeState.CONFIRMED.value,
-        normalized_state=VenueTradeState.CONFIRMED,
-        terminal=True,
-        venue_timestamp=NOW + timedelta(milliseconds=100),
-        received_at=NOW + timedelta(milliseconds=100),
-        sequence_number=None,
-        protocol_version=source_intent.protocol_version,
+
+    def history_event(
+        *,
+        state: VenueTradeState,
+        event_id: str,
+        raw_event_hash: str,
+        received_ms: int,
+        sequence_number: int | None,
+    ) -> VenueTradeEvent:
+        return VenueTradeEvent(
+            schema_version=1,
+            trade_event_id=UUID(event_id),
+            venue="polymarket",
+            raw_event_hash=raw_event_hash,
+            source_channel="recovery_read",
+            venue_trade_id="trade-1",
+            venue_order_id="venue-order-1",
+            intent_id=source_intent.intent_id,
+            original_venue_state=state.value,
+            normalized_state=state,
+            terminal=state in {VenueTradeState.CONFIRMED, VenueTradeState.FAILED},
+            venue_timestamp=NOW + timedelta(milliseconds=received_ms),
+            received_at=NOW + timedelta(milliseconds=received_ms),
+            sequence_number=sequence_number,
+            protocol_version=source_intent.protocol_version,
+        )
+
+    terminal_sequence = (
+        2 if history_shape == "terminal_tie" else (4 if history_shape == "progress" else 1)
     )
+    confirmed = history_event(
+        state=VenueTradeState.CONFIRMED,
+        event_id="42b33848-ff46-4c45-b9ab-0c74510687f3",
+        raw_event_hash=HASHES[11],
+        received_ms=100,
+        sequence_number=terminal_sequence,
+    )
+    if history_shape == "single":
+        trade_events = (confirmed,)
+    elif history_shape == "progress":
+        trade_events = (
+            history_event(
+                state=VenueTradeState.MATCHED,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f0",
+                raw_event_hash=f"{111:064x}",
+                received_ms=60,
+                sequence_number=1,
+            ),
+            history_event(
+                state=VenueTradeState.RETRYING,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f1",
+                raw_event_hash=f"{112:064x}",
+                received_ms=70,
+                sequence_number=2,
+            ),
+            history_event(
+                state=VenueTradeState.MINED,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f2",
+                raw_event_hash=f"{113:064x}",
+                received_ms=80,
+                sequence_number=3,
+            ),
+            confirmed,
+        )
+    elif history_shape == "terminal_tie":
+        trade_events = (
+            history_event(
+                state=VenueTradeState.MATCHED,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f0",
+                raw_event_hash=f"{111:064x}",
+                received_ms=100,
+                sequence_number=1,
+            ),
+            confirmed,
+        )
+    elif history_shape == "nonterminal_tie":
+        trade_events = (
+            history_event(
+                state=VenueTradeState.MATCHED,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f0",
+                raw_event_hash=f"{111:064x}",
+                received_ms=75,
+                sequence_number=None,
+            ),
+            history_event(
+                state=VenueTradeState.RETRYING,
+                event_id="42b33848-ff46-4c45-b9ab-0c74510687f1",
+                raw_event_hash=f"{112:064x}",
+                received_ms=75,
+                sequence_number=None,
+            ),
+            confirmed,
+        )
+    else:
+        raise AssertionError(f"unknown history shape: {history_shape}")
     exact = _authoritative_economics_for_recovery(source_intent)
-    postings = postings_for_confirmed_trades((source_intent,), (trade_event,), (exact,))
+    postings = postings_for_confirmed_trades((source_intent,), trade_events, (exact,))
     snapshot = VenueAccountSnapshot(
         schema_version=1,
         account_fingerprint=ACCOUNT_FINGERPRINT,
@@ -2149,14 +2353,15 @@ def _persist_honest_task11_checkpoint(
         postings,
         snapshot,
         (source_intent,),
-        (trade_event,),
+        trade_events,
         (exact,),
     )
     assert reconciliation.complete
     store.append_live_execution_plan(plan)
     store.append_execution_intent(source_intent)
     store.append_venue_order_event(order_event)
-    store.append_venue_trade_event(trade_event)
+    for trade_event in trade_events:
+        store.append_venue_trade_event(trade_event)
     store.append_authoritative_trade_economics(exact)
     for posting in postings:
         store.append_live_ledger_posting(posting)
@@ -2191,6 +2396,76 @@ def test_reopened_startup_accepts_honest_task11_checkpoint(tmp_path: Path) -> No
     assert report.code is CoordinatorCode.RECOVERY_COMPLETE
     assert report.blocked_intent_ids == ()
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    "history_shape",
+    ["progress", "terminal_tie", "nonterminal_tie"],
+)
+def test_reopened_startup_accepts_honest_multi_event_trade_history_checkpoint(
+    tmp_path: Path,
+    history_shape: str,
+) -> None:
+    path = tmp_path / f"honest-{history_shape}-checkpoint.duckdb"
+    initial = PredictionMarketStore(path)
+    plan, _, _, _, reconciliation = _persist_honest_task11_checkpoint(
+        initial,
+        history_shape=history_shape,
+    )
+    expected_hashes = {
+        "progress": tuple(sorted((f"{111:064x}", f"{112:064x}", f"{113:064x}", HASHES[11]))),
+        "terminal_tie": tuple(sorted((f"{111:064x}", HASHES[11]))),
+        "nonterminal_tie": tuple(sorted((f"{111:064x}", f"{112:064x}", HASHES[11]))),
+    }[history_shape]
+    assert reconciliation.venue_trade_hashes == expected_hashes
+    initial.close()
+    reopened = PredictionMarketStore(path)
+
+    report = recovering_coordinator(
+        reopened,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.blocked_intent_ids == ()
+    reopened.close()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "extra", "cross_category"])
+def test_startup_requires_exact_multi_event_checkpoint_trade_hash_family(
+    store: PredictionMarketStore,
+    corruption: str,
+) -> None:
+    plan, intent, exact, _, reconciliation = _persist_honest_task11_checkpoint(
+        store,
+        history_shape="progress",
+    )
+    hashes = set(reconciliation.venue_trade_hashes)
+    if corruption == "missing":
+        hashes.remove(f"{111:064x}")
+    elif corruption == "extra":
+        hashes.add(f"{199:064x}")
+    else:
+        hashes.add(exact.fee_hash)
+    corrupt = reconciliation.model_copy(update={"venue_trade_hashes": tuple(sorted(hashes))})
+    payload, record_hash = _stored_record(corrupt)
+    store._connection.execute(
+        "UPDATE live_reconciliations SET record_json = ?, record_hash = ? "
+        "WHERE reconciliation_id = ?",
+        [payload, record_hash, reconciliation.reconciliation_id],
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
 
 
 def _task11_tail_records(
@@ -2233,7 +2508,7 @@ def _task11_tail_records(
         terminal=True,
         venue_timestamp=occurred_at,
         received_at=occurred_at,
-        sequence_number=None,
+        sequence_number=1,
         protocol_version=source_intent.protocol_version,
     )
     exact = _authoritative_economics_for_recovery(

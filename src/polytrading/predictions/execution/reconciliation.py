@@ -24,11 +24,13 @@ from polytrading.predictions.execution.ledger import (
     AuthoritativeTradeEconomics,
     LiveLedgerError,
     _bounded_decimal,
+    _classify_trade_histories,
     _decimal_resource_components,
     _exact_add,
     _exact_difference,
     _ExactArithmeticError,
     _is_quantized,
+    _snapshot_trade_event_records,
     postings_for_confirmed_trades,
     verify_live_conservation,
 )
@@ -585,9 +587,26 @@ def reconcile_live_account(
 ) -> LiveReconciliation:
     """Close posting effects against independent two-cut authoritative evidence."""
     observed = _snapshot_input(snapshot)
-    trade_event_hashes = tuple(
-        sorted({trade.raw_event_hash for trade in trades if type(trade) is VenueTradeEvent})
-    )
+    try:
+        trade_histories = _classify_trade_histories(trades)
+        trade_event_hashes = tuple(
+            sorted(
+                event_hash for history in trade_histories for event_hash in history.raw_event_hashes
+            )
+        )
+    except LiveLedgerError as exc:
+        try:
+            trade_event_hashes = tuple(
+                sorted(event.raw_event_hash for event in _snapshot_trade_event_records(trades))
+            )
+        except LiveLedgerError:
+            trade_event_hashes = ()
+        difference = (
+            "TRADE_HISTORY_CONTRADICTION"
+            if str(exc) == "TRADE_EVENT_CONFLICT"
+            else "POSTINGS_INVALID"
+        )
+        return _result(observed, (), {difference}, trade_event_hashes)
     try:
         rows = _snapshot_postings(postings, intents, trades, economics)
     except LiveLedgerError as exc:
@@ -604,9 +623,9 @@ def reconcile_live_account(
     differences: set[str] = set()
     snapshot_evidence = set(_snapshot_evidence(observed)["all"]) | set(trade_event_hashes)
     task1_trades_by_trade = {
-        value.venue_trade_id: value
-        for value in trades
-        if type(value) is VenueTradeEvent and value.normalized_state is VenueTradeState.CONFIRMED
+        history.venue_trade_id: history.confirmed_terminal
+        for history in trade_histories
+        if history.confirmed_terminal is not None
     }
     economics_by_trade = {value.venue_trade_id: value for value in economics}
     if any(row.account_fingerprint != observed.account_fingerprint for row in rows):
@@ -658,6 +677,11 @@ def reconcile_live_account(
     for order in observed.open_orders:
         differences.add(f"OPEN_ORDER_UNEXPLAINED:{order.venue_order_id}")
     expected_trade_ids = {row.venue_trade_id for row in rows}
+    for history in trade_histories:
+        if history.failed_terminal is not None:
+            differences.add(f"SETTLEMENT_FAILED:{history.venue_trade_id}")
+        elif history.confirmed_terminal is None:
+            differences.add(f"TRADE_UNRESOLVED:{history.venue_trade_id}")
     trades = {value.venue_trade_id: value for value in observed.recent_trades}
     settlements = {value.venue_trade_id: value for value in observed.settlements}
     for trade_id in sorted(expected_trade_ids):

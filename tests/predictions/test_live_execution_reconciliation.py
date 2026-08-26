@@ -849,6 +849,8 @@ def test_late_nonterminal_trade_history_prevents_reconciliation_and_pnl() -> Non
     )
 
     assert not result.complete
+    assert result.differences == ("TRADE_HISTORY_CONTRADICTION",)
+    assert result.venue_trade_hashes == tuple(sorted((TRADE_HASH, evidence_hash(70))))
     assert (
         reconciled_live_pnl(
             postings,
@@ -860,6 +862,150 @@ def test_late_nonterminal_trade_history_prevents_reconciliation_and_pnl() -> Non
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        VenueTradeState.FAILED,
+        VenueTradeState.MATCHED_NOT_BROADCASTED,
+        VenueTradeState.MATCHED,
+        VenueTradeState.MINED,
+        VenueTradeState.RETRYING,
+    ],
+)
+@pytest.mark.parametrize("reverse_input", [False, True])
+def test_every_unposted_trade_history_group_blocks_mixed_reconciliation_and_pnl(
+    state: VenueTradeState,
+    reverse_input: bool,
+) -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    confirmed = trade_event(source_intent)
+    unposted_hash = evidence_hash(70)
+    unposted_trade_id = f"unposted-{state.value.lower()}"
+    unposted = trade_event(
+        source_intent,
+        state=state,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        venue_order_id="venue-order-unposted",
+        venue_trade_id=unposted_trade_id,
+        raw_event_hash=unposted_hash,
+        received_at=NOW + timedelta(seconds=3),
+        sequence_number=1,
+    )
+    events = (unposted, confirmed) if reverse_input else (confirmed, unposted)
+    snapshot = snapshot_for(source_intent, exact)
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        events,
+        (exact,),
+    )
+
+    expected_prefix = "SETTLEMENT_FAILED" if state is VenueTradeState.FAILED else "TRADE_UNRESOLVED"
+    assert not result.complete
+    assert f"{expected_prefix}:{unposted_trade_id}" in result.differences
+    assert result.next_action == "HALT_AND_RECONCILE"
+    assert result.venue_trade_hashes == tuple(sorted((TRADE_HASH, unposted_hash)))
+    assert (
+        reconciled_live_pnl(
+            postings,
+            result,
+            snapshot,
+            (source_intent,),
+            events,
+            (exact,),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        VenueTradeState.FAILED,
+        VenueTradeState.MATCHED_NOT_BROADCASTED,
+        VenueTradeState.MATCHED,
+        VenueTradeState.MINED,
+        VenueTradeState.RETRYING,
+    ],
+)
+def test_unposted_trade_history_without_any_confirmed_posting_still_blocks_closure(
+    state: VenueTradeState,
+) -> None:
+    source_intent = intent()
+    unposted_hash = evidence_hash(70)
+    unposted_trade_id = f"unposted-{state.value.lower()}"
+    unposted = trade_event(
+        source_intent,
+        state=state,
+        venue_trade_id=unposted_trade_id,
+        raw_event_hash=unposted_hash,
+        received_at=NOW + timedelta(milliseconds=500),
+        sequence_number=1,
+    )
+    snapshot = empty_snapshot()
+
+    result = reconcile_live_account(
+        (),
+        snapshot,
+        (source_intent,),
+        (unposted,),
+        (),
+    )
+
+    expected_prefix = "SETTLEMENT_FAILED" if state is VenueTradeState.FAILED else "TRADE_UNRESOLVED"
+    assert not result.complete
+    assert result.differences == (f"{expected_prefix}:{unposted_trade_id}",)
+    assert result.next_action == "HALT_AND_RECONCILE"
+    assert result.venue_trade_hashes == (unposted_hash,)
+    assert result.expected_posting_ids == ()
+    assert reconciled_live_pnl((), result, snapshot, (source_intent,), (unposted,), ()) is None
+
+
+def test_unposted_history_for_a_second_intent_is_not_hidden_by_confirmed_postings() -> None:
+    first_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    second_intent = intent(
+        plan_id=UUID("1f067bf8-b4b8-418d-85ce-cf7702b810c1"),
+        intent_id=UUID("267931fd-9ea7-429e-a2ae-cc7458231cd4"),
+    )
+    unresolved_hash = evidence_hash(70)
+    events = (
+        trade_event(first_intent),
+        trade_event(
+            second_intent,
+            state=VenueTradeState.MINED,
+            event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+            venue_order_id="venue-order-second",
+            venue_trade_id="venue-trade-second-intent",
+            raw_event_hash=unresolved_hash,
+            received_at=NOW + timedelta(seconds=3),
+            sequence_number=1,
+        ),
+    )
+    snapshot = snapshot_for(first_intent, exact)
+
+    forward = reconcile_live_account(
+        postings,
+        snapshot,
+        (first_intent, second_intent),
+        events,
+        (exact,),
+    )
+    reverse = reconcile_live_account(
+        tuple(reversed(postings)),
+        snapshot,
+        (second_intent, first_intent),
+        tuple(reversed(events)),
+        (exact,),
+    )
+
+    assert forward == reverse
+    assert not forward.complete
+    assert "TRADE_UNRESOLVED:venue-trade-second-intent" in forward.differences
+    assert forward.venue_trade_hashes == tuple(sorted((TRADE_HASH, unresolved_hash)))
 
 
 def test_wrong_account_cross_cutoff_and_missing_balance_evidence_are_closed_differences() -> None:
