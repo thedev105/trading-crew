@@ -2050,6 +2050,17 @@ class ExecutionCoordinator:
                 )
             )
             latest_complete = complete_reconciliations[-1] if complete_reconciliations else None
+            if economics and (
+                latest_complete is None
+                or any(
+                    exact.occurred_at > latest_complete.observed_at
+                    or exact.information_cutoff > latest_complete.observed_at
+                    for exact in economics
+                )
+            ):
+                account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
+                for intent in intents:
+                    forced_reasons.setdefault(intent.intent_id, account_block_reason)
             posting_ids = {posting.posting_id for posting in postings}
             reconciliation_references_postings = any(
                 reconciliation.expected_posting_ids for reconciliation in complete_reconciliations

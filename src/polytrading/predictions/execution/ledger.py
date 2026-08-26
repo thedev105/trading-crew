@@ -32,8 +32,10 @@ MAX_LEDGER_AMOUNT = Decimal("1000000000000000000000000000000")
 MAX_LIVE_EVIDENCE_ITEMS = 10_000
 _MAX_LEDGER_EXPONENT = 30
 _MAX_LEDGER_COEFFICIENT_DIGITS = 37
-_MAX_EXACT_EXPONENT = 64
-_MAX_EXACT_COEFFICIENT_DIGITS = 128
+_MAX_LEDGER_ADJUSTED_EXPONENT = 30
+_MAX_LEDGER_ALIGNMENT_DELTA = _MAX_LEDGER_EXPONENT + MAX_LEDGER_DECIMAL_PLACES
+_MAX_LEDGER_COEFFICIENT_BITS = 128
+_DECIMAL_RESOURCE_ERROR = "DECIMAL_RESOURCE_INVALID"
 _POSTING_NAMESPACE = UUID("ddf6bc3f-af66-4435-92c0-d3c2713d5865")
 _PUBLIC_TEXT = Annotated[
     str,
@@ -158,6 +160,20 @@ class AuthoritativeTradeEconomics(BaseModel):
             raise ValueError("TRADE_ECONOMICS_INVALID") from None
         return value
 
+    @field_validator(
+        "price",
+        "size",
+        "fee",
+        "cash_quantum",
+        "position_quantum",
+        "realized_pnl",
+    )
+    @classmethod
+    def _bounded_decimal_resource(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None:
+            _decimal_resource_components(value)
+        return value
+
     @field_validator("balance_evidence_hashes")
     @classmethod
     def _sorted_unique_hashes(cls, value: tuple[Sha256, ...]) -> tuple[Sha256, ...]:
@@ -212,38 +228,67 @@ _ECONOMICS_MODELS_SEALED = True
 
 
 def _bounded_decimal(value: Decimal) -> bool:
-    if type(value) is not Decimal or not value.is_finite() or value.copy_abs() > MAX_LEDGER_AMOUNT:
+    try:
+        _decimal_resource_components(value)
+    except _ExactArithmeticError:
         return False
-    exponent = value.as_tuple().exponent
-    return (
-        type(exponent) is int
-        and -MAX_LEDGER_DECIMAL_PLACES <= exponent <= _MAX_LEDGER_EXPONENT
-        and len(value.as_tuple().digits) <= _MAX_LEDGER_COEFFICIENT_DIGITS
-    )
+    return True
 
 
-def _decimal_coefficient(value: Decimal) -> tuple[int, int]:
+def _decimal_resource_components(value: Decimal) -> tuple[int, int]:
     if type(value) is not Decimal or not value.is_finite():
-        raise _ExactArithmeticError from None
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
     parts = value.as_tuple()
-    if type(parts.exponent) is not int:
-        raise _ExactArithmeticError from None
+    exponent = parts.exponent
+    digit_count = len(parts.digits)
+    if (
+        type(exponent) is not int
+        or exponent < -MAX_LEDGER_DECIMAL_PLACES
+        or exponent > _MAX_LEDGER_EXPONENT
+        or digit_count < 1
+        or digit_count > _MAX_LEDGER_COEFFICIENT_DIGITS
+    ):
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
     coefficient = 0
     for digit in parts.digits:
         coefficient = coefficient * 10 + digit
-    return (-coefficient if parts.sign else coefficient), parts.exponent
+    if coefficient == 0:
+        return 0, 0
+    adjusted_exponent = exponent + digit_count - 1
+    if adjusted_exponent > _MAX_LEDGER_ADJUSTED_EXPONENT:
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    if adjusted_exponent == _MAX_LEDGER_ADJUSTED_EXPONENT:
+        delta = _MAX_LEDGER_ADJUSTED_EXPONENT - exponent
+        if delta > _MAX_LEDGER_ALIGNMENT_DELTA or coefficient > 10**delta:
+            raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    return (-coefficient if parts.sign else coefficient), exponent
+
+
+def _decimal_coefficient(value: Decimal) -> tuple[int, int]:
+    return _decimal_resource_components(value)
 
 
 def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
     if (
         type(coefficient) is not int
         or type(exponent) is not int
-        or abs(exponent) > _MAX_EXACT_EXPONENT
+        or exponent < -MAX_LEDGER_DECIMAL_PLACES
+        or exponent > _MAX_LEDGER_EXPONENT
+        or abs(coefficient).bit_length() > _MAX_LEDGER_COEFFICIENT_BITS
     ):
-        raise _ExactArithmeticError from None
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    if coefficient == 0:
+        return Decimal("0")
     rendered = str(abs(coefficient))
-    if len(rendered) > _MAX_EXACT_COEFFICIENT_DIGITS:
-        raise _ExactArithmeticError from None
+    if len(rendered) > _MAX_LEDGER_COEFFICIENT_DIGITS:
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    adjusted_exponent = exponent + len(rendered) - 1
+    if adjusted_exponent > _MAX_LEDGER_ADJUSTED_EXPONENT:
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    if adjusted_exponent == _MAX_LEDGER_ADJUSTED_EXPONENT:
+        delta = _MAX_LEDGER_ADJUSTED_EXPONENT - exponent
+        if delta > _MAX_LEDGER_ALIGNMENT_DELTA or abs(coefficient) > 10**delta:
+            raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
     digits = tuple(int(character) for character in rendered)
     return Decimal((int(coefficient < 0), digits, exponent))
 
@@ -251,9 +296,19 @@ def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
 def _exact_product(left: Decimal, right: Decimal) -> Decimal:
     left_coefficient, left_exponent = _decimal_coefficient(left)
     right_coefficient, right_exponent = _decimal_coefficient(right)
+    if left_coefficient == 0 or right_coefficient == 0:
+        return Decimal("0")
+    output_exponent = left_exponent + right_exponent
+    minimum_output_digits = len(str(abs(left_coefficient))) + len(str(abs(right_coefficient))) - 1
+    if (
+        output_exponent < -MAX_LEDGER_DECIMAL_PLACES
+        or output_exponent > _MAX_LEDGER_EXPONENT
+        or minimum_output_digits > _MAX_LEDGER_COEFFICIENT_DIGITS
+    ):
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
     return _decimal_from_coefficient(
         left_coefficient * right_coefficient,
-        left_exponent + right_exponent,
+        output_exponent,
     )
 
 
@@ -261,8 +316,23 @@ def _exact_add(left: Decimal, right: Decimal) -> Decimal:
     left_coefficient, left_exponent = _decimal_coefficient(left)
     right_coefficient, right_exponent = _decimal_coefficient(right)
     exponent = min(left_exponent, right_exponent)
-    coefficient = left_coefficient * 10 ** (left_exponent - exponent)
-    coefficient += right_coefficient * 10 ** (right_exponent - exponent)
+    left_delta = left_exponent - exponent
+    right_delta = right_exponent - exponent
+    if (
+        left_delta > _MAX_LEDGER_ALIGNMENT_DELTA
+        or right_delta > _MAX_LEDGER_ALIGNMENT_DELTA
+        or (
+            left_coefficient
+            and len(str(abs(left_coefficient))) + left_delta > _MAX_LEDGER_COEFFICIENT_DIGITS
+        )
+        or (
+            right_coefficient
+            and len(str(abs(right_coefficient))) + right_delta > _MAX_LEDGER_COEFFICIENT_DIGITS
+        )
+    ):
+        raise _ExactArithmeticError(_DECIMAL_RESOURCE_ERROR) from None
+    coefficient = left_coefficient * 10**left_delta
+    coefficient += right_coefficient * 10**right_delta
     return _decimal_from_coefficient(coefficient, exponent)
 
 
@@ -278,8 +348,12 @@ def _is_quantized(value: Decimal, quantum: Decimal) -> bool:
         if quantum_coefficient == 0:
             return False
         exponent = min(value_exponent, quantum_exponent)
-        value_integer = value_coefficient * 10 ** (value_exponent - exponent)
-        quantum_integer = quantum_coefficient * 10 ** (quantum_exponent - exponent)
+        value_delta = value_exponent - exponent
+        quantum_delta = quantum_exponent - exponent
+        if value_delta > _MAX_LEDGER_ALIGNMENT_DELTA or quantum_delta > _MAX_LEDGER_ALIGNMENT_DELTA:
+            return False
+        value_integer = value_coefficient * 10**value_delta
+        quantum_integer = quantum_coefficient * 10**quantum_delta
         return value_integer % abs(quantum_integer) == 0
     except _ExactArithmeticError:
         return False
@@ -659,9 +733,11 @@ def _verify_structural_conservation(postings: Sequence[LiveLedgerPosting]) -> No
         if posting.posting_id in seen_ids:
             raise LiveLedgerError("POSTING_ID_DUPLICATE") from None
         seen_ids.add(posting.posting_id)
-        amount = posting.debit_amount or posting.credit_amount
-        if not _bounded_decimal(amount):
+        if not _bounded_decimal(posting.debit_amount) or not _bounded_decimal(
+            posting.credit_amount
+        ):
             raise LiveLedgerError("POSTING_AMOUNT_INVALID") from None
+        amount = posting.debit_amount or posting.credit_amount
         if (
             posting.intent_id is None
             or posting.venue_order_id is None

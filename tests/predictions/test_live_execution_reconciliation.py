@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import (
     Decimal,
@@ -51,6 +52,19 @@ FEE_HASH = "3" * 64
 SOURCE_HASH = "4" * 64
 BALANCE_HASH = "5" * 64
 COST_BASIS_HASH = "6" * 64
+
+
+def hostile_decimal(coefficient: int, exponent: int) -> Decimal:
+    return Decimal((int(coefficient < 0), tuple(map(int, str(abs(coefficient)))), exponent))
+
+
+def bounded_call[ResultT](operation: object) -> ResultT:
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(operation)  # type: ignore[arg-type]
+        return future.result(timeout=1)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def evidence_hash(index: int) -> str:
@@ -386,6 +400,65 @@ def test_reconciliation_and_pnl_ignore_hostile_decimal_context() -> None:
                 "1.25"
             )
             assert dict(context.flags) == before_flags
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (AssetAmountObservation, "amount", hostile_decimal(0, 1_000_000)),
+        (AssetAmountObservation, "amount", hostile_decimal(0, -1_000_000)),
+        (AssetAmountObservation, "amount", hostile_decimal(1, 1_000_000)),
+        (AssetAmountObservation, "amount", hostile_decimal(1, -1_000_000)),
+        (AssetAmountObservation, "quantum", hostile_decimal(1, 1_000_000)),
+        (AllowanceObservation, "amount", hostile_decimal(0, 1_000_000)),
+        (AllowanceObservation, "amount", hostile_decimal(0, -1_000_000)),
+        (AllowanceObservation, "quantum", hostile_decimal(1, -1_000_000)),
+    ],
+)
+def test_snapshot_amounts_reject_hostile_exponents_before_quantum_alignment(
+    model: type[AssetAmountObservation] | type[AllowanceObservation],
+    field: str,
+    value: Decimal,
+) -> None:
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "asset_id": "USDC",
+        "amount": Decimal("1"),
+        "quantum": Decimal("0.000001"),
+        "evidence_hash": evidence_hash(60),
+    }
+    if model is AllowanceObservation:
+        fields["spender_address"] = "0x" + "1" * 40
+    fields[field] = value
+
+    with pytest.raises(ValueError, match="DECIMAL_RESOURCE_INVALID"):
+        bounded_call(lambda: model(**fields))
+
+
+def test_recent_trade_pnl_and_snapshot_alias_reject_hostile_decimal_resources() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    hostile_pnl = snapshot.recent_trades[0].model_dump(mode="python")
+    hostile_pnl["realized_pnl"] = hostile_decimal(1, 1_000_000)
+    with pytest.raises(ValueError, match="DECIMAL_RESOURCE_INVALID"):
+        bounded_call(lambda: RecentTradeObservation.model_validate(hostile_pnl, strict=True))
+
+    hostile_snapshot = snapshot_for(source_intent, exact)
+    object.__setattr__(
+        hostile_snapshot.current_cash_balances[0],
+        "amount",
+        hostile_decimal(0, 1_000_000),
+    )
+    with pytest.raises(LiveReconciliationError, match="SNAPSHOT_INVALID"):
+        bounded_call(
+            lambda: reconcile_live_account(
+                postings,
+                hostile_snapshot,
+                (source_intent,),
+                (trade_event(source_intent),),
+                (exact,),
+            )
+        )
 
 
 @pytest.mark.parametrize(

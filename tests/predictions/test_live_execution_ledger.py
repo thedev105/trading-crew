@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import (
     Decimal,
@@ -21,6 +22,9 @@ from hypothesis import strategies as st
 from polytrading.predictions.execution.ledger import (
     AuthoritativeTradeEconomics,
     LiveLedgerError,
+    _decimal_coefficient,
+    _ExactArithmeticError,
+    _is_quantized,
     postings_for_confirmed_trades,
     verify_live_conservation,
 )
@@ -42,6 +46,19 @@ FEE_HASH = "3" * 64
 SOURCE_HASH = "4" * 64
 BALANCE_HASH = "5" * 64
 COST_BASIS_HASH = "6" * 64
+
+
+def hostile_decimal(coefficient: int, exponent: int) -> Decimal:
+    return Decimal((int(coefficient < 0), tuple(map(int, str(abs(coefficient)))), exponent))
+
+
+def bounded_call[ResultT](operation: object) -> ResultT:
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(operation)  # type: ignore[arg-type]
+        return future.result(timeout=1)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def intent(**overrides: object) -> ExecutionIntent:
@@ -394,19 +411,23 @@ def test_failed_then_confirmed_history_for_same_trade_is_contradictory() -> None
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "error_code"),
     [
-        ("price", Decimal("1.01")),
-        ("price", Decimal("0.5100001")),
-        ("size", Decimal("10.001")),
-        ("fee", Decimal("0.0000001")),
-        ("cash_quantum", Decimal("0.0000001")),
-        ("position_quantum", Decimal("0.001")),
+        ("price", Decimal("1.01"), "TRADE_ECONOMICS_INVALID"),
+        ("price", Decimal("0.5100001"), "DECIMAL_RESOURCE_INVALID"),
+        ("size", Decimal("10.001"), "TRADE_ECONOMICS_INVALID"),
+        ("fee", Decimal("0.0000001"), "DECIMAL_RESOURCE_INVALID"),
+        ("cash_quantum", Decimal("0.0000001"), "DECIMAL_RESOURCE_INVALID"),
+        ("position_quantum", Decimal("0.001"), "TRADE_ECONOMICS_INVALID"),
     ],
 )
-def test_economics_rejects_excess_or_nondivisible_precision(field: str, value: Decimal) -> None:
+def test_economics_rejects_excess_or_nondivisible_precision(
+    field: str,
+    value: Decimal,
+    error_code: str,
+) -> None:
     source_intent = intent()
-    with pytest.raises(ValueError, match="TRADE_ECONOMICS_INVALID"):
+    with pytest.raises(ValueError, match=error_code):
         economics(source_intent, **{field: value})
 
 
@@ -427,6 +448,69 @@ def test_authoritative_notional_never_uses_ambient_decimal_rounding() -> None:
                 cash_quantum=Decimal("0.1"),
                 position_quantum=Decimal("1"),
             )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "extra"),
+    [
+        ("price", hostile_decimal(1, 1_000_000), {}),
+        ("size", hostile_decimal(1, -1_000_000), {}),
+        ("fee", hostile_decimal(0, 1_000_000), {}),
+        ("cash_quantum", hostile_decimal(1, 1_000_000), {}),
+        ("position_quantum", hostile_decimal(1, -1_000_000), {}),
+        (
+            "realized_pnl",
+            hostile_decimal(1, -1_000_000),
+            {"cost_basis_evidence_hash": COST_BASIS_HASH},
+        ),
+    ],
+)
+def test_every_economics_decimal_rejects_hostile_resource_shapes_before_arithmetic(
+    field: str,
+    value: Decimal,
+    extra: dict[str, object],
+) -> None:
+    source_intent = intent()
+
+    with pytest.raises(ValueError, match="DECIMAL_RESOURCE_INVALID"):
+        bounded_call(lambda: economics(source_intent, **{field: value}, **extra))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        hostile_decimal(0, 1_000_000),
+        hostile_decimal(0, -1_000_000),
+        hostile_decimal(1, 1_000_000),
+        hostile_decimal(1, -1_000_000),
+        hostile_decimal(int("9" * 38), -6),
+        hostile_decimal(9, 30),
+    ],
+)
+def test_exact_helpers_reject_unbounded_coefficients_and_exponents_before_alignment(
+    value: Decimal,
+) -> None:
+    with pytest.raises(_ExactArithmeticError, match="DECIMAL_RESOURCE_INVALID"):
+        bounded_call(lambda: _decimal_coefficient(value))
+    assert bounded_call(lambda: _is_quantized(value, Decimal("0.000001"))) is False
+
+
+def test_posting_rejects_a_hostile_zero_on_the_inactive_side_before_netting() -> None:
+    source_intent = intent()
+    event = trade_event(source_intent)
+    exact = economics(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    hostile = postings[0].model_copy(update={"credit_amount": hostile_decimal(0, 1_000_000)})
+
+    with pytest.raises(LiveLedgerError, match="POSTING_AMOUNT_INVALID"):
+        bounded_call(
+            lambda: verify_live_conservation(
+                (hostile, *postings[1:]),
+                (source_intent,),
+                (event,),
+                (exact,),
+            )
+        )
 
 
 def test_valid_economics_and_posting_identities_ignore_hostile_decimal_context() -> None:

@@ -20,11 +20,11 @@ from pydantic import (
 
 from polytrading.predictions.domain import Sha256
 from polytrading.predictions.execution.ledger import (
-    MAX_LEDGER_AMOUNT,
-    MAX_LEDGER_DECIMAL_PLACES,
     MAX_LIVE_EVIDENCE_ITEMS,
     AuthoritativeTradeEconomics,
     LiveLedgerError,
+    _bounded_decimal,
+    _decimal_resource_components,
     _exact_add,
     _exact_difference,
     _ExactArithmeticError,
@@ -129,6 +129,12 @@ class AssetAmountObservation(_StrictObservation):
     quantum: _POSITIVE_DECIMAL
     evidence_hash: Sha256
 
+    @field_validator("amount", "quantum")
+    @classmethod
+    def _bounded_decimal_resource(cls, value: Decimal) -> Decimal:
+        _decimal_resource_components(value)
+        return value
+
     @model_validator(mode="after")
     def _exact_amount(self) -> AssetAmountObservation:
         if not _bounded_decimal(self.amount) or not _bounded_decimal(self.quantum):
@@ -147,6 +153,12 @@ class AllowanceObservation(_StrictObservation):
     amount: _NONNEGATIVE_DECIMAL
     quantum: _POSITIVE_DECIMAL
     evidence_hash: Sha256
+
+    @field_validator("amount", "quantum")
+    @classmethod
+    def _bounded_decimal_resource(cls, value: Decimal) -> Decimal:
+        _decimal_resource_components(value)
+        return value
 
     @model_validator(mode="after")
     def _exact_amount(self) -> AllowanceObservation:
@@ -193,6 +205,13 @@ class RecentTradeObservation(_StrictObservation):
     realized_pnl: Decimal | None = None
     cost_basis_evidence_hash: Sha256 | None = None
     occurred_at: datetime
+
+    @field_validator("realized_pnl")
+    @classmethod
+    def _bounded_decimal_resource(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None:
+            _decimal_resource_components(value)
+        return value
 
     @field_validator("occurred_at")
     @classmethod
@@ -359,13 +378,6 @@ class VenueAccountSnapshot(_StrictObservation):
 
 
 _OBSERVATION_MODELS_SEALED = True
-
-
-def _bounded_decimal(value: Decimal) -> bool:
-    if type(value) is not Decimal or not value.is_finite() or value.copy_abs() > MAX_LEDGER_AMOUNT:
-        return False
-    exponent = value.as_tuple().exponent
-    return type(exponent) is int and exponent >= -MAX_LEDGER_DECIMAL_PLACES
 
 
 def _asset_identity(value: AssetAmountObservation) -> str:
