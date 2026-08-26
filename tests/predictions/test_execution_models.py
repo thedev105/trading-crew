@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -21,6 +22,21 @@ from polytrading.predictions.execution.models import (
 )
 from tests.predictions.execution_helpers import execution_intent_fields, live_execution_plan_fields
 
+PUBLIC_UNSIGNED_ORDER = {
+    "builder": "0x" + "00" * 32,
+    "expiration": "0",
+    "maker": "0x" + "11" * 20,
+    "makerAmount": "5100000",
+    "metadata": "0x" + "00" * 32,
+    "salt": 1,
+    "side": "BUY",
+    "signatureType": 0,
+    "signer": "0x" + "11" * 20,
+    "takerAmount": "10000000",
+    "timestamp": "1787673600000",
+    "tokenId": "217426",
+}
+
 
 def test_intent_accepts_only_immediate_order_types() -> None:
     intent = ExecutionIntent(**execution_intent_fields(order_type=ImmediateOrderType.FAK))
@@ -38,6 +54,106 @@ def test_intent_identity_is_stable_and_content_bound() -> None:
     assert changed.intent_id != first.intent_id
 
 
+def test_intent_tick_size_is_required_positive_and_content_bound() -> None:
+    baseline = ExecutionIntent(**execution_intent_fields())
+    changed = ExecutionIntent(**execution_intent_fields(tick_size=Decimal("0.001")))
+
+    assert baseline.tick_size == Decimal("0.01")
+    assert changed.intent_id != baseline.intent_id
+    missing = execution_intent_fields()
+    missing.pop("tick_size")
+    with pytest.raises(ValidationError, match="Field required"):
+        ExecutionIntent(**missing)
+    with pytest.raises(ValidationError, match="greater than 0"):
+        ExecutionIntent(**execution_intent_fields(tick_size=Decimal("0")))
+
+
+def test_intent_exchange_kind_is_required_closed_and_content_bound() -> None:
+    baseline = ExecutionIntent(**execution_intent_fields())
+    changed = ExecutionIntent(**execution_intent_fields(exchange_kind="negative_risk"))
+
+    assert baseline.exchange_kind == "standard"
+    assert changed.intent_id != baseline.intent_id
+    missing = execution_intent_fields()
+    missing.pop("exchange_kind")
+    with pytest.raises(ValidationError, match="Field required"):
+        ExecutionIntent(**missing)
+    with pytest.raises(ValidationError, match="standard"):
+        ExecutionIntent(**execution_intent_fields(exchange_kind="future_exchange"))
+
+
+def test_signed_envelope_accepts_exact_current_public_unsigned_order() -> None:
+    intent = ExecutionIntent(**execution_intent_fields())
+
+    envelope = SignedOrderEnvelope(
+        schema_version=1,
+        intent_id=intent.intent_id,
+        intent_fingerprint=intent.intent_fingerprint,
+        protocol_version="polymarket-clob-2026-08-25-v1",
+        salt=1,
+        signature_type=0,
+        public_signature="0x" + "11" * 65,
+        domain_fingerprint="1" * 64,
+        exact_body_hash="2" * 64,
+        order_fingerprint="3" * 64,
+        signer_version="eth-account==0.13.7",
+        canonical_order_json=json.dumps(
+            PUBLIC_UNSIGNED_ORDER,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+    assert json.loads(envelope.canonical_order_json) == PUBLIC_UNSIGNED_ORDER
+
+
+def test_signed_envelope_rejects_unicode_decimal_order_integer_strings() -> None:
+    intent = ExecutionIntent(**execution_intent_fields())
+    fullwidth_token_id = "".join(chr(codepoint) for codepoint in (0xFF12, 0xFF11, 0xFF17))
+    public_order = {**PUBLIC_UNSIGNED_ORDER, "tokenId": fullwidth_token_id}
+
+    with pytest.raises(ValidationError, match="integer string"):
+        SignedOrderEnvelope(
+            schema_version=1,
+            intent_id=intent.intent_id,
+            intent_fingerprint=intent.intent_fingerprint,
+            protocol_version="polymarket-clob-2026-08-25-v1",
+            salt=1,
+            signature_type=0,
+            public_signature="0x" + "11" * 65,
+            domain_fingerprint="1" * 64,
+            exact_body_hash="2" * 64,
+            order_fingerprint="3" * 64,
+            signer_version="eth-account==0.13.7",
+            canonical_order_json=json.dumps(
+                public_order,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+
+def test_signed_envelope_rejects_empty_public_order_object() -> None:
+    intent = ExecutionIntent(**execution_intent_fields())
+
+    with pytest.raises(ValidationError, match="public order fields"):
+        SignedOrderEnvelope(
+            schema_version=1,
+            intent_id=intent.intent_id,
+            intent_fingerprint=intent.intent_fingerprint,
+            protocol_version="polymarket-clob-2026-08-25-v1",
+            salt=1,
+            signature_type=0,
+            public_signature="0x" + "11" * 65,
+            domain_fingerprint="1" * 64,
+            exact_body_hash="2" * 64,
+            order_fingerprint="3" * 64,
+            signer_version="eth-account==0.13.7",
+            canonical_order_json="{}",
+        )
+
+
 def test_signed_envelope_rejects_a_mismatched_intent_fingerprint() -> None:
     intent = ExecutionIntent(**execution_intent_fields())
     with pytest.raises(ValidationError, match="intent fingerprint"):
@@ -53,16 +169,21 @@ def test_signed_envelope_rejects_a_mismatched_intent_fingerprint() -> None:
             exact_body_hash="2" * 64,
             order_fingerprint="3" * 64,
             signer_version="1",
-            canonical_order_json="{}",
+            canonical_order_json=json.dumps(
+                PUBLIC_UNSIGNED_ORDER,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
         )
 
 
 @pytest.mark.parametrize(
     "secret_field",
-    ("apiSecret", "headers", "authenticatedFrame", "capabilityBytes"),
+    ("apiSecret", "headers", "authenticatedFrame", "capabilityBytes", "signature"),
 )
 def test_signed_envelope_rejects_nonpublic_order_json_fields(secret_field: str) -> None:
     intent = ExecutionIntent(**execution_intent_fields())
+    public_order = {**PUBLIC_UNSIGNED_ORDER, secret_field: "secret-canary"}
     with pytest.raises(ValidationError, match="public order fields"):
         SignedOrderEnvelope(
             schema_version=1,
@@ -76,7 +197,7 @@ def test_signed_envelope_rejects_nonpublic_order_json_fields(secret_field: str) 
             exact_body_hash="2" * 64,
             order_fingerprint="3" * 64,
             signer_version="1",
-            canonical_order_json=f'{{"{secret_field}":"secret-canary"}}',
+            canonical_order_json=json.dumps(public_order, separators=(",", ":"), sort_keys=True),
         )
 
 

@@ -23,7 +23,11 @@ from polytrading.predictions.execution.models import (
     VenueTradeState,
 )
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
-from tests.predictions.execution_helpers import execution_intent_fields, live_execution_plan_fields
+from tests.predictions.execution_helpers import (
+    execution_intent_fields,
+    live_execution_plan_fields,
+    public_unsigned_order_json,
+)
 from tests.predictions.store_helpers import raw_envelope
 
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
@@ -56,7 +60,7 @@ def execution_records() -> tuple[
             "exact_body_hash": "2" * 64,
             "order_fingerprint": "3" * 64,
             "signer_version": "v1",
-            "canonical_order_json": "{}",
+            "canonical_order_json": public_unsigned_order_json(),
         }
     )
     order_event = VenueOrderEvent.model_validate(

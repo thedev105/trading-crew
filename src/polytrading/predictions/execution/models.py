@@ -24,21 +24,22 @@ PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 _INTENT_NAMESPACE = UUID("b59d5b2a-94e6-4a5e-b184-327132349d5e")
-_PUBLIC_ORDER_ADDRESS_FIELDS = frozenset({"maker", "signer", "taker"})
-_PUBLIC_ORDER_INTEGER_FIELDS = frozenset(
-    {
-        "salt",
-        "tokenId",
-        "makerAmount",
-        "takerAmount",
-        "expiration",
-        "nonce",
-        "feeRateBps",
-        "signatureType",
-    }
+_PUBLIC_ORDER_ADDRESS_FIELDS = frozenset({"maker", "signer"})
+_PUBLIC_ORDER_BYTES32_FIELDS = frozenset({"builder", "metadata"})
+_PUBLIC_ORDER_STRING_INTEGER_FIELDS = frozenset(
+    {"expiration", "makerAmount", "takerAmount", "timestamp", "tokenId"}
 )
-_PUBLIC_ORDER_FIELDS = _PUBLIC_ORDER_ADDRESS_FIELDS | _PUBLIC_ORDER_INTEGER_FIELDS | {"side"}
+_PUBLIC_ORDER_JSON_INTEGER_FIELDS = frozenset({"salt", "signatureType"})
+_PUBLIC_ORDER_FIELDS = (
+    _PUBLIC_ORDER_ADDRESS_FIELDS
+    | _PUBLIC_ORDER_BYTES32_FIELDS
+    | _PUBLIC_ORDER_STRING_INTEGER_FIELDS
+    | _PUBLIC_ORDER_JSON_INTEGER_FIELDS
+    | {"side"}
+)
 _EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
+_BYTES32 = re.compile(r"0x[0-9a-fA-F]{64}")
+_ASCII_INTEGER = re.compile(r"[0-9]+")
 
 
 class ImmediateOrderType(StrEnum):
@@ -206,6 +207,8 @@ class ExecutionIntent(_ExecutionRecord):
     token_id: NonEmptyString
     side: Literal["buy", "sell"]
     limit_price: PositiveDecimal
+    tick_size: PositiveDecimal
+    exchange_kind: Literal["standard", "negative_risk"]
     base_size: PositiveDecimal | None
     maximum_spend: PositiveDecimal | None
     order_type: ImmediateOrderType
@@ -279,23 +282,26 @@ class SignedOrderEnvelope(_ExecutionRecord):
             raise ValueError("canonical_order_json must contain an object")
         if value != _canonical_json(payload):
             raise ValueError("canonical_order_json must use canonical JSON")
-        if not payload:
-            return value
         if set(payload) != _PUBLIC_ORDER_FIELDS:
             raise ValueError("canonical_order_json must contain only public order fields")
         for field in _PUBLIC_ORDER_ADDRESS_FIELDS:
             address = payload[field]
             if not isinstance(address, str) or _EVM_ADDRESS.fullmatch(address) is None:
                 raise ValueError(f"canonical_order_json {field} must be an EVM address")
-        for field in _PUBLIC_ORDER_INTEGER_FIELDS:
+        for field in _PUBLIC_ORDER_BYTES32_FIELDS:
+            value_bytes = payload[field]
+            if not isinstance(value_bytes, str) or _BYTES32.fullmatch(value_bytes) is None:
+                raise ValueError(f"canonical_order_json {field} must be bytes32")
+        for field in _PUBLIC_ORDER_STRING_INTEGER_FIELDS:
             number = payload[field]
-            if not (
-                (type(number) is int and number >= 0)
-                or (isinstance(number, str) and number.isdecimal())
-            ):
+            if not isinstance(number, str) or _ASCII_INTEGER.fullmatch(number) is None:
+                raise ValueError(f"canonical_order_json {field} must be an integer string")
+        for field in _PUBLIC_ORDER_JSON_INTEGER_FIELDS:
+            number = payload[field]
+            if type(number) is not int or number < 0:
                 raise ValueError(f"canonical_order_json {field} must be a nonnegative integer")
-        if type(payload["side"]) is not bool:
-            raise ValueError("canonical_order_json side must be a boolean")
+        if payload["side"] not in {"BUY", "SELL"}:
+            raise ValueError("canonical_order_json side must be BUY or SELL")
         return value
 
     @model_validator(mode="after")

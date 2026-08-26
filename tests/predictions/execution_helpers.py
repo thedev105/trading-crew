@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -23,6 +24,8 @@ def execution_intent_fields(**overrides: object) -> dict[str, object]:
         "token_id": "217426",
         "side": "buy",
         "limit_price": Decimal("0.51"),
+        "tick_size": Decimal("0.01"),
+        "exchange_kind": "standard",
         "base_size": Decimal("10"),
         "maximum_spend": Decimal("5.10"),
         "order_type": ImmediateOrderType.FAK,
@@ -43,6 +46,27 @@ def execution_intent_fields(**overrides: object) -> dict[str, object]:
     projection = ExecutionIntent.model_construct(**fields)
     fields["intent_id"] = deterministic_intent_id(projection)
     return fields
+
+
+def public_unsigned_order_json() -> str:
+    return json.dumps(
+        {
+            "builder": "0x" + "00" * 32,
+            "expiration": "0",
+            "maker": "0x" + "11" * 20,
+            "makerAmount": "5100000",
+            "metadata": "0x" + "00" * 32,
+            "salt": 1,
+            "side": "BUY",
+            "signatureType": 0,
+            "signer": "0x" + "11" * 20,
+            "takerAmount": "10000000",
+            "timestamp": "1787673600000",
+            "tokenId": "217426",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def live_execution_plan_fields(**overrides: object) -> dict[str, object]:
