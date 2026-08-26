@@ -75,24 +75,35 @@ def intent(**overrides: object) -> ExecutionIntent:
     return ExecutionIntent(**execution_intent_fields(**overrides))
 
 
-def trade_event(source_intent: ExecutionIntent) -> VenueTradeEvent:
+def trade_event(
+    source_intent: ExecutionIntent,
+    *,
+    state: VenueTradeState = VenueTradeState.CONFIRMED,
+    event_id: UUID | None = None,
+    venue_order_id: str = ORDER_ID,
+    venue_trade_id: str = TRADE_ID,
+    raw_event_hash: str = TRADE_HASH,
+    venue_timestamp: datetime | None = NOW + timedelta(seconds=1),
+    received_at: datetime = NOW + timedelta(seconds=2),
+    sequence_number: int | None = None,
+) -> VenueTradeEvent:
     return VenueTradeEvent(
         schema_version=1,
-        trade_event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        trade_event_id=event_id or UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
         venue="polymarket",
-        raw_event_hash=TRADE_HASH,
+        raw_event_hash=raw_event_hash,
         source_channel="recovery_read",
-        venue_trade_id=TRADE_ID,
-        venue_order_id=ORDER_ID,
+        venue_trade_id=venue_trade_id,
+        venue_order_id=venue_order_id,
         intent_id=source_intent.intent_id,
-        original_venue_state=VenueTradeState.CONFIRMED.value,
-        normalized_state=VenueTradeState.CONFIRMED,
-        terminal=True,
-        venue_timestamp=NOW + timedelta(seconds=1),
-        received_at=NOW + timedelta(seconds=2),
-        sequence_number=None,
+        original_venue_state=state.value,
+        normalized_state=state,
+        terminal=state in {VenueTradeState.CONFIRMED, VenueTradeState.FAILED},
+        venue_timestamp=venue_timestamp,
+        received_at=received_at,
+        sequence_number=sequence_number,
         protocol_version=source_intent.protocol_version,
-        lineage_hashes=(TRADE_HASH,),
+        lineage_hashes=(raw_event_hash,),
     )
 
 
@@ -100,34 +111,37 @@ def exact_economics(
     source_intent: ExecutionIntent,
     *,
     realized_pnl: Decimal | None = None,
+    **overrides: object,
 ) -> AuthoritativeTradeEconomics:
-    return AuthoritativeTradeEconomics(
-        schema_version=1,
-        account_fingerprint=source_intent.account_fingerprint,
-        intent_id=source_intent.intent_id,
-        venue_order_id=ORDER_ID,
-        venue_trade_id=TRADE_ID,
-        trade_event_hash=TRADE_HASH,
-        cash_asset_id="USDC",
-        position_asset_id=source_intent.token_id,
-        side=source_intent.side,
-        price=Decimal("0.51"),
-        size=Decimal("10"),
-        fee=Decimal("0.01"),
-        cash_quantum=Decimal("0.000001"),
-        position_quantum=Decimal("0.01"),
-        trade_state=VenueTradeState.CONFIRMED,
-        settlement_state=VenueTradeState.CONFIRMED,
-        fee_hash=FEE_HASH,
-        settlement_hash=SETTLEMENT_HASH,
-        source_hash=SOURCE_HASH,
-        balance_evidence_hashes=(BALANCE_HASH,),
-        occurred_at=NOW + timedelta(seconds=1),
-        information_cutoff=NOW + timedelta(seconds=3),
-        protocol_version=source_intent.protocol_version,
-        realized_pnl=realized_pnl,
-        cost_basis_evidence_hash=None if realized_pnl is None else COST_BASIS_HASH,
-    )
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "account_fingerprint": source_intent.account_fingerprint,
+        "intent_id": source_intent.intent_id,
+        "venue_order_id": ORDER_ID,
+        "venue_trade_id": TRADE_ID,
+        "trade_event_hash": TRADE_HASH,
+        "cash_asset_id": "USDC",
+        "position_asset_id": source_intent.token_id,
+        "side": source_intent.side,
+        "price": Decimal("0.51"),
+        "size": Decimal("10"),
+        "fee": Decimal("0.01"),
+        "cash_quantum": Decimal("0.000001"),
+        "position_quantum": Decimal("0.01"),
+        "trade_state": VenueTradeState.CONFIRMED,
+        "settlement_state": VenueTradeState.CONFIRMED,
+        "fee_hash": FEE_HASH,
+        "settlement_hash": SETTLEMENT_HASH,
+        "source_hash": SOURCE_HASH,
+        "balance_evidence_hashes": (BALANCE_HASH,),
+        "occurred_at": NOW + timedelta(seconds=1),
+        "information_cutoff": NOW + timedelta(seconds=3),
+        "protocol_version": source_intent.protocol_version,
+        "realized_pnl": realized_pnl,
+        "cost_basis_evidence_hash": None if realized_pnl is None else COST_BASIS_HASH,
+    }
+    fields.update(overrides)
+    return AuthoritativeTradeEconomics(**fields)
 
 
 def exact_postings(*, realized_pnl: Decimal | None = None):
@@ -403,6 +417,191 @@ def test_reconciliation_and_pnl_ignore_hostile_decimal_context() -> None:
 
 
 @pytest.mark.parametrize(
+    ("information_cutoff", "cutoff_at", "observed_at", "complete", "difference"),
+    [
+        (
+            NOW + timedelta(seconds=3),
+            NOW,
+            NOW + timedelta(seconds=4),
+            True,
+            None,
+        ),
+        (
+            NOW + timedelta(seconds=4),
+            NOW,
+            NOW + timedelta(seconds=4),
+            True,
+            None,
+        ),
+        (
+            NOW + timedelta(seconds=3),
+            NOW + timedelta(seconds=1),
+            NOW + timedelta(seconds=4),
+            False,
+            "POSTING_OUTSIDE_SNAPSHOT:venue-trade-1",
+        ),
+        (
+            NOW + timedelta(seconds=5),
+            NOW,
+            NOW + timedelta(seconds=4),
+            False,
+            "ECONOMICS_OUTSIDE_SNAPSHOT:venue-trade-1",
+        ),
+    ],
+)
+def test_reconciliation_closes_the_full_economics_interval_before_publishing_pnl(
+    information_cutoff: datetime,
+    cutoff_at: datetime,
+    observed_at: datetime,
+    complete: bool,
+    difference: str | None,
+) -> None:
+    source_intent = intent()
+    exact = exact_economics(
+        source_intent,
+        realized_pnl=Decimal("1.25"),
+        information_cutoff=information_cutoff,
+    )
+    exact = AuthoritativeTradeEconomics.model_validate(exact.model_dump(mode="python"), strict=True)
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    snapshot = snapshot_for(
+        source_intent,
+        exact,
+        cutoff_at=cutoff_at,
+        observed_at=observed_at,
+    )
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+    )
+
+    assert result.complete is complete
+    if difference is not None:
+        assert difference in result.differences
+    expected_pnl = Decimal("1.25") if complete else None
+    assert (
+        reconciled_live_pnl(
+            postings,
+            result,
+            snapshot,
+            (source_intent,),
+            (event,),
+            (exact,),
+        )
+        == expected_pnl
+    )
+
+
+def test_one_future_economics_cutoff_prevents_multi_trade_closure_in_any_input_order() -> None:
+    source_intent = intent(base_size=Decimal("10"), maximum_spend=Decimal("5.10"))
+    first_event = trade_event(source_intent)
+    second_event = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        venue_trade_id="venue-trade-2",
+        raw_event_hash=evidence_hash(70),
+        venue_timestamp=NOW + timedelta(seconds=2),
+        received_at=NOW + timedelta(seconds=3),
+    )
+    first_economics = exact_economics(
+        source_intent,
+        realized_pnl=Decimal("1.25"),
+        size=Decimal("5"),
+        fee=Decimal("0.005"),
+    )
+    second_economics = exact_economics(
+        source_intent,
+        venue_trade_id="venue-trade-2",
+        trade_event_hash=evidence_hash(70),
+        size=Decimal("5"),
+        fee=Decimal("0.005"),
+        fee_hash=evidence_hash(71),
+        settlement_hash=evidence_hash(72),
+        source_hash=evidence_hash(73),
+        balance_evidence_hashes=(evidence_hash(74),),
+        occurred_at=NOW + timedelta(seconds=2),
+        information_cutoff=NOW + timedelta(seconds=5),
+    )
+    events = (first_event, second_event)
+    evidence = (first_economics, second_economics)
+    postings = postings_for_confirmed_trades((source_intent,), events, evidence)
+    base = snapshot_for(source_intent, first_economics)
+    second_trade = base.recent_trades[0].model_copy(
+        update={
+            "venue_trade_id": "venue-trade-2",
+            "trade_event_hash": evidence_hash(70),
+            "settlement_hash": evidence_hash(72),
+            "fee_hash": evidence_hash(71),
+            "source_hash": evidence_hash(73),
+            "balance_evidence_hashes": (evidence_hash(74),),
+            "economics_fingerprint": second_economics.economics_fingerprint,
+            "realized_pnl": None,
+            "cost_basis_evidence_hash": None,
+            "occurred_at": NOW + timedelta(seconds=2),
+        }
+    )
+    second_settlement = base.settlements[0].model_copy(
+        update={
+            "venue_trade_id": "venue-trade-2",
+            "settlement_hash": evidence_hash(72),
+            "evidence_hash": evidence_hash(72),
+            "occurred_at": NOW + timedelta(seconds=2),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "recent_trades": (*base.recent_trades, second_trade),
+            "settlements": (*base.settlements, second_settlement),
+            "snapshot_fingerprint": None,
+        }
+    )
+
+    results = []
+    for supplied_events, supplied_economics in (
+        (events, evidence),
+        (tuple(reversed(events)), tuple(reversed(evidence))),
+    ):
+        result = reconcile_live_account(
+            tuple(reversed(postings)),
+            snapshot,
+            (source_intent,),
+            supplied_events,
+            supplied_economics,
+        )
+        results.append(result)
+        assert not result.complete
+        assert "ECONOMICS_OUTSIDE_SNAPSHOT:venue-trade-2" in result.differences
+        assert (
+            reconciled_live_pnl(
+                postings,
+                result,
+                snapshot,
+                (source_intent,),
+                supplied_events,
+                supplied_economics,
+            )
+            is None
+        )
+    assert results[0] == results[1]
+
+
+def test_reconciliation_revalidates_a_bypassed_economics_alias_before_closure() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    object.__setattr__(exact, "information_cutoff", NOW + timedelta(seconds=5))
+
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+
+    assert not result.complete
+    assert pnl_with_evidence(postings, result, snapshot, source_intent, exact) is None
+
+
+@pytest.mark.parametrize(
     ("model", "field", "value"),
     [
         (AssetAmountObservation, "amount", hostile_decimal(0, 1_000_000)),
@@ -596,6 +795,71 @@ def test_trade_side_assets_and_settlement_asset_must_match_posting_accounts() ->
 
     assert "TRADE_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
     assert "SETTLEMENT_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("trade_event_hash", FEE_HASH),
+        ("source_hash", SETTLEMENT_HASH),
+        ("settlement_hash", FEE_HASH),
+        ("fee_hash", SOURCE_HASH),
+        ("balance_evidence_hashes", (SOURCE_HASH,)),
+    ],
+)
+def test_recent_trade_evidence_hash_families_are_equality_bound_by_role(
+    field: str,
+    replacement: object,
+) -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    base = snapshot_for(source_intent, exact)
+    substituted = base.recent_trades[0].model_copy(update={field: replacement})
+    snapshot_updates: dict[str, object] = {
+        "recent_trades": (substituted,),
+        "snapshot_fingerprint": None,
+    }
+    if field == "source_hash":
+        snapshot_updates["open_orders_source_hash"] = SOURCE_HASH
+    snapshot = base.model_copy(update=snapshot_updates)
+
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+
+    assert "TRADE_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
+    assert pnl_with_evidence(postings, result, snapshot, source_intent, exact) is None
+
+
+def test_late_nonterminal_trade_history_prevents_reconciliation_and_pnl() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    confirmed = trade_event(source_intent)
+    late_matched = trade_event(
+        source_intent,
+        state=VenueTradeState.MATCHED,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        raw_event_hash=evidence_hash(70),
+        received_at=NOW + timedelta(seconds=3),
+    )
+    snapshot = snapshot_for(source_intent, exact)
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (confirmed, late_matched),
+        (exact,),
+    )
+
+    assert not result.complete
+    assert (
+        reconciled_live_pnl(
+            postings,
+            result,
+            snapshot,
+            (source_intent,),
+            (confirmed, late_matched),
+            (exact,),
+        )
+        is None
+    )
 
 
 def test_wrong_account_cross_cutoff_and_missing_balance_evidence_are_closed_differences() -> None:

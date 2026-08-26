@@ -603,14 +603,28 @@ def reconcile_live_account(
         return _result(observed, canonical_rows, {difference}, trade_event_hashes)
     differences: set[str] = set()
     snapshot_evidence = set(_snapshot_evidence(observed)["all"]) | set(trade_event_hashes)
+    task1_trades_by_trade = {
+        value.venue_trade_id: value
+        for value in trades
+        if type(value) is VenueTradeEvent and value.normalized_state is VenueTradeState.CONFIRMED
+    }
+    economics_by_trade = {value.venue_trade_id: value for value in economics}
     if any(row.account_fingerprint != observed.account_fingerprint for row in rows):
         differences.add("POSTING_ACCOUNT_MISMATCH")
     for trade_id in sorted({row.venue_trade_id for row in rows}):
         trade_rows = tuple(row for row in rows if row.venue_trade_id == trade_id)
+        exact = economics_by_trade.get(trade_id)
         if any(
             not observed.cutoff_at < row.occurred_at <= observed.observed_at for row in trade_rows
         ):
             differences.add(f"POSTING_OUTSIDE_SNAPSHOT:{trade_id}")
+        if exact is None or not (
+            observed.cutoff_at
+            < exact.occurred_at
+            <= exact.information_cutoff
+            <= observed.observed_at
+        ):
+            differences.add(f"ECONOMICS_OUTSIDE_SNAPSHOT:{trade_id}")
         if any(not set(row.lineage_hashes) <= snapshot_evidence for row in trade_rows):
             differences.add(f"POSTING_EVIDENCE_MISSING:{trade_id}")
     _append_delta_differences(
@@ -646,7 +660,6 @@ def reconcile_live_account(
     expected_trade_ids = {row.venue_trade_id for row in rows}
     trades = {value.venue_trade_id: value for value in observed.recent_trades}
     settlements = {value.venue_trade_id: value for value in observed.settlements}
-    economics_by_trade = {value.venue_trade_id: value for value in economics}
     for trade_id in sorted(expected_trade_ids):
         trade_rows = tuple(row for row in rows if row.venue_trade_id == trade_id)
         first = trade_rows[0]
@@ -662,20 +675,48 @@ def reconcile_live_account(
             expected_side = "buy" if position_amount > 0 else "sell"
         trade = trades.get(trade_id)
         exact = economics_by_trade.get(trade_id)
+        task1_trade = task1_trades_by_trade.get(trade_id)
         if trade is None:
             differences.add(f"TRADE_MISSING:{trade_id}")
         elif (
             exact is None
+            or task1_trade is None
             or trade.state is not VenueTradeState.CONFIRMED
+            or task1_trade.normalized_state is not VenueTradeState.CONFIRMED
+            or not task1_trade.terminal
+            or trade.venue_trade_id != exact.venue_trade_id
+            or trade.venue_trade_id != task1_trade.venue_trade_id
+            or trade.intent_id != exact.intent_id
+            or trade.intent_id != task1_trade.intent_id
             or trade.intent_id != first.intent_id
+            or trade.venue_order_id != exact.venue_order_id
+            or trade.venue_order_id != task1_trade.venue_order_id
             or trade.venue_order_id != first.venue_order_id
+            or trade.trade_event_hash != exact.trade_event_hash
+            or trade.trade_event_hash != task1_trade.raw_event_hash
+            or trade.source_hash != exact.source_hash
+            or trade.settlement_hash != exact.settlement_hash
             or trade.settlement_hash != first.settlement_hash
+            or trade.fee_hash != exact.fee_hash
             or trade.fee_hash != first.fee_hash
+            or trade.balance_evidence_hashes != exact.balance_evidence_hashes
             or trade.balance_evidence_hashes != first.balance_evidence_hashes
             or trade.economics_fingerprint != exact.economics_fingerprint
             or trade.realized_pnl != exact.realized_pnl
             or trade.cost_basis_evidence_hash != exact.cost_basis_evidence_hash
+            or exact.account_fingerprint != observed.account_fingerprint
+            or exact.account_fingerprint != first.account_fingerprint
+            or trade.cash_asset_id != exact.cash_asset_id
+            or trade.position_asset_id != exact.position_asset_id
+            or trade.side != exact.side
+            or exact.trade_state is not VenueTradeState.CONFIRMED
+            or exact.settlement_state is not VenueTradeState.CONFIRMED
+            or trade.occurred_at != exact.occurred_at
             or trade.occurred_at != first.occurred_at
+            or (
+                task1_trade.venue_timestamp is not None
+                and task1_trade.venue_timestamp != trade.occurred_at
+            )
             or {trade.cash_asset_id} != expected_cash_assets
             or {trade.position_asset_id} != expected_position_assets
             or trade.side != expected_side
@@ -696,10 +737,16 @@ def reconcile_live_account(
         elif settlement.state is not VenueTradeState.CONFIRMED:
             differences.add(f"SETTLEMENT_STATE_MISMATCH:{trade_id}")
         elif (
-            settlement.intent_id != first.intent_id
+            exact is None
+            or settlement.intent_id != exact.intent_id
+            or settlement.intent_id != first.intent_id
+            or settlement.venue_order_id != exact.venue_order_id
             or settlement.venue_order_id != first.venue_order_id
+            or settlement.settlement_hash != exact.settlement_hash
             or settlement.settlement_hash != first.settlement_hash
+            or settlement.occurred_at != exact.occurred_at
             or settlement.occurred_at != first.occurred_at
+            or settlement.position_asset_id != exact.position_asset_id
             or {settlement.position_asset_id} != expected_position_assets
         ):
             differences.add(f"SETTLEMENT_EVIDENCE_MISMATCH:{trade_id}")
@@ -759,7 +806,6 @@ def reconciled_live_pnl(
         or closed.reconciliation_id != _reconciliation_id(closed.model_dump(mode="python"))
         or closed.expected_posting_ids != tuple(sorted(row.posting_id for row in rows))
         or any(row.account_fingerprint != closed.account_fingerprint for row in rows)
-        or any(row.occurred_at > closed.observed_at for row in rows)
         or any(not set(row.lineage_hashes) <= closed_hashes for row in rows)
     ):
         return None

@@ -556,17 +556,20 @@ def postings_for_confirmed_trades(
     economics_by_trade = {item.venue_trade_id: item for item in economics_values}
     confirmed_by_trade: dict[str, VenueTradeEvent] = {}
     terminal_by_trade: dict[str, VenueTradeEvent] = {}
+    last_sequence_by_trade: dict[str, int] = {}
     for trade in sorted(trade_values, key=lambda item: (item.received_at, item.trade_event_id)):
+        prior_sequence = last_sequence_by_trade.get(trade.venue_trade_id)
+        if trade.sequence_number is not None:
+            if prior_sequence is not None and trade.sequence_number <= prior_sequence:
+                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
+            last_sequence_by_trade[trade.venue_trade_id] = trade.sequence_number
+        if trade.venue_trade_id in terminal_by_trade:
+            raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
         existing = confirmed_by_trade.get(trade.venue_trade_id)
         if trade.normalized_state in {
             VenueTradeState.CONFIRMED,
             VenueTradeState.FAILED,
         }:
-            terminal = terminal_by_trade.get(trade.venue_trade_id)
-            if terminal is not None and canonical_execution_hash(
-                terminal
-            ) != canonical_execution_hash(trade):
-                raise LiveLedgerError("TRADE_EVENT_CONFLICT") from None
             terminal_by_trade[trade.venue_trade_id] = trade
         if trade.normalized_state is VenueTradeState.CONFIRMED:
             if existing is not None and canonical_execution_hash(

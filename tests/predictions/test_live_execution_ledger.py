@@ -73,7 +73,9 @@ def trade_event(
     venue_order_id: str = ORDER_ID,
     venue_trade_id: str = TRADE_ID,
     raw_event_hash: str = TRADE_HASH,
+    venue_timestamp: datetime | None = NOW + timedelta(seconds=1),
     received_at: datetime = NOW + timedelta(seconds=2),
+    sequence_number: int | None = None,
 ) -> VenueTradeEvent:
     return VenueTradeEvent(
         schema_version=1,
@@ -87,9 +89,9 @@ def trade_event(
         original_venue_state=state.value,
         normalized_state=state,
         terminal=state in {VenueTradeState.CONFIRMED, VenueTradeState.FAILED},
-        venue_timestamp=NOW + timedelta(seconds=1),
+        venue_timestamp=venue_timestamp,
         received_at=received_at,
-        sequence_number=None,
+        sequence_number=sequence_number,
         protocol_version=source_intent.protocol_version,
         lineage_hashes=(raw_event_hash,),
     )
@@ -408,6 +410,157 @@ def test_failed_then_confirmed_history_for_same_trade_is_contradictory() -> None
         postings_for_confirmed_trades(
             (source_intent,), (failed, confirmed), (economics(source_intent),)
         )
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [VenueTradeState.CONFIRMED, VenueTradeState.FAILED],
+)
+@pytest.mark.parametrize(
+    "later_state",
+    [
+        VenueTradeState.MATCHED_NOT_BROADCASTED,
+        VenueTradeState.MATCHED,
+        VenueTradeState.MINED,
+        VenueTradeState.RETRYING,
+    ],
+)
+def test_every_nonterminal_event_after_either_terminal_state_is_contradictory(
+    terminal_state: VenueTradeState,
+    later_state: VenueTradeState,
+) -> None:
+    source_intent = intent()
+    terminal = trade_event(
+        source_intent,
+        state=terminal_state,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f2"),
+        sequence_number=10,
+    )
+    later = trade_event(
+        source_intent,
+        state=later_state,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        raw_event_hash="7" * 64,
+        received_at=NOW + timedelta(seconds=3),
+        sequence_number=11,
+    )
+    exact = (economics(source_intent),) if terminal_state is VenueTradeState.CONFIRMED else ()
+
+    for history in ((terminal, later), (later, terminal)):
+        with pytest.raises(LiveLedgerError, match="TRADE_EVENT_CONFLICT"):
+            postings_for_confirmed_trades((source_intent,), history, exact)
+
+
+@pytest.mark.parametrize("later_sequence", [5, 4])
+def test_later_distinct_trade_event_rejects_equal_or_regressing_sequence(
+    later_sequence: int,
+) -> None:
+    source_intent = intent()
+    matched = trade_event(
+        source_intent,
+        state=VenueTradeState.MATCHED,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f2"),
+        raw_event_hash="7" * 64,
+        received_at=NOW + timedelta(milliseconds=1500),
+        sequence_number=5,
+    )
+    confirmed = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        sequence_number=later_sequence,
+    )
+
+    with pytest.raises(LiveLedgerError, match="TRADE_EVENT_CONFLICT"):
+        postings_for_confirmed_trades(
+            (source_intent,),
+            (confirmed, matched),
+            (economics(source_intent),),
+        )
+
+
+def test_nonterminal_progress_and_retry_before_one_terminal_outcome_remains_valid() -> None:
+    source_intent = intent()
+    progress = (
+        trade_event(
+            source_intent,
+            state=VenueTradeState.MATCHED,
+            event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f0"),
+            raw_event_hash="7" * 64,
+            received_at=NOW + timedelta(milliseconds=1250),
+            sequence_number=1,
+        ),
+        trade_event(
+            source_intent,
+            state=VenueTradeState.RETRYING,
+            event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f1"),
+            raw_event_hash="8" * 64,
+            received_at=NOW + timedelta(milliseconds=1500),
+            sequence_number=2,
+        ),
+        trade_event(
+            source_intent,
+            state=VenueTradeState.MINED,
+            event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f2"),
+            raw_event_hash="9" * 64,
+            received_at=NOW + timedelta(milliseconds=1750),
+            sequence_number=3,
+        ),
+        trade_event(
+            source_intent,
+            event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+            sequence_number=4,
+        ),
+    )
+    exact = economics(source_intent)
+
+    forward = postings_for_confirmed_trades((source_intent,), progress, (exact,))
+    reversed_result = postings_for_confirmed_trades(
+        (source_intent,), tuple(reversed(progress)), (exact,)
+    )
+
+    assert forward == reversed_result
+    assert len(forward) == 6
+
+
+def test_same_receipt_time_uses_deterministic_event_id_order() -> None:
+    source_intent = intent()
+    receipt = NOW + timedelta(seconds=2)
+    matched_first = trade_event(
+        source_intent,
+        state=VenueTradeState.MATCHED,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f2"),
+        raw_event_hash="7" * 64,
+        received_at=receipt,
+    )
+    confirmed_last = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        received_at=receipt,
+    )
+    exact = economics(source_intent)
+
+    forward = postings_for_confirmed_trades(
+        (source_intent,), (confirmed_last, matched_first), (exact,)
+    )
+    reverse = postings_for_confirmed_trades(
+        (source_intent,), (matched_first, confirmed_last), (exact,)
+    )
+    assert forward == reverse
+
+    confirmed_first = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f0"),
+        received_at=receipt,
+    )
+    matched_last = trade_event(
+        source_intent,
+        state=VenueTradeState.MATCHED,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f1"),
+        raw_event_hash="7" * 64,
+        received_at=receipt,
+    )
+    with pytest.raises(LiveLedgerError, match="TRADE_EVENT_CONFLICT"):
+        postings_for_confirmed_trades((source_intent,), (matched_last, confirmed_first), (exact,))
 
 
 @pytest.mark.parametrize(
