@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID
+from threading import Barrier, Lock, Thread
+from uuid import UUID, uuid4
 
 import duckdb
 import pytest
@@ -31,6 +32,33 @@ from tests.predictions.execution_helpers import (
 from tests.predictions.store_helpers import raw_envelope
 
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
+
+
+def test_process_local_execution_claim_is_atomic_and_permanent(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "claims.duckdb")
+    intent_id = uuid4()
+    start = Barrier(3)
+    results: list[bool] = []
+    result_lock = Lock()
+
+    def claim() -> None:
+        start.wait()
+        acquired = store.claim_execution_intent_submission(intent_id)
+        with result_lock:
+            results.append(acquired)
+
+    threads = (Thread(target=claim), Thread(target=claim))
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results) == [False, True]
+    assert store.claim_execution_intent_submission(intent_id) is False
+    assert store.claim_execution_first_fill(intent_id) is True
+    assert store.claim_execution_first_fill(intent_id) is False
+    store.close()
 
 
 def execution_records() -> tuple[

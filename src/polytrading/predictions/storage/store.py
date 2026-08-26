@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import resources
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import UUID
 
@@ -135,6 +136,9 @@ class PredictionMarketStore:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self._connection = duckdb.connect(str(path), read_only=read_only)
         self._in_transaction = False
+        self._execution_claim_lock = Lock()
+        self._execution_claims: set[UUID] = set()
+        self._execution_first_fill_claims: set[UUID] = set()
         try:
             if read_only:
                 self._verify_current_schema()
@@ -146,6 +150,28 @@ class PredictionMarketStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def claim_execution_intent_submission(self, intent_id: UUID) -> bool:
+        """Atomically acquire one permanent process-local claim for this store instance."""
+
+        if type(intent_id) is not UUID:
+            raise ValueError("EXECUTION_INTENT_CLAIM_INVALID") from None
+        with self._execution_claim_lock:
+            if intent_id in self._execution_claims:
+                return False
+            self._execution_claims.add(intent_id)
+            return True
+
+    def claim_execution_first_fill(self, intent_id: UUID) -> bool:
+        """Atomically claim one transient-callback first-fill identity for this process."""
+
+        if type(intent_id) is not UUID:
+            raise ValueError("EXECUTION_FIRST_FILL_CLAIM_INVALID") from None
+        with self._execution_claim_lock:
+            if intent_id in self._execution_first_fill_claims:
+                return False
+            self._execution_first_fill_claims.add(intent_id)
+            return True
 
     @contextmanager
     def transaction(self) -> Iterator[PredictionMarketStore]:

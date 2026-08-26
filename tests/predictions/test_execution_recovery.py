@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,11 +10,13 @@ import pytest
 from polytrading.predictions.execution.coordinator import (
     CoordinatorCode,
     ExecutionCoordinator,
+    PostFillDecision,
     RecoveryReport,
 )
 from polytrading.predictions.execution.kill_switch import KillState
 from polytrading.predictions.execution.models import (
     LiveExecutionPlan,
+    LiveLedgerPosting,
     LiveReconciliation,
     VenueOrderState,
     VenueTradeEvent,
@@ -48,6 +51,8 @@ from tests.predictions.test_execution_coordinator import (
     preflight_evidence,
     submit_result,
 )
+
+SIGNER_ADDRESS = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
 
 
 @pytest.fixture
@@ -111,7 +116,7 @@ def order_read(
         id=order_id,
         market="condition-1",
         asset_id=asset_id,
-        maker_address="0x" + "11" * 20,
+        maker_address=SIGNER_ADDRESS,
         side="BUY",
         price=price,
         original_size=original_size,
@@ -138,7 +143,7 @@ def confirmed_maker_trade(
         id=trade_id,
         market="condition-1",
         asset_id=asset_id,
-        maker_address="0x" + "11" * 20,
+        maker_address=SIGNER_ADDRESS,
         taker_order_id="taker-order-1",
         side="BUY",
         trader_side="MAKER",
@@ -152,7 +157,7 @@ def confirmed_maker_trade(
         maker_orders=(
             MakerOrderReadPayload(
                 order_id=order_id,
-                maker_address="0x" + "11" * 20,
+                maker_address=SIGNER_ADDRESS,
                 matched_amount=matched_amount,
                 price=price,
                 fee_rate_bps="100",
@@ -162,6 +167,36 @@ def confirmed_maker_trade(
                 side="BUY",
             ),
         ),
+        match_time="1787673600",
+        last_update="1787673601",
+    )
+
+
+def confirmed_taker_trade(
+    *,
+    order_id: str,
+    asset_id: str,
+    price: str,
+    matched_amount: str = "10",
+    trade_id: str = "trade-taker-1",
+) -> TradeReadPayload:
+    return TradeReadPayload(
+        kind="TRADE_READ",
+        id=trade_id,
+        market="condition-1",
+        asset_id=asset_id,
+        maker_address="0x" + "33" * 20,
+        taker_order_id=order_id,
+        side="BUY",
+        trader_side="TAKER",
+        price=price,
+        size=matched_amount,
+        outcome="YES",
+        status="CONFIRMED",
+        fee_rate_bps="100",
+        bucket_index=0,
+        transaction_hash="0x" + "44" * 32,
+        maker_orders=(),
         match_time="1787673600",
         last_update="1787673601",
     )
@@ -500,6 +535,110 @@ def test_multiple_distinct_maker_trades_for_one_known_order_recover_exact_total(
     assert store.latest_order_state(intent.intent_id).normalized_state is VenueOrderState.FILLED  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize(
+    ("matched_amount", "expected_state"),
+    [("4", VenueOrderState.PARTIALLY_FILLED), ("10", VenueOrderState.FILLED)],
+)
+def test_exact_known_taker_order_recovers_partial_or_full_fill(
+    store: PredictionMarketStore,
+    matched_amount: str,
+    expected_state: VenueOrderState,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_DELAYED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    trade = confirmed_taker_trade(
+        order_id="venue-order-1",
+        asset_id=intent.token_id,
+        price=str(intent.limit_price),
+        matched_amount=matched_amount,
+    )
+    reader = RecordingAccountReader(
+        orders=OrdersReadPayload(kind="ORDERS_READ", items=()),
+        trades=TradesReadPayload(kind="TRADES_READ", items=(trade,)),
+    )
+
+    report = recovering_coordinator(store, reader, FakeSigner(), plan).recover_account(
+        ACCOUNT_FINGERPRINT
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.recovered_intent_ids == (intent.intent_id,)
+    persisted = store.verified_venue_trade_events_for_intent(
+        intent.intent_id,
+        NOW + timedelta(seconds=4),
+    )
+    assert tuple(event.venue_trade_id for event in persisted) == ("trade-taker-1",)
+    assert store.latest_order_state(intent.intent_id).normalized_state is expected_state  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    "conflicting_update",
+    [
+        {"size": "5"},
+        {"taker_order_id": "venue-order-1"},
+    ],
+)
+def test_conflicting_top_level_and_maker_trade_fields_persist_nothing(
+    store: PredictionMarketStore,
+    conflicting_update: dict[str, str],
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_DELAYED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    valid = confirmed_maker_trade(
+        order_id="venue-order-1",
+        asset_id=intent.token_id,
+        price=str(intent.limit_price),
+        matched_amount="4",
+    )
+    conflicting = valid.model_copy(update=conflicting_update)
+    reader = RecordingAccountReader(
+        orders=OrdersReadPayload(kind="ORDERS_READ", items=()),
+        trades=TradesReadPayload(kind="TRADES_READ", items=(conflicting,)),
+    )
+
+    report = recovering_coordinator(store, reader, FakeSigner(), plan).recover_account(
+        ACCOUNT_FINGERPRINT
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert (
+        store.verified_venue_trade_events_for_intent(
+            intent.intent_id,
+            NOW + timedelta(seconds=4),
+        )
+        == ()
+    )
+    assert (
+        store.latest_order_state(intent.intent_id).normalized_state is VenueOrderState.ACK_DELAYED
+    )  # type: ignore[union-attr]
+
+
 def test_ambiguous_duplicate_maker_correlation_stays_blocked_without_guessing(
     store: PredictionMarketStore,
 ) -> None:
@@ -831,6 +970,222 @@ def test_startup_scans_expired_submitting_intent_and_blocks_without_replay_state
     assert reader.calls == list(report.reads)
 
 
+def test_startup_blocks_intent_only_crash_during_sign_without_replay(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+
+    class ProcessCrash(BaseException):
+        pass
+
+    class CrashingSigner(FakeSigner):
+        def sign(self, candidate, evidence):  # type: ignore[no-untyped-def]
+            del candidate, evidence
+            self.sign_calls += 1
+            raise ProcessCrash
+
+    with pytest.raises(ProcessCrash):
+        ExecutionCoordinator(
+            store=store,
+            preflight=FakePreflight(preflight_evidence(plan)),
+            signer=CrashingSigner(),
+            account_reader=RecordingAccountReader(
+                orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+            ),
+            authority=FakeAuthority(),
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            clock=lambda: NOW,
+            test_only_kill_state=KillState(engaged=False, latest_event=None),
+        ).submit_intent(intent)
+    assert store.verified_execution_intent(intent.intent_id) == intent
+    assert store.verified_signed_order_envelope(intent.intent_id) is None
+    assert store.latest_order_state(intent.intent_id) is None
+    reader = RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=()))
+    restart_signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    restart = recovering_coordinator(store, reader, restart_signer, plan)
+
+    report = restart.recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+    assert restart.new_intents_blocked
+    assert restart_signer.sign_calls == restart_signer.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        PostFillDecision.CONTINUE_FROZEN_PLAN,
+        PostFillDecision.FROZEN_UNWIND,
+        PostFillDecision.HALT_EXPOSED,
+        None,
+    ],
+    ids=["continue", "unwind", "halt", "process-crash"],
+)
+def test_startup_conservatively_blocks_every_persisted_first_fill(
+    store: PredictionMarketStore,
+    decision: PostFillDecision | None,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    preflight = FakePreflight(preflight_evidence(plan))
+    if decision is not None:
+        preflight.decision = decision
+    else:
+
+        class ProcessCrash(BaseException):
+            pass
+
+        def crash(*args: object) -> PostFillDecision:
+            del args
+            preflight.revalidate_calls += 1
+            raise ProcessCrash
+
+        preflight.revalidate_after_fill = crash  # type: ignore[method-assign]
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=preflight,
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    if decision is None:
+        with pytest.raises(ProcessCrash):
+            first.apply_order_event(
+                intent,
+                lifecycle_event(
+                    intent,
+                    VenueOrderState.PARTIALLY_FILLED,
+                    received_at=NOW + timedelta(milliseconds=100),
+                ),
+            )
+    else:
+        first.apply_order_event(
+            intent,
+            lifecycle_event(
+                intent,
+                VenueOrderState.PARTIALLY_FILLED,
+                received_at=NOW + timedelta(milliseconds=100),
+            ),
+        )
+    assert preflight.revalidate_calls == 1
+    reader = RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=()))
+    restart_signer = FakeSigner()
+
+    report = recovering_coordinator(
+        store,
+        reader,
+        restart_signer,
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert restart_signer.sign_calls == restart_signer.submit_calls == 0
+    assert preflight.revalidate_calls == 1
+
+
+def test_cancel_ack_is_durable_before_confirmation_and_never_reissued_after_restart(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    first.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCEL_PENDING,
+            received_at=NOW + timedelta(milliseconds=100),
+        ),
+    )
+
+    class ProcessCrash(BaseException):
+        pass
+
+    class CrashingReader(RecordingAccountReader):
+        def read_order(self, venue_order_id: str) -> RestResult:
+            del venue_order_id
+            self.calls.append(RouteKey.READ_ORDER)
+            raise ProcessCrash
+
+    crash_reader = CrashingReader(
+        orders=OrdersReadPayload(
+            kind="ORDERS_READ",
+            items=(
+                order_read(
+                    order_id="venue-order-1",
+                    asset_id=intent.token_id,
+                    price=str(intent.limit_price),
+                    size_matched="0",
+                    status="LIVE",
+                ),
+            ),
+        )
+    )
+    first_cancel = CancellationSigner(cancellation_result())
+    with pytest.raises(ProcessCrash):
+        recovering_coordinator(store, crash_reader, first_cancel, plan).recover_account(
+            ACCOUNT_FINGERPRINT
+        )
+    assert first_cancel.cancel_calls == 1
+    latest = store.latest_order_state(intent.intent_id)
+    assert latest is not None
+    assert latest.normalized_state is VenueOrderState.CANCEL_PENDING
+    assert latest.original_venue_state == RestCode.CANCEL_ACKNOWLEDGED.value
+    assert latest.source_channel == "recovery_cancel_ack"
+    assert latest.lineage_hashes == tuple(sorted((HASHES[11], HASHES[12])))
+
+    confirming = read_result(
+        RouteKey.READ_ORDER,
+        order_read(
+            order_id="venue-order-1",
+            asset_id=intent.token_id,
+            price=str(intent.limit_price),
+            size_matched="0",
+            status="CANCELED",
+        ),
+    )
+    restart_reader = RecordingAccountReader(
+        orders=OrdersReadPayload(kind="ORDERS_READ", items=()),
+        order=confirming,
+    )
+    restart_signer = CancellationSigner(cancellation_result())
+
+    report = recovering_coordinator(
+        store,
+        restart_reader,
+        restart_signer,
+        plan,
+    ).recover_account(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.recovered_intent_ids == (intent.intent_id,)
+    assert restart_signer.cancel_calls == 0
+    assert restart_reader.calls.count(RouteKey.READ_ORDER) == 1
+    assert store.latest_order_state(intent.intent_id).normalized_state is VenueOrderState.CANCELLED  # type: ignore[union-attr]
+
+
 @pytest.mark.parametrize(
     "trade_state",
     [
@@ -913,6 +1268,141 @@ def test_startup_blocks_account_with_incomplete_reconciliation_even_without_inte
     assert report.code is CoordinatorCode.RECOVERY_BLOCKED
     assert report.blocked_intent_ids == ()
     assert report.kill_reason == "RECONCILIATION_INCOMPLETE"
+    assert restart.new_intents_blocked
+
+
+def test_startup_inspects_complete_trade_history_not_only_last_confirmation(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    for trade_id, state, offset in (
+        ("trade-unresolved", VenueTradeState.MATCHED, 100),
+        ("trade-later-confirmed", VenueTradeState.CONFIRMED, 200),
+    ):
+        store.append_venue_trade_event(
+            VenueTradeEvent(
+                schema_version=1,
+                trade_event_id=uuid4(),
+                venue="polymarket",
+                raw_event_hash=HASHES[11] if offset == 100 else HASHES[12],
+                source_channel="user_stream",
+                venue_trade_id=trade_id,
+                venue_order_id="venue-order-1",
+                intent_id=intent.intent_id,
+                original_venue_state=state.value,
+                normalized_state=state,
+                terminal=state is VenueTradeState.CONFIRMED,
+                venue_timestamp=NOW + timedelta(milliseconds=offset),
+                received_at=NOW + timedelta(milliseconds=offset),
+                sequence_number=None,
+                protocol_version=intent.protocol_version,
+            )
+        )
+    restart = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = restart.recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert report.kill_reason == "SETTLEMENT_MATCHED"
+
+
+@pytest.mark.parametrize("coverage", ["none", "newer", "uncovered", "missing"])
+def test_startup_blocks_unreconciled_or_out_of_cutoff_live_ledger_posting(
+    store: PredictionMarketStore,
+    coverage: str,
+) -> None:
+    posting_id = uuid4()
+    posting_time = NOW + timedelta(milliseconds=200 if coverage == "newer" else 100)
+    if coverage != "missing":
+        store.append_live_ledger_posting(
+            LiveLedgerPosting(
+                schema_version=1,
+                posting_id=posting_id,
+                account_fingerprint=ACCOUNT_FINGERPRINT,
+                intent_id=None,
+                venue_order_id=None,
+                venue_trade_id=None,
+                settlement_hash=None,
+                fee_hash=None,
+                balance_evidence_hashes=(HASHES[9],),
+                debit_account="cash",
+                credit_account="position",
+                asset_id="217426",
+                debit_amount=Decimal("1"),
+                credit_amount=Decimal("0"),
+                occurred_at=posting_time,
+            )
+        )
+    if coverage != "none":
+        store.append_live_reconciliation(
+            LiveReconciliation(
+                schema_version=1,
+                reconciliation_id=uuid4(),
+                account_fingerprint=ACCOUNT_FINGERPRINT,
+                observed_at=NOW + timedelta(milliseconds=150),
+                complete=True,
+                differences=(),
+                evidence_hashes=(HASHES[10],),
+                next_action=None,
+                expected_posting_ids=(posting_id,) if coverage in {"newer", "missing"} else (),
+            )
+        )
+    plan = execution_plan()
+    restart = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = restart.recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == ()
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+    assert restart.new_intents_blocked
+
+
+def test_startup_treats_plan_linked_wrong_account_intent_as_corruption(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    mismatched = execution_intent(plan, account_fingerprint="9" * 64)
+    with store.transaction() as transaction:
+        transaction.append_live_execution_plan(plan)
+        transaction.append_execution_intent(mismatched)
+    restart = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = restart.recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == ()
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
     assert restart.new_intents_blocked
 
 

@@ -6,10 +6,13 @@ authenticated header, raw venue frame, arbitrary request, or transport implement
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from hashlib import sha256
+from itertools import pairwise
+from threading import Lock
 from types import MappingProxyType
 from typing import Literal, Protocol, Self
 from uuid import UUID, uuid5
@@ -432,6 +435,7 @@ class ExecutionCoordinator:
     __slots__ = (
         "_account_fingerprint",
         "_account_reader",
+        "_active_submission_claims",
         "_authority",
         "_clock",
         "_initialized",
@@ -441,6 +445,8 @@ class ExecutionCoordinator:
         "_recovering",
         "_signer",
         "_store",
+        "_submission_claim_lock",
+        "_submission_claims",
         "_test_only_kill_state",
     )
 
@@ -481,6 +487,9 @@ class ExecutionCoordinator:
         object.__setattr__(self, "_clock", clock)
         object.__setattr__(self, "_test_only_kill_state", test_only_kill_state)
         object.__setattr__(self, "_prepared", MappingProxyType({}))
+        object.__setattr__(self, "_submission_claim_lock", Lock())
+        object.__setattr__(self, "_submission_claims", set())
+        object.__setattr__(self, "_active_submission_claims", set())
         object.__setattr__(self, "_recovering", False)
         object.__setattr__(self, "_last_received_at", None)
 
@@ -678,6 +687,7 @@ class ExecutionCoordinator:
         plan = evidence.plan
         if (
             intent.account_fingerprint != self._account_fingerprint
+            or plan.venue != intent.venue
             or plan.plan_id != intent.plan_id
             or plan.account_fingerprint != intent.account_fingerprint
             or plan.capability_fingerprint != intent.capability_fingerprint
@@ -695,6 +705,17 @@ class ExecutionCoordinator:
             or evidence.activation_evidence.manifest_digest != plan.manifest_hash
             or evidence.activation_evidence.verifier_result is not True
             or evidence.signer_healthy is not True
+            or evidence.evidence_hashes
+            != tuple(
+                sorted(
+                    {
+                        evidence.account_evidence_hash,
+                        evidence.balance_evidence_hash,
+                        evidence.allowance_evidence_hash,
+                        evidence.geoblock_evidence_hash,
+                    }
+                )
+            )
         ):
             return CoordinatorCode.PREFLIGHT_IDENTITY_MISMATCH
         if (
@@ -730,9 +751,76 @@ class ExecutionCoordinator:
             evidence.protocol_deadline,
             evidence.capability_deadline,
         )
-        if any(deadline <= now for deadline in deadlines):
+        if (
+            not intent.created_at <= now < intent.deadline
+            or plan.observed_at > now
+            or plan.information_cutoff > now
+            or evidence.activation_evidence.verified_at > now
+            or any(deadline <= now for deadline in deadlines)
+        ):
             return CoordinatorCode.PREFLIGHT_EVIDENCE_STALE
         return None
+
+    @staticmethod
+    def _canonical_evidence(evidence: object) -> tuple[bytes, Sha256] | None:
+        if type(evidence) is not PreflightEvidence:
+            return None
+        try:
+            validated = PreflightEvidence.model_validate(
+                evidence.model_dump(mode="python"),
+                strict=True,
+            )
+            payload = validated.model_dump_json().encode("utf-8")
+            replay = PreflightEvidence.model_validate_json(payload, strict=True)
+        except Exception:
+            return None
+        if replay != validated:
+            return None
+        return payload, sha256(payload).hexdigest()
+
+    def _prepared_evidence(self, intent_id: UUID) -> PreflightEvidence | None:
+        snapshot = self._prepared.get(intent_id)
+        if (
+            type(snapshot) is not tuple
+            or len(snapshot) != 2
+            or type(snapshot[0]) is not bytes
+            or type(snapshot[1]) is not str
+            or sha256(snapshot[0]).hexdigest() != snapshot[1]
+        ):
+            return None
+        try:
+            return PreflightEvidence.model_validate_json(snapshot[0], strict=True)
+        except Exception:
+            return None
+
+    def _fresh_mutation_evidence(
+        self,
+        intent: ExecutionIntent,
+        operation: ExecutionOperation,
+    ) -> tuple[PreflightEvidence | None, datetime, CoordinatorCode | None]:
+        now = self._now()
+        if self._killed(now):
+            return None, now, CoordinatorCode.EXECUTION_KILL_ENGAGED
+        evidence = self._prepared_evidence(intent.intent_id)
+        if evidence is None:
+            return None, now, CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID
+        evidence_code = self._evidence_code(intent, evidence, now)
+        if evidence_code is not None:
+            return None, now, evidence_code
+        if not self._authority_allowed(intent, evidence, operation, now):
+            return None, now, CoordinatorCode.AUTHORITY_DENIED
+
+        # Treat the authority callback as hostile: sample and reconstruct again after it returns.
+        now = self._now()
+        if self._killed(now):
+            return None, now, CoordinatorCode.EXECUTION_KILL_ENGAGED
+        evidence = self._prepared_evidence(intent.intent_id)
+        if evidence is None:
+            return None, now, CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID
+        evidence_code = self._evidence_code(intent, evidence, now)
+        if evidence_code is not None:
+            return None, now, evidence_code
+        return evidence, now, None
 
     def prepare(self, intent: ExecutionIntent) -> PreparationResult:
         """Validate all preflight evidence and durably persist plan plus intent."""
@@ -743,7 +831,9 @@ class ExecutionCoordinator:
         if self._killed(now):
             return self._result(CoordinatorCode.EXECUTION_KILL_ENGAGED, intent)
         if intent.intent_id in self._prepared:
-            evidence = self._prepared[intent.intent_id]
+            evidence = self._prepared_evidence(intent.intent_id)
+            if evidence is None:
+                return self._result(CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID, intent)
             return self._result(
                 CoordinatorCode.PREPARED,
                 intent,
@@ -771,9 +861,10 @@ class ExecutionCoordinator:
                 refusal_code=outcome.code,
                 evidence_hashes=outcome.evidence_hashes,
             )
-        if type(outcome) is not PreflightEvidence:
+        snapshot = self._canonical_evidence(outcome)
+        if snapshot is None:
             return self._result(CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID, intent)
-        evidence = outcome
+        evidence = PreflightEvidence.model_validate_json(snapshot[0], strict=True)
         evidence_code = self._evidence_code(intent, evidence, now)
         if evidence_code is not None:
             return self._result(
@@ -789,6 +880,15 @@ class ExecutionCoordinator:
             now,
         ):
             return self._result(CoordinatorCode.AUTHORITY_DENIED, intent)
+        evidence = PreflightEvidence.model_validate_json(snapshot[0], strict=True)
+        evidence_code = self._evidence_code(intent, evidence, self._now())
+        if evidence_code is not None:
+            return self._result(
+                evidence_code,
+                intent,
+                plan_id=evidence.plan.plan_id,
+                evidence_hashes=evidence.evidence_hashes,
+            )
         try:
             with self._store.transaction() as transaction:
                 transaction.append_live_execution_plan(evidence.plan)
@@ -803,7 +903,7 @@ class ExecutionCoordinator:
         object.__setattr__(
             self,
             "_prepared",
-            MappingProxyType({**self._prepared, intent.intent_id: evidence}),
+            MappingProxyType({**self._prepared, intent.intent_id: snapshot}),
         )
         return self._result(
             CoordinatorCode.PREPARED,
@@ -962,6 +1062,11 @@ class ExecutionCoordinator:
             )
         except Exception:
             event = None
+        first_fill_claimed = (
+            event is not None
+            and event.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
+            and self._store.claim_execution_first_fill(intent.intent_id)
+        )
         try:
             history = self._store.verified_venue_order_events_for_intent(
                 intent.intent_id,
@@ -1031,17 +1136,22 @@ class ExecutionCoordinator:
             lineage_hashes=tuple(sorted(set((*event.lineage_hashes, event.raw_event_hash)))),
         )
         self._store.append_venue_order_event(correlated)
-        first_fill = correlated.normalized_state in {
-            VenueOrderState.PARTIALLY_FILLED,
-            VenueOrderState.FILLED,
-        } and not any(
-            prior.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
-            for prior in history
+        first_fill = (
+            correlated.normalized_state
+            in {
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+            }
+            and first_fill_claimed
+            and not any(
+                prior.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
+                for prior in history
+            )
         )
         decision = None
         kill_reason = None
         if first_fill:
-            evidence = self._prepared.get(intent.intent_id)
+            evidence = self._prepared_evidence(intent.intent_id)
             invalid_decision = evidence is None
             outcome: object = None
             if evidence is not None:
@@ -1078,18 +1188,24 @@ class ExecutionCoordinator:
         account_fingerprint: Sha256,
         as_of: datetime,
     ) -> tuple[ExecutionIntent, ...]:
-        intents = {
-            intent.intent_id: intent
-            for plan in self._store.verified_live_execution_plans_for_account(
-                account_fingerprint,
-                as_of,
-            )
+        intents: dict[UUID, ExecutionIntent] = {}
+        for plan in self._store.verified_live_execution_plans_for_account(
+            account_fingerprint,
+            as_of,
+        ):
             for intent in self._store.verified_execution_intent_history_for_plan(
                 plan.plan_id,
                 as_of,
-            )
-            if intent.account_fingerprint == account_fingerprint
-        }
+            ):
+                if (
+                    intent.plan_id != plan.plan_id
+                    or intent.account_fingerprint != account_fingerprint
+                    or intent.account_fingerprint != plan.account_fingerprint
+                    or intent.venue != plan.venue
+                    or intent.capability_fingerprint != plan.capability_fingerprint
+                ):
+                    raise ConflictingRecordError("plan-linked intent identity mismatch")
+                intents[intent.intent_id] = intent
         return tuple(
             sorted(
                 intents.values(),
@@ -1112,12 +1228,18 @@ class ExecutionCoordinator:
             or self._evidence_code(intent, outcome, now) is not None
         ):
             return None
+        snapshot = self._canonical_evidence(outcome)
+        if snapshot is None:
+            return None
+        evidence = PreflightEvidence.model_validate_json(snapshot[0], strict=True)
+        if self._evidence_code(intent, evidence, now) is not None:
+            return None
         object.__setattr__(
             self,
             "_prepared",
-            MappingProxyType({**self._prepared, intent.intent_id: outcome}),
+            MappingProxyType({**self._prepared, intent.intent_id: snapshot}),
         )
-        return outcome
+        return evidence
 
     @staticmethod
     def _order_read_fill_state(
@@ -1198,41 +1320,101 @@ class ExecutionCoordinator:
         evidence_hash: Sha256,
         now: datetime,
     ) -> bool:
+        try:
+            envelope = self._store.verified_signed_order_envelope(intent.intent_id)
+        except ConflictingRecordError:
+            return False
+        if (
+            envelope is None
+            or envelope.intent_id != intent.intent_id
+            or envelope.intent_fingerprint != intent.intent_fingerprint
+            or envelope.protocol_version != intent.protocol_version
+        ):
+            return False
+        try:
+            public_order = json.loads(envelope.canonical_order_json)
+            signer_address = public_order["signer"]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            return False
+        if (
+            type(signer_address) is not str
+            or public_order.get("maker") != signer_address
+            or public_order.get("tokenId") != intent.token_id
+            or public_order.get("side") != intent.side.upper()
+        ):
+            return False
+
+        items = payload.items
+        try:
+            item_order = tuple((int(item.last_update), item.id) for item in items)
+        except ValueError:
+            return False
+        if item_order != tuple(sorted(item_order)) or len({item.id for item in items}) != len(
+            items
+        ):
+            return False
+
         correlations = []
         seen_trade_ids: set[str] = set()
         total_matched = Decimal("0")
-        for trade in sorted(payload.items, key=lambda item: item.id):
+        for trade in items:
             matching_maker_orders = tuple(
                 maker_order
                 for maker_order in trade.maker_orders
                 if maker_order.order_id == venue_order_id
             )
-            if not matching_maker_orders:
+            taker_match = trade.trader_side == "TAKER" and trade.taker_order_id == venue_order_id
+            maker_match = trade.trader_side == "MAKER" and bool(matching_maker_orders)
+            if not taker_match and not maker_match:
                 continue
-            if (
-                len(matching_maker_orders) != 1
-                or trade.id in seen_trade_ids
-                or trade.trader_side != "MAKER"
-                or trade.status != VenueTradeState.CONFIRMED.value
-                or trade.asset_id != intent.token_id
-            ):
+            if trade.id in seen_trade_ids or taker_match == maker_match:
                 return False
-            maker_order = matching_maker_orders[0]
             try:
-                matched = Decimal(maker_order.matched_amount)
-                price = Decimal(maker_order.price)
-                fee_rate_bps = int(maker_order.fee_rate_bps)
+                matched = Decimal(trade.size)
+                price = Decimal(trade.price)
+                fee_rate_bps = int(trade.fee_rate_bps)
+                match_time = int(trade.match_time)
+                last_update = int(trade.last_update)
             except (InvalidOperation, ValueError):
                 return False
             if (
-                maker_order.asset_id != intent.token_id
-                or maker_order.side != intent.side.upper()
-                or maker_order.maker_address != trade.maker_address
+                trade.status != VenueTradeState.CONFIRMED.value
+                or trade.transaction_hash is None
+                or trade.asset_id != intent.token_id
+                or trade.side != intent.side.upper()
                 or price != intent.limit_price
                 or fee_rate_bps > intent.fee_rate_bps_cap
                 or matched <= 0
                 or intent.base_size is None
+                or match_time > last_update
             ):
+                return False
+            if maker_match:
+                if len(matching_maker_orders) != 1:
+                    return False
+                maker_order = matching_maker_orders[0]
+                try:
+                    maker_matched = Decimal(maker_order.matched_amount)
+                    maker_price = Decimal(maker_order.price)
+                    maker_fee_rate_bps = int(maker_order.fee_rate_bps)
+                except (InvalidOperation, ValueError):
+                    return False
+                if (
+                    trade.taker_order_id == venue_order_id
+                    or maker_order.asset_id != intent.token_id
+                    or maker_order.side != intent.side.upper()
+                    or maker_order.maker_address.casefold() != signer_address.casefold()
+                    or trade.maker_address.casefold() != signer_address.casefold()
+                    or maker_order.maker_address.casefold() != trade.maker_address.casefold()
+                    or maker_price != intent.limit_price
+                    or maker_price != price
+                    or maker_fee_rate_bps != fee_rate_bps
+                    or maker_fee_rate_bps > intent.fee_rate_bps_cap
+                    or maker_matched != matched
+                    or maker_order.outcome != trade.outcome
+                ):
+                    return False
+            elif matching_maker_orders:
                 return False
             seen_trade_ids.add(trade.id)
             total_matched += matched
@@ -1289,43 +1471,134 @@ class ExecutionCoordinator:
         now: datetime,
     ) -> tuple[bool, bool, str | None]:
         try:
-            envelope = self._store.verified_signed_order_envelope(intent.intent_id)
+            history = self._store.verified_venue_order_events_for_intent(
+                intent.intent_id,
+                datetime.max.replace(tzinfo=UTC),
+            )
         except ConflictingRecordError:
-            return False, False, CoordinatorCode.ENVELOPE_COLLISION.value
-        evidence = self._recovery_evidence(intent, now)
-        if envelope is None or evidence is None:
-            return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
-        if not self._authority_allowed(
-            intent,
-            evidence,
-            ExecutionOperation.CANCEL_ORDER,
-            now,
+            return False, False, CoordinatorCode.ORDER_EVENT_CONTRADICTION.value
+        acknowledgements = tuple(
+            event
+            for event in history
+            if event.original_venue_state == RestCode.CANCEL_ACKNOWLEDGED.value
+        )
+        acknowledgement = acknowledgements[0] if len(acknowledgements) == 1 else None
+        if acknowledgements and (
+            acknowledgement is None
+            or acknowledgement.venue != intent.venue
+            or acknowledgement.intent_id != intent.intent_id
+            or acknowledgement.venue_order_id != venue_order_id
+            or acknowledgement.normalized_state is not VenueOrderState.CANCEL_PENDING
+            or acknowledgement.terminal
+            or acknowledgement.protocol_version != intent.protocol_version
+            or acknowledgement.source_channel != "recovery_cancel_ack"
+            or acknowledgement.raw_event_hash not in acknowledgement.lineage_hashes
         ):
-            return False, False, CoordinatorCode.AUTHORITY_DENIED.value
-        outcome: object = None
-        try:
-            outcome = self._signer.cancel(
+            return False, False, CoordinatorCode.ORDER_EVENT_CONTRADICTION.value
+
+        if acknowledgement is None:
+            try:
+                envelope = self._store.verified_signed_order_envelope(intent.intent_id)
+            except ConflictingRecordError:
+                return False, False, CoordinatorCode.ENVELOPE_COLLISION.value
+            evidence = self._recovery_evidence(intent, self._now())
+            if envelope is None or evidence is None:
+                return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
+            authority_now = self._now()
+            if self._evidence_code(
+                intent, evidence, authority_now
+            ) is not None or not self._authority_allowed(
                 intent,
-                envelope,
-                venue_order_id,
                 evidence,
+                ExecutionOperation.CANCEL_ORDER,
+                authority_now,
+            ):
+                return False, False, CoordinatorCode.AUTHORITY_DENIED.value
+            # Reconstruct and revalidate after the injected authority callback.
+            authority_now = self._now()
+            evidence = self._prepared_evidence(intent.intent_id)
+            if evidence is None or self._evidence_code(intent, evidence, authority_now) is not None:
+                return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
+            outcome: object = None
+            try:
+                outcome = self._signer.cancel(
+                    intent,
+                    envelope,
+                    venue_order_id,
+                    evidence,
+                )
+            except Exception:
+                return False, False, RestCode.CANCEL_OUTCOME_UNKNOWN.value
+            outcome_now = self._now()
+            if type(outcome) is RestResult:
+                try:
+                    outcome = RestResult.model_validate(
+                        outcome.model_dump(mode="python"),
+                        strict=True,
+                    )
+                except Exception:
+                    outcome = None
+            if (
+                type(outcome) is not RestResult
+                or outcome.route is not RouteKey.CANCEL_ORDER
+                or outcome.code is not RestCode.CANCEL_ACKNOWLEDGED
+                or type(outcome.payload) is not CancellationPayload
+                or outcome.payload.order_id != venue_order_id
+                or outcome.payload.confirmation_required is not True
+                or outcome.observed_at > outcome_now
+                or (outcome.raw_body_hash is None and outcome.request_body_hash is None)
+            ):
+                reason = (
+                    outcome.code.value
+                    if type(outcome) is RestResult and outcome.route is RouteKey.CANCEL_ORDER
+                    else RestCode.CANCEL_OUTCOME_UNKNOWN.value
+                )
+                return False, False, reason
+            lineage_hashes = tuple(
+                sorted(
+                    {
+                        value
+                        for value in (outcome.raw_body_hash, outcome.request_body_hash)
+                        if value is not None
+                    }
+                )
             )
-        except Exception:
-            return False, False, RestCode.CANCEL_OUTCOME_UNKNOWN.value
-        if (
-            type(outcome) is not RestResult
-            or outcome.route is not RouteKey.CANCEL_ORDER
-            or outcome.code is not RestCode.CANCEL_ACKNOWLEDGED
-            or type(outcome.payload) is not CancellationPayload
-            or outcome.payload.order_id != venue_order_id
-            or outcome.payload.confirmation_required is not True
-        ):
-            reason = (
-                outcome.code.value
-                if type(outcome) is RestResult and outcome.route is RouteKey.CANCEL_ORDER
-                else RestCode.CANCEL_OUTCOME_UNKNOWN.value
+            received_at = self._received_at(outcome_now)
+            acknowledgement = VenueOrderEvent(
+                schema_version=1,
+                event_id=uuid5(
+                    _COORDINATOR_NAMESPACE,
+                    "|".join(
+                        (
+                            "cancel-ack",
+                            str(intent.intent_id),
+                            venue_order_id,
+                            *lineage_hashes,
+                        )
+                    ),
+                ),
+                venue=intent.venue,
+                raw_event_hash=outcome.raw_body_hash or outcome.request_body_hash,
+                source_channel="recovery_cancel_ack",
+                venue_order_id=venue_order_id,
+                intent_id=intent.intent_id,
+                original_venue_state=RestCode.CANCEL_ACKNOWLEDGED.value,
+                normalized_state=VenueOrderState.CANCEL_PENDING,
+                terminal=False,
+                venue_timestamp=None,
+                received_at=received_at,
+                sequence_number=None,
+                protocol_version=intent.protocol_version,
+                lineage_hashes=lineage_hashes,
             )
-            return False, False, reason
+            try:
+                self._store.append_venue_order_event(acknowledgement)
+            except ConflictingRecordError:
+                return False, False, CoordinatorCode.ORDER_EVENT_CONTRADICTION.value
+
+        previous_received_at = self._last_received_at
+        if previous_received_at is None or previous_received_at < acknowledgement.received_at:
+            object.__setattr__(self, "_last_received_at", acknowledgement.received_at)
         confirmation: object = None
         try:
             confirmation = self._account_reader.read_order(venue_order_id)
@@ -1362,17 +1635,7 @@ class ExecutionCoordinator:
             raw_event_hash=confirmation.raw_body_hash,
             now=now,
             lineage_hashes=tuple(
-                sorted(
-                    {
-                        value
-                        for value in (
-                            outcome.raw_body_hash,
-                            outcome.request_body_hash,
-                            confirmation.raw_body_hash,
-                        )
-                        if value is not None
-                    }
-                )
+                sorted({*acknowledgement.lineage_hashes, confirmation.raw_body_hash})
             ),
         )
         return (
@@ -1519,15 +1782,50 @@ class ExecutionCoordinator:
             except ConflictingRecordError:
                 forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                 continue
-            if trade_history and trade_history[-1].normalized_state in {
-                VenueTradeState.MATCHED_NOT_BROADCASTED,
-                VenueTradeState.MATCHED,
-                VenueTradeState.MINED,
-                VenueTradeState.RETRYING,
-                VenueTradeState.FAILED,
-            }:
+            if startup:
+                try:
+                    order_history = self._store.verified_venue_order_events_for_intent(
+                        intent.intent_id,
+                        now,
+                    )
+                except ConflictingRecordError:
+                    forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
+                    continue
+                if not order_history or order_history[-1].normalized_state in {
+                    VenueOrderState.PARTIALLY_FILLED,
+                    VenueOrderState.FILLED,
+                }:
+                    forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
+                    continue
+            unresolved_trade = next(
+                (
+                    event
+                    for event in trade_history
+                    if event.normalized_state
+                    in {
+                        VenueTradeState.MATCHED_NOT_BROADCASTED,
+                        VenueTradeState.MATCHED,
+                        VenueTradeState.MINED,
+                        VenueTradeState.RETRYING,
+                        VenueTradeState.FAILED,
+                    }
+                ),
+                None,
+            )
+            trade_identities = [event.venue_trade_id for event in trade_history]
+            trade_sequences = [
+                event.sequence_number
+                for event in trade_history
+                if event.sequence_number is not None
+            ]
+            trade_contradiction = len(trade_identities) != len(set(trade_identities)) or any(
+                current <= previous for previous, current in pairwise(trade_sequences)
+            )
+            if trade_contradiction:
+                forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
+            elif unresolved_trade is not None:
                 forced_reasons[intent.intent_id] = (
-                    f"SETTLEMENT_{trade_history[-1].normalized_state.value}"
+                    f"SETTLEMENT_{unresolved_trade.normalized_state.value}"
                 )
             elif uncertainty_reason is not None:
                 try:
@@ -1547,11 +1845,32 @@ class ExecutionCoordinator:
                     account_fingerprint,
                     now,
                 )
+                postings = self._store.verified_live_ledger_postings_for_account(
+                    account_fingerprint,
+                    now,
+                )
             except Exception:
                 reconciliations = ()
+                postings = ()
                 account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
             if reconciliations and not reconciliations[-1].complete:
                 account_block_reason = "RECONCILIATION_INCOMPLETE"
+                for intent in intents:
+                    forced_reasons.setdefault(intent.intent_id, account_block_reason)
+            complete_reconciliations = tuple(
+                reconciliation for reconciliation in reconciliations if reconciliation.complete
+            )
+            latest_complete = complete_reconciliations[-1] if complete_reconciliations else None
+            posting_ids = {posting.posting_id for posting in postings}
+            reconciliation_references_postings = bool(
+                latest_complete is not None and latest_complete.expected_posting_ids
+            )
+            if (postings or reconciliation_references_postings) and (
+                latest_complete is None
+                or any(posting.occurred_at > latest_complete.observed_at for posting in postings)
+                or set(latest_complete.expected_posting_ids) != posting_ids
+            ):
+                account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
                 for intent in intents:
                     forced_reasons.setdefault(intent.intent_id, account_block_reason)
         if forced_reasons:
@@ -1769,7 +2088,41 @@ class ExecutionCoordinator:
         )
 
     def submit_intent(self, intent: ExecutionIntent) -> SubmissionResult:
-        """Sign once and submit once, with both durable boundaries committed first."""
+        """Claim permanently, then sign and submit at most once for this coordinator."""
+
+        with self._submission_claim_lock:
+            already_claimed = intent.intent_id in self._submission_claims
+            active = intent.intent_id in self._active_submission_claims
+            if not already_claimed:
+                self._submission_claims.add(intent.intent_id)
+                self._active_submission_claims.add(intent.intent_id)
+        if already_claimed:
+            if active:
+                return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, intent)
+            now = self._now()
+            kill_reason = self._engage_kill(
+                trigger=CoordinatorCode.DUPLICATE_INTENT.value,
+                intent=intent,
+                venue_order_id=None,
+                now=now,
+            )
+            return self._submission_result(
+                CoordinatorCode.DUPLICATE_INTENT,
+                intent,
+                kill_reason=kill_reason,
+            )
+        if not self._store.claim_execution_intent_submission(intent.intent_id):
+            with self._submission_claim_lock:
+                self._active_submission_claims.discard(intent.intent_id)
+            return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, intent)
+        try:
+            return self._submit_claimed_intent(intent)
+        finally:
+            with self._submission_claim_lock:
+                self._active_submission_claims.discard(intent.intent_id)
+
+    def _submit_claimed_intent(self, intent: ExecutionIntent) -> SubmissionResult:
+        """Execute one already-claimed append-only submission lifecycle."""
 
         now = self._now()
         try:
@@ -1798,7 +2151,7 @@ class ExecutionCoordinator:
                 intent,
                 kill_reason=kill_reason,
             )
-        evidence = self._prepared.get(intent.intent_id)
+        evidence = self._prepared_evidence(intent.intent_id)
         if evidence is None:
             prepared = self.prepare(intent)
             if prepared.code is not CoordinatorCode.PREPARED:
@@ -1818,7 +2171,12 @@ class ExecutionCoordinator:
                     intent,
                     kill_reason=kill_reason,
                 )
-            evidence = self._prepared[intent.intent_id]
+            evidence = self._prepared_evidence(intent.intent_id)
+            if evidence is None:
+                return self._submission_result(
+                    CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID,
+                    intent,
+                )
         try:
             persisted_envelope = self._store.verified_signed_order_envelope(intent.intent_id)
         except ConflictingRecordError:
@@ -1835,6 +2193,24 @@ class ExecutionCoordinator:
             )
             return self._submission_result(
                 CoordinatorCode.ENVELOPE_COLLISION,
+                intent,
+                kill_reason=kill_reason,
+            )
+        evidence, now, boundary_code = self._fresh_mutation_evidence(
+            intent,
+            ExecutionOperation.SIGN_ORDER,
+        )
+        if boundary_code is not None or evidence is None:
+            kill_reason = None
+            if boundary_code is CoordinatorCode.AUTHORITY_DENIED:
+                kill_reason = self._engage_kill(
+                    trigger=CoordinatorCode.AUTHORITY_DENIED.value,
+                    intent=intent,
+                    venue_order_id=None,
+                    now=now,
+                )
+            return self._submission_result(
+                boundary_code or CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID,
                 intent,
                 kill_reason=kill_reason,
             )
@@ -1871,23 +2247,7 @@ class ExecutionCoordinator:
                 trigger="ORDER_ENVELOPE_MISMATCH",
                 now=now,
             )
-        if not self._authority_allowed(
-            intent,
-            evidence,
-            ExecutionOperation.SUBMIT_ORDER,
-            now,
-        ):
-            kill_reason = self._engage_kill(
-                trigger=CoordinatorCode.AUTHORITY_DENIED.value,
-                intent=intent,
-                venue_order_id=None,
-                now=now,
-            )
-            return self._submission_result(
-                CoordinatorCode.AUTHORITY_DENIED,
-                intent,
-                kill_reason=kill_reason,
-            )
+        now = self._now()
         submitting = self._order_event(
             intent,
             state=VenueOrderState.SUBMITTING,
@@ -1900,8 +2260,10 @@ class ExecutionCoordinator:
         )
         try:
             with self._store.transaction() as transaction:
-                transaction.append_signed_order_envelope(envelope)
-                transaction.append_venue_order_event(submitting)
+                envelope_appended = transaction.append_signed_order_envelope(envelope)
+                event_appended = transaction.append_venue_order_event(submitting)
+                if not envelope_appended or not event_appended:
+                    raise ConflictingRecordError("submission boundary already exists")
         except ConflictingRecordError:
             kill_reason = self._engage_kill(
                 trigger=CoordinatorCode.ENVELOPE_COLLISION.value,
@@ -1914,16 +2276,45 @@ class ExecutionCoordinator:
                 intent,
                 kill_reason=kill_reason,
             )
+        evidence, now, boundary_code = self._fresh_mutation_evidence(
+            intent,
+            ExecutionOperation.SUBMIT_ORDER,
+        )
+        if boundary_code is not None or evidence is None:
+            kill_reason = None
+            if boundary_code is CoordinatorCode.AUTHORITY_DENIED:
+                kill_reason = self._engage_kill(
+                    trigger=CoordinatorCode.AUTHORITY_DENIED.value,
+                    intent=intent,
+                    venue_order_id=None,
+                    now=now,
+                )
+            return self._submission_result(
+                boundary_code or CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID,
+                intent,
+                event=submitting,
+                kill_reason=kill_reason,
+            )
         transport_failed = False
         result: object = None
         try:
             result = self._signer.submit(intent, envelope, evidence)
         except Exception:
             transport_failed = True
+        now = self._now()
+        if type(result) is RestResult:
+            try:
+                result = RestResult.model_validate(
+                    result.model_dump(mode="python"),
+                    strict=True,
+                )
+            except Exception:
+                result = None
         if (
             transport_failed
             or type(result) is not RestResult
             or (type(result) is RestResult and result.route is not RouteKey.SUBMIT_ORDER)
+            or (type(result) is RestResult and result.observed_at > now)
         ):
             return self._unknown_after_port_failure(
                 intent,

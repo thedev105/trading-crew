@@ -4,6 +4,7 @@ import copy
 import pickle
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier, Lock, Thread
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,6 +28,7 @@ from polytrading.predictions.execution.models import (
     ExecutionIntent,
     ExecutionOperation,
     ImmediateOrderType,
+    KillSwitchEvent,
     LiveExecutionPlan,
     SignedOrderEnvelope,
     VenueOrderEvent,
@@ -83,18 +85,17 @@ def execution_intent(
     **overrides: object,
 ) -> ExecutionIntent:
     plan = execution_plan() if plan is None else plan
-    return ExecutionIntent(
-        **execution_intent_fields(
-            plan_id=plan.plan_id,
-            token_id=plan.token_ids[0],
-            order_type=plan.leg_order_types[0],
-            limit_price=plan.limit_prices[0],
-            fee_rate_bps_cap=plan.fee_rate_bps_caps[0],
-            account_fingerprint=plan.account_fingerprint,
-            capability_fingerprint=plan.capability_fingerprint,
-            **overrides,
-        )
-    )
+    fields: dict[str, object] = {
+        "plan_id": plan.plan_id,
+        "token_id": plan.token_ids[0],
+        "order_type": plan.leg_order_types[0],
+        "limit_price": plan.limit_prices[0],
+        "fee_rate_bps_cap": plan.fee_rate_bps_caps[0],
+        "account_fingerprint": plan.account_fingerprint,
+        "capability_fingerprint": plan.capability_fingerprint,
+    }
+    fields.update(overrides)
+    return ExecutionIntent(**execution_intent_fields(**fields))
 
 
 def activation_evidence() -> ActivationEvidence:
@@ -266,16 +267,40 @@ def coordinator(
     store: PredictionMarketStore,
     preflight: FakePreflight,
     signer: FakeSigner | None = None,
+    *,
+    authority: CoordinatorAuthorityPort | None = None,
+    clock: object | None = None,
 ) -> ExecutionCoordinator:
     return ExecutionCoordinator(
         store=store,
         preflight=preflight,
         signer=FakeSigner() if signer is None else signer,
         account_reader=FakeAccountReader(),
-        authority=FakeAuthority(),
+        authority=FakeAuthority() if authority is None else authority,
         account_fingerprint=ACCOUNT_FINGERPRINT,
-        clock=lambda: NOW,
+        clock=(lambda: NOW) if clock is None else clock,
         test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+
+
+def engage_durable_kill(
+    store: PredictionMarketStore,
+    intent: ExecutionIntent,
+    *,
+    occurred_at: datetime = NOW,
+) -> None:
+    store.append_kill_switch_event(
+        KillSwitchEvent(
+            schema_version=1,
+            kill_event_id=uuid4(),
+            trigger=CoordinatorCode.RECOVERY_BLOCKED.value,
+            scope=ACCOUNT_FINGERPRINT,
+            source_intent_id=intent.intent_id,
+            source_order_id=None,
+            prior_state=False,
+            occurred_at=occurred_at,
+            clearance_evidence_hashes=(),
+        )
     )
 
 
@@ -353,6 +378,366 @@ def lifecycle_event(
         sequence_number=sequence_number,
         protocol_version=intent.protocol_version,
     )
+
+
+def test_simultaneous_submission_has_one_permanent_claim_and_one_mutation(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executor = coordinator(store, FakePreflight(preflight_evidence(plan)), signer)
+    start = Barrier(3)
+    results: list[SubmissionResult] = []
+    failures: list[BaseException] = []
+    result_lock = Lock()
+
+    def submit() -> None:
+        start.wait()
+        try:
+            result = executor.submit_intent(intent)
+            with result_lock:
+                results.append(result)
+        except BaseException as error:
+            with result_lock:
+                failures.append(error)
+
+    threads = (Thread(target=submit), Thread(target=submit))
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert sorted(result.code for result in results) == [
+        CoordinatorCode.DUPLICATE_INTENT,
+        CoordinatorCode.SUBMITTED,
+    ]
+    assert signer.sign_calls == signer.submit_calls == 1
+    assert tuple(
+        event.normalized_state
+        for event in store.verified_venue_order_events_for_intent(
+            intent.intent_id,
+            NOW + timedelta(seconds=1),
+        )
+    ) == (VenueOrderState.SUBMITTING, VenueOrderState.ACK_MATCHED)
+
+
+def test_separate_coordinators_on_one_store_share_the_permanent_claim(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executors = (
+        coordinator(store, FakePreflight(preflight_evidence(plan)), signer),
+        coordinator(store, FakePreflight(preflight_evidence(plan)), signer),
+    )
+    start = Barrier(3)
+    results: list[SubmissionResult] = []
+    failures: list[BaseException] = []
+    result_lock = Lock()
+
+    def submit(executor: ExecutionCoordinator) -> None:
+        start.wait()
+        try:
+            result = executor.submit_intent(intent)
+            with result_lock:
+                results.append(result)
+        except BaseException as error:
+            with result_lock:
+                failures.append(error)
+
+    threads = tuple(Thread(target=submit, args=(executor,)) for executor in executors)
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert sorted(result.code for result in results) == [
+        CoordinatorCode.DUPLICATE_INTENT,
+        CoordinatorCode.SUBMITTED,
+    ]
+    assert signer.sign_calls == signer.submit_calls == 1
+    assert tuple(
+        event.normalized_state
+        for event in store.verified_venue_order_events_for_intent(
+            intent.intent_id,
+            NOW + timedelta(seconds=1),
+        )
+    ) == (VenueOrderState.SUBMITTING, VenueOrderState.ACK_MATCHED)
+
+
+@pytest.mark.parametrize("callback", ["preflight", "authority", "signer"])
+def test_recursive_submission_fails_immediately_without_callback_lock_or_transaction(
+    store: PredictionMarketStore,
+    callback: str,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    evidence = preflight_evidence(plan)
+    recursive: list[SubmissionResult] = []
+    holder: dict[str, ExecutionCoordinator] = {}
+
+    class RecursivePreflight(FakePreflight):
+        def validate(self, candidate: ExecutionIntent, now: datetime) -> PreflightEvidence:
+            if callback == "preflight" and not recursive:
+                recursive.append(holder["executor"].submit_intent(candidate))
+            return super().validate(candidate, now)  # type: ignore[return-value]
+
+    class RecursiveAuthority(FakeAuthority):
+        def snapshot(
+            self,
+            candidate: ExecutionIntent,
+            candidate_evidence: PreflightEvidence,
+            operation: ExecutionOperation,
+            now: datetime,
+        ) -> AuthorityContext:
+            executor = holder["executor"]
+            assert not executor._submission_claim_lock.locked()
+            assert not store._in_transaction
+            if callback == "authority" and not recursive:
+                recursive.append(executor.submit_intent(candidate))
+            return super().snapshot(candidate, candidate_evidence, operation, now)
+
+    class RecursiveSigner(FakeSigner):
+        def sign(
+            self,
+            candidate: ExecutionIntent,
+            candidate_evidence: PreflightEvidence,
+        ) -> SignedOrderEnvelope:
+            executor = holder["executor"]
+            assert not executor._submission_claim_lock.locked()
+            assert not store._in_transaction
+            if callback == "signer" and not recursive:
+                recursive.append(executor.submit_intent(candidate))
+            return super().sign(candidate, candidate_evidence)
+
+    signer = RecursiveSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executor = coordinator(
+        store,
+        RecursivePreflight(evidence),
+        signer,
+        authority=RecursiveAuthority(),
+    )
+    holder["executor"] = executor
+
+    assert executor.submit_intent(intent).code is CoordinatorCode.SUBMITTED
+    assert [result.code for result in recursive] == [CoordinatorCode.DUPLICATE_INTENT]
+    assert signer.sign_calls == signer.submit_calls == 1
+
+
+def test_durable_kill_between_prepare_and_sign_prevents_all_signer_io(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executor = coordinator(store, FakePreflight(preflight_evidence(plan)), signer)
+    assert executor.prepare(intent).code is CoordinatorCode.PREPARED
+    engage_durable_kill(store, intent)
+
+    result = executor.submit_intent(intent)
+
+    assert result.code is CoordinatorCode.EXECUTION_KILL_ENGAGED
+    assert signer.sign_calls == signer.submit_calls == 0
+    assert store.verified_signed_order_envelope(intent.intent_id) is None
+    assert store.latest_order_state(intent.intent_id) is None
+
+
+@pytest.mark.parametrize(
+    "operation", [ExecutionOperation.SIGN_ORDER, ExecutionOperation.SUBMIT_ORDER]
+)
+def test_kill_installed_by_fresh_authority_callback_stops_the_next_mutation(
+    store: PredictionMarketStore,
+    operation: ExecutionOperation,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+
+    class KillingAuthority(FakeAuthority):
+        def snapshot(
+            self,
+            candidate: ExecutionIntent,
+            evidence: PreflightEvidence,
+            candidate_operation: ExecutionOperation,
+            now: datetime,
+        ) -> AuthorityContext:
+            context = super().snapshot(candidate, evidence, candidate_operation, now)
+            matching_call = candidate_operation is operation and self.calls.count(
+                candidate_operation
+            ) == (2 if operation is ExecutionOperation.SIGN_ORDER else 1)
+            if matching_call:
+                engage_durable_kill(store, candidate, occurred_at=now)
+            return context
+
+    executor = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        signer,
+        authority=KillingAuthority(),
+    )
+
+    result = executor.submit_intent(intent)
+
+    assert result.code is CoordinatorCode.EXECUTION_KILL_ENGAGED
+    assert signer.submit_calls == 0
+    assert signer.sign_calls == (0 if operation is ExecutionOperation.SIGN_ORDER else 1)
+    assert (store.verified_signed_order_envelope(intent.intent_id) is not None) is (
+        operation is ExecutionOperation.SUBMIT_ORDER
+    )
+    latest = store.latest_order_state(intent.intent_id)
+    assert (latest is not None and latest.normalized_state is VenueOrderState.SUBMITTING) is (
+        operation is ExecutionOperation.SUBMIT_ORDER
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["expired_intent", "future_intent", "future_plan", "future_cutoff", "future_activation"],
+)
+def test_prepare_rejects_every_temporal_boundary_with_zero_writes(
+    store: PredictionMarketStore,
+    boundary: str,
+) -> None:
+    plan_overrides: dict[str, object] = {}
+    intent_overrides: dict[str, object] = {}
+    evidence_overrides: dict[str, object] = {}
+    if boundary == "expired_intent":
+        intent_overrides.update(
+            created_at=NOW - timedelta(seconds=2),
+            deadline=NOW - timedelta(seconds=1),
+        )
+    elif boundary == "future_intent":
+        intent_overrides.update(
+            created_at=NOW + timedelta(seconds=1),
+            deadline=NOW + timedelta(seconds=4),
+        )
+    elif boundary == "future_plan":
+        plan_overrides["observed_at"] = NOW + timedelta(seconds=1)
+    elif boundary == "future_cutoff":
+        plan_overrides["information_cutoff"] = NOW + timedelta(seconds=1)
+    else:
+        activation = activation_evidence().model_copy(
+            update={"verified_at": NOW + timedelta(seconds=1)}
+        )
+        evidence_overrides["activation_evidence"] = activation
+    plan = execution_plan(**plan_overrides)
+    intent = execution_intent(plan, **intent_overrides)
+    signer = FakeSigner()
+
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan, **evidence_overrides)),
+        signer,
+    ).prepare(intent)
+
+    assert result.code is CoordinatorCode.PREFLIGHT_EVIDENCE_STALE
+    assert store.verified_live_execution_plan(plan.plan_id) is None
+    assert store.verified_execution_intent(intent.intent_id) is None
+    assert signer.sign_calls == signer.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "lineage",
+    [
+        tuple(sorted(HASHES[9:12])),
+        tuple(sorted((HASHES[9], HASHES[10], HASHES[11], HASHES[13]))),
+    ],
+)
+def test_prepare_rejects_omitted_or_swapped_evidence_lineage(
+    store: PredictionMarketStore,
+    lineage: tuple[str, ...],
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan, evidence_hashes=lineage)),
+    ).prepare(intent)
+
+    assert result.code is CoordinatorCode.PREFLIGHT_IDENTITY_MISMATCH
+    assert store.verified_execution_intent(intent.intent_id) is None
+
+
+def test_callback_owned_evidence_alias_cannot_change_later_mutation_truth(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    evidence = preflight_evidence(plan)
+    seen_evidence_ids: list[int] = []
+
+    class MutatingSigner(FakeSigner):
+        def sign(
+            self,
+            candidate: ExecutionIntent,
+            candidate_evidence: PreflightEvidence,
+        ) -> SignedOrderEnvelope:
+            seen_evidence_ids.append(id(candidate_evidence))
+            object.__setattr__(candidate_evidence, "signer_healthy", False)
+            return super().sign(candidate, candidate_evidence)
+
+        def submit(
+            self,
+            candidate: ExecutionIntent,
+            envelope: SignedOrderEnvelope,
+            candidate_evidence: PreflightEvidence,
+        ) -> RestResult:
+            seen_evidence_ids.append(id(candidate_evidence))
+            assert candidate_evidence.signer_healthy is True
+            return super().submit(candidate, envelope, candidate_evidence)
+
+    signer = MutatingSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executor = coordinator(store, FakePreflight(evidence), signer)
+    assert executor.prepare(intent).code is CoordinatorCode.PREPARED
+    object.__setattr__(evidence, "protocol_version", "hostile-alias")
+
+    result = executor.submit_intent(intent)
+
+    assert result.code is CoordinatorCode.SUBMITTED
+    assert signer.sign_calls == signer.submit_calls == 1
+    assert len(set(seen_evidence_ids)) == 2
+
+
+def test_callback_owned_rest_result_alias_is_not_retained_for_classification(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    callback_result = submit_result(RestCode.ORDER_ACK_MATCHED)
+    classified_results: list[RestResult] = []
+    original = ExecutionCoordinator._classify_submit_result
+
+    def observe_classification(
+        executor: ExecutionCoordinator,
+        candidate: ExecutionIntent,
+        result: RestResult,
+        now: datetime,
+    ) -> SubmissionResult:
+        classified_results.append(result)
+        return original(executor, candidate, result, now)
+
+    monkeypatch.setattr(
+        ExecutionCoordinator,
+        "_classify_submit_result",
+        observe_classification,
+    )
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        FakeSigner(callback_result),
+    ).submit_intent(intent)
+
+    assert result.code is CoordinatorCode.SUBMITTED
+    assert classified_results == [callback_result]
+    assert classified_results[0] is not callback_result
 
 
 def test_preflight_refusal_writes_nothing_and_never_calls_signer(
