@@ -1035,7 +1035,7 @@ class HttpxPolymarketRestTransport:
         timeouts: RestTimeouts | None = None,
     ) -> None:
         self._initialize(
-            transport=httpx.AsyncHTTPTransport(retries=0),
+            transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False),
             timestamp=timestamp,
             clock=clock,
             retry_policy=retry_policy,

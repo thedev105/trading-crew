@@ -4,7 +4,9 @@ import copy
 import hashlib
 import json
 import pickle
+import ssl
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import httpx
@@ -1674,6 +1676,34 @@ def test_redirect_is_rejected_without_following_the_location() -> None:
     assert result.code is RestCode.PROTOCOL_RESPONSE_INVALID
     assert calls == 1
     assert "attacker.invalid" not in repr(result)
+
+
+@pytest.mark.parametrize("variable", ("SSL_CERT_FILE", "SSL_CERT_DIR"))
+def test_production_transport_ignores_ambient_tls_trust(
+    variable: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    hostile_path = str(tmp_path / "missing-ambient-ca")
+    other_variable = "SSL_CERT_DIR" if variable == "SSL_CERT_FILE" else "SSL_CERT_FILE"
+    monkeypatch.delenv(other_variable, raising=False)
+    monkeypatch.setenv(variable, hostile_path)
+
+    if variable == "SSL_CERT_DIR":
+        create_default_context = ssl.create_default_context
+
+        def reject_ambient_capath(*args, **kwargs):
+            if kwargs.get("capath") == hostile_path:
+                raise FileNotFoundError("ambient certificate directory was read")
+            return create_default_context(*args, **kwargs)
+
+        monkeypatch.setattr(ssl, "create_default_context", reject_ambient_capath)
+
+    transport = HttpxPolymarketRestTransport(
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
+    )
+    asyncio.run(transport.aclose())
 
 
 def test_trusted_transport_test_seam_uses_exclusively_owned_bounded_client() -> None:
