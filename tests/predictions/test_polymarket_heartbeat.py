@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -15,6 +15,19 @@ from polytrading.predictions.polymarket_execution.routes import (
 )
 
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
+
+
+class _HostileTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        del value
+        raise RuntimeError("public-time-control-canary")
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        return timedelta(0)
+
+
+HOSTILE_TIME = datetime(2026, 8, 25, 16, tzinfo=_HostileTimezone())
 
 
 def test_accepted_heartbeat_confirms_only_the_returned_identifier() -> None:
@@ -39,6 +52,41 @@ def test_accepted_heartbeat_confirms_only_the_returned_identifier() -> None:
     assert state.status == "CONFIRMED"
     assert state.heartbeat_id == "heartbeat-1"
     assert state.kill_reason is None
+
+
+@pytest.mark.parametrize(
+    ("raw_body_hash", "request_body_hash", "expected_evidence"),
+    (
+        (None, "b" * 64, ("b" * 64,)),
+        ("a" * 64, "a" * 64, ("a" * 64,)),
+    ),
+    ids=("absent-raw-hash", "equal-request-and-raw-hashes"),
+)
+def test_every_valid_accepted_heartbeat_evidence_shape_confirms(
+    raw_body_hash: str | None,
+    request_body_hash: str,
+    expected_evidence: tuple[str, ...],
+) -> None:
+    result = RestResult(
+        route=RouteKey.HEARTBEAT,
+        code=RestCode.HEARTBEAT_ACCEPTED,
+        observed_at=NOW,
+        raw_body_hash=raw_body_hash,
+        request_body_hash=request_body_hash,
+        attempts=1,
+        recovery_required=False,
+        kill_required=False,
+        payload=HeartbeatAckPayload(
+            kind="HEARTBEAT_ACK",
+            heartbeat_id="heartbeat-valid-evidence-shape",
+        ),
+    )
+
+    state = classify_heartbeat(HeartbeatState.initial(), result, NOW)
+
+    assert state.status == "CONFIRMED"
+    assert state.heartbeat_id == "heartbeat-valid-evidence-shape"
+    assert state.evidence_hashes == expected_evidence
 
 
 def _accepted_result(heartbeat_id: str = "heartbeat-previous") -> RestResult:
@@ -319,6 +367,87 @@ def test_heartbeat_factories_and_transitions_return_strict_immutable_values() ->
         assert type(state.evidence_hashes) is tuple
         assert type(state.required_reads) is tuple
         assert len(state.evidence_hashes) <= 2
+
+
+def test_heartbeat_state_initialization_is_one_shot_for_every_alias() -> None:
+    uncertain = HeartbeatState.uncertain(
+        observed_at=NOW,
+        previous_heartbeat_id="heartbeat-before-uncertainty",
+        evidence_hashes=("a" * 64,),
+    )
+    alias = uncertain
+    captured: ValueError | None = None
+
+    try:
+        uncertain.__init__(
+            status="RECOVERED",
+            observed_at=NOW,
+            heartbeat_id="heartbeat-before-uncertainty",
+            evidence_hashes=("a" * 64,),
+            kill_reason=None,
+            required_reads=(),
+        )
+    except ValueError as error:
+        captured = error
+
+    assert alias.status == "UNCERTAIN"
+    assert alias.kill_reason == "HEARTBEAT_CANCELLATION_UNCERTAIN"
+    assert captured is not None
+    assert str(captured) == "HEARTBEAT_STATE_INVALID"
+    assert captured.__cause__ is None
+    assert captured.__context__ is None
+
+
+def test_heartbeat_factory_and_recovery_hide_hostile_timezone_callbacks() -> None:
+    uncertain = HeartbeatState.uncertain(
+        observed_at=NOW,
+        previous_heartbeat_id="heartbeat-before-uncertainty",
+        evidence_hashes=("a" * 64,),
+    )
+    operations = (
+        lambda: HeartbeatState.confirmed(
+            observed_at=HOSTILE_TIME,
+            heartbeat_id="heartbeat-confirmed",
+            evidence_hashes=("a" * 64, "b" * 64),
+        ),
+        lambda: uncertain.on_authoritative_reads_completed(
+            (
+                RouteKey.READ_OPEN_ORDERS,
+                RouteKey.READ_TRADES,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+            ),
+            observed_at=HOSTILE_TIME,
+        ),
+    )
+
+    for operation in operations:
+        captured: ValueError | None = None
+        try:
+            operation()
+        except ValueError as error:
+            captured = error
+
+        assert captured is not None
+        assert str(captured) == "HEARTBEAT_STATE_INVALID"
+        assert "public-time-control-canary" not in str(captured)
+        assert captured.__cause__ is None
+        assert captured.__context__ is None
+        assert uncertain.status == "UNCERTAIN"
+
+
+def test_heartbeat_classifier_hides_hostile_timezone_callbacks() -> None:
+    captured: ValueError | None = None
+
+    try:
+        classify_heartbeat(HeartbeatState.initial(), _accepted_result(), HOSTILE_TIME)
+    except ValueError as error:
+        captured = error
+
+    assert captured is not None
+    assert str(captured) == "HEARTBEAT_RESULT_INVALID"
+    assert "public-time-control-canary" not in str(captured)
+    assert captured.__cause__ is None
+    assert captured.__context__ is None
 
 
 @pytest.mark.parametrize(

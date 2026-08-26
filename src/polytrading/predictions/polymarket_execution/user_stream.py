@@ -6,11 +6,11 @@ import json
 import math
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from threading import RLock
+from threading import Lock, get_ident
 from typing import Annotated, Literal, Protocol, Self
 from uuid import UUID, uuid5
 
@@ -54,6 +54,19 @@ class UserStreamProtocolError(ValueError):
         super().__init__("USER_STREAM_PROTOCOL_ERROR")
 
 
+def _normalize_task9_datetime(value: object, *, error_code: str) -> datetime:
+    invalid = type(value) is not datetime
+    normalized: datetime | None = None
+    if not invalid:
+        try:
+            normalized = normalize_utc_timestamp(value)
+        except Exception:
+            invalid = True
+    if invalid or normalized is None:
+        raise ValueError(error_code) from None
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class _UserSubscriptionEvidence:
     frame_hash: Sha256
@@ -65,7 +78,11 @@ class _UserSubscriptionEvidence:
             len(self.frame_hash) != 64
             or any(character not in "0123456789abcdef" for character in self.frame_hash)
             or self.protocol_version != load_protocol_snapshot().version
-            or normalize_utc_timestamp(self.observed_at) != self.observed_at
+            or _normalize_task9_datetime(
+                self.observed_at,
+                error_code="USER_SUBSCRIPTION_EVIDENCE_INVALID",
+            )
+            != self.observed_at
         ):
             raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
 
@@ -78,12 +95,13 @@ class _SignerUserStreamSession:
     """Signer-owned one-way authenticated subscription with sanitized evidence only."""
 
     __slots__ = (
-        "_attempted",
         "_evidence",
         "_lock",
+        "_owner_thread_id",
         "_read_guard",
         "_sealed",
         "_secrets",
+        "_state",
         "_transport",
     )
 
@@ -98,6 +116,16 @@ class _SignerUserStreamSession:
         transport: _UserSubscriptionTransport,
         read_guard: Callable[[datetime], AuthorityDecision],
     ) -> None:
+        initialized = False
+        try:
+            object.__getattribute__(self, "_sealed")
+        except AttributeError:
+            initialized = False
+        else:
+            initialized = True
+        if initialized:
+            raise UserStreamProtocolError() from None
+        object.__setattr__(self, "_sealed", True)
         if type(secrets) is not SecretMaterial:
             raise TypeError("SECRET_MATERIAL_REQUIRED") from None
         sender = getattr(transport, "send_user_subscription", None)
@@ -108,15 +136,17 @@ class _SignerUserStreamSession:
         object.__setattr__(self, "_secrets", secrets)
         object.__setattr__(self, "_transport", transport)
         object.__setattr__(self, "_read_guard", read_guard)
-        object.__setattr__(self, "_attempted", False)
         object.__setattr__(self, "_evidence", None)
-        object.__setattr__(self, "_lock", RLock())
-        object.__setattr__(self, "_sealed", True)
+        object.__setattr__(self, "_lock", Lock())
+        object.__setattr__(self, "_owner_thread_id", get_ident())
+        object.__setattr__(self, "_state", "READY")
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
-        if getattr(self, "_sealed", False):
-            raise AttributeError("USER_SUBSCRIPTION_SESSION_IMMUTABLE") from None
+        raise AttributeError("USER_SUBSCRIPTION_SESSION_IMMUTABLE") from None
+
+    def __delattr__(self, name: str) -> None:
+        del name
         raise AttributeError("USER_SUBSCRIPTION_SESSION_IMMUTABLE") from None
 
     def __repr__(self) -> str:
@@ -140,24 +170,28 @@ class _SignerUserStreamSession:
         raise UserStreamProtocolError() from None
 
     def open(self, *, observed_at: datetime) -> _UserSubscriptionEvidence:
-        with self._lock:
-            return self._open_serialized(observed_at=observed_at)
-
-    def _open_serialized(self, *, observed_at: datetime) -> _UserSubscriptionEvidence:
-        if self._evidence is not None:
-            return self._evidence
-        if self._attempted:
+        if get_ident() != self._owner_thread_id:
             raise UserStreamProtocolError() from None
-        object.__setattr__(self, "_attempted", True)
+        with self._lock:
+            if self._evidence is not None:
+                return self._evidence
+            if self._state != "READY":
+                raise UserStreamProtocolError() from None
+            object.__setattr__(self, "_state", "OPENING")
         invalid = False
         normalized: datetime | None = None
         decision: AuthorityDecision | None = None
         try:
-            normalized = normalize_utc_timestamp(observed_at)
+            normalized = _normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_PROTOCOL_ERROR",
+            )
             decision = self._read_guard(normalized)
         except Exception:
             invalid = True
         if invalid or type(decision) is not AuthorityDecision or not decision.allowed:
+            with self._lock:
+                object.__setattr__(self, "_state", "FAILED")
             raise UserStreamProtocolError() from None
 
         frame: bytes | None = None
@@ -179,14 +213,26 @@ class _SignerUserStreamSession:
         except Exception:
             invalid = True
         if invalid or frame is None or normalized is None:
+            with self._lock:
+                object.__setattr__(self, "_state", "FAILED")
             raise UserStreamProtocolError() from None
-        evidence = _UserSubscriptionEvidence(
-            frame_hash=sha256(frame).hexdigest(),
-            protocol_version=load_protocol_snapshot().version,
-            observed_at=normalized,
-        )
-        object.__setattr__(self, "_evidence", evidence)
+        evidence: _UserSubscriptionEvidence | None = None
+        try:
+            evidence = _UserSubscriptionEvidence(
+                frame_hash=sha256(frame).hexdigest(),
+                protocol_version=load_protocol_snapshot().version,
+                observed_at=normalized,
+            )
+        except Exception:
+            invalid = True
         frame = None
+        if invalid or evidence is None:
+            with self._lock:
+                object.__setattr__(self, "_state", "FAILED")
+            raise UserStreamProtocolError() from None
+        with self._lock:
+            object.__setattr__(self, "_evidence", evidence)
+            object.__setattr__(self, "_state", "SUCCEEDED")
         return evidence
 
 
@@ -330,7 +376,7 @@ def _validated_wire(frame: bytes) -> _OrderWire | _TradeWire:
     return wire
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class UserStreamHealth:
     status: Literal["CONNECTED", "RECOVERY_REQUIRED"]
     observed_at: datetime
@@ -354,6 +400,52 @@ class UserStreamHealth:
         "DISCONNECTED_AWAITING_RECONNECT",
         "DISCONNECTED_AWAITING_READS",
     ] = "NONE"
+    _initialized: bool = field(init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        status: Literal["CONNECTED", "RECOVERY_REQUIRED"],
+        observed_at: datetime,
+        monotonic_at: float,
+        kill_reason: (
+            Literal[
+                "USER_STREAM_DISCONNECTED",
+                "USER_STREAM_PROTOCOL_ERROR",
+                "USER_STREAM_PING_MISSED",
+                "USER_STREAM_PONG_MISSED",
+            ]
+            | None
+        ),
+        required_reads: tuple[RouteKey, ...],
+        next_ping_at: float,
+        pong_deadline_at: float | None,
+        recovery_phase: Literal[
+            "NONE",
+            "READS_REQUIRED",
+            "DISCONNECTED_AWAITING_BOTH",
+            "DISCONNECTED_AWAITING_RECONNECT",
+            "DISCONNECTED_AWAITING_READS",
+        ] = "NONE",
+    ) -> None:
+        initialized = False
+        try:
+            object.__getattribute__(self, "_initialized")
+        except AttributeError:
+            initialized = False
+        else:
+            initialized = True
+        if initialized:
+            raise ValueError("USER_STREAM_HEALTH_INVALID") from None
+        object.__setattr__(self, "_initialized", True)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "monotonic_at", monotonic_at)
+        object.__setattr__(self, "kill_reason", kill_reason)
+        object.__setattr__(self, "required_reads", required_reads)
+        object.__setattr__(self, "next_ping_at", next_ping_at)
+        object.__setattr__(self, "pong_deadline_at", pong_deadline_at)
+        object.__setattr__(self, "recovery_phase", recovery_phase)
+        self.__post_init__()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         del cls, kwargs
@@ -375,7 +467,10 @@ class UserStreamHealth:
         normalized: datetime | None = None
         if not invalid:
             try:
-                normalized = normalize_utc_timestamp(self.observed_at)
+                normalized = _normalize_task9_datetime(
+                    self.observed_at,
+                    error_code="USER_STREAM_HEALTH_INVALID",
+                )
             except Exception:
                 invalid = True
         interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
@@ -416,6 +511,7 @@ class UserStreamHealth:
                 self.kill_reason is not None
                 or self.required_reads != ()
                 or self.recovery_phase != "NONE"
+                or not _has_representable_cadence_origin(self.next_ping_at)
             )
         elif not invalid:
             invalid = (
@@ -446,11 +542,14 @@ class UserStreamHealth:
         monotonic = _finite_monotonic(monotonic_at)
         return cls(
             status="CONNECTED",
-            observed_at=normalize_utc_timestamp(observed_at),
+            observed_at=_normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            ),
             monotonic_at=monotonic,
             kill_reason=None,
             required_reads=(),
-            next_ping_at=monotonic + load_protocol_snapshot().websocket.ping_interval_seconds,
+            next_ping_at=_representable_cadence_after(monotonic),
             pong_deadline_at=None,
             recovery_phase="NONE",
         )
@@ -466,12 +565,17 @@ class UserStreamHealth:
         observed_at: datetime,
         monotonic_at: float,
     ) -> UserStreamHealth:
+        if self.status == "RECOVERY_REQUIRED":
+            return self
         monotonic = _finite_monotonic(monotonic_at)
         if monotonic < self.monotonic_at:
             raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
         return type(self)(
             status="RECOVERY_REQUIRED",
-            observed_at=normalize_utc_timestamp(observed_at),
+            observed_at=_normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            ),
             monotonic_at=monotonic,
             kill_reason=reason,
             required_reads=_RECOVERY_READS,
@@ -530,7 +634,10 @@ class UserStreamHealth:
         )
         return type(self)(
             status=self.status,
-            observed_at=normalize_utc_timestamp(observed_at),
+            observed_at=_normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            ),
             monotonic_at=monotonic,
             kill_reason=self.kill_reason,
             required_reads=self.required_reads,
@@ -564,7 +671,10 @@ class UserStreamHealth:
         )
         return type(self)(
             status=self.status,
-            observed_at=normalize_utc_timestamp(observed_at),
+            observed_at=_normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            ),
             monotonic_at=monotonic,
             kill_reason=self.kill_reason,
             required_reads=self.required_reads,
@@ -590,7 +700,10 @@ class UserStreamHealth:
     ) -> UserStreamHealth:
         return type(self)(
             status="CONNECTED",
-            observed_at=normalize_utc_timestamp(observed_at),
+            observed_at=_normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            ),
             monotonic_at=monotonic_at,
             kill_reason=None,
             required_reads=(),
@@ -631,12 +744,21 @@ class UserStreamHealth:
             return self._kill("USER_STREAM_PING_MISSED", observed_at, monotonic)
         if not _ping_due(monotonic, self.next_ping_at):
             return self._kill("USER_STREAM_PROTOCOL_ERROR", observed_at, monotonic)
-        interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
+        cadence_invalid = False
+        next_ping_at = 0.0
+        pong_deadline_at = 0.0
+        try:
+            next_ping_at = _representable_cadence_after(self.next_ping_at)
+            pong_deadline_at = _representable_cadence_after(monotonic)
+        except ValueError:
+            cadence_invalid = True
+        if cadence_invalid:
+            return self._kill("USER_STREAM_PROTOCOL_ERROR", observed_at, monotonic)
         return self._advance_connected(
             observed_at=observed_at,
             monotonic_at=monotonic,
-            next_ping_at=self.next_ping_at + interval,
-            pong_deadline_at=monotonic + interval,
+            next_ping_at=next_ping_at,
+            pong_deadline_at=pong_deadline_at,
         )
 
     def on_pong(
@@ -724,6 +846,30 @@ def _finite_monotonic(value: float) -> float:
     return float(value)
 
 
+def _representable_cadence_after(monotonic_at: float) -> float:
+    interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
+    deadline = monotonic_at + interval
+    if (
+        not math.isfinite(deadline)
+        or deadline <= monotonic_at
+        or deadline - monotonic_at != interval
+    ):
+        raise ValueError("USER_STREAM_HEALTH_INVALID") from None
+    return deadline
+
+
+def _has_representable_cadence_origin(deadline: float) -> bool:
+    interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
+    origin = deadline - interval
+    return (
+        math.isfinite(origin)
+        and origin >= 0
+        and origin < deadline
+        and origin + interval == deadline
+        and deadline - origin == interval
+    )
+
+
 def _ping_due(monotonic_at: float, deadline: float) -> bool:
     return monotonic_at >= deadline
 
@@ -783,10 +929,18 @@ class UserStreamParser:
         if type(max_event_identities) is not int or not 1 <= max_event_identities <= 10_000:
             raise ValueError("USER_STREAM_IDENTITY_LIMIT_INVALID") from None
         initial_monotonic, _ = _read_injected_monotonic(monotonic)
-        self._health = UserStreamHealth.connected(
-            connected_at,
-            monotonic_at=initial_monotonic,
-        )
+        health: UserStreamHealth | None = None
+        invalid = False
+        try:
+            health = UserStreamHealth.connected(
+                connected_at,
+                monotonic_at=initial_monotonic,
+            )
+        except ValueError:
+            invalid = True
+        if invalid or health is None:
+            raise UserStreamProtocolError() from None
+        self._health = health
         self._monotonic = monotonic
         self._max_event_identities = max_event_identities
         self._seen_evidence: dict[tuple[str, str, str], str] = {}
@@ -865,8 +1019,11 @@ class UserStreamParser:
 
     def _install_protocol_kill(self, observed_at: datetime, *, monotonic_at: float) -> None:
         try:
-            normalized = normalize_utc_timestamp(observed_at)
-        except Exception:
+            normalized = _normalize_task9_datetime(
+                observed_at,
+                error_code="USER_STREAM_HEALTH_INVALID",
+            )
+        except ValueError:
             normalized = self._health.observed_at
         self._health = self._health.on_protocol_error(
             normalized,
@@ -932,7 +1089,10 @@ def parse_user_event(
     wire = _validated_wire(frame)
     invalid_metadata = False
     try:
-        received_at = normalize_utc_timestamp(receipt_time)
+        received_at = _normalize_task9_datetime(
+            receipt_time,
+            error_code="USER_STREAM_PROTOCOL_ERROR",
+        )
         venue_timestamp = _millisecond_timestamp(wire.timestamp)
     except (ValueError, TypeError, OverflowError, OSError):
         invalid_metadata = True
