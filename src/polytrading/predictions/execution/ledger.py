@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Annotated, Literal, Self
 from uuid import UUID, uuid5
 
@@ -30,6 +30,10 @@ from polytrading.predictions.execution.models import (
 MAX_LEDGER_DECIMAL_PLACES = 6
 MAX_LEDGER_AMOUNT = Decimal("1000000000000000000000000000000")
 MAX_LIVE_EVIDENCE_ITEMS = 10_000
+_MAX_LEDGER_EXPONENT = 30
+_MAX_LEDGER_COEFFICIENT_DIGITS = 37
+_MAX_EXACT_EXPONENT = 64
+_MAX_EXACT_COEFFICIENT_DIGITS = 128
 _POSTING_NAMESPACE = UUID("ddf6bc3f-af66-4435-92c0-d3c2713d5865")
 _PUBLIC_TEXT = Annotated[
     str,
@@ -54,6 +58,10 @@ class LiveLedgerError(ValueError):
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
+
+
+class _ExactArithmeticError(ValueError):
+    pass
 
 
 class AuthoritativeTradeEconomics(BaseModel):
@@ -168,13 +176,17 @@ class AuthoritativeTradeEconomics(BaseModel):
         )
         if any(not _bounded_decimal(value) for value in values):
             raise ValueError("TRADE_ECONOMICS_INVALID") from None
+        try:
+            notional = _exact_product(self.price, self.size)
+        except _ExactArithmeticError:
+            raise ValueError("TRADE_ECONOMICS_INVALID") from None
         if (
             self.price > Decimal("1")
             or self.cash_quantum < Decimal("0.000001")
             or self.position_quantum < Decimal("0.01")
             or not _is_quantized(self.size, self.position_quantum)
-            or not _bounded_decimal(self.price * self.size)
-            or not _is_quantized(self.price * self.size, self.cash_quantum)
+            or not _bounded_decimal(notional)
+            or not _is_quantized(notional, self.cash_quantum)
             or not _is_quantized(self.fee, self.cash_quantum)
             or self.occurred_at > self.information_cutoff
             or (self.realized_pnl is None) != (self.cost_basis_evidence_hash is None)
@@ -203,13 +215,73 @@ def _bounded_decimal(value: Decimal) -> bool:
     if type(value) is not Decimal or not value.is_finite() or value.copy_abs() > MAX_LEDGER_AMOUNT:
         return False
     exponent = value.as_tuple().exponent
-    return type(exponent) is int and exponent >= -MAX_LEDGER_DECIMAL_PLACES
+    return (
+        type(exponent) is int
+        and -MAX_LEDGER_DECIMAL_PLACES <= exponent <= _MAX_LEDGER_EXPONENT
+        and len(value.as_tuple().digits) <= _MAX_LEDGER_COEFFICIENT_DIGITS
+    )
+
+
+def _decimal_coefficient(value: Decimal) -> tuple[int, int]:
+    if type(value) is not Decimal or not value.is_finite():
+        raise _ExactArithmeticError from None
+    parts = value.as_tuple()
+    if type(parts.exponent) is not int:
+        raise _ExactArithmeticError from None
+    coefficient = 0
+    for digit in parts.digits:
+        coefficient = coefficient * 10 + digit
+    return (-coefficient if parts.sign else coefficient), parts.exponent
+
+
+def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
+    if (
+        type(coefficient) is not int
+        or type(exponent) is not int
+        or abs(exponent) > _MAX_EXACT_EXPONENT
+    ):
+        raise _ExactArithmeticError from None
+    rendered = str(abs(coefficient))
+    if len(rendered) > _MAX_EXACT_COEFFICIENT_DIGITS:
+        raise _ExactArithmeticError from None
+    digits = tuple(int(character) for character in rendered)
+    return Decimal((int(coefficient < 0), digits, exponent))
+
+
+def _exact_product(left: Decimal, right: Decimal) -> Decimal:
+    left_coefficient, left_exponent = _decimal_coefficient(left)
+    right_coefficient, right_exponent = _decimal_coefficient(right)
+    return _decimal_from_coefficient(
+        left_coefficient * right_coefficient,
+        left_exponent + right_exponent,
+    )
+
+
+def _exact_add(left: Decimal, right: Decimal) -> Decimal:
+    left_coefficient, left_exponent = _decimal_coefficient(left)
+    right_coefficient, right_exponent = _decimal_coefficient(right)
+    exponent = min(left_exponent, right_exponent)
+    coefficient = left_coefficient * 10 ** (left_exponent - exponent)
+    coefficient += right_coefficient * 10 ** (right_exponent - exponent)
+    return _decimal_from_coefficient(coefficient, exponent)
+
+
+def _exact_difference(left: Decimal, right: Decimal) -> Decimal:
+    right_coefficient, right_exponent = _decimal_coefficient(right)
+    return _exact_add(left, _decimal_from_coefficient(-right_coefficient, right_exponent))
 
 
 def _is_quantized(value: Decimal, quantum: Decimal) -> bool:
     try:
-        return value % quantum == 0
-    except (InvalidOperation, ZeroDivisionError):
+        value_coefficient, value_exponent = _decimal_coefficient(value)
+        quantum_coefficient, quantum_exponent = _decimal_coefficient(quantum)
+        if quantum_coefficient == 0:
+            return False
+        exponent = min(value_exponent, quantum_exponent)
+        value_integer = value_coefficient * 10 ** (value_exponent - exponent)
+        quantum_integer = quantum_coefficient * 10 ** (quantum_exponent - exponent)
+        return value_integer % abs(quantum_integer) == 0
+    except _ExactArithmeticError:
         return False
 
 
@@ -340,8 +412,12 @@ def _validated_trade_binding(
     trade: VenueTradeEvent,
     evidence: AuthoritativeTradeEconomics,
 ) -> None:
-    notional = evidence.price * evidence.size
-    fee_cap = notional * Decimal(intent.fee_rate_bps_cap) / Decimal(10_000)
+    try:
+        notional = _exact_product(evidence.price, evidence.size)
+        fee_scaled = _exact_product(evidence.fee, Decimal(10_000))
+        fee_cap_scaled = _exact_product(notional, Decimal(intent.fee_rate_bps_cap))
+    except _ExactArithmeticError:
+        raise LiveLedgerError("TRADE_ECONOMICS_MISMATCH") from None
     price_allowed = (
         evidence.price <= intent.limit_price
         if intent.side == "buy"
@@ -367,7 +443,7 @@ def _validated_trade_binding(
         or not _is_quantized(evidence.price, intent.tick_size)
         or (intent.base_size is not None and evidence.size > intent.base_size)
         or (intent.maximum_spend is not None and notional > intent.maximum_spend)
-        or evidence.fee > fee_cap
+        or fee_scaled > fee_cap_scaled
         or intent.created_at > evidence.occurred_at
         or evidence.occurred_at > intent.deadline
         or evidence.occurred_at > trade.received_at
@@ -427,13 +503,43 @@ def postings_for_confirmed_trades(
     if set(economics_by_trade) != set(confirmed_by_trade):
         raise LiveLedgerError("TRADE_ECONOMICS_MISMATCH") from None
 
-    rows: list[LiveLedgerPosting] = []
+    intent_order_ids: dict[UUID, str] = {}
+    order_intent_ids: dict[str, UUID] = {}
+    intent_sizes: dict[UUID, Decimal] = defaultdict(lambda: Decimal("0"))
+    intent_notionals: dict[UUID, Decimal] = defaultdict(lambda: Decimal("0"))
     for trade_id, trade in sorted(confirmed_by_trade.items()):
         if trade.intent_id is None or trade.intent_id not in intent_by_id:
             raise LiveLedgerError("TRADE_ECONOMICS_MISMATCH") from None
         source_intent = intent_by_id[trade.intent_id]
         exact = economics_by_trade[trade_id]
         _validated_trade_binding(source_intent, trade, exact)
+        intent_order = intent_order_ids.setdefault(source_intent.intent_id, exact.venue_order_id)
+        order_intent = order_intent_ids.setdefault(exact.venue_order_id, source_intent.intent_id)
+        if intent_order != exact.venue_order_id or order_intent != source_intent.intent_id:
+            raise LiveLedgerError("INTENT_ORDER_GROUP_INVALID") from None
+        try:
+            intent_sizes[source_intent.intent_id] = _exact_add(
+                intent_sizes[source_intent.intent_id], exact.size
+            )
+            intent_notionals[source_intent.intent_id] = _exact_add(
+                intent_notionals[source_intent.intent_id],
+                _exact_product(exact.price, exact.size),
+            )
+        except _ExactArithmeticError:
+            raise LiveLedgerError("INTENT_TRADE_BOUNDS_EXCEEDED") from None
+
+    for intent_id, total_size in intent_sizes.items():
+        source_intent = intent_by_id[intent_id]
+        if (source_intent.base_size is not None and total_size > source_intent.base_size) or (
+            source_intent.maximum_spend is not None
+            and intent_notionals[intent_id] > source_intent.maximum_spend
+        ):
+            raise LiveLedgerError("INTENT_TRADE_BOUNDS_EXCEEDED") from None
+
+    rows: list[LiveLedgerPosting] = []
+    for trade_id in sorted(confirmed_by_trade):
+        exact = economics_by_trade[trade_id]
+        source_intent = intent_by_id[exact.intent_id]
         lineage = tuple(
             sorted(
                 {
@@ -451,7 +557,10 @@ def postings_for_confirmed_trades(
                 }
             )
         )
-        notional = exact.price * exact.size
+        try:
+            notional = _exact_product(exact.price, exact.size)
+        except _ExactArithmeticError:
+            raise LiveLedgerError("TRADE_ECONOMICS_MISMATCH") from None
         if exact.side == "buy":
             rows.extend(
                 _paired_postings(
@@ -523,7 +632,7 @@ def postings_for_confirmed_trades(
                 )
             )
     result = tuple(sorted(rows, key=lambda item: item.posting_id))
-    verify_live_conservation(result)
+    _verify_structural_conservation(result)
     return result
 
 
@@ -538,8 +647,7 @@ def _valid_account_base(value: str) -> bool:
     return value.partition(":")[0] in _ACCOUNT_BASES
 
 
-def verify_live_conservation(postings: Sequence[LiveLedgerPosting]) -> None:
-    """Verify deterministic pairing and exact per-evidence/per-asset conservation."""
+def _verify_structural_conservation(postings: Sequence[LiveLedgerPosting]) -> None:
     values = _snapshot_sequence(postings, LiveLedgerPosting, "POSTING_INVALID")
     seen_ids: set[UUID] = set()
     pairs: dict[tuple[object, ...], list[LiveLedgerPosting]] = defaultdict(list)
@@ -607,23 +715,55 @@ def verify_live_conservation(postings: Sequence[LiveLedgerPosting]) -> None:
             posting.lineage_hashes,
             posting.asset_id,
         )
-        group_totals[evidence_group][0] += posting.debit_amount
-        group_totals[evidence_group][1] += posting.credit_amount
-        asset_totals[posting.asset_id][0] += posting.debit_amount
-        asset_totals[posting.asset_id][1] += posting.credit_amount
+        try:
+            group_totals[evidence_group][0] = _exact_add(
+                group_totals[evidence_group][0], posting.debit_amount
+            )
+            group_totals[evidence_group][1] = _exact_add(
+                group_totals[evidence_group][1], posting.credit_amount
+            )
+            asset_totals[posting.asset_id][0] = _exact_add(
+                asset_totals[posting.asset_id][0], posting.debit_amount
+            )
+            asset_totals[posting.asset_id][1] = _exact_add(
+                asset_totals[posting.asset_id][1], posting.credit_amount
+            )
+        except _ExactArithmeticError:
+            raise LiveLedgerError("POSTING_AMOUNT_INVALID") from None
     for rows in pairs.values():
+        try:
+            debit_total = Decimal("0")
+            credit_total = Decimal("0")
+            for row in rows:
+                debit_total = _exact_add(debit_total, row.debit_amount)
+                credit_total = _exact_add(credit_total, row.credit_amount)
+        except _ExactArithmeticError:
+            raise LiveLedgerError("POSTING_AMOUNT_INVALID") from None
         if (
             len(rows) != 2
             or sum(row.debit_amount > 0 for row in rows) != 1
             or sum(row.credit_amount > 0 for row in rows) != 1
-            or sum((row.debit_amount for row in rows), Decimal("0"))
-            != sum((row.credit_amount for row in rows), Decimal("0"))
+            or debit_total != credit_total
         ):
             raise LiveLedgerError("POSTING_PAIR_INVALID") from None
     if any(debit != credit for debit, credit in group_totals.values()) or any(
         debit != credit for debit, credit in asset_totals.values()
     ):
         raise LiveLedgerError("POSTING_CONSERVATION_INVALID") from None
+
+
+def verify_live_conservation(
+    postings: Sequence[LiveLedgerPosting],
+    intents: Sequence[ExecutionIntent],
+    trades: Sequence[VenueTradeEvent],
+    economics: Sequence[AuthoritativeTradeEconomics],
+) -> None:
+    """Verify exact canonical topology before structural conservation."""
+    values = _snapshot_sequence(postings, LiveLedgerPosting, "POSTING_INVALID")
+    _verify_structural_conservation(values)
+    canonical = postings_for_confirmed_trades(intents, trades, economics)
+    if tuple(sorted(values, key=lambda item: item.posting_id)) != canonical:
+        raise LiveLedgerError("POSTING_TOPOLOGY_MISMATCH") from None
 
 
 __all__ = [

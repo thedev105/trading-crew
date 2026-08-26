@@ -3,7 +3,15 @@ from __future__ import annotations
 import copy
 import pickle
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import (
+    Decimal,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    Rounded,
+    Underflow,
+    localcontext,
+)
 from uuid import UUID, uuid4
 
 import pytest
@@ -45,6 +53,8 @@ def trade_event(
     *,
     state: VenueTradeState = VenueTradeState.CONFIRMED,
     event_id: UUID | None = None,
+    venue_order_id: str = ORDER_ID,
+    venue_trade_id: str = TRADE_ID,
     raw_event_hash: str = TRADE_HASH,
     received_at: datetime = NOW + timedelta(seconds=2),
 ) -> VenueTradeEvent:
@@ -54,8 +64,8 @@ def trade_event(
         venue="polymarket",
         raw_event_hash=raw_event_hash,
         source_channel="recovery_read",
-        venue_trade_id=TRADE_ID,
-        venue_order_id=ORDER_ID,
+        venue_trade_id=venue_trade_id,
+        venue_order_id=venue_order_id,
         intent_id=source_intent.intent_id,
         original_venue_state=state.value,
         normalized_state=state,
@@ -117,27 +127,31 @@ def account_net(postings: tuple[LiveLedgerPosting, ...], account: str, asset: st
 
 
 def test_empty_live_ledger_is_conserved() -> None:
-    assert verify_live_conservation(()) is None
+    assert verify_live_conservation((), (), (), ()) is None
 
 
 def test_confirmed_buy_creates_exact_balanced_cash_position_and_fee_pairs() -> None:
     source_intent = intent()
+    event = trade_event(source_intent)
+    exact = economics(source_intent)
 
     postings = postings_for_confirmed_trades(
         (source_intent,),
-        (trade_event(source_intent),),
-        (economics(source_intent),),
+        (event,),
+        (exact,),
     )
 
     assert len(postings) == 6
     assert tuple(posting.posting_id for posting in postings) == tuple(
         sorted(posting.posting_id for posting in postings)
     )
-    assert verify_live_conservation(tuple(reversed(postings))) is None
+    assert (
+        verify_live_conservation(tuple(reversed(postings)), (source_intent,), (event,), (exact,))
+        is None
+    )
     assert account_net(postings, "venue_cash:USDC", "USDC") == Decimal("-5.11")
     assert account_net(postings, "venue_position:217426", "217426") == Decimal("10")
     assert account_net(postings, "fees_paid:USDC", "USDC") == Decimal("0.01")
-    exact = economics(source_intent)
     assert all(
         {
             TRADE_HASH,
@@ -222,6 +236,133 @@ def test_identical_trade_and_economics_duplicates_are_idempotent_and_order_indep
     assert duplicate == single
 
 
+def test_cumulative_fills_cannot_exceed_intent_size_or_spend() -> None:
+    source_intent = intent(base_size=Decimal("10"), maximum_spend=Decimal("5.10"))
+    first = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        venue_trade_id="venue-trade-1",
+        raw_event_hash="1" * 64,
+    )
+    second = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        venue_trade_id="venue-trade-2",
+        raw_event_hash="7" * 64,
+        received_at=NOW + timedelta(seconds=3),
+    )
+    first_economics = economics(
+        source_intent,
+        venue_trade_id="venue-trade-1",
+        trade_event_hash="1" * 64,
+        size=Decimal("6"),
+        fee=Decimal("0"),
+    )
+    second_economics = economics(
+        source_intent,
+        venue_trade_id="venue-trade-2",
+        trade_event_hash="7" * 64,
+        size=Decimal("5"),
+        fee=Decimal("0"),
+        information_cutoff=NOW + timedelta(seconds=4),
+    )
+
+    for events, evidence in (
+        ((first, second), (first_economics, second_economics)),
+        ((second, first), (second_economics, first_economics)),
+    ):
+        with pytest.raises(LiveLedgerError, match="INTENT_TRADE_BOUNDS_EXCEEDED"):
+            postings_for_confirmed_trades((source_intent,), events, evidence)
+
+
+def test_one_intent_cannot_bind_multiple_venue_orders() -> None:
+    source_intent = intent(base_size=Decimal("10"), maximum_spend=Decimal("5.10"))
+    first = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        venue_order_id="venue-order-1",
+        venue_trade_id="venue-trade-1",
+        raw_event_hash="1" * 64,
+    )
+    second = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        venue_order_id="venue-order-2",
+        venue_trade_id="venue-trade-2",
+        raw_event_hash="7" * 64,
+        received_at=NOW + timedelta(seconds=3),
+    )
+    first_economics = economics(
+        source_intent,
+        venue_order_id="venue-order-1",
+        venue_trade_id="venue-trade-1",
+        trade_event_hash="1" * 64,
+        size=Decimal("5"),
+        fee=Decimal("0"),
+    )
+    second_economics = economics(
+        source_intent,
+        venue_order_id="venue-order-2",
+        venue_trade_id="venue-trade-2",
+        trade_event_hash="7" * 64,
+        size=Decimal("5"),
+        fee=Decimal("0"),
+        information_cutoff=NOW + timedelta(seconds=4),
+    )
+
+    with pytest.raises(LiveLedgerError, match="INTENT_ORDER_GROUP_INVALID"):
+        postings_for_confirmed_trades(
+            (source_intent,),
+            (second, first),
+            (first_economics, second_economics),
+        )
+
+
+def test_one_venue_order_cannot_span_intents() -> None:
+    first_intent = intent(base_size=Decimal("5"), maximum_spend=Decimal("2.55"))
+    second_intent = intent(
+        plan_id=UUID("0d7c250b-0a21-55f3-a897-8bc98c59f905"),
+        leg_sequence=1,
+        base_size=Decimal("5"),
+        maximum_spend=Decimal("2.55"),
+    )
+    first = trade_event(
+        first_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        venue_trade_id="venue-trade-1",
+        raw_event_hash="1" * 64,
+    )
+    second = trade_event(
+        second_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+        venue_trade_id="venue-trade-2",
+        raw_event_hash="7" * 64,
+        received_at=NOW + timedelta(seconds=3),
+    )
+    first_economics = economics(
+        first_intent,
+        venue_trade_id="venue-trade-1",
+        trade_event_hash="1" * 64,
+        size=Decimal("5"),
+        fee=Decimal("0"),
+    )
+    second_economics = economics(
+        second_intent,
+        venue_trade_id="venue-trade-2",
+        trade_event_hash="7" * 64,
+        size=Decimal("5"),
+        fee=Decimal("0"),
+        information_cutoff=NOW + timedelta(seconds=4),
+    )
+
+    with pytest.raises(LiveLedgerError, match="INTENT_ORDER_GROUP_INVALID"):
+        postings_for_confirmed_trades(
+            (first_intent, second_intent),
+            (first, second),
+            (first_economics, second_economics),
+        )
+
+
 def test_conflicting_duplicate_trade_economics_is_rejected() -> None:
     source_intent = intent()
     first = economics(source_intent)
@@ -269,6 +410,57 @@ def test_economics_rejects_excess_or_nondivisible_precision(field: str, value: D
         economics(source_intent, **{field: value})
 
 
+def test_authoritative_notional_never_uses_ambient_decimal_rounding() -> None:
+    source_intent = intent(
+        base_size=Decimal("11"),
+        maximum_spend=Decimal("5.61"),
+    )
+
+    with localcontext() as context:
+        context.prec = 2
+        with pytest.raises(ValueError, match="TRADE_ECONOMICS_INVALID"):
+            economics(
+                source_intent,
+                price=Decimal("0.51"),
+                size=Decimal("11"),
+                fee=Decimal("0"),
+                cash_quantum=Decimal("0.1"),
+                position_quantum=Decimal("1"),
+            )
+
+
+def test_valid_economics_and_posting_identities_ignore_hostile_decimal_context() -> None:
+    source_intent = intent()
+    event = trade_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+    )
+    expected_economics = economics(source_intent)
+    expected_postings = postings_for_confirmed_trades(
+        (source_intent,),
+        (event,),
+        (expected_economics,),
+    )
+
+    for precision, minimum_exponent, maximum_exponent in ((1, -2, 2), (100, -99, 99)):
+        with localcontext() as context:
+            context.prec = precision
+            context.Emin = minimum_exponent
+            context.Emax = maximum_exponent
+            for signal in (Inexact, Rounded, Overflow, Underflow, InvalidOperation):
+                context.traps[signal] = True
+            before_flags = dict(context.flags)
+            exact = economics(source_intent)
+            actual = postings_for_confirmed_trades(
+                (source_intent,),
+                (event,),
+                (exact,),
+            )
+            assert exact == expected_economics
+            assert actual == expected_postings
+            assert dict(context.flags) == before_flags
+
+
 def test_confirmed_economics_must_match_exact_trade_and_intent_lineage() -> None:
     source_intent = intent()
     with pytest.raises(LiveLedgerError, match="TRADE_ECONOMICS_MISMATCH"):
@@ -289,10 +481,9 @@ def test_explicit_cost_basis_bound_pnl_creates_balanced_signed_rows(
         realized_pnl=realized_pnl,
         cost_basis_evidence_hash=COST_BASIS_HASH,
     )
+    event = trade_event(source_intent)
 
-    postings = postings_for_confirmed_trades(
-        (source_intent,), (trade_event(source_intent),), (exact,)
-    )
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
 
     assert len(postings) == 8
     assert account_net(postings, "realized_pnl:USDC", "USDC") == -realized_pnl
@@ -301,7 +492,7 @@ def test_explicit_cost_basis_bound_pnl_creates_balanced_signed_rows(
         for row in postings
         if "realized_pnl:USDC" in (row.debit_account, row.credit_account)
     )
-    assert verify_live_conservation(postings) is None
+    assert verify_live_conservation(postings, (source_intent,), (event,), (exact,)) is None
 
 
 def test_pnl_without_cost_basis_is_unrepresentable() -> None:
@@ -332,28 +523,54 @@ def test_authoritative_economics_denies_reinitialization_and_subclass_forks() ->
 
 def test_conservation_rejects_duplicate_ids_unpaired_rows_and_content_mutation() -> None:
     source_intent = intent()
-    postings = postings_for_confirmed_trades(
-        (source_intent,), (trade_event(source_intent),), (economics(source_intent),)
-    )
+    event = trade_event(source_intent)
+    exact = economics(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
 
     with pytest.raises(LiveLedgerError, match="POSTING_ID_DUPLICATE"):
-        verify_live_conservation((postings[0], postings[0]))
+        verify_live_conservation((postings[0], postings[0]), (source_intent,), (event,), (exact,))
     with pytest.raises(LiveLedgerError, match="POSTING_PAIR_INVALID"):
-        verify_live_conservation(postings[:-1])
+        verify_live_conservation(postings[:-1], (source_intent,), (event,), (exact,))
     changed = postings[0].model_copy(update={"asset_id": "other"})
     with pytest.raises(LiveLedgerError, match="POSTING_ID_MISMATCH"):
-        verify_live_conservation((changed, *postings[1:]))
+        verify_live_conservation((changed, *postings[1:]), (source_intent,), (event,), (exact,))
+
+
+@pytest.mark.parametrize(
+    "omitted_account_base",
+    ["venue_cash", "venue_position", "fees_paid", "realized_pnl"],
+)
+def test_conservation_rejects_balanced_but_incomplete_canonical_topology(
+    omitted_account_base: str,
+) -> None:
+    source_intent = intent()
+    event = trade_event(source_intent)
+    exact = economics(
+        source_intent,
+        realized_pnl=Decimal("1.25"),
+        cost_basis_evidence_hash=COST_BASIS_HASH,
+    )
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    incomplete = tuple(
+        row
+        for row in postings
+        if omitted_account_base
+        not in {row.debit_account.partition(":")[0], row.credit_account.partition(":")[0]}
+    )
+
+    with pytest.raises(LiveLedgerError, match="POSTING_TOPOLOGY_MISMATCH"):
+        verify_live_conservation(incomplete, (source_intent,), (event,), (exact,))
 
 
 def test_conservation_rejects_unclosed_account_names() -> None:
     source_intent = intent()
-    postings = postings_for_confirmed_trades(
-        (source_intent,), (trade_event(source_intent),), (economics(source_intent),)
-    )
+    event = trade_event(source_intent)
+    exact = economics(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
     changed = postings[0].model_copy(update={"debit_account": "wallet_cash"})
 
     with pytest.raises(LiveLedgerError, match="POSTING_ACCOUNT_INVALID"):
-        verify_live_conservation((changed, *postings[1:]))
+        verify_live_conservation((changed, *postings[1:]), (source_intent,), (event,), (exact,))
 
 
 @given(
@@ -375,12 +592,11 @@ def test_generated_confirmed_postings_conserve_for_exact_quantized_economics(
         maximum_spend=price * size,
     )
     exact = economics(source_intent, price=price, size=size, fee=fee)
+    event = trade_event(source_intent)
 
-    postings = postings_for_confirmed_trades(
-        (source_intent,), (trade_event(source_intent),), (exact,)
-    )
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
 
-    assert verify_live_conservation(postings) is None
+    assert verify_live_conservation(postings, (source_intent,), (event,), (exact,)) is None
     for asset in {row.asset_id for row in postings}:
         assert sum(
             (row.debit_amount for row in postings if row.asset_id == asset), Decimal("0")

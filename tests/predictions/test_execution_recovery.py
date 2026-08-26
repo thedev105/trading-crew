@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -14,6 +16,10 @@ from polytrading.predictions.execution.coordinator import (
     RecoveryReport,
 )
 from polytrading.predictions.execution.kill_switch import KillState
+from polytrading.predictions.execution.ledger import (
+    AuthoritativeTradeEconomics,
+    postings_for_confirmed_trades,
+)
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     LiveExecutionPlan,
@@ -22,6 +28,13 @@ from polytrading.predictions.execution.models import (
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
+)
+from polytrading.predictions.execution.reconciliation import (
+    AssetAmountObservation,
+    RecentTradeObservation,
+    SettlementObservation,
+    VenueAccountSnapshot,
+    reconcile_live_account,
 )
 from polytrading.predictions.polymarket_execution.heartbeat import HeartbeatState
 from polytrading.predictions.polymarket_execution.rest import RestResult
@@ -1960,29 +1973,15 @@ def test_valid_complete_reconciliations_close_each_bounded_snapshot(
     store: PredictionMarketStore,
     checkpoint_shape: str,
 ) -> None:
-    plan, _intent, first_posting = _seed_reconciliation_history(store)
-    _append_complete_reconciliation(
-        store,
-        observed_at=NOW + timedelta(milliseconds=200),
-        posting_ids=(first_posting.posting_id,),
+    plan, _, _, _, first = _persist_honest_task11_checkpoint(store)
+    second = first.model_copy(
+        update={
+            "reconciliation_id": uuid4(),
+            "observed_at": NOW
+            + timedelta(milliseconds=300 if checkpoint_shape == "cumulative" else 200),
+        }
     )
-    posting_ids = (first_posting.posting_id,)
-    observed_at = NOW + timedelta(milliseconds=200)
-    if checkpoint_shape == "cumulative":
-        second_posting = first_posting.model_copy(
-            update={
-                "posting_id": uuid4(),
-                "occurred_at": NOW + timedelta(milliseconds=250),
-            }
-        )
-        store.append_live_ledger_posting(second_posting)
-        posting_ids = (first_posting.posting_id, second_posting.posting_id)
-        observed_at = NOW + timedelta(milliseconds=300)
-    _append_complete_reconciliation(
-        store,
-        observed_at=observed_at,
-        posting_ids=posting_ids,
-    )
+    store.append_live_reconciliation(second)
 
     report = recovering_coordinator(
         store,
@@ -1993,6 +1992,287 @@ def test_valid_complete_reconciliations_close_each_bounded_snapshot(
 
     assert report.code is CoordinatorCode.RECOVERY_COMPLETE
     assert report.blocked_intent_ids == ()
+
+
+def _authoritative_economics_for_recovery(
+    source_intent: ExecutionIntent,
+    *,
+    venue_trade_id: str = "trade-1",
+    trade_event_hash: str = HASHES[11],
+) -> AuthoritativeTradeEconomics:
+    return AuthoritativeTradeEconomics(
+        schema_version=1,
+        account_fingerprint=source_intent.account_fingerprint,
+        intent_id=source_intent.intent_id,
+        venue_order_id="venue-order-1",
+        venue_trade_id=venue_trade_id,
+        trade_event_hash=trade_event_hash,
+        cash_asset_id="USDC",
+        position_asset_id=source_intent.token_id,
+        side=source_intent.side,
+        price=Decimal("0.51"),
+        size=Decimal("10"),
+        fee=Decimal("0.01"),
+        cash_quantum=Decimal("0.000001"),
+        position_quantum=Decimal("0.01"),
+        trade_state=VenueTradeState.CONFIRMED,
+        settlement_state=VenueTradeState.CONFIRMED,
+        fee_hash=HASHES[13],
+        settlement_hash=HASHES[12],
+        source_hash=HASHES[14],
+        balance_evidence_hashes=(f"{101:064x}",),
+        occurred_at=NOW + timedelta(milliseconds=100),
+        information_cutoff=NOW + timedelta(milliseconds=150),
+        protocol_version=source_intent.protocol_version,
+        realized_pnl=None,
+        cost_basis_evidence_hash=None,
+    )
+
+
+def _checkpoint_asset(
+    asset_id: str,
+    amount: str,
+    quantum: str,
+    hash_index: int,
+) -> AssetAmountObservation:
+    return AssetAmountObservation(
+        schema_version=1,
+        asset_id=asset_id,
+        amount=Decimal(amount),
+        quantum=Decimal(quantum),
+        evidence_hash=f"{hash_index:064x}",
+    )
+
+
+def _persist_honest_task11_checkpoint(
+    store: PredictionMarketStore,
+) -> tuple[
+    LiveExecutionPlan,
+    ExecutionIntent,
+    AuthoritativeTradeEconomics,
+    tuple[LiveLedgerPosting, ...],
+    LiveReconciliation,
+]:
+    plan = execution_plan()
+    source_intent = execution_intent(plan)
+    order_event = lifecycle_event(
+        source_intent,
+        VenueOrderState.RECONCILED,
+        received_at=NOW + timedelta(milliseconds=50),
+    ).model_copy(update={"intent_id": source_intent.intent_id})
+    trade_event = VenueTradeEvent(
+        schema_version=1,
+        trade_event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687f3"),
+        venue="polymarket",
+        raw_event_hash=HASHES[11],
+        source_channel="recovery_read",
+        venue_trade_id="trade-1",
+        venue_order_id="venue-order-1",
+        intent_id=source_intent.intent_id,
+        original_venue_state=VenueTradeState.CONFIRMED.value,
+        normalized_state=VenueTradeState.CONFIRMED,
+        terminal=True,
+        venue_timestamp=NOW + timedelta(milliseconds=100),
+        received_at=NOW + timedelta(milliseconds=100),
+        sequence_number=None,
+        protocol_version=source_intent.protocol_version,
+    )
+    exact = _authoritative_economics_for_recovery(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (trade_event,), (exact,))
+    snapshot = VenueAccountSnapshot(
+        schema_version=1,
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        cutoff_at=NOW,
+        observed_at=NOW + timedelta(milliseconds=200),
+        opening_cash_balances=(_checkpoint_asset("USDC", "100", "0.000001", 201),),
+        current_cash_balances=(_checkpoint_asset("USDC", "94.89", "0.000001", 101),),
+        opening_token_positions=(_checkpoint_asset(source_intent.token_id, "0", "0.01", 202),),
+        current_token_positions=(_checkpoint_asset(source_intent.token_id, "10", "0.01", 101),),
+        opening_allowances=(),
+        current_allowances=(),
+        opening_cumulative_fees=(_checkpoint_asset("USDC", "0", "0.000001", 203),),
+        current_cumulative_fees=(_checkpoint_asset("USDC", "0.01", "0.000001", 204),),
+        open_orders=(),
+        recent_trades=(
+            RecentTradeObservation(
+                schema_version=1,
+                venue_trade_id=exact.venue_trade_id,
+                venue_order_id=exact.venue_order_id,
+                intent_id=source_intent.intent_id,
+                cash_asset_id=exact.cash_asset_id,
+                position_asset_id=exact.position_asset_id,
+                side=exact.side,
+                state=VenueTradeState.CONFIRMED,
+                trade_event_hash=exact.trade_event_hash,
+                settlement_hash=exact.settlement_hash,
+                fee_hash=exact.fee_hash,
+                source_hash=exact.source_hash,
+                balance_evidence_hashes=exact.balance_evidence_hashes,
+                economics_fingerprint=exact.economics_fingerprint,
+                realized_pnl=None,
+                cost_basis_evidence_hash=None,
+                occurred_at=exact.occurred_at,
+            ),
+        ),
+        settlements=(
+            SettlementObservation(
+                schema_version=1,
+                venue_trade_id=exact.venue_trade_id,
+                venue_order_id=exact.venue_order_id,
+                intent_id=source_intent.intent_id,
+                position_asset_id=exact.position_asset_id,
+                state=VenueTradeState.CONFIRMED,
+                settlement_hash=exact.settlement_hash,
+                evidence_hash=exact.settlement_hash,
+                occurred_at=exact.occurred_at,
+            ),
+        ),
+        opening_cash_source_hash=f"{205:064x}",
+        current_cash_source_hash=f"{206:064x}",
+        opening_position_source_hash=f"{207:064x}",
+        current_position_source_hash=f"{208:064x}",
+        opening_allowance_source_hash=f"{209:064x}",
+        current_allowance_source_hash=f"{210:064x}",
+        opening_fee_source_hash=f"{211:064x}",
+        current_fee_source_hash=f"{212:064x}",
+        open_orders_source_hash=f"{213:064x}",
+        recent_trades_source_hash=f"{214:064x}",
+        settlements_source_hash=f"{215:064x}",
+    )
+    reconciliation = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade_event,),
+        (exact,),
+    )
+    assert reconciliation.complete
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(source_intent)
+    store.append_venue_order_event(order_event)
+    store.append_venue_trade_event(trade_event)
+    store.append_authoritative_trade_economics(exact)
+    for posting in postings:
+        store.append_live_ledger_posting(posting)
+    store.append_live_reconciliation(reconciliation)
+    return plan, source_intent, exact, postings, reconciliation
+
+
+def _stored_record(record: object) -> tuple[str, str]:
+    payload = json.dumps(
+        record.model_dump(mode="json"),  # type: ignore[union-attr]
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return payload, sha256(payload.encode()).hexdigest()
+
+
+def test_reopened_startup_accepts_honest_task11_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "honest-checkpoint.duckdb"
+    initial = PredictionMarketStore(path)
+    plan, *_ = _persist_honest_task11_checkpoint(initial)
+    initial.close()
+    reopened = PredictionMarketStore(path)
+
+    report = recovering_coordinator(
+        reopened,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.blocked_intent_ids == ()
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_economics", "cash_asset", "wrong_hash_family", "orphan", "incomplete"],
+)
+def test_startup_blocks_task11_checkpoint_without_canonical_economics_closure(
+    store: PredictionMarketStore,
+    corruption: str,
+) -> None:
+    plan, intent, exact, postings, reconciliation = _persist_honest_task11_checkpoint(store)
+    if corruption == "missing_economics":
+        store._connection.execute("DELETE FROM authoritative_trade_economics")
+    elif corruption == "cash_asset":
+        cash_posting = next(
+            posting
+            for posting in postings
+            if posting.asset_id == exact.cash_asset_id
+            and "venue_cash"
+            in {posting.debit_account.partition(":")[0], posting.credit_account.partition(":")[0]}
+        )
+        corrupt = cash_posting.model_copy(update={"asset_id": "CORRUPT-CASH"})
+        payload, record_hash = _stored_record(corrupt)
+        store._connection.execute(
+            "UPDATE live_ledger_postings SET record_json = ?, record_hash = ? WHERE posting_id = ?",
+            [payload, record_hash, cash_posting.posting_id],
+        )
+    elif corruption == "wrong_hash_family":
+        wrong_family = reconciliation.model_copy(
+            update={
+                "evidence_hashes": tuple(
+                    value for value in reconciliation.evidence_hashes if value != exact.fee_hash
+                ),
+                "venue_trade_hashes": tuple(
+                    sorted({*reconciliation.venue_trade_hashes, exact.fee_hash})
+                ),
+            }
+        )
+        payload, record_hash = _stored_record(wrong_family)
+        store._connection.execute(
+            "UPDATE live_reconciliations SET record_json = ?, record_hash = ? "
+            "WHERE reconciliation_id = ?",
+            [payload, record_hash, reconciliation.reconciliation_id],
+        )
+    elif corruption == "orphan":
+        store.append_authoritative_trade_economics(
+            _authoritative_economics_for_recovery(
+                intent,
+                venue_trade_id="orphan-economics",
+                trade_event_hash=HASHES[10],
+            )
+        )
+    else:
+        omitted_ids = {
+            posting.posting_id
+            for posting in postings
+            if "fees_paid"
+            in {posting.debit_account.partition(":")[0], posting.credit_account.partition(":")[0]}
+        }
+        for posting_id in omitted_ids:
+            store._connection.execute(
+                "DELETE FROM live_ledger_postings WHERE posting_id = ?", [posting_id]
+            )
+        incomplete = reconciliation.model_copy(
+            update={
+                "expected_posting_ids": tuple(
+                    value
+                    for value in reconciliation.expected_posting_ids
+                    if value not in omitted_ids
+                )
+            }
+        )
+        payload, record_hash = _stored_record(incomplete)
+        store._connection.execute(
+            "UPDATE live_reconciliations SET record_json = ?, record_hash = ? "
+            "WHERE reconciliation_id = ?",
+            [payload, record_hash, reconciliation.reconciliation_id],
+        )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
 
 
 def test_startup_treats_plan_linked_wrong_account_intent_as_corruption(

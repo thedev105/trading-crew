@@ -24,6 +24,10 @@ from polytrading.predictions.execution.authority import (
     verify_mutation_authority,
 )
 from polytrading.predictions.execution.kill_switch import KillState
+from polytrading.predictions.execution.ledger import (
+    LiveLedgerError,
+    postings_for_confirmed_trades,
+)
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -2019,9 +2023,14 @@ class ExecutionCoordinator:
                     account_fingerprint,
                     now,
                 )
+                economics = self._store.verified_authoritative_trade_economics_for_account(
+                    account_fingerprint,
+                    now,
+                )
             except Exception:
                 reconciliations = ()
                 postings = ()
+                economics = ()
                 account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
             if any(not reconciliation.complete for reconciliation in reconciliations):
                 account_block_reason = "RECONCILIATION_INCOMPLETE"
@@ -2054,7 +2063,6 @@ class ExecutionCoordinator:
                 for intent in intents:
                     forced_reasons.setdefault(intent.intent_id, account_block_reason)
             if latest_complete is not None:
-                intent_by_id = {intent.intent_id: intent for intent in intents}
                 order_events = tuple(
                     event for history in order_histories.values() for event in history
                 )
@@ -2078,84 +2086,83 @@ class ExecutionCoordinator:
                         for event in trade_events
                         if event.received_at <= reconciliation.observed_at
                     )
+                    bounded_intents = tuple(
+                        intent
+                        for intent in intents
+                        if intent.created_at <= reconciliation.observed_at
+                    )
+                    bounded_economics = tuple(
+                        exact
+                        for exact in economics
+                        if exact.occurred_at <= reconciliation.observed_at
+                        and exact.information_cutoff <= reconciliation.observed_at
+                    )
                     bounded_posting_ids = {posting.posting_id for posting in bounded_postings}
                     bounded_order_hashes = {event.raw_event_hash for event in bounded_order_events}
                     bounded_trade_hashes = {event.raw_event_hash for event in bounded_trade_events}
+                    exact_trade_hashes = {exact.trade_event_hash for exact in bounded_economics}
+                    exact_evidence_hashes = {
+                        evidence_hash
+                        for exact in bounded_economics
+                        for evidence_hash in (
+                            exact.economics_fingerprint,
+                            exact.settlement_hash,
+                            exact.fee_hash,
+                            exact.source_hash,
+                            *(
+                                ()
+                                if exact.cost_basis_evidence_hash is None
+                                else (exact.cost_basis_evidence_hash,)
+                            ),
+                        )
+                    }
+                    exact_balance_hashes = {
+                        evidence_hash
+                        for exact in bounded_economics
+                        for evidence_hash in exact.balance_evidence_hashes
+                    }
+                    try:
+                        canonical_postings = postings_for_confirmed_trades(
+                            bounded_intents,
+                            bounded_trade_events,
+                            bounded_economics,
+                        )
+                    except LiveLedgerError:
+                        canonical_postings = ()
+                        relationally_closed = False
+                    supplied_postings = tuple(
+                        sorted(bounded_postings, key=lambda posting: posting.posting_id)
+                    )
+                    known_raw_hashes = bounded_order_hashes | bounded_trade_hashes
+                    known_economics_hashes = exact_evidence_hashes | exact_balance_hashes
+                    reconciliation_hashes = {
+                        *reconciliation.evidence_hashes,
+                        *reconciliation.venue_order_hashes,
+                        *reconciliation.venue_trade_hashes,
+                        *reconciliation.balance_hashes,
+                        *reconciliation.allowance_hashes,
+                    }
                     if (
                         reconciliation.account_fingerprint != account_fingerprint
                         or set(reconciliation.expected_posting_ids) != bounded_posting_ids
+                        or supplied_postings != canonical_postings
                         or not set(reconciliation.venue_order_hashes) <= bounded_order_hashes
-                        or not set(reconciliation.venue_trade_hashes) <= bounded_trade_hashes
+                        or set(reconciliation.venue_trade_hashes) != exact_trade_hashes
+                        or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
+                        or not exact_balance_hashes <= set(reconciliation.balance_hashes)
+                        or set(reconciliation.evidence_hashes) & known_raw_hashes
+                        or set(reconciliation.venue_order_hashes) & known_economics_hashes
+                        or set(reconciliation.venue_trade_hashes) & known_economics_hashes
+                        or set(reconciliation.balance_hashes)
+                        & (known_raw_hashes | exact_evidence_hashes)
+                        or set(reconciliation.allowance_hashes)
+                        & (known_raw_hashes | known_economics_hashes)
+                        or any(
+                            not set(posting.lineage_hashes) <= reconciliation_hashes
+                            for posting in supplied_postings
+                        )
                     ):
                         relationally_closed = False
-                    for posting in bounded_postings:
-                        posting_intent = (
-                            None
-                            if posting.intent_id is None
-                            else intent_by_id.get(posting.intent_id)
-                        )
-                        related_orders = tuple(
-                            event
-                            for event in bounded_order_events
-                            if event.venue_order_id == posting.venue_order_id
-                        )
-                        related_trades = tuple(
-                            event
-                            for event in bounded_trade_events
-                            if event.venue_trade_id == posting.venue_trade_id
-                        )
-                        if (
-                            posting.account_fingerprint != account_fingerprint
-                            or (
-                                posting.intent_id is not None
-                                and (
-                                    posting_intent is None
-                                    or posting_intent.created_at > reconciliation.observed_at
-                                    or posting.asset_id != posting_intent.token_id
-                                )
-                            )
-                            or (
-                                posting.venue_order_id is not None
-                                and (
-                                    posting_intent is None
-                                    or len(related_orders) == 0
-                                    or any(
-                                        event.intent_id != posting_intent.intent_id
-                                        for event in related_orders
-                                    )
-                                    or not {event.raw_event_hash for event in related_orders}
-                                    <= set(reconciliation.venue_order_hashes)
-                                )
-                            )
-                            or (
-                                posting.venue_trade_id is not None
-                                and (
-                                    posting_intent is None
-                                    or len(related_trades) == 0
-                                    or any(
-                                        event.intent_id != posting_intent.intent_id
-                                        or (
-                                            posting.venue_order_id is not None
-                                            and event.venue_order_id != posting.venue_order_id
-                                        )
-                                        for event in related_trades
-                                    )
-                                    or not {event.raw_event_hash for event in related_trades}
-                                    <= set(reconciliation.venue_trade_hashes)
-                                )
-                            )
-                            or (
-                                posting.settlement_hash is not None
-                                and posting.settlement_hash not in reconciliation.venue_trade_hashes
-                            )
-                            or (
-                                posting.fee_hash is not None
-                                and posting.fee_hash not in reconciliation.evidence_hashes
-                            )
-                            or not set(posting.balance_evidence_hashes)
-                            <= set(reconciliation.balance_hashes)
-                        ):
-                            relationally_closed = False
                 if not relationally_closed:
                     account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
                     for intent in intents:

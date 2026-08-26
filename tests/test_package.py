@@ -346,14 +346,8 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
     ]
     json_members = [
         *dossier_members,
-        (
-            "polytrading/predictions/polymarket_execution/fixtures/"
-            "event_vectors_v1.json"
-        ),
-        (
-            "polytrading/predictions/polymarket_execution/fixtures/"
-            "order_vectors_v1.json"
-        ),
+        ("polytrading/predictions/polymarket_execution/fixtures/event_vectors_v1.json"),
+        ("polytrading/predictions/polymarket_execution/fixtures/order_vectors_v1.json"),
         "polytrading/predictions/polymarket_execution/fixtures/protocol_v1.json",
         "polytrading/predictions/polymarket_execution/fixtures/sources_v1.json",
     ]
@@ -389,6 +383,7 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
             "polytrading/predictions/storage/schema/007_experiments.sql",
             "polytrading/predictions/storage/schema/008_live_execution.sql",
             "polytrading/predictions/storage/schema/009_execution_operation_claims.sql",
+            "polytrading/predictions/storage/schema/010_authoritative_trade_economics.sql",
         ]
         prediction_web_asset_members = {
             name

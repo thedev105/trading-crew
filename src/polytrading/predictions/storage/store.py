@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from importlib import resources
 from pathlib import Path
@@ -28,6 +29,7 @@ from polytrading.predictions.domain import (
     TradeRecord,
 )
 from polytrading.predictions.economics_models import ScanReport
+from polytrading.predictions.execution.ledger import AuthoritativeTradeEconomics
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -40,6 +42,7 @@ from polytrading.predictions.execution.models import (
     VenueOrderEvent,
     VenueOrderState,
     VenueTradeEvent,
+    VenueTradeState,
     canonical_execution_hash,
 )
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
@@ -96,6 +99,30 @@ def _canonical_json(record: BaseModel) -> str:
 
 def _record_hash(record: BaseModel) -> str:
     return sha256(_canonical_json(record).encode()).hexdigest()
+
+
+def _authoritative_trade_economics_from_json(payload: str) -> AuthoritativeTradeEconomics:
+    raw = json.loads(payload)
+    if type(raw) is not dict:
+        raise ValueError("TRADE_ECONOMICS_INVALID") from None
+    values = dict(raw)
+    values["intent_id"] = UUID(values["intent_id"])
+    for field in (
+        "price",
+        "size",
+        "fee",
+        "cash_quantum",
+        "position_quantum",
+        "realized_pnl",
+    ):
+        if values.get(field) is not None:
+            values[field] = Decimal(values[field])
+    values["balance_evidence_hashes"] = tuple(values["balance_evidence_hashes"])
+    values["occurred_at"] = datetime.fromisoformat(values["occurred_at"])
+    values["information_cutoff"] = datetime.fromisoformat(values["information_cutoff"])
+    values["trade_state"] = VenueTradeState(values["trade_state"])
+    values["settlement_state"] = VenueTradeState(values["settlement_state"])
+    return AuthoritativeTradeEconomics.model_validate(values, strict=True)
 
 
 def _verified_record[RecordT: BaseModel](
@@ -467,6 +494,52 @@ class PredictionMarketStore:
             values=(record.trade_event_id, record.intent_id, record.received_at),
             record=record,
         )
+
+    def append_authoritative_trade_economics(self, record: AuthoritativeTradeEconomics) -> bool:
+        try:
+            exact = AuthoritativeTradeEconomics.model_validate(
+                record.model_dump(mode="python"), strict=True
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("TRADE_ECONOMICS_INVALID") from error
+        existing = self._verified_authoritative_trade_economics_identity(exact)
+        if existing:
+            if len(existing) != 1 or existing[0] != exact:
+                raise ConflictingRecordError(
+                    "conflicting authoritative_trade_economics record for immutable identity"
+                ) from None
+            return False
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO authoritative_trade_economics (
+                    economics_fingerprint, account_fingerprint, intent_id,
+                    venue_order_id, venue_trade_id, trade_state, settlement_state,
+                    occurred_at, information_cutoff, record_json, record_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    exact.economics_fingerprint,
+                    exact.account_fingerprint,
+                    exact.intent_id,
+                    exact.venue_order_id,
+                    exact.venue_trade_id,
+                    exact.trade_state.value,
+                    exact.settlement_state.value,
+                    exact.occurred_at,
+                    exact.information_cutoff,
+                    _canonical_json(exact),
+                    _record_hash(exact),
+                ],
+            )
+        except duckdb.Error as error:
+            winner = self._verified_authoritative_trade_economics_identity(exact)
+            if len(winner) == 1 and winner[0] == exact:
+                return False
+            raise ConflictingRecordError(
+                "authoritative_trade_economics insertion conflicted without a verified winner"
+            ) from error
+        return True
 
     def append_live_ledger_posting(self, record: LiveLedgerPosting) -> bool:
         record = self._validated_execution_record(
@@ -938,6 +1011,7 @@ class PredictionMarketStore:
         matches: Callable[[RecordT], bool],
         sort_key: Callable[[RecordT], Any],
         reverse: bool = False,
+        decode: Callable[[str], RecordT] | None = None,
     ) -> tuple[RecordT, ...]:
         # SQL narrows candidates only. Every returned row is strictly re-parsed, hashed,
         # and compared to its indexed identity/account/timestamps before model semantics
@@ -951,16 +1025,163 @@ class PredictionMarketStore:
         records: list[RecordT] = []
         for row in rows:
             try:
-                record = model.model_validate_json(row[-2])
+                record = model.model_validate_json(row[-2]) if decode is None else decode(row[-2])
             except (TypeError, ValueError) as error:
                 raise ConflictingRecordError(f"stored {table} record is invalid") from error
-            if canonical_execution_hash(record) != row[-1]:
+            if _record_hash(record) != row[-1]:
                 raise ConflictingRecordError(f"stored {table} failed its immutable record hash")
             if tuple(row[:-2]) != indexed_values(record):
                 raise ConflictingRecordError(f"stored {table} indexed columns do not match")
             if matches(record):
                 records.append(record)
         return tuple(sorted(records, key=sort_key, reverse=reverse))
+
+    @staticmethod
+    def _authoritative_economics_indexed_values(
+        record: AuthoritativeTradeEconomics,
+    ) -> tuple[Any, ...]:
+        return (
+            record.economics_fingerprint,
+            record.account_fingerprint,
+            str(record.intent_id),
+            record.venue_order_id,
+            record.venue_trade_id,
+            record.trade_state.value,
+            record.settlement_state.value,
+            _epoch_us(record.occurred_at),
+            _epoch_us(record.information_cutoff),
+        )
+
+    def _verified_authoritative_trade_economics_identity(
+        self,
+        record: AuthoritativeTradeEconomics,
+    ) -> tuple[AuthoritativeTradeEconomics, ...]:
+        return self._verified_records(
+            table="authoritative_trade_economics",
+            model=AuthoritativeTradeEconomics,
+            candidate_where=(
+                "economics_fingerprint = ? OR "
+                "TRY(json_extract_string(record_json, '$.economics_fingerprint')) = ? OR "
+                "((account_fingerprint = ? OR TRY(json_extract_string(record_json, "
+                "'$.account_fingerprint')) = ?) AND "
+                "(venue_trade_id = ? OR TRY(json_extract_string(record_json, "
+                "'$.venue_trade_id')) = ?))"
+            ),
+            candidate_parameters=(
+                record.economics_fingerprint,
+                record.economics_fingerprint,
+                record.account_fingerprint,
+                record.account_fingerprint,
+                record.venue_trade_id,
+                record.venue_trade_id,
+            ),
+            index_columns=(
+                "economics_fingerprint",
+                "account_fingerprint",
+                "CAST(intent_id AS VARCHAR)",
+                "venue_order_id",
+                "venue_trade_id",
+                "trade_state",
+                "settlement_state",
+                "epoch_us(occurred_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=self._authoritative_economics_indexed_values,
+            matches=lambda candidate: (
+                candidate.economics_fingerprint == record.economics_fingerprint
+                or (
+                    candidate.account_fingerprint == record.account_fingerprint
+                    and candidate.venue_trade_id == record.venue_trade_id
+                )
+            ),
+            sort_key=lambda candidate: (
+                candidate.occurred_at,
+                candidate.venue_order_id,
+                candidate.venue_trade_id,
+                candidate.economics_fingerprint,
+            ),
+            decode=_authoritative_trade_economics_from_json,
+        )
+
+    def verified_authoritative_trade_economics_for_account(
+        self,
+        account_fingerprint: str,
+        as_of: datetime,
+    ) -> tuple[AuthoritativeTradeEconomics, ...]:
+        return self._verified_authoritative_trade_economics(
+            identity_column="account_fingerprint",
+            identity_json_field="account_fingerprint",
+            identity=account_fingerprint,
+            as_of=as_of,
+            matches=lambda record: record.account_fingerprint == account_fingerprint,
+        )
+
+    def verified_authoritative_trade_economics_for_intent(
+        self,
+        intent_id: UUID,
+        as_of: datetime,
+    ) -> tuple[AuthoritativeTradeEconomics, ...]:
+        return self._verified_authoritative_trade_economics(
+            identity_column="intent_id",
+            identity_json_field="intent_id",
+            identity=intent_id,
+            as_of=as_of,
+            matches=lambda record: record.intent_id == intent_id,
+        )
+
+    def _verified_authoritative_trade_economics(
+        self,
+        *,
+        identity_column: str,
+        identity_json_field: str,
+        identity: str | UUID,
+        as_of: datetime,
+        matches: Callable[[AuthoritativeTradeEconomics], bool],
+    ) -> tuple[AuthoritativeTradeEconomics, ...]:
+        return self._verified_records(
+            table="authoritative_trade_economics",
+            model=AuthoritativeTradeEconomics,
+            candidate_where=(
+                f"({identity_column} = ? OR TRY(json_extract_string(record_json, "
+                f"'$.{identity_json_field}')) = ?) AND "
+                "(occurred_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.occurred_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(information_cutoff <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.information_cutoff')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(
+                identity,
+                str(identity),
+                as_of,
+                as_of,
+                as_of,
+                as_of,
+            ),
+            index_columns=(
+                "economics_fingerprint",
+                "account_fingerprint",
+                "CAST(intent_id AS VARCHAR)",
+                "venue_order_id",
+                "venue_trade_id",
+                "trade_state",
+                "settlement_state",
+                "epoch_us(occurred_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=self._authoritative_economics_indexed_values,
+            matches=lambda record: (
+                matches(record)
+                and record.occurred_at <= as_of
+                and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (
+                record.occurred_at,
+                record.venue_order_id,
+                record.venue_trade_id,
+                record.economics_fingerprint,
+            ),
+            decode=_authoritative_trade_economics_from_json,
+        )
 
     def verified_live_execution_plan(
         self, plan_id: UUID, as_of: datetime | None = None

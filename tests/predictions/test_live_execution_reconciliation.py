@@ -3,7 +3,15 @@ from __future__ import annotations
 import copy
 import pickle
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import (
+    Decimal,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    Rounded,
+    Underflow,
+    localcontext,
+)
 from uuid import UUID
 
 import pytest
@@ -15,6 +23,7 @@ from polytrading.predictions.execution.ledger import (
 )
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
+    LiveReconciliation,
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
@@ -117,6 +126,38 @@ def exact_postings(*, realized_pnl: Decimal | None = None):
     )
 
 
+def reconcile_with_evidence(
+    postings: object,
+    snapshot: VenueAccountSnapshot,
+    source_intent: ExecutionIntent,
+    exact: AuthoritativeTradeEconomics,
+):
+    return reconcile_live_account(
+        postings,  # type: ignore[arg-type]
+        snapshot,
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+    )
+
+
+def pnl_with_evidence(
+    postings: object,
+    reconciliation: LiveReconciliation,
+    snapshot: VenueAccountSnapshot,
+    source_intent: ExecutionIntent,
+    exact: AuthoritativeTradeEconomics,
+) -> Decimal | None:
+    return reconciled_live_pnl(
+        postings,  # type: ignore[arg-type]
+        reconciliation,
+        snapshot,
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+    )
+
+
 def asset(
     asset_id: str,
     amount: str,
@@ -166,6 +207,7 @@ def snapshot_for(
                 source_hash=SOURCE_HASH,
                 balance_evidence_hashes=(balance_hash,),
                 economics_fingerprint=exact.economics_fingerprint,
+                realized_pnl=exact.realized_pnl,
                 cost_basis_evidence_hash=exact.cost_basis_evidence_hash,
                 occurred_at=NOW + timedelta(seconds=1),
             ),
@@ -272,30 +314,78 @@ def empty_snapshot() -> VenueAccountSnapshot:
 
 
 def test_empty_two_cut_snapshot_reconciles_but_has_no_publishable_pnl() -> None:
-    result = reconcile_live_account((), empty_snapshot())
+    snapshot = empty_snapshot()
+    result = reconcile_live_account((), snapshot, (), (), ())
 
     assert result.complete
     assert result.differences == ()
     assert result.next_action is None
-    assert reconciled_live_pnl((), result) is None
+    assert reconciled_live_pnl((), result, snapshot, (), (), ()) is None
 
 
 def test_exact_independent_deltas_and_identity_evidence_reconcile_deterministically() -> None:
     source_intent, exact, postings = exact_postings()
     snapshot = snapshot_for(source_intent, exact)
 
-    forward = reconcile_live_account(postings, snapshot)
-    reversed_result = reconcile_live_account(tuple(reversed(postings)), snapshot)
+    forward = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+    reversed_result = reconcile_with_evidence(
+        tuple(reversed(postings)), snapshot, source_intent, exact
+    )
 
     assert forward == reversed_result
     assert forward.complete
     assert forward.account_fingerprint == ACCOUNT
     assert forward.expected_posting_ids == tuple(sorted(row.posting_id for row in postings))
-    assert {TRADE_HASH, SETTLEMENT_HASH, FEE_HASH, SOURCE_HASH, BALANCE_HASH} <= set(
-        forward.evidence_hashes
-    )
+    assert {SETTLEMENT_HASH, FEE_HASH, SOURCE_HASH} <= set(forward.evidence_hashes)
+    assert forward.venue_trade_hashes == (TRADE_HASH,)
+    assert BALANCE_HASH in forward.balance_hashes
     assert forward.reconciliation_id != UUID(int=0)
-    assert reconciled_live_pnl(postings, forward) is None
+    assert pnl_with_evidence(postings, forward, snapshot, source_intent, exact) is None
+
+
+def test_reconciliation_hash_families_separate_raw_events_and_account_reads() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+
+    assert result.venue_order_hashes == ()
+    assert result.venue_trade_hashes == (TRADE_HASH,)
+    assert {
+        snapshot.open_orders_source_hash,
+        snapshot.recent_trades_source_hash,
+        snapshot.settlements_source_hash,
+        SOURCE_HASH,
+        SETTLEMENT_HASH,
+        FEE_HASH,
+        COST_BASIS_HASH,
+        exact.economics_fingerprint,
+    } <= set(result.evidence_hashes)
+    assert BALANCE_HASH in result.balance_hashes
+    assert snapshot.opening_allowance_source_hash in result.allowance_hashes
+    assert not set(result.venue_trade_hashes) & set(result.evidence_hashes)
+
+
+def test_reconciliation_and_pnl_ignore_hostile_decimal_context() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    expected = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+    assert pnl_with_evidence(postings, expected, snapshot, source_intent, exact) == Decimal("1.25")
+
+    for precision, minimum_exponent, maximum_exponent in ((1, -2, 2), (100, -99, 99)):
+        with localcontext() as context:
+            context.prec = precision
+            context.Emin = minimum_exponent
+            context.Emax = maximum_exponent
+            for signal in (Inexact, Rounded, Overflow, Underflow, InvalidOperation):
+                context.traps[signal] = True
+            before_flags = dict(context.flags)
+            actual = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+            assert actual == expected
+            assert pnl_with_evidence(postings, actual, snapshot, source_intent, exact) == Decimal(
+                "1.25"
+            )
+            assert dict(context.flags) == before_flags
 
 
 @pytest.mark.parametrize(
@@ -311,12 +401,13 @@ def test_any_unclosed_account_delta_halts_without_pnl(
     snapshot_change: dict[str, str], difference: str
 ) -> None:
     source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
-    result = reconcile_live_account(postings, snapshot_for(source_intent, exact, **snapshot_change))
+    snapshot = snapshot_for(source_intent, exact, **snapshot_change)
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
 
     assert not result.complete
     assert difference in result.differences
     assert result.next_action == "HALT_AND_RECONCILE"
-    assert reconciled_live_pnl(postings, result) is None
+    assert pnl_with_evidence(postings, result, snapshot, source_intent, exact) is None
 
 
 def test_open_order_recent_trade_and_settlement_must_close_exactly() -> None:
@@ -330,18 +421,29 @@ def test_open_order_recent_trade_and_settlement_must_close_exactly() -> None:
         evidence_hash=evidence_hash(40),
     )
 
-    open_result = reconcile_live_account(
-        postings, snapshot_for(source_intent, exact, open_orders=(still_open,))
+    open_result = reconcile_with_evidence(
+        postings,
+        snapshot_for(source_intent, exact, open_orders=(still_open,)),
+        source_intent,
+        exact,
     )
-    trade_result = reconcile_live_account(
-        postings, snapshot_for(source_intent, exact, include_trade=False)
+    trade_result = reconcile_with_evidence(
+        postings,
+        snapshot_for(source_intent, exact, include_trade=False),
+        source_intent,
+        exact,
     )
-    settlement_result = reconcile_live_account(
-        postings, snapshot_for(source_intent, exact, include_settlement=False)
+    settlement_result = reconcile_with_evidence(
+        postings,
+        snapshot_for(source_intent, exact, include_settlement=False),
+        source_intent,
+        exact,
     )
-    failed_result = reconcile_live_account(
+    failed_result = reconcile_with_evidence(
         postings,
         snapshot_for(source_intent, exact, settlement_state=VenueTradeState.FAILED),
+        source_intent,
+        exact,
     )
 
     assert "OPEN_ORDER_UNEXPLAINED:venue-order-1" in open_result.differences
@@ -367,7 +469,7 @@ def test_extra_authoritative_trade_and_settlement_facts_remain_differences() -> 
         }
     )
 
-    result = reconcile_live_account(postings, with_extras)
+    result = reconcile_with_evidence(postings, with_extras, source_intent, exact)
 
     assert "TRADE_UNEXPLAINED:venue-trade-2" in result.differences
     assert "SETTLEMENT_UNEXPLAINED:venue-trade-2" in result.differences
@@ -417,7 +519,7 @@ def test_trade_side_assets_and_settlement_asset_must_match_posting_accounts() ->
         }
     )
 
-    result = reconcile_live_account(postings, mismatched)
+    result = reconcile_with_evidence(postings, mismatched, source_intent, exact)
 
     assert "TRADE_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
     assert "SETTLEMENT_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
@@ -426,15 +528,23 @@ def test_trade_side_assets_and_settlement_asset_must_match_posting_accounts() ->
 def test_wrong_account_cross_cutoff_and_missing_balance_evidence_are_closed_differences() -> None:
     source_intent, exact, postings = exact_postings()
 
-    wrong_account = reconcile_live_account(
-        postings, snapshot_for(source_intent, exact, account_fingerprint="b" * 64)
+    wrong_account = reconcile_with_evidence(
+        postings,
+        snapshot_for(source_intent, exact, account_fingerprint="b" * 64),
+        source_intent,
+        exact,
     )
-    cross_cutoff = reconcile_live_account(
+    cross_cutoff = reconcile_with_evidence(
         postings,
         snapshot_for(source_intent, exact, cutoff_at=NOW + timedelta(seconds=1)),
+        source_intent,
+        exact,
     )
-    missing_evidence = reconcile_live_account(
-        postings, snapshot_for(source_intent, exact, balance_hash=evidence_hash(41))
+    missing_evidence = reconcile_with_evidence(
+        postings,
+        snapshot_for(source_intent, exact, balance_hash=evidence_hash(41)),
+        source_intent,
+        exact,
     )
 
     assert "POSTING_ACCOUNT_MISMATCH" in wrong_account.differences
@@ -447,12 +557,86 @@ def test_explicit_balanced_cost_basis_pnl_is_publishable_only_after_exact_closur
     expected_pnl: Decimal,
 ) -> None:
     source_intent, exact, postings = exact_postings(realized_pnl=expected_pnl)
-    result = reconcile_live_account(postings, snapshot_for(source_intent, exact))
+    snapshot = snapshot_for(source_intent, exact)
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
 
     assert result.complete
     assert COST_BASIS_HASH in result.evidence_hashes
-    assert reconciled_live_pnl(postings, result) == expected_pnl
-    assert reconciled_live_pnl(postings[:-1], result) is None
+    assert pnl_with_evidence(postings, result, snapshot, source_intent, exact) == expected_pnl
+    assert pnl_with_evidence(postings[:-1], result, snapshot, source_intent, exact) is None
+
+
+def test_reconciliation_rejects_balanced_subset_that_omits_canonical_pnl_pair() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    incomplete = tuple(
+        row
+        for row in postings
+        if "realized_pnl"
+        not in {row.debit_account.partition(":")[0], row.credit_account.partition(":")[0]}
+    )
+
+    result = reconcile_live_account(
+        incomplete,
+        snapshot_for(source_intent, exact),
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+    )
+
+    assert "POSTING_TOPOLOGY_MISMATCH" in result.differences
+    assert result.next_action == "HALT_AND_RECONCILE"
+
+
+def test_recent_trade_observation_commits_to_exact_signed_realized_pnl() -> None:
+    assert "realized_pnl" in RecentTradeObservation.model_fields
+
+
+def test_public_round_tripped_reconciliation_revalidates_and_publishes_exact_pnl() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+    )
+    round_tripped = LiveReconciliation.model_validate_json(result.model_dump_json())
+
+    assert type(round_tripped) is LiveReconciliation
+    assert reconciled_live_pnl(
+        postings,
+        round_tripped,
+        snapshot,
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+    ) == Decimal("1.25")
+
+
+def test_pnl_amount_and_sign_must_match_the_exact_economics_commitment() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    base = snapshot_for(source_intent, exact)
+    wrong_trade = base.recent_trades[0].model_copy(update={"realized_pnl": Decimal("-1.25")})
+    mismatched = base.model_copy(
+        update={"recent_trades": (wrong_trade,), "snapshot_fingerprint": None}
+    )
+
+    result = reconcile_with_evidence(postings, mismatched, source_intent, exact)
+
+    assert "TRADE_EVIDENCE_MISMATCH:venue-trade-1" in result.differences
+    assert pnl_with_evidence(postings, result, mismatched, source_intent, exact) is None
+
+
+def test_forged_public_reconciliation_cannot_publish_pnl() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    result = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+    forged = result.model_copy(
+        update={"reconciliation_id": UUID("42b33848-ff46-4c45-b9ab-0c74510687f5")}
+    )
+
+    assert pnl_with_evidence(postings, forged, snapshot, source_intent, exact) is None
 
 
 def test_snapshot_requires_exact_utc_ordering_sorted_unique_facts_and_matching_cuts() -> None:
@@ -478,7 +662,7 @@ def test_snapshot_requires_exact_utc_ordering_sorted_unique_facts_and_matching_c
         VenueAccountSnapshot.model_construct()
 
 
-def test_snapshot_and_reconciliation_deny_reinitialization_and_subclass_forks() -> None:
+def test_snapshot_denies_reinitialization_and_reconciliation_is_publicly_round_trippable() -> None:
     source_intent, exact, postings = exact_postings()
     snapshot = snapshot_for(source_intent, exact)
     snapshot_alias = snapshot
@@ -493,35 +677,33 @@ def test_snapshot_and_reconciliation_deny_reinitialization_and_subclass_forks() 
         class ForkedSnapshot(VenueAccountSnapshot):
             pass
 
-    reconciliation = reconcile_live_account(postings, snapshot)
-    reconciliation_alias = reconciliation
-    reconciliation_fields = reconciliation.model_dump(mode="python")
-    reconciliation_fields["complete"] = False
-    reconciliation_fields["differences"] = ("forged",)
-    reconciliation_fields["next_action"] = "HALT_AND_RECONCILE"
-    with pytest.raises(ValueError, match="LIVE_RECONCILIATION_INVALID"):
-        reconciliation.__init__(**reconciliation_fields)
-    assert reconciliation_alias.complete
-    for record, error in (
-        (snapshot, "VENUE_ACCOUNT_SNAPSHOT_INVALID"),
-        (reconciliation, "LIVE_RECONCILIATION_INVALID"),
-    ):
-        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
-            with pytest.raises(ValueError, match=error):
-                operation(record)
-        with pytest.raises(ValueError, match=error):
-            record.__getstate__()
+    reconciliation = reconcile_with_evidence(postings, snapshot, source_intent, exact)
+    assert type(reconciliation) is LiveReconciliation
+    assert (
+        LiveReconciliation.model_validate_json(reconciliation.model_dump_json()) == reconciliation
+    )
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(ValueError, match="VENUE_ACCOUNT_SNAPSHOT_INVALID"):
+            operation(snapshot)
+    with pytest.raises(ValueError, match="VENUE_ACCOUNT_SNAPSHOT_INVALID"):
+        snapshot.__getstate__()
 
 
 def test_reconciliation_snapshots_inputs_and_rejects_malformed_posting_sets_stably() -> None:
     source_intent, exact, postings = exact_postings()
     snapshot = snapshot_for(source_intent, exact)
 
-    duplicate = reconcile_live_account((postings[0], postings[0]), snapshot)
+    duplicate = reconcile_with_evidence((postings[0], postings[0]), snapshot, source_intent, exact)
     assert duplicate.differences == ("POSTINGS_INVALID",)
     assert duplicate.next_action == "HALT_AND_RECONCILE"
 
     with pytest.raises(LiveReconciliationError, match="SNAPSHOT_INVALID"):
-        reconcile_live_account(postings, object())  # type: ignore[arg-type]
+        reconcile_live_account(
+            postings,
+            object(),  # type: ignore[arg-type]
+            (source_intent,),
+            (trade_event(source_intent),),
+            (exact,),
+        )
     with pytest.raises(ValidationError):
         snapshot.current_cash_balances[0].amount = Decimal("0")

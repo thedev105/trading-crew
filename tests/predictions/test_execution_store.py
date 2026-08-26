@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.execution.ledger import AuthoritativeTradeEconomics
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -32,6 +33,41 @@ from tests.predictions.execution_helpers import (
 from tests.predictions.store_helpers import raw_envelope
 
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
+
+
+def authoritative_economics(
+    source_intent: ExecutionIntent,
+    **overrides: object,
+) -> AuthoritativeTradeEconomics:
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "account_fingerprint": source_intent.account_fingerprint,
+        "intent_id": source_intent.intent_id,
+        "venue_order_id": "order-1",
+        "venue_trade_id": "trade-1",
+        "trade_event_hash": "5" * 64,
+        "cash_asset_id": "USDC",
+        "position_asset_id": source_intent.token_id,
+        "side": source_intent.side,
+        "price": Decimal("0.51"),
+        "size": Decimal("10"),
+        "fee": Decimal("0.01"),
+        "cash_quantum": Decimal("0.000001"),
+        "position_quantum": Decimal("0.01"),
+        "trade_state": VenueTradeState.CONFIRMED,
+        "settlement_state": VenueTradeState.CONFIRMED,
+        "fee_hash": "3" * 64,
+        "settlement_hash": "2" * 64,
+        "source_hash": "4" * 64,
+        "balance_evidence_hashes": ("6" * 64,),
+        "occurred_at": NOW + timedelta(seconds=1),
+        "information_cutoff": NOW + timedelta(seconds=3),
+        "protocol_version": source_intent.protocol_version,
+        "realized_pnl": None,
+        "cost_basis_evidence_hash": None,
+    }
+    fields.update(overrides)
+    return AuthoritativeTradeEconomics(**fields)
 
 
 def test_durable_execution_claim_is_atomic_across_store_instances_and_reopen(
@@ -264,7 +300,7 @@ def execution_records() -> tuple[
     )
 
 
-def test_migration_009_creates_all_execution_tables(tmp_path: Path) -> None:
+def test_migration_010_creates_all_execution_tables(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     names = {
         row[0]
@@ -284,7 +320,101 @@ def test_migration_009_creates_all_execution_tables(tmp_path: Path) -> None:
         "activation_evidence",
         "protocol_conformance_results",
         "execution_operation_claims",
+        "authoritative_trade_economics",
     } <= names
+
+
+def test_authoritative_economics_round_trips_by_account_intent_and_cutoff(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "predictions.duckdb"
+    store = PredictionMarketStore(path)
+    _, source_intent, *_ = execution_records()
+    exact = authoritative_economics(source_intent)
+
+    assert store.append_authoritative_trade_economics(exact)
+    assert not store.append_authoritative_trade_economics(exact)
+    assert store.verified_authoritative_trade_economics_for_account(
+        source_intent.account_fingerprint, exact.information_cutoff
+    ) == (exact,)
+    assert store.verified_authoritative_trade_economics_for_intent(
+        source_intent.intent_id, exact.information_cutoff
+    ) == (exact,)
+    assert (
+        store.verified_authoritative_trade_economics_for_account(
+            source_intent.account_fingerprint,
+            exact.information_cutoff - timedelta(microseconds=1),
+        )
+        == ()
+    )
+    store.close()
+
+    reopened = PredictionMarketStore(path, read_only=True)
+    assert reopened.verified_authoritative_trade_economics_for_account(
+        source_intent.account_fingerprint, exact.information_cutoff
+    ) == (exact,)
+    reopened.close()
+
+
+def test_authoritative_economics_conflict_for_same_trade_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _, source_intent, *_ = execution_records()
+    exact = authoritative_economics(source_intent)
+    conflicting = authoritative_economics(source_intent, source_hash="7" * 64)
+
+    assert store.append_authoritative_trade_economics(exact)
+    with pytest.raises(ConflictingRecordError, match="authoritative_trade_economics"):
+        store.append_authoritative_trade_economics(conflicting)
+
+
+def test_authoritative_economics_history_order_is_deterministic(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _, source_intent, *_ = execution_records()
+    later = authoritative_economics(
+        source_intent,
+        venue_trade_id="trade-2",
+        trade_event_hash="7" * 64,
+        source_hash="8" * 64,
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+    earlier = authoritative_economics(source_intent)
+
+    store.append_authoritative_trade_economics(later)
+    store.append_authoritative_trade_economics(earlier)
+
+    assert store.verified_authoritative_trade_economics_for_intent(
+        source_intent.intent_id, later.information_cutoff
+    ) == (earlier, later)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("record_hash", "0" * 64),
+        ("account_fingerprint", "9" * 64),
+        ("record_json", "{"),
+    ],
+)
+def test_authoritative_economics_verified_query_detects_corruption(
+    tmp_path: Path,
+    column: str,
+    value: str,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _, source_intent, *_ = execution_records()
+    exact = authoritative_economics(source_intent)
+    store.append_authoritative_trade_economics(exact)
+    store._connection.execute(
+        f"UPDATE authoritative_trade_economics SET {column} = ?",
+        [value],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="authoritative_trade_economics"):
+        store.verified_authoritative_trade_economics_for_account(
+            source_intent.account_fingerprint, exact.information_cutoff
+        )
 
 
 def test_intent_retry_is_idempotent_but_conflicting_content_fails(tmp_path: Path) -> None:
@@ -441,7 +571,7 @@ def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
     versions = store._connection.execute(
         "SELECT version FROM schema_migrations ORDER BY version"
     ).fetchall()
-    assert versions[-1] == (9,)
+    assert versions[-1] == (10,)
 
 
 def test_reopened_read_only_store_verifies_execution_readiness(tmp_path: Path) -> None:

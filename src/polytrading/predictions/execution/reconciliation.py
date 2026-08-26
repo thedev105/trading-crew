@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Annotated, Literal, Self
 from uuid import UUID, uuid5
 
@@ -23,13 +23,21 @@ from polytrading.predictions.execution.ledger import (
     MAX_LEDGER_AMOUNT,
     MAX_LEDGER_DECIMAL_PLACES,
     MAX_LIVE_EVIDENCE_ITEMS,
+    AuthoritativeTradeEconomics,
     LiveLedgerError,
+    _exact_add,
+    _exact_difference,
+    _ExactArithmeticError,
+    _is_quantized,
+    postings_for_confirmed_trades,
     verify_live_conservation,
 )
 from polytrading.predictions.execution.models import (
+    ExecutionIntent,
     LiveLedgerPosting,
     LiveReconciliation,
     VenueOrderState,
+    VenueTradeEvent,
     VenueTradeState,
     canonical_execution_hash,
 )
@@ -182,6 +190,7 @@ class RecentTradeObservation(_StrictObservation):
         tuple[Sha256, ...], Field(min_length=1, max_length=MAX_LIVE_EVIDENCE_ITEMS)
     ]
     economics_fingerprint: Sha256
+    realized_pnl: Decimal | None = None
     cost_basis_evidence_hash: Sha256 | None = None
     occurred_at: datetime
 
@@ -198,6 +207,14 @@ class RecentTradeObservation(_StrictObservation):
         if value != tuple(sorted(set(value))):
             raise ValueError("VENUE_ACCOUNT_SNAPSHOT_INVALID") from None
         return value
+
+    @model_validator(mode="after")
+    def _exact_realized_pnl_commitment(self) -> RecentTradeObservation:
+        if (self.realized_pnl is None) != (self.cost_basis_evidence_hash is None) or (
+            self.realized_pnl is not None and not _bounded_decimal(self.realized_pnl)
+        ):
+            raise ValueError("VENUE_ACCOUNT_SNAPSHOT_INVALID") from None
+        return self
 
 
 class SettlementObservation(_StrictObservation):
@@ -344,67 +361,11 @@ class VenueAccountSnapshot(_StrictObservation):
 _OBSERVATION_MODELS_SEALED = True
 
 
-class _SealedLiveReconciliation(LiveReconciliation):
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        del cls, kwargs
-        raise TypeError("LIVE_RECONCILIATION_NOT_SUBCLASSABLE") from None
-
-    def __init__(self, **data: object) -> None:
-        try:
-            object.__getattribute__(self, "__pydantic_fields_set__")
-        except AttributeError:
-            pass
-        else:
-            raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-        super().__init__(**data)
-
-    @classmethod
-    def model_construct(cls, _fields_set: set[str] | None = None, **values: object) -> Self:
-        del _fields_set, values
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-    def model_copy(
-        self,
-        *,
-        update: Mapping[str, object] | None = None,
-        deep: bool = False,
-    ) -> Self:
-        del deep
-        values = self.model_dump(mode="python")
-        if update is not None:
-            values.update(update)
-        return type(self).model_validate(values, strict=True)
-
-    def __copy__(self) -> object:
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-    def __deepcopy__(self, memo: object) -> object:
-        del memo
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-    def __reduce__(self) -> object:
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-    def __reduce_ex__(self, protocol: int) -> object:
-        del protocol
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-    def __getstate__(self) -> object:
-        raise ValueError("LIVE_RECONCILIATION_INVALID") from None
-
-
 def _bounded_decimal(value: Decimal) -> bool:
     if type(value) is not Decimal or not value.is_finite() or value.copy_abs() > MAX_LEDGER_AMOUNT:
         return False
     exponent = value.as_tuple().exponent
     return type(exponent) is int and exponent >= -MAX_LEDGER_DECIMAL_PLACES
-
-
-def _is_quantized(value: Decimal, quantum: Decimal) -> bool:
-    try:
-        return value % quantum == 0
-    except (InvalidOperation, ZeroDivisionError):
-        return False
 
 
 def _asset_identity(value: AssetAmountObservation) -> str:
@@ -442,7 +403,12 @@ def _snapshot_input(snapshot: object) -> VenueAccountSnapshot:
         raise LiveReconciliationError("SNAPSHOT_INVALID") from None
 
 
-def _snapshot_postings(postings: object) -> tuple[LiveLedgerPosting, ...]:
+def _snapshot_postings(
+    postings: object,
+    intents: Sequence[ExecutionIntent],
+    trades: Sequence[VenueTradeEvent],
+    economics: Sequence[AuthoritativeTradeEconomics],
+) -> tuple[LiveLedgerPosting, ...]:
     if not isinstance(postings, Sequence) or isinstance(postings, (str, bytes, bytearray)):
         raise LiveLedgerError("POSTING_INVALID") from None
     if len(postings) > MAX_LIVE_EVIDENCE_ITEMS:
@@ -458,32 +424,31 @@ def _snapshot_postings(postings: object) -> tuple[LiveLedgerPosting, ...]:
         except (TypeError, ValueError):
             raise LiveLedgerError("POSTING_INVALID") from None
     result = tuple(values)
-    verify_live_conservation(result)
+    verify_live_conservation(result, intents, trades, economics)
     return result
 
 
 def _snapshot_evidence(snapshot: VenueAccountSnapshot) -> dict[str, tuple[Sha256, ...]]:
-    order_hashes = {
+    evidence_hashes = {
+        snapshot.snapshot_fingerprint,
         snapshot.open_orders_source_hash,
+        snapshot.recent_trades_source_hash,
+        snapshot.settlements_source_hash,
         *(value.evidence_hash for value in snapshot.open_orders),
     }
-    trade_hashes = {snapshot.recent_trades_source_hash}
     for value in snapshot.recent_trades:
-        trade_hashes.update(
+        evidence_hashes.update(
             {
-                value.trade_event_hash,
                 value.settlement_hash,
                 value.fee_hash,
                 value.source_hash,
                 value.economics_fingerprint,
-                *value.balance_evidence_hashes,
             }
         )
         if value.cost_basis_evidence_hash is not None:
-            trade_hashes.add(value.cost_basis_evidence_hash)
-    settlement_hashes = {snapshot.settlements_source_hash}
+            evidence_hashes.add(value.cost_basis_evidence_hash)
     for value in snapshot.settlements:
-        settlement_hashes.update({value.settlement_hash, value.evidence_hash})
+        evidence_hashes.update({value.settlement_hash, value.evidence_hash})
     balance_hashes = {
         snapshot.opening_cash_source_hash,
         snapshot.current_cash_source_hash,
@@ -501,24 +466,18 @@ def _snapshot_evidence(snapshot: VenueAccountSnapshot) -> dict[str, tuple[Sha256
         snapshot.current_cumulative_fees,
     ):
         balance_hashes.update(value.evidence_hash for value in values)
+    for value in snapshot.recent_trades:
+        balance_hashes.update(value.balance_evidence_hashes)
     allowance_hashes = {
         snapshot.opening_allowance_source_hash,
         snapshot.current_allowance_source_hash,
         *(value.evidence_hash for value in snapshot.opening_allowances),
         *(value.evidence_hash for value in snapshot.current_allowances),
     }
-    all_hashes = {
-        snapshot.snapshot_fingerprint,
-        *order_hashes,
-        *trade_hashes,
-        *settlement_hashes,
-        *balance_hashes,
-        *allowance_hashes,
-    }
+    all_hashes = evidence_hashes | balance_hashes | allowance_hashes
     return {
         "all": tuple(sorted(all_hashes)),
-        "orders": tuple(sorted(order_hashes)),
-        "trades": tuple(sorted(trade_hashes | settlement_hashes)),
+        "evidence": tuple(sorted(evidence_hashes)),
         "balances": tuple(sorted(balance_hashes)),
         "allowances": tuple(sorted(allowance_hashes)),
     }
@@ -531,10 +490,17 @@ def _base_account(account: str) -> str:
 def _posting_nets(postings: tuple[LiveLedgerPosting, ...], base_account: str) -> dict[str, Decimal]:
     totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     for posting in postings:
-        if _base_account(posting.debit_account) == base_account:
-            totals[posting.asset_id] += posting.debit_amount
-        if _base_account(posting.credit_account) == base_account:
-            totals[posting.asset_id] -= posting.credit_amount
+        try:
+            if _base_account(posting.debit_account) == base_account:
+                totals[posting.asset_id] = _exact_add(
+                    totals[posting.asset_id], posting.debit_amount
+                )
+            if _base_account(posting.credit_account) == base_account:
+                totals[posting.asset_id] = _exact_difference(
+                    totals[posting.asset_id], posting.credit_amount
+                )
+        except _ExactArithmeticError:
+            raise LiveLedgerError("POSTING_AMOUNT_INVALID") from None
     return dict(totals)
 
 
@@ -543,7 +509,13 @@ def _observed_deltas(
     current: tuple[AssetAmountObservation, ...],
 ) -> dict[str, Decimal]:
     opening_values = {value.asset_id: value.amount for value in opening}
-    return {value.asset_id: value.amount - opening_values[value.asset_id] for value in current}
+    try:
+        return {
+            value.asset_id: _exact_difference(value.amount, opening_values[value.asset_id])
+            for value in current
+        }
+    except _ExactArithmeticError:
+        raise LiveReconciliationError("SNAPSHOT_INVALID") from None
 
 
 def _append_delta_differences(
@@ -562,7 +534,8 @@ def _result(
     snapshot: VenueAccountSnapshot,
     postings: tuple[LiveLedgerPosting, ...],
     differences: set[str],
-) -> _SealedLiveReconciliation:
+    trade_event_hashes: tuple[Sha256, ...] = (),
+) -> LiveReconciliation:
     evidence = _snapshot_evidence(snapshot)
     expected_ids = tuple(sorted(posting.posting_id for posting in postings))
     fields: dict[str, object] = {
@@ -572,17 +545,17 @@ def _result(
         "observed_at": snapshot.observed_at,
         "complete": not differences,
         "differences": tuple(sorted(differences)),
-        "evidence_hashes": evidence["all"],
+        "evidence_hashes": evidence["evidence"],
         "next_action": None if not differences else "HALT_AND_RECONCILE",
-        "venue_order_hashes": evidence["orders"],
-        "venue_trade_hashes": evidence["trades"],
+        "venue_order_hashes": (),
+        "venue_trade_hashes": tuple(sorted(set(trade_event_hashes))),
         "balance_hashes": evidence["balances"],
         "allowance_hashes": evidence["allowances"],
         "expected_posting_ids": expected_ids,
         "lineage_hashes": (snapshot.snapshot_fingerprint,),
     }
     fields["reconciliation_id"] = _reconciliation_id(fields)
-    return _SealedLiveReconciliation(**fields)
+    return LiveReconciliation(**fields)
 
 
 def _reconciliation_id(fields: Mapping[str, object]) -> UUID:
@@ -594,15 +567,30 @@ def _reconciliation_id(fields: Mapping[str, object]) -> UUID:
 def reconcile_live_account(
     postings: Sequence[LiveLedgerPosting],
     snapshot: VenueAccountSnapshot,
+    intents: Sequence[ExecutionIntent],
+    trades: Sequence[VenueTradeEvent],
+    economics: Sequence[AuthoritativeTradeEconomics],
 ) -> LiveReconciliation:
     """Close posting effects against independent two-cut authoritative evidence."""
     observed = _snapshot_input(snapshot)
+    trade_event_hashes = tuple(
+        sorted({trade.raw_event_hash for trade in trades if type(trade) is VenueTradeEvent})
+    )
     try:
-        rows = _snapshot_postings(postings)
-    except LiveLedgerError:
-        return _result(observed, (), {"POSTINGS_INVALID"})
+        rows = _snapshot_postings(postings, intents, trades, economics)
+    except LiveLedgerError as exc:
+        difference = (
+            "POSTING_TOPOLOGY_MISMATCH"
+            if str(exc) == "POSTING_TOPOLOGY_MISMATCH"
+            else "POSTINGS_INVALID"
+        )
+        try:
+            canonical_rows = postings_for_confirmed_trades(intents, trades, economics)
+        except LiveLedgerError:
+            canonical_rows = ()
+        return _result(observed, canonical_rows, {difference}, trade_event_hashes)
     differences: set[str] = set()
-    snapshot_evidence = set(_snapshot_evidence(observed)["all"])
+    snapshot_evidence = set(_snapshot_evidence(observed)["all"]) | set(trade_event_hashes)
     if any(row.account_fingerprint != observed.account_fingerprint for row in rows):
         differences.add("POSTING_ACCOUNT_MISMATCH")
     for trade_id in sorted({row.venue_trade_id for row in rows}):
@@ -646,6 +634,7 @@ def reconcile_live_account(
     expected_trade_ids = {row.venue_trade_id for row in rows}
     trades = {value.venue_trade_id: value for value in observed.recent_trades}
     settlements = {value.venue_trade_id: value for value in observed.settlements}
+    economics_by_trade = {value.venue_trade_id: value for value in economics}
     for trade_id in sorted(expected_trade_ids):
         trade_rows = tuple(row for row in rows if row.venue_trade_id == trade_id)
         first = trade_rows[0]
@@ -660,15 +649,20 @@ def reconcile_live_account(
             position_amount = position_nets[next(iter(expected_position_assets))]
             expected_side = "buy" if position_amount > 0 else "sell"
         trade = trades.get(trade_id)
+        exact = economics_by_trade.get(trade_id)
         if trade is None:
             differences.add(f"TRADE_MISSING:{trade_id}")
         elif (
-            trade.state is not VenueTradeState.CONFIRMED
+            exact is None
+            or trade.state is not VenueTradeState.CONFIRMED
             or trade.intent_id != first.intent_id
             or trade.venue_order_id != first.venue_order_id
             or trade.settlement_hash != first.settlement_hash
             or trade.fee_hash != first.fee_hash
             or trade.balance_evidence_hashes != first.balance_evidence_hashes
+            or trade.economics_fingerprint != exact.economics_fingerprint
+            or trade.realized_pnl != exact.realized_pnl
+            or trade.cost_basis_evidence_hash != exact.cost_basis_evidence_hash
             or trade.occurred_at != first.occurred_at
             or {trade.cash_asset_id} != expected_cash_assets
             or {trade.position_asset_id} != expected_position_assets
@@ -716,32 +710,45 @@ def reconcile_live_account(
         differences.add(f"TRADE_UNEXPLAINED:{trade_id}")
     for trade_id in sorted(set(settlements) - expected_trade_ids):
         differences.add(f"SETTLEMENT_UNEXPLAINED:{trade_id}")
-    return _result(observed, rows, differences)
+    return _result(observed, rows, differences, trade_event_hashes)
 
 
 def reconciled_live_pnl(
     postings: Sequence[LiveLedgerPosting],
     reconciliation: LiveReconciliation | None,
+    snapshot: VenueAccountSnapshot,
+    intents: Sequence[ExecutionIntent],
+    trades: Sequence[VenueTradeEvent],
+    economics: Sequence[AuthoritativeTradeEconomics],
 ) -> Decimal | None:
-    """Return only explicitly posted realized P&L after exact independent closure."""
-    if type(reconciliation) is not _SealedLiveReconciliation:
+    """Reconstruct all evidence before publishing explicitly posted realized P&L."""
+    if type(reconciliation) is not LiveReconciliation:
         return None
     try:
-        closed = _SealedLiveReconciliation.model_validate(
+        closed = LiveReconciliation.model_validate(
             reconciliation.model_dump(mode="python"), strict=True
         )
-        rows = _snapshot_postings(postings)
+        rows = _snapshot_postings(postings, intents, trades, economics)
+        reconstructed = reconcile_live_account(rows, snapshot, intents, trades, economics)
     except (TypeError, ValueError, LiveLedgerError):
         return None
+    closed_hashes = {
+        *closed.evidence_hashes,
+        *closed.venue_order_hashes,
+        *closed.venue_trade_hashes,
+        *closed.balance_hashes,
+        *closed.allowance_hashes,
+    }
     if (
-        not closed.complete
+        closed != reconstructed
+        or not closed.complete
         or closed.differences
         or closed.next_action is not None
         or closed.reconciliation_id != _reconciliation_id(closed.model_dump(mode="python"))
         or closed.expected_posting_ids != tuple(sorted(row.posting_id for row in rows))
         or any(row.account_fingerprint != closed.account_fingerprint for row in rows)
         or any(row.occurred_at > closed.observed_at for row in rows)
-        or any(not set(row.lineage_hashes) <= set(closed.evidence_hashes) for row in rows)
+        or any(not set(row.lineage_hashes) <= closed_hashes for row in rows)
     ):
         return None
     pnl_rows = tuple(
@@ -754,10 +761,13 @@ def reconciled_live_pnl(
         return None
     pnl = Decimal("0")
     for row in pnl_rows:
-        if _base_account(row.credit_account) == "realized_pnl":
-            pnl += row.credit_amount
-        if _base_account(row.debit_account) == "realized_pnl":
-            pnl -= row.debit_amount
+        try:
+            if _base_account(row.credit_account) == "realized_pnl":
+                pnl = _exact_add(pnl, row.credit_amount)
+            if _base_account(row.debit_account) == "realized_pnl":
+                pnl = _exact_difference(pnl, row.debit_amount)
+        except _ExactArithmeticError:
+            return None
     return pnl
 
 
