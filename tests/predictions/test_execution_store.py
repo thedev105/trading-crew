@@ -5,6 +5,7 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from pydantic import ValidationError
 
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.execution.models import (
@@ -291,10 +292,8 @@ def test_verified_execution_reads_exclude_later_events_and_expired_intents(tmp_p
         "UPDATE execution_intents SET created_at = ? WHERE intent_id = ?",
         [NOW - timedelta(seconds=1), intent.intent_id],
     )
-    assert (
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
         store.verified_execution_intent(intent.intent_id, NOW - timedelta(microseconds=1))
-        is None
-    )
 
 
 def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
@@ -359,3 +358,125 @@ def test_execution_record_json_never_contains_unmodeled_secret_canaries(tmp_path
         "SELECT record_json FROM execution_intents WHERE intent_id = ?", [intent.intent_id]
     ).fetchone()[0]
     assert canary not in stored_json
+
+
+@pytest.mark.parametrize(
+    ("append_method", "record_index", "field", "invalid_value", "table"),
+    [
+        (
+            "append_live_execution_plan",
+            0,
+            "observed_at",
+            datetime(2026, 8, 25, 16),
+            "live_execution_plans",
+        ),
+        (
+            "append_execution_intent",
+            1,
+            "created_at",
+            datetime(2026, 8, 25, 16),
+            "execution_intents",
+        ),
+        (
+            "append_signed_order_envelope",
+            2,
+            "canonical_order_json",
+            '{"private_key":"private-key-canary"}',
+            "signed_order_envelopes",
+        ),
+        (
+            "append_venue_order_event",
+            3,
+            "received_at",
+            datetime(2026, 8, 25, 16),
+            "venue_order_events",
+        ),
+        (
+            "append_venue_trade_event",
+            4,
+            "received_at",
+            datetime(2026, 8, 25, 16),
+            "venue_trade_events",
+        ),
+        ("append_live_ledger_posting", 5, "debit_amount", Decimal("-1"), "live_ledger_postings"),
+        (
+            "append_live_reconciliation",
+            6,
+            "observed_at",
+            datetime(2026, 8, 25, 16),
+            "live_reconciliations",
+        ),
+        (
+            "append_kill_switch_event",
+            7,
+            "occurred_at",
+            datetime(2026, 8, 25, 16),
+            "execution_kill_events",
+        ),
+        (
+            "append_activation_evidence",
+            8,
+            "verified_at",
+            datetime(2026, 8, 25, 16),
+            "activation_evidence",
+        ),
+        (
+            "append_protocol_conformance_result",
+            9,
+            "observed_at",
+            datetime(2026, 8, 25, 16),
+            "protocol_conformance_results",
+        ),
+    ],
+)
+def test_execution_appends_revalidate_constructed_models(
+    append_method: str,
+    record_index: int,
+    field: str,
+    invalid_value: object,
+    table: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    record = execution_records()[record_index]
+    fields = record.model_dump()
+    fields[field] = invalid_value
+    constructed = type(record).model_construct(**fields)
+
+    with pytest.raises(ValidationError):
+        getattr(store, append_method)(constructed)
+    assert store._connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+
+
+def test_verified_execution_intent_rejects_a_corrupted_indexed_identity(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _, intent, *_ = execution_records()
+    store.append_execution_intent(intent)
+    store._connection.execute(
+        "UPDATE execution_intents SET intent_id = ? WHERE intent_id = ?",
+        [UUID("99999999-9999-9999-9999-999999999999"), intent.intent_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_execution_intent(intent.intent_id, NOW)
+
+
+def test_order_history_uses_sequence_number_before_uuid_for_equal_timestamps(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _, intent, _, first, *_ = execution_records()
+    first = first.model_copy(update={"event_id": UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")})
+    second = first.model_copy(
+        update={
+            "event_id": UUID("00000000-0000-0000-0000-000000000001"),
+            "sequence_number": 2,
+            "normalized_state": VenueOrderState.FILLED,
+            "terminal": True,
+        }
+    )
+    store.append_venue_order_event(first)
+    store.append_venue_order_event(second)
+
+    assert store.verified_venue_order_events_for_intent(intent.intent_id, NOW) == (first, second)
+    assert store.latest_order_state(intent.intent_id, NOW) == second

@@ -12,7 +12,7 @@ from typing import Any
 from uuid import UUID
 
 import duckdb
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from polytrading.predictions.attestations import RuleAttestation
 from polytrading.predictions.candidates_models import CandidateRelationship
@@ -54,6 +54,19 @@ def _utc_from_epoch_us(value: int | None) -> datetime | None:
     if value is None:
         return None
     return _UNIX_EPOCH + timedelta(microseconds=value)
+
+
+def _epoch_us(value: datetime) -> int:
+    return (value - _UNIX_EPOCH) // timedelta(microseconds=1)
+
+
+def _order_event_sort_key(record: VenueOrderEvent) -> tuple[datetime, bool, int, UUID]:
+    return (
+        record.received_at,
+        record.sequence_number is None,
+        record.sequence_number if record.sequence_number is not None else 0,
+        record.event_id,
+    )
 
 
 class ConflictingRecordError(ValueError):
@@ -201,6 +214,9 @@ class PredictionMarketStore:
         return True
 
     def append_execution_intent(self, record: ExecutionIntent) -> bool:
+        record = self._validated_execution_record(
+            record, ExecutionIntent, "execution_intents", "intent_id", record.intent_id
+        )
         return self._append_hashed_record(
             table="execution_intents",
             identity_column="intent_id",
@@ -217,6 +233,9 @@ class PredictionMarketStore:
         )
 
     def append_live_execution_plan(self, record: LiveExecutionPlan) -> bool:
+        record = self._validated_execution_record(
+            record, LiveExecutionPlan, "live_execution_plans", "plan_id", record.plan_id
+        )
         return self._append_hashed_record(
             table="live_execution_plans",
             identity_column="plan_id",
@@ -239,6 +258,9 @@ class PredictionMarketStore:
         )
 
     def append_signed_order_envelope(self, record: SignedOrderEnvelope) -> bool:
+        record = self._validated_execution_record(
+            record, SignedOrderEnvelope, "signed_order_envelopes", "intent_id", record.intent_id
+        )
         return self._append_hashed_record(
             table="signed_order_envelopes",
             identity_column="intent_id",
@@ -249,6 +271,9 @@ class PredictionMarketStore:
         )
 
     def append_venue_order_event(self, record: VenueOrderEvent) -> bool:
+        record = self._validated_execution_record(
+            record, VenueOrderEvent, "venue_order_events", "event_id", record.event_id
+        )
         return self._append_hashed_record(
             table="venue_order_events",
             identity_column="event_id",
@@ -259,6 +284,9 @@ class PredictionMarketStore:
         )
 
     def append_venue_trade_event(self, record: VenueTradeEvent) -> bool:
+        record = self._validated_execution_record(
+            record, VenueTradeEvent, "venue_trade_events", "trade_event_id", record.trade_event_id
+        )
         return self._append_hashed_record(
             table="venue_trade_events",
             identity_column="trade_event_id",
@@ -269,6 +297,9 @@ class PredictionMarketStore:
         )
 
     def append_live_ledger_posting(self, record: LiveLedgerPosting) -> bool:
+        record = self._validated_execution_record(
+            record, LiveLedgerPosting, "live_ledger_postings", "posting_id", record.posting_id
+        )
         return self._append_hashed_record(
             table="live_ledger_postings",
             identity_column="posting_id",
@@ -284,6 +315,13 @@ class PredictionMarketStore:
         )
 
     def append_live_reconciliation(self, record: LiveReconciliation) -> bool:
+        record = self._validated_execution_record(
+            record,
+            LiveReconciliation,
+            "live_reconciliations",
+            "reconciliation_id",
+            record.reconciliation_id,
+        )
         return self._append_hashed_record(
             table="live_reconciliations",
             identity_column="reconciliation_id",
@@ -294,6 +332,9 @@ class PredictionMarketStore:
         )
 
     def append_kill_switch_event(self, record: KillSwitchEvent) -> bool:
+        record = self._validated_execution_record(
+            record, KillSwitchEvent, "execution_kill_events", "kill_event_id", record.kill_event_id
+        )
         return self._append_hashed_record(
             table="execution_kill_events",
             identity_column="kill_event_id",
@@ -304,6 +345,13 @@ class PredictionMarketStore:
         )
 
     def append_activation_evidence(self, record: ActivationEvidence) -> bool:
+        record = self._validated_execution_record(
+            record,
+            ActivationEvidence,
+            "activation_evidence",
+            "activation_evidence_id",
+            record.activation_evidence_id,
+        )
         return self._append_hashed_record(
             table="activation_evidence",
             identity_column="activation_evidence_id",
@@ -319,6 +367,13 @@ class PredictionMarketStore:
         )
 
     def append_protocol_conformance_result(self, record: ProtocolConformanceResult) -> bool:
+        record = self._validated_execution_record(
+            record,
+            ProtocolConformanceResult,
+            "protocol_conformance_results",
+            "conformance_result_id",
+            record.conformance_result_id,
+        )
         return self._append_hashed_record(
             table="protocol_conformance_results",
             identity_column="conformance_result_id",
@@ -651,6 +706,26 @@ class PredictionMarketStore:
         )
         return True
 
+    def _validated_execution_record[RecordT: BaseModel](
+        self,
+        record: BaseModel,
+        model: type[RecordT],
+        table: str,
+        identity_column: str,
+        identity: UUID,
+    ) -> RecordT:
+        try:
+            return model.model_validate(record.model_dump())
+        except ValidationError:
+            existing = self._connection.execute(
+                f"SELECT record_hash FROM {table} WHERE {identity_column} = ?", [identity]
+            ).fetchone()
+            if existing is not None and canonical_execution_hash(record) != existing[0]:
+                raise ConflictingRecordError(
+                    f"conflicting {table} record for immutable identity {identity}"
+                ) from None
+            raise
+
     def _append_hashed_record(
         self,
         *,
@@ -684,27 +759,33 @@ class PredictionMarketStore:
         *,
         table: str,
         model: type[RecordT],
-        where: str = "TRUE",
-        parameters: tuple[Any, ...] = (),
+        candidate_where: str,
+        candidate_parameters: tuple[Any, ...],
+        index_columns: tuple[str, ...],
+        indexed_values: Callable[[RecordT], tuple[Any, ...]],
         matches: Callable[[RecordT], bool],
         sort_key: Callable[[RecordT], Any],
         reverse: bool = False,
     ) -> tuple[RecordT, ...]:
-        # The optional SQL predicate is reserved for storage-only metadata. Model-derived
-        # identities and cutoffs are applied below after strict re-parsing, so a corrupted
-        # index cannot reveal a record outside its own immutable semantics.
+        # SQL narrows candidates only. Every returned row is strictly re-parsed, hashed,
+        # and compared to its indexed identity/account/timestamps before model semantics
+        # decide whether it belongs in the result.
+        selected_indexes = ", ".join(index_columns)
         rows = self._connection.execute(
-            f"SELECT record_json, record_hash FROM {table} WHERE {where}",
-            parameters,
+            f"SELECT {selected_indexes}, record_json, record_hash "
+            f"FROM {table} WHERE {candidate_where}",
+            candidate_parameters,
         ).fetchall()
         records: list[RecordT] = []
         for row in rows:
             try:
-                record = model.model_validate_json(row[0])
+                record = model.model_validate_json(row[-2])
             except (TypeError, ValueError) as error:
                 raise ConflictingRecordError(f"stored {table} record is invalid") from error
-            if canonical_execution_hash(record) != row[1]:
+            if canonical_execution_hash(record) != row[-1]:
                 raise ConflictingRecordError(f"stored {table} failed its immutable record hash")
+            if tuple(row[:-2]) != indexed_values(record):
+                raise ConflictingRecordError(f"stored {table} indexed columns do not match")
             if matches(record):
                 records.append(record)
         return tuple(sorted(records, key=sort_key, reverse=reverse))
@@ -715,6 +796,30 @@ class PredictionMarketStore:
         records = self._verified_records(
             table="live_execution_plans",
             model=LiveExecutionPlan,
+            candidate_where=(
+                "(plan_id = ? OR json_extract_string(record_json, '$.plan_id') = ?) "
+                "AND (observed_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.observed_at') AS TIMESTAMPTZ) <= ?)"
+                if as_of is not None
+                else "plan_id = ? OR json_extract_string(record_json, '$.plan_id') = ?"
+            ),
+            candidate_parameters=(plan_id, str(plan_id), as_of, as_of)
+            if as_of is not None
+            else (plan_id, str(plan_id)),
+            index_columns=(
+                "CAST(plan_id AS VARCHAR)",
+                "CAST(proposal_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(observed_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=lambda record: (
+                str(record.plan_id),
+                str(record.proposal_id),
+                record.account_fingerprint,
+                _epoch_us(record.observed_at),
+                _epoch_us(record.information_cutoff),
+            ),
             matches=lambda record: record.plan_id == plan_id
             and (
                 as_of is None
@@ -730,6 +835,32 @@ class PredictionMarketStore:
         records = self._verified_records(
             table="execution_intents",
             model=ExecutionIntent,
+            candidate_where=(
+                "(intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?) "
+                "AND (created_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.created_at') AS TIMESTAMPTZ) <= ?) "
+                "AND (deadline >= ? OR CAST(json_extract_string(record_json, "
+                "'$.deadline') AS TIMESTAMPTZ) >= ?)"
+                if as_of is not None
+                else "intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?"
+            ),
+            candidate_parameters=(intent_id, str(intent_id), as_of, as_of, as_of, as_of)
+            if as_of is not None
+            else (intent_id, str(intent_id)),
+            index_columns=(
+                "CAST(intent_id AS VARCHAR)",
+                "CAST(plan_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(created_at)",
+                "epoch_us(deadline)",
+            ),
+            indexed_values=lambda record: (
+                str(record.intent_id),
+                str(record.plan_id),
+                record.account_fingerprint,
+                _epoch_us(record.created_at),
+                _epoch_us(record.deadline),
+            ),
             matches=lambda record: record.intent_id == intent_id
             and (
                 as_of is None
@@ -745,6 +876,28 @@ class PredictionMarketStore:
         return self._verified_records(
             table="execution_intents",
             model=ExecutionIntent,
+            candidate_where=(
+                "(plan_id = ? OR json_extract_string(record_json, '$.plan_id') = ?) "
+                "AND (created_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.created_at') AS TIMESTAMPTZ) <= ?) "
+                "AND (deadline >= ? OR CAST(json_extract_string(record_json, "
+                "'$.deadline') AS TIMESTAMPTZ) >= ?)"
+            ),
+            candidate_parameters=(plan_id, str(plan_id), as_of, as_of, as_of, as_of),
+            index_columns=(
+                "CAST(intent_id AS VARCHAR)",
+                "CAST(plan_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(created_at)",
+                "epoch_us(deadline)",
+            ),
+            indexed_values=lambda record: (
+                str(record.intent_id),
+                str(record.plan_id),
+                record.account_fingerprint,
+                _epoch_us(record.created_at),
+                _epoch_us(record.deadline),
+            ),
             matches=lambda record: record.plan_id == plan_id
             and record.created_at <= as_of
             and record.deadline >= as_of,
@@ -754,16 +907,18 @@ class PredictionMarketStore:
     def verified_signed_order_envelope(
         self, intent_id: UUID, as_of: datetime | None = None
     ) -> SignedOrderEnvelope | None:
-        where = "intent_id = ?"
-        parameters: tuple[Any, ...] = (intent_id,)
+        candidate_where = "intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?"
+        candidate_parameters: tuple[Any, ...] = (intent_id, str(intent_id))
         if as_of is not None:
-            where += " AND persisted_at <= ?"
-            parameters += (as_of,)
+            candidate_where = f"({candidate_where}) AND persisted_at <= ?"
+            candidate_parameters += (as_of,)
         records = self._verified_records(
             table="signed_order_envelopes",
             model=SignedOrderEnvelope,
-            where=where,
-            parameters=parameters,
+            candidate_where=candidate_where,
+            candidate_parameters=candidate_parameters,
+            index_columns=("CAST(intent_id AS VARCHAR)",),
+            indexed_values=lambda record: (str(record.intent_id),),
             matches=lambda record: record.intent_id == intent_id,
             sort_key=lambda record: record.intent_id,
         )
@@ -775,19 +930,55 @@ class PredictionMarketStore:
         return self._verified_records(
             table="venue_order_events",
             model=VenueOrderEvent,
+            candidate_where=(
+                "(intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?) "
+                "AND (received_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.received_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(intent_id, str(intent_id), as_of, as_of),
+            index_columns=(
+                "CAST(event_id AS VARCHAR)",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(received_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.event_id),
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.received_at),
+            ),
             matches=lambda record: record.intent_id == intent_id and record.received_at <= as_of,
-            sort_key=lambda record: (record.received_at, record.event_id),
+            sort_key=_order_event_sort_key,
         )
 
     def latest_order_state(
         self, intent_id: UUID, as_of: datetime | None = None
     ) -> VenueOrderEvent | None:
+        candidate_where = "intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?"
+        candidate_parameters: tuple[Any, ...] = (intent_id, str(intent_id))
+        if as_of is not None:
+            candidate_where = (
+                f"({candidate_where}) AND (received_at <= ? OR "
+                "CAST(json_extract_string(record_json, '$.received_at') AS TIMESTAMPTZ) <= ?)"
+            )
+            candidate_parameters += (as_of, as_of)
         records = self._verified_records(
             table="venue_order_events",
             model=VenueOrderEvent,
+            candidate_where=candidate_where,
+            candidate_parameters=candidate_parameters,
+            index_columns=(
+                "CAST(event_id AS VARCHAR)",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(received_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.event_id),
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.received_at),
+            ),
             matches=lambda record: record.intent_id == intent_id
             and (as_of is None or record.received_at <= as_of),
-            sort_key=lambda record: (record.received_at, record.event_id),
+            sort_key=_order_event_sort_key,
             reverse=True,
         )
         return records[0] if records else None
@@ -798,6 +989,22 @@ class PredictionMarketStore:
         return self._verified_records(
             table="venue_trade_events",
             model=VenueTradeEvent,
+            candidate_where=(
+                "(intent_id = ? OR json_extract_string(record_json, '$.intent_id') = ?) "
+                "AND (received_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.received_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(intent_id, str(intent_id), as_of, as_of),
+            index_columns=(
+                "CAST(trade_event_id AS VARCHAR)",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(received_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.trade_event_id),
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.received_at),
+            ),
             matches=lambda record: record.intent_id == intent_id and record.received_at <= as_of,
             sort_key=lambda record: (record.received_at, record.trade_event_id),
         )
@@ -808,6 +1015,24 @@ class PredictionMarketStore:
         return self._verified_records(
             table="live_ledger_postings",
             model=LiveLedgerPosting,
+            candidate_where=(
+                "(account_fingerprint = ? OR json_extract_string(record_json, "
+                "'$.account_fingerprint') = ?) AND (occurred_at <= ? OR "
+                "CAST(json_extract_string(record_json, '$.occurred_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(account_fingerprint, account_fingerprint, as_of, as_of),
+            index_columns=(
+                "CAST(posting_id AS VARCHAR)",
+                "account_fingerprint",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(occurred_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.posting_id),
+                record.account_fingerprint,
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.occurred_at),
+            ),
             matches=lambda record: record.account_fingerprint == account_fingerprint
             and record.occurred_at <= as_of,
             sort_key=lambda record: (record.occurred_at, record.posting_id),
@@ -819,6 +1044,22 @@ class PredictionMarketStore:
         return self._verified_records(
             table="live_reconciliations",
             model=LiveReconciliation,
+            candidate_where=(
+                "(account_fingerprint = ? OR json_extract_string(record_json, "
+                "'$.account_fingerprint') = ?) AND (observed_at <= ? OR "
+                "CAST(json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(account_fingerprint, account_fingerprint, as_of, as_of),
+            index_columns=(
+                "CAST(reconciliation_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(observed_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.reconciliation_id),
+                record.account_fingerprint,
+                _epoch_us(record.observed_at),
+            ),
             matches=lambda record: record.account_fingerprint == account_fingerprint
             and record.observed_at <= as_of,
             sort_key=lambda record: (record.observed_at, record.reconciliation_id),
@@ -830,6 +1071,22 @@ class PredictionMarketStore:
         return self._verified_records(
             table="execution_kill_events",
             model=KillSwitchEvent,
+            candidate_where=(
+                "(scope = ? OR json_extract_string(record_json, '$.scope') = ?) "
+                "AND (occurred_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.occurred_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(scope, scope, as_of, as_of),
+            index_columns=(
+                "CAST(kill_event_id AS VARCHAR)",
+                "scope",
+                "epoch_us(occurred_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.kill_event_id),
+                record.scope,
+                _epoch_us(record.occurred_at),
+            ),
             matches=lambda record: record.scope == scope and record.occurred_at <= as_of,
             sort_key=lambda record: (record.occurred_at, record.kill_event_id),
         )
@@ -840,6 +1097,24 @@ class PredictionMarketStore:
         records = self._verified_records(
             table="activation_evidence",
             model=ActivationEvidence,
+            candidate_where=(
+                "(capability_digest = ? OR json_extract_string(record_json, "
+                "'$.capability_digest') = ?) AND (verified_at <= ? OR "
+                "CAST(json_extract_string(record_json, '$.verified_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(capability_digest, capability_digest, as_of, as_of),
+            index_columns=(
+                "CAST(activation_evidence_id AS VARCHAR)",
+                "capability_digest",
+                "epoch_us(verified_at)",
+                "epoch_us(expires_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.activation_evidence_id),
+                record.capability_digest,
+                _epoch_us(record.verified_at),
+                None if record.expires_at is None else _epoch_us(record.expires_at),
+            ),
             matches=lambda record: record.capability_digest == capability_digest
             and record.verified_at <= as_of,
             sort_key=lambda record: (record.verified_at, record.activation_evidence_id),
@@ -853,6 +1128,16 @@ class PredictionMarketStore:
         return self._verified_records(
             table="protocol_conformance_results",
             model=ProtocolConformanceResult,
+            candidate_where=(
+                "observed_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.observed_at') AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=("CAST(conformance_result_id AS VARCHAR)", "epoch_us(observed_at)"),
+            indexed_values=lambda record: (
+                str(record.conformance_result_id),
+                _epoch_us(record.observed_at),
+            ),
             matches=lambda record: record.observed_at <= as_of,
             sort_key=lambda record: (record.observed_at, record.conformance_result_id),
         )
