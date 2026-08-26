@@ -29,7 +29,9 @@ from polytrading.predictions.execution.ledger import (
     _exact_add,
     _exact_difference,
     _ExactArithmeticError,
+    _hash_families_are_pairwise_disjoint,
     _is_quantized,
+    _snapshot_sequence,
     _snapshot_trade_event_records,
     postings_for_confirmed_trades,
     verify_live_conservation,
@@ -423,21 +425,7 @@ def _snapshot_postings(
     trades: Sequence[VenueTradeEvent],
     economics: Sequence[AuthoritativeTradeEconomics],
 ) -> tuple[LiveLedgerPosting, ...]:
-    if not isinstance(postings, Sequence) or isinstance(postings, (str, bytes, bytearray)):
-        raise LiveLedgerError("POSTING_INVALID") from None
-    if len(postings) > MAX_LIVE_EVIDENCE_ITEMS:
-        raise LiveLedgerError("POSTING_INVALID") from None
-    values: list[LiveLedgerPosting] = []
-    for posting in tuple(postings):
-        if type(posting) is not LiveLedgerPosting:
-            raise LiveLedgerError("POSTING_INVALID") from None
-        try:
-            values.append(
-                LiveLedgerPosting.model_validate(posting.model_dump(mode="python"), strict=True)
-            )
-        except (TypeError, ValueError):
-            raise LiveLedgerError("POSTING_INVALID") from None
-    result = tuple(values)
+    result = _snapshot_sequence(postings, LiveLedgerPosting, "POSTING_INVALID")
     verify_live_conservation(result, intents, trades, economics)
     return result
 
@@ -551,6 +539,15 @@ def _result(
     trade_event_hashes: tuple[Sha256, ...] = (),
 ) -> LiveReconciliation:
     evidence = _snapshot_evidence(snapshot)
+    differences = set(differences)
+    if not _hash_families_are_pairwise_disjoint(
+        (),
+        trade_event_hashes,
+        evidence["evidence"],
+        evidence["balances"],
+        evidence["allowances"],
+    ):
+        differences.add("HASH_FAMILY_OVERLAP")
     expected_ids = tuple(sorted(posting.posting_id for posting in postings))
     fields: dict[str, object] = {
         "schema_version": 1,
@@ -588,7 +585,18 @@ def reconcile_live_account(
     """Close posting effects against independent two-cut authoritative evidence."""
     observed = _snapshot_input(snapshot)
     try:
-        trade_histories = _classify_trade_histories(trades)
+        posting_values = _snapshot_sequence(postings, LiveLedgerPosting, "POSTING_INVALID")
+        intent_values = _snapshot_sequence(intents, ExecutionIntent, "INTENT_EVIDENCE_INVALID")
+        trade_values = _snapshot_sequence(trades, VenueTradeEvent, "TRADE_EVENT_INVALID")
+        economics_values = _snapshot_sequence(
+            economics,
+            AuthoritativeTradeEconomics,
+            "ECONOMICS_EVIDENCE_INVALID",
+        )
+    except LiveLedgerError:
+        return _result(observed, (), {"POSTINGS_INVALID"})
+    try:
+        trade_histories = _classify_trade_histories(trade_values)
         trade_event_hashes = tuple(
             sorted(
                 event_hash for history in trade_histories for event_hash in history.raw_event_hashes
@@ -597,7 +605,9 @@ def reconcile_live_account(
     except LiveLedgerError as exc:
         try:
             trade_event_hashes = tuple(
-                sorted(event.raw_event_hash for event in _snapshot_trade_event_records(trades))
+                sorted(
+                    event.raw_event_hash for event in _snapshot_trade_event_records(trade_values)
+                )
             )
         except LiveLedgerError:
             trade_event_hashes = ()
@@ -608,7 +618,12 @@ def reconcile_live_account(
         )
         return _result(observed, (), {difference}, trade_event_hashes)
     try:
-        rows = _snapshot_postings(postings, intents, trades, economics)
+        rows = _snapshot_postings(
+            posting_values,
+            intent_values,
+            trade_values,
+            economics_values,
+        )
     except LiveLedgerError as exc:
         difference = (
             "POSTING_TOPOLOGY_MISMATCH"
@@ -616,7 +631,11 @@ def reconcile_live_account(
             else "POSTINGS_INVALID"
         )
         try:
-            canonical_rows = postings_for_confirmed_trades(intents, trades, economics)
+            canonical_rows = postings_for_confirmed_trades(
+                intent_values,
+                trade_values,
+                economics_values,
+            )
         except LiveLedgerError:
             canonical_rows = ()
         return _result(observed, canonical_rows, {difference}, trade_event_hashes)
@@ -627,7 +646,7 @@ def reconcile_live_account(
         for history in trade_histories
         if history.confirmed_terminal is not None
     }
-    economics_by_trade = {value.venue_trade_id: value for value in economics}
+    economics_by_trade = {value.venue_trade_id: value for value in economics_values}
     if any(row.account_fingerprint != observed.account_fingerprint for row in rows):
         differences.add("POSTING_ACCOUNT_MISMATCH")
     for trade_id in sorted({row.venue_trade_id for row in rows}):
@@ -811,8 +830,27 @@ def reconciled_live_pnl(
         closed = LiveReconciliation.model_validate(
             reconciliation.model_dump(mode="python"), strict=True
         )
-        rows = _snapshot_postings(postings, intents, trades, economics)
-        reconstructed = reconcile_live_account(rows, snapshot, intents, trades, economics)
+        posting_values = _snapshot_sequence(postings, LiveLedgerPosting, "POSTING_INVALID")
+        intent_values = _snapshot_sequence(intents, ExecutionIntent, "INTENT_EVIDENCE_INVALID")
+        trade_values = _snapshot_sequence(trades, VenueTradeEvent, "TRADE_EVENT_INVALID")
+        economics_values = _snapshot_sequence(
+            economics,
+            AuthoritativeTradeEconomics,
+            "ECONOMICS_EVIDENCE_INVALID",
+        )
+        rows = _snapshot_postings(
+            posting_values,
+            intent_values,
+            trade_values,
+            economics_values,
+        )
+        reconstructed = reconcile_live_account(
+            rows,
+            snapshot,
+            intent_values,
+            trade_values,
+            economics_values,
+        )
     except (TypeError, ValueError, LiveLedgerError):
         return None
     closed_hashes = {

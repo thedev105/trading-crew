@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -387,7 +387,7 @@ def _snapshot_model[ModelT: BaseModel](value: object, model: type[ModelT], code:
         raise LiveLedgerError(code) from None
     try:
         return model.model_validate(value.model_dump(mode="python"), strict=True)
-    except (TypeError, ValueError):
+    except Exception:
         raise LiveLedgerError(code) from None
 
 
@@ -398,9 +398,31 @@ def _snapshot_sequence[ModelT: BaseModel](
 ) -> tuple[ModelT, ...]:
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
         raise LiveLedgerError(code) from None
-    if len(values) > MAX_LIVE_EVIDENCE_ITEMS:
+    materialized: list[object] = []
+    try:
+        iterator = iter(values)
+        for _ in range(MAX_LIVE_EVIDENCE_ITEMS + 1):
+            try:
+                materialized.append(next(iterator))
+            except StopIteration:
+                break
+    except Exception:
         raise LiveLedgerError(code) from None
-    return tuple(_snapshot_model(value, model, code) for value in tuple(values))
+    if len(materialized) > MAX_LIVE_EVIDENCE_ITEMS:
+        raise LiveLedgerError(code) from None
+    return tuple(_snapshot_model(value, model, code) for value in materialized)
+
+
+def _hash_families_are_pairwise_disjoint(
+    *families: Collection[Sha256],
+) -> bool:
+    observed: set[Sha256] = set()
+    for family in families:
+        current = set(family)
+        if observed & current:
+            return False
+        observed.update(current)
+    return True
 
 
 def _dedupe_records[ModelT: BaseModel](

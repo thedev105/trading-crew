@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import (
@@ -52,6 +53,44 @@ FEE_HASH = "3" * 64
 SOURCE_HASH = "4" * 64
 BALANCE_HASH = "5" * 64
 COST_BASIS_HASH = "6" * 64
+
+
+class ScriptedSequence(Sequence[object]):
+    """Returns a bounded caller-controlled view on each traversal."""
+
+    def __init__(self, views: tuple[tuple[object, ...], ...]) -> None:
+        self._views = views
+        self.iterations = 0
+
+    def __len__(self) -> int:
+        return len(self._views[min(self.iterations, len(self._views) - 1)])
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        raise IndexError
+
+    def __iter__(self) -> Iterator[object]:
+        view = self._views[min(self.iterations, len(self._views) - 1)]
+        self.iterations += 1
+        yield from view
+
+
+class MutatingAfterYieldSequence(Sequence[object]):
+    def __init__(self, value: AuthoritativeTradeEconomics) -> None:
+        self.value = value
+        self.iterations = 0
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        raise IndexError
+
+    def __iter__(self) -> Iterator[object]:
+        self.iterations += 1
+        yield self.value
+        object.__setattr__(self.value, "information_cutoff", NOW + timedelta(seconds=5))
 
 
 def hostile_decimal(coefficient: int, exponent: int) -> Decimal:
@@ -292,7 +331,7 @@ def snapshot_for(
             ),
         ),
         opening_cumulative_fees=(asset("USDC", "0", "0.000001", evidence_hash(14)),),
-        current_cumulative_fees=(asset("USDC", fee_current, "0.000001", FEE_HASH),),
+        current_cumulative_fees=(asset("USDC", fee_current, "0.000001", evidence_hash(15)),),
         open_orders=open_orders,
         recent_trades=recent_trades,
         settlements=settlements,
@@ -339,6 +378,129 @@ def empty_snapshot() -> VenueAccountSnapshot:
         recent_trades_source_hash=evidence_hash(29),
         settlements_source_hash=evidence_hash(30),
     )
+
+
+def test_total_snapshot_reconciliation_closes_only_the_first_economics_view() -> None:
+    source_intent = intent()
+    future = exact_economics(
+        source_intent,
+        realized_pnl=Decimal("1.25"),
+        information_cutoff=NOW + timedelta(seconds=5),
+    )
+    later_bypass = AuthoritativeTradeEconomics.model_validate(
+        future.model_dump(mode="python"), strict=True
+    )
+    object.__setattr__(later_bypass, "information_cutoff", NOW + timedelta(seconds=3))
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (future,))
+    snapshot = snapshot_for(
+        source_intent,
+        future,
+        observed_at=NOW + timedelta(seconds=4),
+    )
+    changing = ScriptedSequence(((future,), (later_bypass,), (later_bypass,)))
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        changing,  # type: ignore[arg-type]
+    )
+
+    assert not result.complete
+    assert result.differences == (f"ECONOMICS_OUTSIDE_SNAPSHOT:{TRADE_ID}",)
+    assert changing.iterations == 1
+
+
+def test_total_snapshot_pnl_never_retraverses_a_future_economics_view() -> None:
+    source_intent = intent()
+    future = exact_economics(
+        source_intent,
+        realized_pnl=Decimal("1.25"),
+        information_cutoff=NOW + timedelta(seconds=5),
+    )
+    later_bypass = AuthoritativeTradeEconomics.model_validate(
+        future.model_dump(mode="python"), strict=True
+    )
+    object.__setattr__(later_bypass, "information_cutoff", NOW + timedelta(seconds=3))
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (future,))
+    snapshot = snapshot_for(
+        source_intent,
+        future,
+        observed_at=NOW + timedelta(seconds=4),
+    )
+    false_complete = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        ScriptedSequence(((future,), (later_bypass,))),  # type: ignore[arg-type]
+    )
+    changing = ScriptedSequence(((future,), (future,), (later_bypass,)))
+
+    assert (
+        reconciled_live_pnl(
+            postings,
+            false_complete,
+            snapshot,
+            (source_intent,),
+            (event,),
+            changing,  # type: ignore[arg-type]
+        )
+        is None
+    )
+    assert changing.iterations == 1
+
+
+def test_total_snapshot_pnl_iterates_every_caller_collection_exactly_once() -> None:
+    source_intent = intent()
+    exact = exact_economics(source_intent, realized_pnl=Decimal("1.25"))
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    snapshot = snapshot_for(source_intent, exact)
+    closed = reconcile_live_account(postings, snapshot, (source_intent,), (event,), (exact,))
+    posting_values = ScriptedSequence((postings, ()))
+    intent_values = ScriptedSequence(((source_intent,), ()))
+    trade_values = ScriptedSequence(((event,), ()))
+    economics_values = ScriptedSequence(((exact,), ()))
+
+    assert reconciled_live_pnl(
+        posting_values,  # type: ignore[arg-type]
+        closed,
+        snapshot,
+        intent_values,  # type: ignore[arg-type]
+        trade_values,  # type: ignore[arg-type]
+        economics_values,  # type: ignore[arg-type]
+    ) == Decimal("1.25")
+    assert tuple(
+        values.iterations
+        for values in (posting_values, intent_values, trade_values, economics_values)
+    ) == (1, 1, 1, 1)
+
+
+def test_total_snapshot_revalidates_an_alias_mutated_after_it_is_yielded() -> None:
+    source_intent = intent()
+    exact = exact_economics(source_intent)
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    snapshot = snapshot_for(source_intent, exact)
+    changing = MutatingAfterYieldSequence(
+        AuthoritativeTradeEconomics.model_validate(exact.model_dump(mode="python"), strict=True)
+    )
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        changing,  # type: ignore[arg-type]
+    )
+
+    assert not result.complete
+    assert result.differences == ("POSTINGS_INVALID",)
+    assert changing.iterations == 1
 
 
 def test_empty_two_cut_snapshot_reconciles_but_has_no_publishable_pnl() -> None:
@@ -392,6 +554,98 @@ def test_reconciliation_hash_families_separate_raw_events_and_account_reads() ->
     assert BALANCE_HASH in result.balance_hashes
     assert snapshot.opening_allowance_source_hash in result.allowance_hashes
     assert not set(result.venue_trade_hashes) & set(result.evidence_hashes)
+
+
+@pytest.mark.parametrize(
+    ("collision", "snapshot_updates"),
+    [
+        ("raw_evidence", {"open_orders_source_hash": TRADE_HASH}),
+        ("raw_balance", {"current_fee_source_hash": TRADE_HASH}),
+        ("raw_allowance", {"current_allowance_source_hash": TRADE_HASH}),
+        ("evidence_balance", {"current_fee_source_hash": SOURCE_HASH}),
+        ("evidence_allowance", {"current_allowance_source_hash": SOURCE_HASH}),
+        ("balance_allowance", {"current_allowance_source_hash": BALANCE_HASH}),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_typed_hash_family_disjointness_rejects_every_pairwise_collision_in_any_order(
+    collision: str,
+    snapshot_updates: dict[str, object],
+    reverse: bool,
+) -> None:
+    del collision
+    source_intent = intent()
+    exact = exact_economics(source_intent, realized_pnl=Decimal("1.25"))
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    snapshot = snapshot_for(source_intent, exact).model_copy(
+        update={**snapshot_updates, "snapshot_fingerprint": None}
+    )
+    supplied = tuple(reversed(postings)) if reverse else postings
+
+    result = reconcile_live_account(
+        supplied,
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+    )
+
+    assert not result.complete
+    assert result.differences == ("HASH_FAMILY_OVERLAP",)
+    assert result.next_action == "HALT_AND_RECONCILE"
+    assert (
+        reconciled_live_pnl(
+            supplied,
+            result,
+            snapshot,
+            (source_intent,),
+            (event,),
+            (exact,),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("early_path", ["contradiction", "topology"])
+def test_typed_hash_family_disjointness_is_enforced_on_every_result_path(
+    early_path: str,
+) -> None:
+    source_intent = intent()
+    exact = exact_economics(source_intent)
+    event = trade_event(source_intent)
+    postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
+    snapshot = snapshot_for(source_intent, exact).model_copy(
+        update={
+            "current_allowance_source_hash": SOURCE_HASH,
+            "snapshot_fingerprint": None,
+        }
+    )
+    supplied_trades = (event,)
+    supplied_postings = postings
+    expected_other = "POSTINGS_INVALID"
+    if early_path == "contradiction":
+        disguised = event.model_copy(
+            update={
+                "trade_event_id": UUID("42b33848-ff46-4c45-b9ab-0c74510687f4"),
+                "received_at": NOW + timedelta(milliseconds=2500),
+            }
+        )
+        supplied_trades = (event, disguised)
+        expected_other = "TRADE_HISTORY_CONTRADICTION"
+    else:
+        supplied_postings = postings[:-2]
+
+    result = reconcile_live_account(
+        supplied_postings,
+        snapshot,
+        (source_intent,),
+        supplied_trades,
+        (exact,),
+    )
+
+    assert not result.complete
+    assert result.differences == tuple(sorted(("HASH_FAMILY_OVERLAP", expected_other)))
 
 
 def test_reconciliation_and_pnl_ignore_hostile_decimal_context() -> None:

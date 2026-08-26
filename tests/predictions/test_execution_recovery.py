@@ -2229,7 +2229,9 @@ def _persist_honest_task11_checkpoint(
         received_ms=100,
         sequence_number=terminal_sequence,
     )
-    if history_shape == "single":
+    if history_shape == "cutoff_equal":
+        confirmed = confirmed.model_copy(update={"received_at": NOW + timedelta(milliseconds=200)})
+    if history_shape in {"single", "cutoff_equal"}:
         trade_events = (confirmed,)
     elif history_shape == "progress":
         trade_events = (
@@ -2287,7 +2289,14 @@ def _persist_honest_task11_checkpoint(
         )
     else:
         raise AssertionError(f"unknown history shape: {history_shape}")
-    exact = _authoritative_economics_for_recovery(source_intent)
+    exact = _authoritative_economics_for_recovery(
+        source_intent,
+        information_cutoff=(
+            NOW + timedelta(milliseconds=200)
+            if history_shape == "cutoff_equal"
+            else NOW + timedelta(milliseconds=150)
+        ),
+    )
     postings = postings_for_confirmed_trades((source_intent,), trade_events, (exact,))
     snapshot = VenueAccountSnapshot(
         schema_version=1,
@@ -2614,6 +2623,229 @@ def test_standalone_economics_requires_a_complete_checkpoint(
     assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
 
 
+def _run_task11_recovery_path(
+    store: PredictionMarketStore,
+    plan: LiveExecutionPlan,
+    recovery_path: str,
+) -> RecoveryReport:
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+    if recovery_path == "startup":
+        return executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+    return executor.recover_account(ACCOUNT_FINGERPRINT)
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+@pytest.mark.parametrize("checkpoint", ["none", "earlier"])
+@pytest.mark.parametrize("conflict", ["trade_identity", "raw_hash"])
+@pytest.mark.parametrize("reverse_intents", [False, True])
+def test_account_wide_recovery_classification_rejects_cross_intent_conflicts(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
+    checkpoint: str,
+    conflict: str,
+    reverse_intents: bool,
+) -> None:
+    plan, first_intent, _, _, _ = _persist_honest_task11_checkpoint(store)
+    if checkpoint == "none":
+        store._connection.execute("DELETE FROM live_reconciliations")
+        store._connection.execute("DELETE FROM live_ledger_postings")
+        store._connection.execute("DELETE FROM authoritative_trade_economics")
+    second_intent, second_order, second_trade, _ = _task11_tail_records(plan)
+    if conflict == "trade_identity":
+        second_trade = second_trade.model_copy(update={"venue_trade_id": "trade-1"})
+    else:
+        second_trade = second_trade.model_copy(update={"raw_event_hash": HASHES[11]})
+    store.append_execution_intent(second_intent)
+    store.append_venue_order_event(second_order)
+    store.append_venue_trade_event(second_trade)
+
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+    if reverse_intents:
+        original = type(executor)._account_intents
+        monkeypatch.setattr(
+            type(executor),
+            "_account_intents",
+            lambda self, account, now: tuple(reversed(original(self, account, now))),
+        )
+    report = (
+        executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+        if recovery_path == "startup"
+        else executor.recover_account(ACCOUNT_FINGERPRINT)
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == tuple(
+        sorted((first_intent.intent_id, second_intent.intent_id))
+    )
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+def test_account_wide_recovery_classification_blocks_unexpected_store_faults(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+
+    def fail_history(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("hostile store fault")
+
+    monkeypatch.setattr(store, "verified_venue_trade_events_for_intent", fail_history)
+
+    report = _run_task11_recovery_path(store, plan, "account")
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (source_intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+@pytest.mark.parametrize("tail_shape", ["single", "terminal_prefix", "equal_cutoff"])
+def test_confirmed_raw_checkpoint_closure_blocks_trade_only_tails(
+    store: PredictionMarketStore,
+    recovery_path: str,
+    tail_shape: str,
+) -> None:
+    plan, first_intent, *_ = _persist_honest_task11_checkpoint(store)
+    second_intent, second_order, second_trade, _ = _task11_tail_records(plan)
+    tail_events = (second_trade,)
+    if tail_shape == "equal_cutoff":
+        second_trade = second_trade.model_copy(
+            update={"received_at": NOW + timedelta(milliseconds=200)}
+        )
+        tail_events = (second_trade,)
+    elif tail_shape == "terminal_prefix":
+        prefix = second_trade.model_copy(
+            update={
+                "trade_event_id": UUID("42b33848-ff46-4c45-b9ab-0c74510687f5"),
+                "raw_event_hash": f"{403:064x}",
+                "original_venue_state": VenueTradeState.MATCHED.value,
+                "normalized_state": VenueTradeState.MATCHED,
+                "terminal": False,
+                "venue_timestamp": NOW + timedelta(milliseconds=225),
+                "received_at": NOW + timedelta(milliseconds=225),
+                "sequence_number": 1,
+            }
+        )
+        second_trade = second_trade.model_copy(update={"sequence_number": 2})
+        tail_events = (prefix, second_trade)
+    store.append_execution_intent(second_intent)
+    store.append_venue_order_event(second_order)
+    for event in tail_events:
+        store.append_venue_trade_event(event)
+
+    report = _run_task11_recovery_path(store, plan, recovery_path)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == tuple(
+        sorted((first_intent.intent_id, second_intent.intent_id))
+    )
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+def test_confirmed_raw_checkpoint_closure_requires_a_checkpoint(
+    store: PredictionMarketStore,
+    recovery_path: str,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    store._connection.execute("DELETE FROM live_reconciliations")
+    store._connection.execute("DELETE FROM live_ledger_postings")
+    store._connection.execute("DELETE FROM authoritative_trade_economics")
+
+    report = _run_task11_recovery_path(store, plan, recovery_path)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (source_intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+def test_confirmed_raw_checkpoint_closure_rejects_a_later_incomplete_checkpoint(
+    store: PredictionMarketStore,
+    recovery_path: str,
+) -> None:
+    plan, first_intent, _, _, first_reconciliation = _persist_honest_task11_checkpoint(store)
+    second_intent, second_order, second_trade, _ = _task11_tail_records(plan)
+    store.append_execution_intent(second_intent)
+    store.append_venue_order_event(second_order)
+    store.append_venue_trade_event(second_trade)
+    store.append_live_reconciliation(
+        first_reconciliation.model_copy(
+            update={
+                "reconciliation_id": uuid4(),
+                "observed_at": NOW + timedelta(milliseconds=400),
+                "complete": False,
+                "differences": ("tail_unclosed",),
+                "next_action": "HALT_AND_RECONCILE",
+            }
+        )
+    )
+
+    report = _run_task11_recovery_path(store, plan, recovery_path)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == tuple(
+        sorted((first_intent.intent_id, second_intent.intent_id))
+    )
+    assert report.kill_reason in {
+        CoordinatorCode.RECOVERY_BLOCKED.value,
+        "RECONCILIATION_INCOMPLETE",
+    }
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+def test_confirmed_raw_checkpoint_closure_rejects_a_forged_hash_only_checkpoint(
+    store: PredictionMarketStore,
+    recovery_path: str,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    store._connection.execute("DELETE FROM live_reconciliations")
+    store._connection.execute("DELETE FROM live_ledger_postings")
+    store._connection.execute("DELETE FROM authoritative_trade_economics")
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=200),
+        posting_ids=(),
+        order_hashes=(),
+        trade_hashes=(HASHES[11],),
+        fee_hashes=(),
+        balance_hashes=(),
+    )
+
+    report = _run_task11_recovery_path(store, plan, recovery_path)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (source_intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+@pytest.mark.parametrize("history_shape", ["single", "progress", "cutoff_equal"])
+def test_confirmed_raw_checkpoint_closure_accepts_honest_complete_histories(
+    store: PredictionMarketStore,
+    recovery_path: str,
+    history_shape: str,
+) -> None:
+    plan, *_ = _persist_honest_task11_checkpoint(store, history_shape=history_shape)
+
+    report = _run_task11_recovery_path(store, plan, recovery_path)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.blocked_intent_ids == ()
+
+
 def test_fully_cumulative_later_complete_checkpoint_closes_the_economics_tail(
     store: PredictionMarketStore,
 ) -> None:
@@ -2713,6 +2945,10 @@ def test_fully_cumulative_later_complete_checkpoint_closes_the_economics_tail(
 
     assert report.code is CoordinatorCode.RECOVERY_COMPLETE
     assert report.blocked_intent_ids == ()
+
+    account_report = _run_task11_recovery_path(store, plan, "account")
+    assert account_report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert account_report.blocked_intent_ids == ()
 
 
 @pytest.mark.parametrize(

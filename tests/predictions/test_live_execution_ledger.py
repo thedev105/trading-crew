@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import (
@@ -20,6 +21,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from polytrading.predictions.execution.ledger import (
+    MAX_LIVE_EVIDENCE_ITEMS,
     AuthoritativeTradeEconomics,
     LiveLedgerError,
     _decimal_coefficient,
@@ -46,6 +48,70 @@ FEE_HASH = "3" * 64
 SOURCE_HASH = "4" * 64
 BALANCE_HASH = "5" * 64
 COST_BASIS_HASH = "6" * 64
+
+
+class ScriptedSequence(Sequence[object]):
+    """A bounded hostile Sequence with explicit traversal and length behavior."""
+
+    def __init__(
+        self,
+        views: tuple[tuple[object, ...], ...],
+        *,
+        reported_length: int = 0,
+    ) -> None:
+        self._views = views
+        self._reported_length = reported_length
+        self.iterations = 0
+        self.yields = 0
+
+    def __len__(self) -> int:
+        return self._reported_length
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        raise IndexError
+
+    def __iter__(self) -> Iterator[object]:
+        view = self._views[min(self.iterations, len(self._views) - 1)]
+        self.iterations += 1
+        for value in view:
+            self.yields += 1
+            yield value
+
+
+class CappedInfiniteSequence(Sequence[object]):
+    """Models an infinite Sequence while making a regression fail in bounded work."""
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+        self.iterations = 0
+        self.yields = 0
+
+    def __len__(self) -> int:
+        return 0
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        raise IndexError
+
+    def __iter__(self) -> Iterator[object]:
+        self.iterations += 1
+        for _ in range(MAX_LIVE_EVIDENCE_ITEMS + 1):
+            self.yields += 1
+            yield self._value
+        raise AssertionError("sequence consumption exceeded the MAX+1 guard")
+
+
+class RaisingIteratorSequence(Sequence[object]):
+    def __len__(self) -> int:
+        raise RuntimeError("hostile length")
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        raise IndexError
+
+    def __iter__(self) -> Iterator[object]:
+        raise RuntimeError("hostile iterator")
 
 
 def hostile_decimal(coefficient: int, exponent: int) -> Decimal:
@@ -143,6 +209,62 @@ def account_net(postings: tuple[LiveLedgerPosting, ...], account: str, asset: st
         )
         for posting in postings
     )
+
+
+@pytest.mark.parametrize(
+    ("actual_count", "accepted"),
+    [
+        (0, True),
+        (MAX_LIVE_EVIDENCE_ITEMS, True),
+        (MAX_LIVE_EVIDENCE_ITEMS + 1, False),
+    ],
+)
+def test_total_snapshot_enforces_actual_empty_max_and_max_plus_one_boundaries(
+    actual_count: int,
+    accepted: bool,
+) -> None:
+    source_intent = intent()
+    values = ScriptedSequence(
+        ((source_intent,) * actual_count,),
+        reported_length=0,
+    )
+
+    if accepted:
+        assert bounded_call(lambda: postings_for_confirmed_trades(values, (), ())) == ()
+    else:
+        with pytest.raises(LiveLedgerError, match="INTENT_EVIDENCE_INVALID"):
+            bounded_call(lambda: postings_for_confirmed_trades(values, (), ()))
+
+    assert values.iterations == 1
+    assert values.yields == min(actual_count, MAX_LIVE_EVIDENCE_ITEMS + 1)
+
+
+def test_total_snapshot_does_not_trust_a_huge_reported_length_for_one_value() -> None:
+    source_intent = intent()
+    values = ScriptedSequence(
+        ((source_intent,),),
+        reported_length=MAX_LIVE_EVIDENCE_ITEMS + 1_000_000,
+    )
+
+    assert bounded_call(lambda: postings_for_confirmed_trades(values, (), ())) == ()
+    assert values.iterations == values.yields == 1
+
+
+def test_total_snapshot_caps_an_infinite_sequence_before_any_unbounded_work() -> None:
+    values = CappedInfiniteSequence(intent())
+
+    with pytest.raises(LiveLedgerError, match="INTENT_EVIDENCE_INVALID"):
+        bounded_call(lambda: postings_for_confirmed_trades(values, (), ()))
+
+    assert values.iterations == 1
+    assert values.yields == MAX_LIVE_EVIDENCE_ITEMS + 1
+
+
+def test_total_snapshot_translates_iterator_faults_to_the_public_stable_code() -> None:
+    with pytest.raises(LiveLedgerError, match="INTENT_EVIDENCE_INVALID") as exc_info:
+        bounded_call(lambda: postings_for_confirmed_trades(RaisingIteratorSequence(), (), ()))
+
+    assert exc_info.value.__cause__ is None
 
 
 def test_empty_live_ledger_is_conserved() -> None:

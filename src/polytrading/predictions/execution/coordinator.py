@@ -25,7 +25,9 @@ from polytrading.predictions.execution.authority import (
 from polytrading.predictions.execution.kill_switch import KillState
 from polytrading.predictions.execution.ledger import (
     LiveLedgerError,
+    _ClassifiedTradeHistory,
     _classify_trade_histories,
+    _hash_families_are_pairwise_disjoint,
     postings_for_confirmed_trades,
 )
 from polytrading.predictions.execution.models import (
@@ -1944,38 +1946,67 @@ class ExecutionCoordinator:
         forced_reasons: dict[UUID, str] = {}
         order_histories: dict[UUID, tuple[VenueOrderEvent, ...]] = {}
         trade_histories: dict[UUID, tuple[VenueTradeEvent, ...]] = {}
+        account_history_invalid = False
         for intent in intents:
             try:
-                trade_history = self._store.verified_venue_trade_events_for_intent(
-                    intent.intent_id,
-                    now,
-                )
-            except ConflictingRecordError:
-                forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
-                continue
-            trade_histories[intent.intent_id] = trade_history
-            if startup:
-                try:
-                    order_history = self._store.verified_venue_order_events_for_intent(
+                trade_histories[intent.intent_id] = (
+                    self._store.verified_venue_trade_events_for_intent(
                         intent.intent_id,
                         now,
                     )
-                except ConflictingRecordError:
-                    forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
-                    continue
-                order_histories[intent.intent_id] = order_history
-                if not order_history or any(
+                )
+                order_histories[intent.intent_id] = (
+                    self._store.verified_venue_order_events_for_intent(
+                        intent.intent_id,
+                        now,
+                    )
+                )
+            except Exception:
+                account_history_invalid = True
+                break
+        classified_by_intent: dict[UUID, list[_ClassifiedTradeHistory]] = {
+            intent.intent_id: [] for intent in intents
+        }
+        if not account_history_invalid:
+            account_trade_events = tuple(
+                event for history in trade_histories.values() for event in history
+            )
+            try:
+                classified_histories = _classify_trade_histories(account_trade_events)
+            except Exception:
+                account_history_invalid = True
+            else:
+                known_intent_ids = set(classified_by_intent)
+                if any(
+                    event.intent_id != intent_id
+                    for intent_id, history in trade_histories.items()
+                    for event in history
+                ):
+                    account_history_invalid = True
+                for history in classified_histories:
+                    intent_id = history.intent_id
+                    if intent_id is None or intent_id not in known_intent_ids:
+                        account_history_invalid = True
+                        break
+                    classified_by_intent[intent_id].append(history)
+        if account_history_invalid:
+            for intent in intents:
+                forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
+        for intent in intents:
+            if intent.intent_id in forced_reasons:
+                continue
+            order_history = order_histories[intent.intent_id]
+            if startup and (
+                not order_history
+                or any(
                     event.normalized_state
                     in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
                     for event in order_history
-                ):
-                    forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
-                    continue
-            try:
-                classified_histories = _classify_trade_histories(trade_history)
-            except LiveLedgerError:
+                )
+            ):
                 forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                 continue
+            classified_histories = classified_by_intent[intent.intent_id]
             failed_history = next(
                 (
                     history
@@ -2001,19 +2032,12 @@ class ExecutionCoordinator:
                     if unresolved_state is None
                     else f"SETTLEMENT_{unresolved_state.value}"
                 )
-            elif uncertainty_reason is not None:
-                try:
-                    order_history = self._store.verified_venue_order_events_for_intent(
-                        intent.intent_id,
-                        now,
-                    )
-                except ConflictingRecordError:
-                    forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
-                    continue
-                if order_history and not order_history[-1].terminal:
-                    forced_reasons[intent.intent_id] = uncertainty_reason
+            elif (
+                uncertainty_reason is not None and order_history and not order_history[-1].terminal
+            ):
+                forced_reasons[intent.intent_id] = uncertainty_reason
         account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value if store_scan_failed else None
-        if startup:
+        if not store_scan_failed:
             try:
                 reconciliations = self._store.verified_live_reconciliations_for_account(
                     account_fingerprint,
@@ -2050,6 +2074,20 @@ class ExecutionCoordinator:
                 )
             )
             latest_complete = complete_reconciliations[-1] if complete_reconciliations else None
+            confirmed_raw_events = tuple(
+                event for history in trade_histories.values() for event in history
+            )
+            if confirmed_raw_events and (
+                latest_complete is None
+                or any(
+                    event.received_at > latest_complete.observed_at
+                    or event.raw_event_hash not in latest_complete.venue_trade_hashes
+                    for event in confirmed_raw_events
+                )
+            ):
+                account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
+                for intent in intents:
+                    forced_reasons.setdefault(intent.intent_id, account_block_reason)
             if economics and (
                 latest_complete is None
                 or any(
@@ -2173,6 +2211,13 @@ class ExecutionCoordinator:
                         or not exact_trade_hashes <= classified_trade_hashes
                         or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
                         or not exact_balance_hashes <= set(reconciliation.balance_hashes)
+                        or not _hash_families_are_pairwise_disjoint(
+                            reconciliation.venue_order_hashes,
+                            reconciliation.venue_trade_hashes,
+                            reconciliation.evidence_hashes,
+                            reconciliation.balance_hashes,
+                            reconciliation.allowance_hashes,
+                        )
                         or set(reconciliation.evidence_hashes) & known_raw_hashes
                         or set(reconciliation.venue_order_hashes) & known_economics_hashes
                         or set(reconciliation.venue_trade_hashes) & known_economics_hashes
