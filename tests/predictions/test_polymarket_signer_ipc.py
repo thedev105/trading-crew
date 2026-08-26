@@ -261,7 +261,12 @@ def _payload(operation: ExecutionOperation) -> object:
     if operation is ExecutionOperation.READ_TRADES:
         return ReadTradesPayload(operation=operation)
     if operation is ExecutionOperation.READ_ACCOUNT:
-        return ReadAccountPayload(operation=operation)
+        return ReadAccountPayload(
+            operation=operation,
+            signature_type=0,
+            asset_type="COLLATERAL",
+            token_id=None,
+        )
     raise AssertionError("UNKNOWN_TEST_OPERATION") from None
 
 
@@ -1531,6 +1536,78 @@ def test_service_close_zeroizes_owned_secret_buffers_and_refuses_uncached_work()
 
     assert response.error_code == "IPC_SIGNER_CLOSED"
     assert all(not any(value) for value in buffers)
+
+
+def test_service_close_closes_handler_owner_before_zeroizing_secrets() -> None:
+    events: list[str] = []
+    buffers = (
+        bytearray(PRIVATE_KEY),
+        bytearray(API_KEY),
+        bytearray(API_SECRET),
+        bytearray(PASSPHRASE),
+    )
+
+    def close_handlers() -> None:
+        assert any(buffers[1])
+        events.append("handlers")
+
+    base = _handlers()
+    handlers = SignerOperationHandlers(
+        submit_order=base.submit_order,
+        cancel_order=base.cancel_order,
+        heartbeat=base.heartbeat,
+        read_orders=base.read_orders,
+        read_trades=base.read_trades,
+        read_account=base.read_account,
+        close=close_handlers,
+    )
+    service = SignerService(
+        secrets=SecretMaterial(*buffers),
+        authority_context_factory=lambda request, observed_at: authority_context(),
+        read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
+        handlers=handlers,
+        clock=lambda: NOW,
+    )
+
+    service.close()
+    service.close()
+
+    assert events == ["handlers"]
+    assert all(not any(buffer) for buffer in buffers)
+
+
+def test_service_close_contains_handler_close_failure_and_zeroizes_secrets() -> None:
+    buffers = (
+        bytearray(PRIVATE_KEY),
+        bytearray(API_KEY),
+        bytearray(API_SECRET),
+        bytearray(PASSPHRASE),
+    )
+
+    def fail_close() -> None:
+        raise RuntimeError("private handler close failure")
+
+    base = _handlers()
+    handlers = SignerOperationHandlers(
+        submit_order=base.submit_order,
+        cancel_order=base.cancel_order,
+        heartbeat=base.heartbeat,
+        read_orders=base.read_orders,
+        read_trades=base.read_trades,
+        read_account=base.read_account,
+        close=fail_close,
+    )
+    service = SignerService(
+        secrets=SecretMaterial(*buffers),
+        authority_context_factory=lambda request, observed_at: authority_context(),
+        read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
+        handlers=handlers,
+        clock=lambda: NOW,
+    )
+
+    service.close()
+
+    assert all(not any(buffer) for buffer in buffers)
 
 
 def test_spawned_sidecar_returns_byte_identical_replay_and_rejects_collision() -> None:

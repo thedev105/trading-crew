@@ -7,6 +7,7 @@ import os
 import select
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -52,6 +53,7 @@ from polytrading.predictions.polymarket_execution.protocol import (
     PolymarketProtocolSnapshot,
     load_protocol_snapshot,
 )
+from polytrading.predictions.polymarket_execution.routes import RestCode
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBoundaryError,
     SecretMaterial,
@@ -140,6 +142,7 @@ class SignerOperationHandlers:
     read_orders: ReadOrdersHandler
     read_trades: ReadTradesHandler
     read_account: ReadAccountHandler
+    close: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,8 +204,15 @@ class SignerService:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
-            self._secrets.close()
+            try:
+                if self._handlers.close is not None:
+                    with suppress(Exception):
+                        self._handlers.close()
+            finally:
+                self._secrets.close()
 
     def handle_raw(self, payload: bytes) -> SignerResponse:
         """Parse one bounded wire payload without reflecting invalid input."""
@@ -523,7 +533,14 @@ class SignerService:
             not isinstance(request.payload, SubmitOrderPayload)
             or not response.ok
             or type(response.result) is not SanitizedOperationResult
-            or response.result.result_code != "SUBMIT_ORDER_OK"
+            or response.result.result_code
+            not in {
+                "SUBMIT_ORDER_OK",
+                RestCode.ORDER_ACK_MATCHED,
+                RestCode.ORDER_ACK_DELAYED,
+                RestCode.ORDER_ACK_LIVE_UNEXPECTED,
+                RestCode.ORDER_ACK_UNMATCHED,
+            }
             or response.result.venue_order_id is None
         ):
             return None

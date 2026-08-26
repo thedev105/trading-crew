@@ -229,6 +229,24 @@
       "response_fields": [],
       "response_item_fields": ["id", "market", "asset_id", "owner", "maker_address", "taker_order_id", "side", "trader_side", "price", "size", "outcome", "status", "fee_rate_bps", "bucket_index", "transaction_hash", "maker_orders", "match_time", "last_update"]
     },
+    "balance_allowance": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/balance-allowance",
+      "auth_level": "L2",
+      "request_body_shape": "none",
+      "query_fields": ["signature_type", "asset_type", "token_id"],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_body_shape": "object",
+      "response_fields": ["balance", "allowances"],
+      "response_item_fields": [],
+      "allowed_signature_types": [0],
+      "allowed_asset_types": ["COLLATERAL", "CONDITIONAL"],
+      "conditional_token_id_required": true,
+      "balance_encoding": "ascii_nonnegative_integer_string",
+      "allowances_encoding": "evm_address_to_ascii_nonnegative_integer_string"
+    },
     "cancel_order": {
       "host": "https://clob.polymarket.com",
       "method": "DELETE",

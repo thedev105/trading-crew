@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraint
 
 POLYMARKET_PROTOCOL_VERSION = "polymarket-clob-2026-08-25-v1"
 _PROTOCOL_FIXTURE_NAME = "protocol_v1.json"
-_PROTOCOL_FIXTURE_SHA256 = "5f39f5b87e1dac292d58464bf6c7e272708452be21ead2fd65d1ba6439647122"
+_PROTOCOL_FIXTURE_SHA256 = "de7409eb9956cefe1d546adf611767ec2fecda11ff496172f90ddcd3525e751c"
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -113,6 +113,14 @@ class Route(_FixtureModel):
     response_item_fields: tuple[str, ...]
 
 
+class BalanceAllowanceRoute(Route):
+    allowed_signature_types: tuple[Literal[0], ...]
+    allowed_asset_types: tuple[Literal["COLLATERAL", "CONDITIONAL"], ...]
+    conditional_token_id_required: Literal[True]
+    balance_encoding: Literal["ascii_nonnegative_integer_string"]
+    allowances_encoding: Literal["evm_address_to_ascii_nonnegative_integer_string"]
+
+
 class RouteCatalog(_FixtureModel):
     create_api_key: Route
     derive_api_key: Route
@@ -122,6 +130,7 @@ class RouteCatalog(_FixtureModel):
     get_order: Route
     list_orders: Route
     list_trades: Route
+    balance_allowance: BalanceAllowanceRoute
     cancel_order: Route
     cancel_orders: Route
     cancel_market_orders: Route
@@ -344,7 +353,9 @@ def verify_protocol_sources(
     fixture_root = (
         snapshot.fixture_root
         if snapshot is not None
-        else Path(root) if root is not None else bundled_fixture_path()
+        else Path(root)
+        if root is not None
+        else bundled_fixture_path()
     )
     return _verify_fixture_root(fixture_root)
 

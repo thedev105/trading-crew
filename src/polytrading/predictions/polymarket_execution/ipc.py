@@ -26,6 +26,18 @@ from polytrading.predictions.execution.models import (
     SignedOrderEnvelope,
 )
 from polytrading.predictions.polymarket_execution.protocol import POLYMARKET_PROTOCOL_VERSION
+from polytrading.predictions.polymarket_execution.routes import (
+    BalanceAllowancePayload,
+    CancellationPayload,
+    HeartbeatAckPayload,
+    OrderAckPayload,
+    OrderReadPayload,
+    OrdersReadPayload,
+    RestCode,
+    RouteKey,
+    RoutePublicPayload,
+    TradesReadPayload,
+)
 
 MAX_FRAME_BYTES: Final = 1_048_576
 _FRAME_HEADER_BYTES: Final = 4
@@ -38,7 +50,12 @@ _HeartbeatIdentifier = Annotated[
     str,
     StringConstraints(max_length=256, pattern=r"^[\x20-\x7e]*$"),
 ]
-SignerResultCode = Literal[
+_AsciiInteger = Annotated[
+    str,
+    StringConstraints(pattern=r"^(0|[1-9][0-9]*)$", max_length=256),
+]
+_EvmAddress = Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{40}$")]
+LegacySignerResultCode = Literal[
     "SUBMIT_ORDER_OK",
     "CANCEL_ORDER_OK",
     "HEARTBEAT_OK",
@@ -46,6 +63,7 @@ SignerResultCode = Literal[
     "READ_TRADES_OK",
     "READ_ACCOUNT_OK",
 ]
+SignerResultCode = LegacySignerResultCode | RestCode
 SignerErrorCode = Literal[
     "IPC_MODEL_INVALID",
     "IPC_FRAME_BYTES_REQUIRED",
@@ -234,15 +252,41 @@ class HeartbeatPayload(_SignerRecord):
 
 class ReadOrdersPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.READ_ORDERS]
-    venue_order_id: _PublicIdentifier | None
+    venue_order_id: _PublicIdentifier | None = None
+    id: _PublicIdentifier | None = None
+    market: _PublicIdentifier | None = None
+    asset_id: _AsciiInteger | None = None
+
+    @model_validator(mode="after")
+    def _single_order_or_list_filters(self) -> ReadOrdersPayload:
+        if self.venue_order_id is not None and any(
+            value is not None for value in (self.id, self.market, self.asset_id)
+        ):
+            raise ValueError("single-order read cannot carry list filters")
+        return self
 
 
 class ReadTradesPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.READ_TRADES]
+    id: _PublicIdentifier | None = None
+    market: _PublicIdentifier | None = None
+    asset_id: _AsciiInteger | None = None
+    maker_address: _EvmAddress | None = None
+    after: Annotated[int, Field(ge=0)] | None = None
+    before: Annotated[int, Field(ge=0)] | None = None
 
 
 class ReadAccountPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.READ_ACCOUNT]
+    signature_type: Literal[0]
+    asset_type: Literal["COLLATERAL", "CONDITIONAL"]
+    token_id: _AsciiInteger | None
+
+    @model_validator(mode="after")
+    def _token_matches_asset_type(self) -> ReadAccountPayload:
+        if (self.asset_type == "CONDITIONAL") != (self.token_id is not None):
+            raise ValueError("token_id is required only for CONDITIONAL assets")
+        return self
 
 
 SignerPayload = Annotated[
@@ -324,6 +368,14 @@ class SanitizedOperationResult(_SignerRecord):
     evidence_hashes: tuple[Sha256, ...]
     venue_order_id: _PublicIdentifier | None = None
     heartbeat_id: _HeartbeatIdentifier | None = None
+    route: RouteKey | None = None
+    observed_at: datetime | None = None
+    raw_body_hash: Sha256 | None = None
+    request_body_hash: Sha256 | None = None
+    attempts: Annotated[int, Field(ge=0, le=2)] | None = None
+    recovery_required: bool | None = None
+    kill_required: bool | None = None
+    public_payload: RoutePublicPayload | None = None
 
     @field_validator("evidence_hashes")
     @classmethod
@@ -332,9 +384,14 @@ class SanitizedOperationResult(_SignerRecord):
             raise ValueError("evidence hashes must be sorted and unique")
         return value
 
+    @field_validator("observed_at")
+    @classmethod
+    def _observed_at_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_timestamp(value)
+
     @model_validator(mode="after")
     def _operation_valid_identifiers(self) -> SanitizedOperationResult:
-        expected_codes: dict[ExecutionOperation, SignerResultCode] = {
+        expected_codes: dict[ExecutionOperation, LegacySignerResultCode] = {
             ExecutionOperation.SUBMIT_ORDER: "SUBMIT_ORDER_OK",
             ExecutionOperation.CANCEL_ORDER: "CANCEL_ORDER_OK",
             ExecutionOperation.HEARTBEAT: "HEARTBEAT_OK",
@@ -342,17 +399,201 @@ class SanitizedOperationResult(_SignerRecord):
             ExecutionOperation.READ_TRADES: "READ_TRADES_OK",
             ExecutionOperation.READ_ACCOUNT: "READ_ACCOUNT_OK",
         }
-        if self.result_code != expected_codes[self.operation]:
-            raise ValueError("result code does not match operation")
-        if self.operation in {ExecutionOperation.SUBMIT_ORDER, ExecutionOperation.CANCEL_ORDER}:
+        if isinstance(self.result_code, str) and not isinstance(self.result_code, RestCode):
+            if self.result_code != expected_codes[self.operation]:
+                raise ValueError("result code does not match operation")
+            if any(
+                value is not None
+                for value in (
+                    self.route,
+                    self.observed_at,
+                    self.raw_body_hash,
+                    self.request_body_hash,
+                    self.attempts,
+                    self.recovery_required,
+                    self.kill_required,
+                    self.public_payload,
+                )
+            ):
+                raise ValueError("legacy result cannot carry REST fields")
+            if self.operation in {
+                ExecutionOperation.SUBMIT_ORDER,
+                ExecutionOperation.CANCEL_ORDER,
+            }:
+                if self.venue_order_id is None or self.heartbeat_id is not None:
+                    raise ValueError("operation result identifiers are invalid")
+            elif self.operation is ExecutionOperation.HEARTBEAT:
+                if not self.heartbeat_id or self.venue_order_id is not None:
+                    raise ValueError("operation result identifiers are invalid")
+            elif self.operation is ExecutionOperation.READ_ORDERS:
+                if self.heartbeat_id is not None:
+                    raise ValueError("operation result identifiers are invalid")
+            elif self.venue_order_id is not None or self.heartbeat_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+            return self
+
+        if not isinstance(self.result_code, RestCode):
+            raise ValueError("result code is invalid")
+        expected_routes = {
+            ExecutionOperation.SUBMIT_ORDER: {RouteKey.SUBMIT_ORDER},
+            ExecutionOperation.CANCEL_ORDER: {RouteKey.CANCEL_ORDER},
+            ExecutionOperation.HEARTBEAT: {RouteKey.HEARTBEAT},
+            ExecutionOperation.READ_ORDERS: {
+                RouteKey.READ_ORDER,
+                RouteKey.READ_OPEN_ORDERS,
+            },
+            ExecutionOperation.READ_TRADES: {RouteKey.READ_TRADES},
+            ExecutionOperation.READ_ACCOUNT: {RouteKey.READ_BALANCE_ALLOWANCE},
+        }
+        if (
+            self.route not in expected_routes[self.operation]
+            or self.observed_at is None
+            or self.attempts is None
+            or self.recovery_required is None
+            or self.kill_required is None
+        ):
+            raise ValueError("REST result does not match operation")
+        read_codes = {
+            RestCode.READ_OK,
+            RestCode.READ_NOT_FOUND,
+            RestCode.READ_FAILED,
+            RestCode.RATE_LIMITED,
+            RestCode.AUTH_REJECTED,
+            RestCode.PROTOCOL_RESPONSE_INVALID,
+            RestCode.TRANSPORT_UNAVAILABLE,
+            RestCode.AUTH_REQUEST_BUILD_FAILED,
+        }
+        route_codes = {
+            RouteKey.SUBMIT_ORDER: {
+                RestCode.ORDER_ACK_MATCHED,
+                RestCode.ORDER_ACK_DELAYED,
+                RestCode.ORDER_ACK_LIVE_UNEXPECTED,
+                RestCode.ORDER_ACK_UNMATCHED,
+                RestCode.ORDER_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            },
+            RouteKey.CANCEL_ORDER: {
+                RestCode.CANCEL_ACKNOWLEDGED,
+                RestCode.CANCEL_NOT_CONFIRMED,
+                RestCode.CANCEL_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            },
+            RouteKey.HEARTBEAT: {
+                RestCode.HEARTBEAT_ACCEPTED,
+                RestCode.HEARTBEAT_ID_MISMATCH,
+                RestCode.HEARTBEAT_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            },
+            RouteKey.READ_ORDER: read_codes,
+            RouteKey.READ_OPEN_ORDERS: read_codes,
+            RouteKey.READ_TRADES: read_codes,
+            RouteKey.READ_BALANCE_ALLOWANCE: read_codes,
+        }
+        assert self.route is not None
+        if self.result_code not in route_codes[self.route]:
+            raise ValueError("REST code does not match route")
+        expected_payload_type: type[object] | None = None
+        if self.result_code in {
+            RestCode.ORDER_ACK_MATCHED,
+            RestCode.ORDER_ACK_DELAYED,
+            RestCode.ORDER_ACK_LIVE_UNEXPECTED,
+            RestCode.ORDER_ACK_UNMATCHED,
+        }:
+            expected_payload_type = OrderAckPayload
+        elif self.result_code is RestCode.CANCEL_ACKNOWLEDGED:
+            expected_payload_type = CancellationPayload
+        elif self.result_code in {
+            RestCode.HEARTBEAT_ACCEPTED,
+            RestCode.HEARTBEAT_ID_MISMATCH,
+        }:
+            expected_payload_type = HeartbeatAckPayload
+        elif self.result_code is RestCode.READ_OK:
+            expected_payload_type = {
+                RouteKey.READ_ORDER: OrderReadPayload,
+                RouteKey.READ_OPEN_ORDERS: OrdersReadPayload,
+                RouteKey.READ_TRADES: TradesReadPayload,
+                RouteKey.READ_BALANCE_ALLOWANCE: BalanceAllowancePayload,
+            }[self.route]
+        if (expected_payload_type is None) != (self.public_payload is None) or (
+            expected_payload_type is not None
+            and type(self.public_payload) is not expected_payload_type
+        ):
+            raise ValueError("REST payload does not match code")
+        expected_hashes = tuple(
+            sorted(
+                {
+                    value
+                    for value in (self.raw_body_hash, self.request_body_hash)
+                    if value is not None
+                }
+            )
+        )
+        if self.evidence_hashes != expected_hashes:
+            raise ValueError("REST evidence hashes do not match")
+        if (self.result_code is RestCode.AUTH_REQUEST_BUILD_FAILED) != (self.attempts == 0):
+            raise ValueError("REST attempts do not match code")
+        no_recovery = {
+            RestCode.ORDER_ACK_MATCHED,
+            RestCode.HEARTBEAT_ACCEPTED,
+            RestCode.READ_OK,
+            RestCode.READ_NOT_FOUND,
+        }
+        no_kill = no_recovery | {
+            RestCode.CANCEL_ACKNOWLEDGED,
+            RestCode.CANCEL_NOT_CONFIRMED,
+            RestCode.HEARTBEAT_ID_MISMATCH,
+            RestCode.PROTOCOL_RESPONSE_INVALID,
+            RestCode.READ_FAILED,
+            RestCode.RATE_LIMITED,
+            RestCode.TRANSPORT_UNAVAILABLE,
+        }
+        expected_recovery = self.result_code not in no_recovery
+        if self.result_code is RestCode.CANCEL_ACKNOWLEDGED:
+            expected_recovery = True
+        expected_kill = self.result_code not in no_kill
+        if (self.recovery_required, self.kill_required) != (
+            expected_recovery,
+            expected_kill,
+        ):
+            raise ValueError("REST flags do not match code")
+        if self.operation is ExecutionOperation.SUBMIT_ORDER:
+            if self.heartbeat_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+            if isinstance(self.public_payload, OrderAckPayload):
+                if self.venue_order_id != self.public_payload.order_id:
+                    raise ValueError("order acknowledgement identifier mismatch")
+            elif self.venue_order_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+        elif self.operation is ExecutionOperation.CANCEL_ORDER:
             if self.venue_order_id is None or self.heartbeat_id is not None:
                 raise ValueError("operation result identifiers are invalid")
+            if isinstance(self.public_payload, CancellationPayload) and (
+                self.public_payload.order_id != self.venue_order_id
+            ):
+                raise ValueError("cancellation identifier mismatch")
         elif self.operation is ExecutionOperation.HEARTBEAT:
-            if not self.heartbeat_id or self.venue_order_id is not None:
+            if (
+                self.venue_order_id is not None
+                or (
+                    isinstance(self.public_payload, HeartbeatAckPayload)
+                    and self.public_payload.heartbeat_id != self.heartbeat_id
+                )
+                or (
+                    not isinstance(self.public_payload, HeartbeatAckPayload)
+                    and self.heartbeat_id is not None
+                )
+            ):
                 raise ValueError("operation result identifiers are invalid")
         elif self.operation is ExecutionOperation.READ_ORDERS:
             if self.heartbeat_id is not None:
                 raise ValueError("operation result identifiers are invalid")
+            if isinstance(self.public_payload, OrderReadPayload) and (
+                self.venue_order_id != self.public_payload.id
+            ):
+                raise ValueError("read order identifier mismatch")
         elif self.venue_order_id is not None or self.heartbeat_id is not None:
             raise ValueError("operation result identifiers are invalid")
         return self

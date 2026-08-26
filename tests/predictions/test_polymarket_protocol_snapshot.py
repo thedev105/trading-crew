@@ -242,6 +242,26 @@ def test_authentication_routes_and_execution_contract_are_frozen() -> None:
     )
 
 
+def test_eoa_balance_allowance_route_and_wire_shape_are_frozen() -> None:
+    route = load_protocol_snapshot().routes.balance_allowance
+
+    assert route.host == "https://clob.polymarket.com"
+    assert route.method == "GET"
+    assert route.path == "/balance-allowance"
+    assert route.auth_level == "L2"
+    assert route.request_body_shape == "none"
+    assert route.query_fields == ("signature_type", "asset_type", "token_id")
+    assert route.request_fields == ()
+    assert route.response_body_shape == "object"
+    assert route.response_fields == ("balance", "allowances")
+    assert route.response_item_fields == ()
+    assert route.allowed_signature_types == (0,)
+    assert route.allowed_asset_types == ("COLLATERAL", "CONDITIONAL")
+    assert route.conditional_token_id_required is True
+    assert route.balance_encoding == "ascii_nonnegative_integer_string"
+    assert route.allowances_encoding == ("evm_address_to_ascii_nonnegative_integer_string")
+
+
 def test_stale_generated_heartbeat_route_is_evidence_not_an_allowed_route() -> None:
     snapshot = load_protocol_snapshot()
 
