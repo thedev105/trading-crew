@@ -32,6 +32,7 @@ from polytrading.predictions.polymarket_execution.rest import (
     HttpxPolymarketRestTransport,
     ReadRetryPolicy,
     RestCode,
+    RestResult,
     RestrictedGeoblockEvidence,
     RestrictedGeoblockResponse,
     RestTimeouts,
@@ -41,6 +42,7 @@ from polytrading.predictions.polymarket_execution.routes import (
     ROUTE_SET_HASH,
     ROUTE_SET_VERSION,
     ROUTE_SPECS,
+    AllowanceEntry,
     BalanceAllowancePayload,
     CancelOrderRequest,
     GeoblockRequest,
@@ -308,6 +310,69 @@ def test_route_request_models_reject_unknown_fields_and_type_coercion() -> None:
         GeoblockRequest.model_construct(route=RouteKey.SUBMIT_ORDER)
 
 
+@pytest.mark.parametrize(
+    "values",
+    (
+        {
+            "route": RouteKey.SUBMIT_ORDER,
+            "code": RestCode.ORDER_OUTCOME_UNKNOWN,
+            "request_body_hash": "a" * 64,
+            "attempts": 2,
+            "recovery_required": True,
+            "kill_required": True,
+        },
+        {
+            "route": RouteKey.CANCEL_ORDER,
+            "code": RestCode.CANCEL_OUTCOME_UNKNOWN,
+            "request_body_hash": None,
+            "attempts": 1,
+            "recovery_required": True,
+            "kill_required": True,
+        },
+        {
+            "route": RouteKey.HEARTBEAT,
+            "code": RestCode.AUTH_REQUEST_BUILD_FAILED,
+            "request_body_hash": "a" * 64,
+            "attempts": 0,
+            "recovery_required": True,
+            "kill_required": True,
+        },
+        {
+            "route": RouteKey.READ_ORDER,
+            "code": RestCode.READ_NOT_FOUND,
+            "request_body_hash": "a" * 64,
+            "attempts": 1,
+            "recovery_required": False,
+            "kill_required": False,
+        },
+    ),
+    ids=("mutation-retry", "mutation-missing-hash", "build-extra-hash", "get-extra-hash"),
+)
+def test_rest_result_rejects_impossible_route_evidence(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        RestResult(
+            observed_at=NOW,
+            raw_body_hash=None,
+            payload=None,
+            **values,
+        )
+
+
+def test_rest_result_rejects_non_order_read_not_found() -> None:
+    with pytest.raises(ValidationError):
+        RestResult(
+            route=RouteKey.READ_OPEN_ORDERS,
+            code=RestCode.READ_NOT_FOUND,
+            observed_at=NOW,
+            raw_body_hash="b" * 64,
+            request_body_hash=None,
+            attempts=1,
+            recovery_required=False,
+            kill_required=False,
+            payload=None,
+        )
+
+
 def test_submit_request_binds_the_exact_task5_intent_and_envelope() -> None:
     request = submit_order_request()
 
@@ -401,20 +466,20 @@ def test_balance_allowance_payload_accepts_only_integer_strings_by_evm_address()
     payload = BalanceAllowancePayload(
         kind="BALANCE_ALLOWANCE",
         balance="1000000",
-        allowances={"0x" + "11" * 20: "500000"},
+        allowances=(AllowanceEntry(address="0x" + "11" * 20, amount="500000"),),
     )
     assert payload.balance == "1000000"
 
-    for allowances in (
-        {"not-an-address": "500000"},
-        {"0x" + "11" * 20: "0.5"},
-        {"0x" + "11" * 20: 500000},
+    for allowance in (
+        {"address": "not-an-address", "amount": "500000"},
+        {"address": "0x" + "11" * 20, "amount": "0.5"},
+        {"address": "0x" + "11" * 20, "amount": 500000},
     ):
         with pytest.raises(ValidationError):
             BalanceAllowancePayload(
                 kind="BALANCE_ALLOWANCE",
                 balance="1000000",
-                allowances=allowances,
+                allowances=(allowance,),
             )
 
 
@@ -447,6 +512,67 @@ def test_read_arrays_are_bounded_to_ten_thousand_items() -> None:
             kind="TRADES_READ",
             items=(trade_read_payload(),) * 10_001,
         )
+    with pytest.raises(ValidationError):
+        BalanceAllowancePayload(
+            kind="BALANCE_ALLOWANCE",
+            balance="1",
+            allowances=(AllowanceEntry(address="0x" + "11" * 20, amount="1"),) * 10_001,
+        )
+
+
+def test_balance_and_cancel_wire_mappings_are_bounded_to_ten_thousand_items() -> None:
+    balance_result, _ = execute_with_response(
+        ReadBalanceAllowanceRequest(
+            route=RouteKey.READ_BALANCE_ALLOWANCE,
+            signature_type=0,
+            asset_type="COLLATERAL",
+            token_id=None,
+        ),
+        {
+            "balance": "1",
+            "allowances": {f"0x{index:040x}": "1" for index in range(10_001)},
+        },
+        credentials=clob_credentials(),
+    )
+    cancel_result, _ = execute_with_response(
+        CancelOrderRequest(route=RouteKey.CANCEL_ORDER, order_id="venue-order-1"),
+        {
+            "canceled": [],
+            "not_canceled": {f"order-{index}": "not found" for index in range(10_001)},
+        },
+        credentials=clob_credentials(),
+    )
+
+    assert balance_result.code is RestCode.PROTOCOL_RESPONSE_INVALID
+    assert balance_result.payload is None
+    assert cancel_result.code is RestCode.CANCEL_OUTCOME_UNKNOWN
+    assert cancel_result.payload is None
+
+
+def test_balance_allowances_are_deeply_immutable_and_deterministic() -> None:
+    low_address = "0x" + "11" * 20
+    high_address = "0x" + "22" * 20
+    result, _ = execute_with_response(
+        ReadBalanceAllowanceRequest(
+            route=RouteKey.READ_BALANCE_ALLOWANCE,
+            signature_type=0,
+            asset_type="COLLATERAL",
+            token_id=None,
+        ),
+        {
+            "balance": "1000000",
+            "allowances": {high_address: "2", low_address: "1"},
+        },
+        credentials=clob_credentials(),
+    )
+
+    assert result.code is RestCode.READ_OK
+    with pytest.raises(TypeError):
+        result.payload.allowances[0] = "not-an-integer"
+    assert result.payload.model_dump(mode="json")["allowances"] == [
+        {"address": low_address, "amount": "1"},
+        {"address": high_address, "amount": "2"},
+    ]
 
 
 def test_submit_signs_and_sends_the_exact_canonical_outer_body_once() -> None:
@@ -483,7 +609,7 @@ def test_submit_signs_and_sends_the_exact_canonical_outer_body_once() -> None:
 
     request = submit_order_request()
     credentials = clob_credentials()
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=timestamp,
         clock=lambda: NOW,
@@ -553,7 +679,7 @@ def test_submit_timeout_is_unknown_and_called_once() -> None:
         calls += 1
         raise httpx.ReadTimeout("secret venue exception", request=request)
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(lose_response),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -652,7 +778,7 @@ def execute_with_response(
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -841,7 +967,7 @@ def test_restricted_geoblock_execution_retains_same_response_evidence_once() -> 
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -890,6 +1016,47 @@ def test_restricted_geoblock_execution_retains_same_response_evidence_once() -> 
         json.dumps(restricted)
 
 
+@pytest.mark.parametrize(
+    ("kind", "slot", "error_code"),
+    (
+        ("evidence", "_raw_ip", "GEOBLOCK_EVIDENCE_IMMUTABLE"),
+        ("evidence", "_exact_bytes", "GEOBLOCK_EVIDENCE_IMMUTABLE"),
+        ("evidence", "_sealed", "GEOBLOCK_EVIDENCE_IMMUTABLE"),
+        ("response", "_result", "GEOBLOCK_RESTRICTED_RESPONSE_IMMUTABLE"),
+        ("response", "_evidence", "GEOBLOCK_RESTRICTED_RESPONSE_IMMUTABLE"),
+        ("response", "_sealed", "GEOBLOCK_RESTRICTED_RESPONSE_IMMUTABLE"),
+    ),
+)
+def test_restricted_geoblock_slots_cannot_be_deleted(
+    kind: str,
+    slot: str,
+    error_code: str,
+) -> None:
+    exact_body = b'{"blocked":false,"country":"US","ip":"192.0.2.1","region":null}'
+    evidence = RestrictedGeoblockEvidence(raw_ip="192.0.2.1", exact_bytes=exact_body)
+    result = RestResult(
+        route=RouteKey.GEOBLOCK,
+        code=RestCode.GEOBLOCK_OK,
+        observed_at=NOW,
+        raw_body_hash=hashlib.sha256(exact_body).hexdigest(),
+        request_body_hash=None,
+        attempts=1,
+        recovery_required=False,
+        kill_required=False,
+        payload=GeoblockResult(
+            kind="GEOBLOCK",
+            blocked=False,
+            country="US",
+            region=None,
+        ),
+    )
+    restricted = RestrictedGeoblockResponse(result=result, evidence=evidence)
+    target = evidence if kind == "evidence" else restricted
+
+    with pytest.raises(AttributeError, match=error_code):
+        delattr(target, slot)
+
+
 def test_restricted_geoblock_failure_has_no_restricted_evidence() -> None:
     calls = 0
 
@@ -902,7 +1069,7 @@ def test_restricted_geoblock_failure_has_no_restricted_evidence() -> None:
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1079,7 +1246,7 @@ def test_read_retry_reuses_the_identical_signed_request_without_resigning() -> N
     async def sleeper(delay: float) -> None:
         sleeps.append(delay)
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=timestamp,
         clock=lambda: NOW,
@@ -1128,7 +1295,7 @@ def test_mutations_never_retry_even_when_a_read_retry_policy_is_enabled(
         ),
         "heartbeat": HeartbeatRequest(route=RouteKey.HEARTBEAT, heartbeat_id=""),
     }
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1184,7 +1351,7 @@ def test_retryable_read_status_retries_once_and_ignores_retry_after() -> None:
     async def sleeper(delay: float) -> None:
         sleeps.append(delay)
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1237,6 +1404,85 @@ def test_read_http_failures_have_stable_sanitized_codes(
 
     assert result.code is expected
     assert "venue detail" not in repr(result)
+    if status_code == 404:
+        assert (result.recovery_required, result.kill_required) == (False, False)
+
+
+@pytest.mark.parametrize(
+    "route_request",
+    (
+        ReadOpenOrdersRequest(route=RouteKey.READ_OPEN_ORDERS),
+        ReadTradesRequest(route=RouteKey.READ_TRADES),
+        ReadBalanceAllowanceRequest(
+            route=RouteKey.READ_BALANCE_ALLOWANCE,
+            signature_type=0,
+            asset_type="COLLATERAL",
+            token_id=None,
+        ),
+    ),
+    ids=("open-orders", "trades", "balance-allowance"),
+)
+def test_only_single_order_404_is_a_nonhalting_not_found(route_request: object) -> None:
+    result, _ = execute_with_response(
+        route_request,
+        {"private": "venue detail"},
+        status_code=404,
+        credentials=clob_credentials(),
+    )
+
+    assert result.code is RestCode.READ_FAILED
+    assert (result.recovery_required, result.kill_required) == (True, True)
+
+
+def test_exhausted_authenticated_safety_read_failures_require_recovery_and_kill() -> None:
+    rate_limited, _ = execute_with_response(
+        ReadOpenOrdersRequest(route=RouteKey.READ_OPEN_ORDERS),
+        {"private": "venue detail"},
+        status_code=429,
+        credentials=clob_credentials(),
+    )
+    malformed, _ = execute_with_response(
+        ReadTradesRequest(route=RouteKey.READ_TRADES),
+        {"unexpected": "venue detail"},
+        credentials=clob_credentials(),
+    )
+
+    async def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("private transport detail", request=request)
+
+    transport = HttpxPolymarketRestTransport._for_test(
+        httpx.MockTransport(unavailable),
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
+    )
+
+    async def exercise():
+        try:
+            return await transport.execute(
+                ReadBalanceAllowanceRequest(
+                    route=RouteKey.READ_BALANCE_ALLOWANCE,
+                    signature_type=0,
+                    asset_type="COLLATERAL",
+                    token_id=None,
+                ),
+                credentials=clob_credentials(),
+            )
+        finally:
+            await transport.aclose()
+
+    transport_failed = asyncio.run(exercise())
+
+    assert (
+        rate_limited.code,
+        malformed.code,
+        transport_failed.code,
+    ) == (
+        RestCode.RATE_LIMITED,
+        RestCode.PROTOCOL_RESPONSE_INVALID,
+        RestCode.TRANSPORT_UNAVAILABLE,
+    )
+    for result in (rate_limited, malformed, transport_failed):
+        assert (result.recovery_required, result.kill_required) == (True, True)
 
 
 def test_malformed_and_oversized_read_responses_are_protocol_invalid() -> None:
@@ -1248,7 +1494,7 @@ def test_malformed_and_oversized_read_responses_are_protocol_invalid() -> None:
         )
 
     async def exercise(handler):
-        transport = HttpxPolymarketRestTransport(
+        transport = HttpxPolymarketRestTransport._for_test(
             httpx.MockTransport(handler),
             timestamp=lambda: TIMESTAMP,
             clock=lambda: NOW,
@@ -1280,7 +1526,7 @@ def test_duplicate_response_keys_are_protocol_invalid() -> None:
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1337,7 +1583,7 @@ def test_public_geoblock_does_not_request_a_timestamp_or_auth_headers() -> None:
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=timestamp,
         clock=lambda: NOW,
@@ -1370,7 +1616,7 @@ def test_clock_and_timestamp_failures_are_closed_build_failures() -> None:
         raise RuntimeError("private timestamp text")
 
     async def execute(clock, timestamp):
-        transport = HttpxPolymarketRestTransport(
+        transport = HttpxPolymarketRestTransport._for_test(
             httpx.MockTransport(handler),
             timestamp=timestamp,
             clock=clock,
@@ -1408,7 +1654,7 @@ def test_redirect_is_rejected_without_following_the_location() -> None:
             },
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1430,7 +1676,7 @@ def test_redirect_is_rejected_without_following_the_location() -> None:
     assert "attacker.invalid" not in repr(result)
 
 
-def test_injected_async_client_is_scrubbed_and_uses_bounded_timeouts() -> None:
+def test_trusted_transport_test_seam_uses_exclusively_owned_bounded_client() -> None:
     captured_extensions: list[dict[str, object]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1443,15 +1689,8 @@ def test_injected_async_client_is_scrubbed_and_uses_bounded_timeouts() -> None:
             headers={"content-type": "application/json"},
         )
 
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-        follow_redirects=False,
-        trust_env=False,
-        headers={"x-caller-header": "secret"},
-        cookies={"session": "secret"},
-    )
-    transport = HttpxPolymarketRestTransport(
-        client=client,
+    transport = HttpxPolymarketRestTransport._for_test(
+        httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
         timeouts=RestTimeouts(connect=1.5, read=2.5, write=1.25, pool=0.75),
@@ -1469,6 +1708,97 @@ def test_injected_async_client_is_scrubbed_and_uses_bounded_timeouts() -> None:
     assert captured_extensions == [
         {"timeout": {"connect": 1.5, "read": 2.5, "write": 1.25, "pool": 0.75}}
     ]
+
+
+def test_caller_owned_async_client_cannot_observe_later_auth_headers() -> None:
+    observed_headers: list[dict[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=json.dumps(wire_order(), separators=(",", ":"), sort_keys=True).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    async def observe(request: httpx.Request) -> None:
+        observed_headers.append(dict(request.headers))
+
+    async def exercise():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        )
+        try:
+            try:
+                transport = HttpxPolymarketRestTransport(
+                    client=client,  # type: ignore[call-arg]
+                    timestamp=lambda: TIMESTAMP,
+                    clock=lambda: NOW,
+                )
+            except TypeError:
+                return None
+            client.event_hooks["request"].append(observe)
+            return await transport.execute(
+                ReadOrderRequest(route=RouteKey.READ_ORDER, order_id="venue-order-1"),
+                credentials=clob_credentials(),
+            )
+        finally:
+            await client.aclose()
+
+    result = asyncio.run(exercise())
+
+    assert observed_headers == []
+    assert result is None
+
+
+def test_caller_owned_async_client_cannot_forward_auth_on_later_redirect_change() -> None:
+    forwarded_headers: list[dict[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "clob.polymarket.com":
+            return httpx.Response(
+                307,
+                content=b'{"redirect":"private"}',
+                headers={
+                    "content-type": "application/json",
+                    "location": "https://attacker.invalid/leak",
+                },
+            )
+        forwarded_headers.append(dict(request.headers))
+        return httpx.Response(
+            200,
+            content=json.dumps(wire_order(), separators=(",", ":"), sort_keys=True).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    async def exercise():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            trust_env=False,
+        )
+        try:
+            try:
+                transport = HttpxPolymarketRestTransport(
+                    client=client,  # type: ignore[call-arg]
+                    timestamp=lambda: TIMESTAMP,
+                    clock=lambda: NOW,
+                )
+            except TypeError:
+                return None
+            client.follow_redirects = True
+            return await transport.execute(
+                ReadOrderRequest(route=RouteKey.READ_ORDER, order_id="venue-order-1"),
+                credentials=clob_credentials(),
+            )
+        finally:
+            await client.aclose()
+
+    result = asyncio.run(exercise())
+
+    assert forwarded_headers == []
+    assert result is None
 
 
 @pytest.mark.parametrize(
@@ -1537,7 +1867,7 @@ def test_task7_private_route_handler_returns_only_the_closed_task8_result() -> N
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,
@@ -1598,7 +1928,7 @@ def test_task7_submit_handler_is_fixed_to_submit_and_closes_with_owner() -> None
             headers={"content-type": "application/json"},
         )
 
-    transport = HttpxPolymarketRestTransport(
+    transport = HttpxPolymarketRestTransport._for_test(
         httpx.MockTransport(handler),
         timestamp=lambda: TIMESTAMP,
         clock=lambda: NOW,

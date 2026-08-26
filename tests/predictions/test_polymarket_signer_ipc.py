@@ -34,12 +34,20 @@ from polytrading.predictions.polymarket_execution.ipc import (
     SignOrderPayload,
     SubmitOrderPayload,
     canonical_request_bytes,
+    canonical_response_bytes,
     parse_signer_request,
     read_frame,
     write_frame,
 )
 from polytrading.predictions.polymarket_execution.order import OrderSigningError, sign_order
 from polytrading.predictions.polymarket_execution.protocol import load_protocol_snapshot
+from polytrading.predictions.polymarket_execution.routes import (
+    AllowanceEntry,
+    BalanceAllowancePayload,
+    OrderAckPayload,
+    RestCode,
+    RouteKey,
+)
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 from polytrading.predictions.polymarket_execution.signer import (
     SignerOperationHandlers,
@@ -329,6 +337,33 @@ def _handlers(**overrides: object) -> SignerOperationHandlers:
     return SignerOperationHandlers(**fields)  # type: ignore[arg-type]
 
 
+def _balance_operation_result(
+    *,
+    entry_count: int,
+    amount: str,
+) -> SanitizedOperationResult:
+    return SanitizedOperationResult(
+        operation=ExecutionOperation.READ_ACCOUNT,
+        result_code=RestCode.READ_OK,
+        evidence_hashes=("b" * 64,),
+        route=RouteKey.READ_BALANCE_ALLOWANCE,
+        observed_at=NOW,
+        raw_body_hash="b" * 64,
+        request_body_hash=None,
+        attempts=1,
+        recovery_required=False,
+        kill_required=False,
+        public_payload=BalanceAllowancePayload(
+            kind="BALANCE_ALLOWANCE",
+            balance="1",
+            allowances=tuple(
+                AllowanceEntry(address=f"0x{index:040x}", amount=amount)
+                for index in range(entry_count)
+            ),
+        ),
+    )
+
+
 def _service(
     *,
     authority_calls: list[UUID] | None = None,
@@ -382,6 +417,7 @@ def _child_service_factory(
     secrets: SecretMaterial,
     *,
     crash_operation: ExecutionOperation | None,
+    oversized_balance: bool = False,
 ) -> SignerService:
     global _CHILD_SECRET_MATERIAL
     _CHILD_SECRET_MATERIAL = secrets
@@ -403,6 +439,8 @@ def _child_service_factory(
         operation = payload.operation  # type: ignore[attr-defined]
         if operation is crash_operation:
             raise SystemExit("SANITIZED_CHILD_CRASH")
+        if oversized_balance and operation is ExecutionOperation.READ_ACCOUNT:
+            return _balance_operation_result(entry_count=10_000, amount="1" * 56)
         return SanitizedOperationResult(
             operation=operation,
             result_code={
@@ -448,6 +486,7 @@ def _spawned_signer_target(
     secret_handles: tuple[object, object, object, object],
     audit_handle: object,
     crash_operation: ExecutionOperation | None,
+    oversized_balance: bool,
     max_requests: int,
     max_lifetime_seconds: float,
 ) -> None:
@@ -463,6 +502,7 @@ def _spawned_signer_target(
             service_factory=lambda secrets: _child_service_factory(
                 secrets,
                 crash_operation=crash_operation,
+                oversized_balance=oversized_balance,
             ),
             max_requests=max_requests,
             max_lifetime_seconds=max_lifetime_seconds,
@@ -495,6 +535,7 @@ def _secret_descriptor(value: bytes) -> int:
 def _spawn_signer(
     *,
     crash_operation: ExecutionOperation | None = None,
+    oversized_balance: bool = False,
     max_requests: int = 1,
     max_lifetime_seconds: float = 5,
 ) -> tuple[multiprocessing.Process, int, int, int]:
@@ -513,6 +554,7 @@ def _spawn_signer(
             tuple(reduction.DupFd(descriptor) for descriptor in secret_fds),
             reduction.DupFd(audit_write),
             crash_operation,
+            oversized_balance,
             max_requests,
             max_lifetime_seconds,
         ),
@@ -823,6 +865,273 @@ def test_submit_binds_venue_order_id_before_known_intent_cancellation() -> None:
     assert submitted.ok is True
     assert cancelled.ok is True
     assert cancel_calls == 1
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("result_code", "status", "requires_halt"),
+    (
+        (RestCode.ORDER_ACK_MATCHED, "matched", False),
+        (RestCode.ORDER_ACK_DELAYED, "delayed", True),
+        (RestCode.ORDER_ACK_LIVE_UNEXPECTED, "live", True),
+        (RestCode.ORDER_ACK_UNMATCHED, "unmatched", True),
+    ),
+)
+def test_acknowledged_submit_binding_rejects_changed_intent_fingerprint(
+    result_code: RestCode,
+    status: str,
+    requires_halt: bool,
+) -> None:
+    cancel_calls = 0
+    request_hash = "a" * 64
+    response_hash = "b" * 64
+
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code=result_code,
+            evidence_hashes=(request_hash, response_hash),
+            venue_order_id="order-1",
+            route=RouteKey.SUBMIT_ORDER,
+            observed_at=NOW,
+            raw_body_hash=response_hash,
+            request_body_hash=request_hash,
+            attempts=1,
+            recovery_required=requires_halt,
+            kill_required=requires_halt,
+            public_payload=OrderAckPayload(
+                kind="ORDER_ACK",
+                order_id="order-1",
+                status=status,
+                making_amount="1",
+                taking_amount="2",
+                transaction_hashes=(),
+                trade_ids=(),
+            ),
+        )
+
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.CANCEL_ORDER,
+            result_code="CANCEL_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=payload.venue_order_id,
+        )
+
+    service = _service(handlers=_handlers(submit_order=submit, cancel_order=cancel))
+    submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+    changed = service.handle(
+        _request(
+            ExecutionOperation.CANCEL_ORDER,
+            request_id=uuid4(),
+            intent_fingerprint="f" * 64,
+        )
+    )
+
+    assert submitted.ok is True
+    assert changed.error_code == "CANCEL_ORDER_BINDING_MISMATCH"
+    assert cancel_calls == 0
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "updates"),
+    (
+        ("submit", {"attempts": 2}),
+        ("submit", {"request_body_hash": None, "evidence_hashes": ["b" * 64]}),
+        (
+            "read",
+            {"request_body_hash": "a" * 64, "evidence_hashes": ["a" * 64, "b" * 64]},
+        ),
+    ),
+    ids=("mutation-retry", "mutation-missing-hash", "get-extra-hash"),
+)
+def test_ipc_round_trip_rejects_impossible_route_evidence(
+    kind: str,
+    updates: dict[str, object],
+) -> None:
+    if kind == "submit":
+        result = SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code=RestCode.ORDER_ACK_MATCHED,
+            evidence_hashes=("a" * 64, "b" * 64),
+            venue_order_id="order-1",
+            route=RouteKey.SUBMIT_ORDER,
+            observed_at=NOW,
+            raw_body_hash="b" * 64,
+            request_body_hash="a" * 64,
+            attempts=1,
+            recovery_required=False,
+            kill_required=False,
+            public_payload=OrderAckPayload(
+                kind="ORDER_ACK",
+                order_id="order-1",
+                status="matched",
+                making_amount="1",
+                taking_amount="2",
+                transaction_hashes=(),
+                trade_ids=(),
+            ),
+        )
+    else:
+        result = SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ORDERS,
+            result_code=RestCode.READ_NOT_FOUND,
+            evidence_hashes=("b" * 64,),
+            venue_order_id="order-1",
+            route=RouteKey.READ_ORDER,
+            observed_at=NOW,
+            raw_body_hash="b" * 64,
+            request_body_hash=None,
+            attempts=1,
+            recovery_required=False,
+            kill_required=False,
+            public_payload=None,
+        )
+    response = SignerResponse.accepted(uuid4(), result)
+    document = json.loads(canonical_response_bytes(response))
+    document["result"].update(updates)
+
+    with pytest.raises(SignerProtocolError, match="IPC_MODEL_INVALID"):
+        SignerResponse.model_validate_json(
+            json.dumps(document, separators=(",", ":"), sort_keys=True),
+            strict=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "route", "result_code", "venue_order_id", "recovery_required"),
+    (
+        (
+            ExecutionOperation.READ_ORDERS,
+            RouteKey.READ_OPEN_ORDERS,
+            RestCode.READ_NOT_FOUND,
+            None,
+            False,
+        ),
+        (
+            ExecutionOperation.READ_ORDERS,
+            RouteKey.READ_ORDER,
+            RestCode.TRANSPORT_UNAVAILABLE,
+            "order-1",
+            True,
+        ),
+        (
+            ExecutionOperation.READ_TRADES,
+            RouteKey.READ_TRADES,
+            RestCode.RATE_LIMITED,
+            None,
+            True,
+        ),
+        (
+            ExecutionOperation.READ_ACCOUNT,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+            RestCode.PROTOCOL_RESPONSE_INVALID,
+            None,
+            True,
+        ),
+    ),
+    ids=("non-order-404", "transport", "rate-limit", "malformed"),
+)
+def test_ipc_rejects_nonconservative_authenticated_read_results(
+    operation: ExecutionOperation,
+    route: RouteKey,
+    result_code: RestCode,
+    venue_order_id: str | None,
+    recovery_required: bool,
+) -> None:
+    with pytest.raises(SignerProtocolError, match="IPC_MODEL_INVALID"):
+        SanitizedOperationResult(
+            operation=operation,
+            result_code=result_code,
+            evidence_hashes=("b" * 64,),
+            venue_order_id=venue_order_id,
+            route=route,
+            observed_at=NOW,
+            raw_body_hash="b" * 64,
+            request_body_hash=None,
+            attempts=1,
+            recovery_required=recovery_required,
+            kill_required=False,
+            public_payload=None,
+        )
+
+
+def test_handler_result_is_freshly_revalidated_before_binding_and_cache() -> None:
+    cancel_calls = 0
+    forged = SanitizedOperationResult(
+        operation=ExecutionOperation.SUBMIT_ORDER,
+        result_code=RestCode.ORDER_ACK_MATCHED,
+        evidence_hashes=("a" * 64, "b" * 64),
+        venue_order_id="order-1",
+        route=RouteKey.SUBMIT_ORDER,
+        observed_at=NOW,
+        raw_body_hash="b" * 64,
+        request_body_hash="a" * 64,
+        attempts=1,
+        recovery_required=False,
+        kill_required=False,
+        public_payload=OrderAckPayload(
+            kind="ORDER_ACK",
+            order_id="order-1",
+            status="matched",
+            making_amount="1",
+            taking_amount="2",
+            transaction_hashes=(),
+            trade_ids=(),
+        ),
+    )
+    object.__setattr__(forged, "attempts", 2)
+
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
+        return forged
+
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.CANCEL_ORDER,
+            result_code="CANCEL_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=payload.venue_order_id,
+        )
+
+    service = _service(handlers=_handlers(submit_order=submit, cancel_order=cancel))
+    submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+    cancelled = service.handle(_request(ExecutionOperation.CANCEL_ORDER, request_id=uuid4()))
+
+    assert submitted.error_code == "IPC_OPERATION_RESULT_INVALID"
+    assert cancelled.error_code == "CANCEL_ORDER_UNKNOWN"
+    assert cancel_calls == 0
+    service.close()
+
+
+def test_oversized_public_handler_result_becomes_a_stable_bounded_error() -> None:
+    largest_minimal_result = _balance_operation_result(entry_count=10_000, amount="1")
+    assert (
+        len(canonical_response_bytes(SignerResponse.accepted(uuid4(), largest_minimal_result)))
+        <= MAX_FRAME_BYTES
+    )
+
+    oversized_result = _balance_operation_result(entry_count=10_000, amount="1" * 56)
+    candidate = SignerResponse.accepted(uuid4(), oversized_result)
+    assert len(canonical_response_bytes(candidate)) > MAX_FRAME_BYTES
+
+    def read_account(payload: ReadAccountPayload) -> SanitizedOperationResult:
+        del payload
+        return oversized_result
+
+    service = _service(handlers=_handlers(read_account=read_account))
+    response = service.handle(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4()))
+    bounded_bytes = canonical_response_bytes(response)
+
+    assert response.error_code == "IPC_OPERATION_RESULT_INVALID"
+    assert len(bounded_bytes) <= MAX_FRAME_BYTES
+    write_frame(io.BytesIO(), bounded_bytes)
     service.close()
 
 
@@ -1638,6 +1947,36 @@ def test_spawned_sidecar_returns_byte_identical_replay_and_rejects_collision() -
     rendered = first + retry + collision_raw
     for canary in (API_KEY, API_SECRET, PASSPHRASE):
         assert canary not in rendered
+
+
+def test_spawned_sidecar_bounds_oversized_public_result_and_continues() -> None:
+    process, request_write, response_read, audit_read = _spawn_signer(
+        oversized_balance=True,
+        max_requests=2,
+    )
+    request_stream = _FdStream(request_write)
+    response_stream = _FdStream(response_read)
+
+    write_frame(
+        request_stream,
+        canonical_request_bytes(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4())),
+    )  # type: ignore[arg-type]
+    oversized_raw = read_frame(response_stream)  # type: ignore[arg-type]
+    oversized = SignerResponse.model_validate_json(oversized_raw, strict=True)
+    write_frame(
+        request_stream,
+        canonical_request_bytes(_request(ExecutionOperation.READ_TRADES, request_id=uuid4())),
+    )  # type: ignore[arg-type]
+    continued_raw = read_frame(response_stream)  # type: ignore[arg-type]
+    continued = SignerResponse.model_validate_json(continued_raw, strict=True)
+
+    exitcode, audit = _join_spawned(process, request_write, response_read, audit_read)
+
+    assert oversized.error_code == "IPC_OPERATION_RESULT_INVALID"
+    assert len(oversized_raw) <= MAX_FRAME_BYTES
+    assert continued.ok is True
+    assert exitcode == 0
+    assert audit == b"1"
 
 
 @pytest.mark.parametrize(

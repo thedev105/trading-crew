@@ -34,6 +34,7 @@ from polytrading.predictions.polymarket_execution.auth import (
 )
 from polytrading.predictions.polymarket_execution.routes import (
     ROUTE_SPECS,
+    AllowanceEntry,
     BalanceAllowancePayload,
     CancellationPayload,
     CancelOrderRequest,
@@ -56,6 +57,9 @@ from polytrading.predictions.polymarket_execution.routes import (
     SubmitOrderRequest,
     TradeReadPayload,
     TradesReadPayload,
+    allowed_route_result_codes,
+    expected_route_result_flags,
+    validate_route_result_evidence,
 )
 
 if TYPE_CHECKING:
@@ -108,55 +112,6 @@ _READ_RETRY_ROUTES = frozenset(
     }
 )
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
-
-
-def _read_result_codes() -> frozenset[RestCode]:
-    return frozenset(
-        {
-            RestCode.READ_OK,
-            RestCode.READ_NOT_FOUND,
-            RestCode.READ_FAILED,
-            RestCode.RATE_LIMITED,
-            RestCode.AUTH_REJECTED,
-            RestCode.PROTOCOL_RESPONSE_INVALID,
-            RestCode.TRANSPORT_UNAVAILABLE,
-            RestCode.AUTH_REQUEST_BUILD_FAILED,
-        }
-    )
-
-
-def _outcome_flags(
-    route: RouteKey,
-    code: RestCode,
-    payload: RoutePublicPayload | None,
-) -> tuple[bool, bool]:
-    no_recovery = {
-        RestCode.ORDER_ACK_MATCHED,
-        RestCode.HEARTBEAT_ACCEPTED,
-        RestCode.READ_OK,
-        RestCode.READ_NOT_FOUND,
-        RestCode.GEOBLOCK_OK,
-    }
-    no_kill = no_recovery | {
-        RestCode.CANCEL_ACKNOWLEDGED,
-        RestCode.CANCEL_NOT_CONFIRMED,
-        RestCode.HEARTBEAT_ID_MISMATCH,
-        RestCode.PROTOCOL_RESPONSE_INVALID,
-        RestCode.READ_FAILED,
-        RestCode.RATE_LIMITED,
-        RestCode.TRANSPORT_UNAVAILABLE,
-    }
-    recovery = code not in no_recovery
-    kill = code not in no_kill
-    if code is RestCode.CANCEL_ACKNOWLEDGED:
-        recovery = True
-    if route is RouteKey.GEOBLOCK and (
-        code is not RestCode.GEOBLOCK_OK
-        or (isinstance(payload, GeoblockResult) and payload.blocked)
-    ):
-        recovery = True
-        kill = True
-    return recovery, kill
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,43 +205,7 @@ class RestResult(BaseModel):
 
     @model_validator(mode="after")
     def _closed_route_variant(self) -> RestResult:
-        route_codes = {
-            RouteKey.SUBMIT_ORDER: {
-                RestCode.ORDER_ACK_MATCHED,
-                RestCode.ORDER_ACK_DELAYED,
-                RestCode.ORDER_ACK_LIVE_UNEXPECTED,
-                RestCode.ORDER_ACK_UNMATCHED,
-                RestCode.ORDER_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.CANCEL_ORDER: {
-                RestCode.CANCEL_ACKNOWLEDGED,
-                RestCode.CANCEL_NOT_CONFIRMED,
-                RestCode.CANCEL_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.HEARTBEAT: {
-                RestCode.HEARTBEAT_ACCEPTED,
-                RestCode.HEARTBEAT_ID_MISMATCH,
-                RestCode.HEARTBEAT_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.READ_ORDER: _read_result_codes(),
-            RouteKey.READ_OPEN_ORDERS: _read_result_codes(),
-            RouteKey.READ_TRADES: _read_result_codes(),
-            RouteKey.READ_BALANCE_ALLOWANCE: _read_result_codes(),
-            RouteKey.GEOBLOCK: {
-                RestCode.GEOBLOCK_OK,
-                RestCode.GEOBLOCK_FAILED,
-                RestCode.AUTH_REJECTED,
-                RestCode.PROTOCOL_RESPONSE_INVALID,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-        }
-        if self.code not in route_codes[self.route]:
+        if self.code not in allowed_route_result_codes(self.route):
             raise ValueError("REST_CODE_ROUTE_MISMATCH")
         expected_payload_type: type[BaseModel] | None = None
         if self.code in {
@@ -313,12 +232,16 @@ class RestResult(BaseModel):
             expected_payload_type is not None and type(self.payload) is not expected_payload_type
         ):
             raise ValueError("REST_PAYLOAD_CODE_MISMATCH")
-        if (self.code is RestCode.AUTH_REQUEST_BUILD_FAILED) != (self.attempts == 0):
-            raise ValueError("REST_ATTEMPTS_CODE_MISMATCH")
-        expected_recovery, expected_kill = _outcome_flags(
-            self.route,
-            self.code,
-            self.payload,
+        validate_route_result_evidence(
+            route=self.route,
+            code=self.code,
+            attempts=self.attempts,
+            request_body_hash=self.request_body_hash,
+        )
+        expected_recovery, expected_kill = expected_route_result_flags(
+            route=self.route,
+            code=self.code,
+            payload=self.payload,
         )
         if (self.recovery_required, self.kill_required) != (
             expected_recovery,
@@ -366,6 +289,10 @@ class RestrictedGeoblockEvidence:
         del name, value
         if object.__getattribute__(self, "_sealed"):
             raise AttributeError("GEOBLOCK_EVIDENCE_IMMUTABLE") from None
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("GEOBLOCK_EVIDENCE_IMMUTABLE") from None
 
     def __repr__(self) -> str:
         return "RestrictedGeoblockEvidence(<restricted>)"
@@ -432,6 +359,10 @@ class RestrictedGeoblockResponse:
         del name, value
         if object.__getattribute__(self, "_sealed"):
             raise AttributeError("GEOBLOCK_RESTRICTED_RESPONSE_IMMUTABLE") from None
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("GEOBLOCK_RESTRICTED_RESPONSE_IMMUTABLE") from None
 
     @property
     def result(self) -> RestResult:
@@ -501,7 +432,10 @@ class _CancelWire(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     canceled: Annotated[tuple[_PublicIdentifier, ...], Field(max_length=MAX_ARRAY_ITEMS)]
-    not_canceled: dict[_PublicIdentifier, _PrintableText]
+    not_canceled: Annotated[
+        dict[_PublicIdentifier, _PrintableText],
+        Field(max_length=MAX_ARRAY_ITEMS),
+    ]
 
 
 class _HeartbeatWire(BaseModel):
@@ -583,7 +517,10 @@ class _BalanceAllowanceWire(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     balance: _AsciiInteger
-    allowances: dict[_EvmAddress, _AsciiInteger]
+    allowances: Annotated[
+        dict[_EvmAddress, _AsciiInteger],
+        Field(max_length=MAX_ARRAY_ITEMS),
+    ]
 
 
 class _GeoblockWire(BaseModel):
@@ -681,7 +618,11 @@ def _result(
     request_body_hash: str | None = None,
     payload: RoutePublicPayload | None = None,
 ) -> RestResult:
-    recovery, kill = _outcome_flags(route, code, payload)
+    recovery, kill = expected_route_result_flags(
+        route=route,
+        code=code,
+        payload=payload,
+    )
     return RestResult(
         route=route,
         code=code,
@@ -771,8 +712,10 @@ def sanitize_venue_error(
     }
     if status_code in {401, 403}:
         code = RestCode.AUTH_REJECTED
-    elif route in read_routes and status_code == 404:
+    elif route is RouteKey.READ_ORDER and status_code == 404:
         code = RestCode.READ_NOT_FOUND
+    elif route in read_routes and status_code == 404:
+        code = RestCode.READ_FAILED
     elif route in read_routes and status_code == 429:
         code = RestCode.RATE_LIMITED
     elif route in read_routes and status_code is not None and status_code >= 500:
@@ -920,7 +863,10 @@ def _strict_success_result(
             payload = BalanceAllowancePayload(
                 kind="BALANCE_ALLOWANCE",
                 balance=wire_balance.balance,
-                allowances=wire_balance.allowances,
+                allowances=tuple(
+                    AllowanceEntry(address=address, amount=amount)
+                    for address, amount in sorted(wire_balance.allowances.items())
+                ),
             )
         elif isinstance(request, GeoblockRequest):
             wire_geo = _GeoblockWire.model_validate_json(body, strict=True)
@@ -1075,49 +1021,74 @@ def _build_request(
 
 
 class HttpxPolymarketRestTransport:
-    """Execute only closed typed requests using an injected non-retrying HTTP transport."""
+    """Execute closed typed requests through an exclusively owned HTTP client."""
 
     __slots__ = ("_client", "_clock", "_retry_policy", "_sleeper", "_timestamp")
 
     def __init__(
         self,
-        transport: httpx.AsyncBaseTransport | None = None,
         *,
-        client: httpx.AsyncClient | None = None,
         timestamp: Callable[[], str],
         clock: Callable[[], datetime],
         retry_policy: ReadRetryPolicy | None = None,
         sleeper: AsyncSleeper | None = None,
         timeouts: RestTimeouts | None = None,
     ) -> None:
-        if (transport is None) == (client is None):
-            raise TypeError("ONE_HTTPX_CLIENT_OR_TRANSPORT_REQUIRED")
+        self._initialize(
+            transport=httpx.AsyncHTTPTransport(retries=0),
+            timestamp=timestamp,
+            clock=clock,
+            retry_policy=retry_policy,
+            sleeper=sleeper,
+            timeouts=timeouts,
+        )
+
+    @classmethod
+    def _for_test(
+        cls,
+        transport: httpx.AsyncBaseTransport,
+        *,
+        timestamp: Callable[[], str],
+        clock: Callable[[], datetime],
+        retry_policy: ReadRetryPolicy | None = None,
+        sleeper: AsyncSleeper | None = None,
+        timeouts: RestTimeouts | None = None,
+    ) -> Self:
+        """Construct with an explicitly trusted fake transport for offline tests only."""
+        if not isinstance(transport, httpx.AsyncBaseTransport):
+            raise TypeError("HTTPX_ASYNC_TRANSPORT_REQUIRED")
+        instance = cls.__new__(cls)
+        instance._initialize(
+            transport=transport,
+            timestamp=timestamp,
+            clock=clock,
+            retry_policy=retry_policy,
+            sleeper=sleeper,
+            timeouts=timeouts,
+        )
+        return instance
+
+    def _initialize(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport,
+        timestamp: Callable[[], str],
+        clock: Callable[[], datetime],
+        retry_policy: ReadRetryPolicy | None,
+        sleeper: AsyncSleeper | None,
+        timeouts: RestTimeouts | None,
+    ) -> None:
         checked_timeouts = timeouts or RestTimeouts()
         if not isinstance(checked_timeouts, RestTimeouts):
             raise TypeError("REST_TIMEOUTS_REQUIRED")
-        if transport is not None:
-            if not isinstance(transport, httpx.AsyncBaseTransport):
-                raise TypeError("HTTPX_ASYNC_TRANSPORT_REQUIRED")
-            self._client = httpx.AsyncClient(
-                transport=transport,
-                follow_redirects=False,
-                trust_env=False,
-                timeout=checked_timeouts.as_httpx(),
-                headers={},
-                cookies={},
-            )
-        else:
-            if not isinstance(client, httpx.AsyncClient):
-                raise TypeError("HTTPX_ASYNC_CLIENT_REQUIRED")
-            if client.follow_redirects:
-                raise ValueError("HTTPX_REDIRECTS_MUST_BE_DISABLED") from None
-            client.headers.clear()
-            client.cookies.clear()
-            client.auth = None
-            client.event_hooks["request"].clear()
-            client.event_hooks["response"].clear()
-            client.timeout = checked_timeouts.as_httpx()
-            self._client = client
+        self._client = httpx.AsyncClient(
+            transport=transport,
+            follow_redirects=False,
+            trust_env=False,
+            timeout=checked_timeouts.as_httpx(),
+            headers={},
+            cookies={},
+        )
         self._timestamp = timestamp
         self._clock = clock
         self._retry_policy = retry_policy or ReadRetryPolicy()

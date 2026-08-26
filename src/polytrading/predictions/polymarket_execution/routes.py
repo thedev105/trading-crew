@@ -309,10 +309,26 @@ class TradesReadPayload(_RouteRecord):
     items: Annotated[tuple[TradeReadPayload, ...], Field(max_length=10_000)]
 
 
+class AllowanceEntry(_RouteRecord):
+    address: _EvmAddress
+    amount: _AsciiInteger
+
+
 class BalanceAllowancePayload(_RouteRecord):
     kind: Literal["BALANCE_ALLOWANCE"]
     balance: _AsciiInteger
-    allowances: dict[_EvmAddress, _AsciiInteger]
+    allowances: Annotated[tuple[AllowanceEntry, ...], Field(max_length=10_000)]
+
+    @field_validator("allowances")
+    @classmethod
+    def _sorted_unique_allowances(
+        cls,
+        value: tuple[AllowanceEntry, ...],
+    ) -> tuple[AllowanceEntry, ...]:
+        addresses = tuple(item.address for item in value)
+        if addresses != tuple(sorted(addresses)) or len(addresses) != len(set(addresses)):
+            raise ValueError("allowances must be sorted and unique")
+        return value
 
 
 class GeoblockResult(_RouteRecord):
@@ -386,10 +402,127 @@ ROUTE_SET_HASH = canonical_execution_hash(
 )
 
 
+def validate_route_result_evidence(
+    *,
+    route: RouteKey,
+    code: RestCode,
+    attempts: int,
+    request_body_hash: str | None,
+) -> None:
+    """Reject attempt/body evidence impossible for the closed route specification."""
+    build_failed = code is RestCode.AUTH_REQUEST_BUILD_FAILED
+    if ROUTE_SPECS[route].mutation:
+        expected_attempts = 0 if build_failed else 1
+        expected_body_hash = not build_failed
+        if attempts != expected_attempts or (request_body_hash is not None) != expected_body_hash:
+            raise ValueError("REST_RESULT_EVIDENCE_INVALID") from None
+        return
+    if request_body_hash is not None:
+        raise ValueError("REST_RESULT_EVIDENCE_INVALID") from None
+    if build_failed:
+        if attempts != 0:
+            raise ValueError("REST_RESULT_EVIDENCE_INVALID") from None
+    elif attempts not in {1, 2}:
+        raise ValueError("REST_RESULT_EVIDENCE_INVALID") from None
+
+
+def allowed_route_result_codes(route: RouteKey) -> frozenset[RestCode]:
+    """Return the exact closed result-code set for one route."""
+    read_codes = {
+        RestCode.READ_OK,
+        RestCode.READ_FAILED,
+        RestCode.RATE_LIMITED,
+        RestCode.AUTH_REJECTED,
+        RestCode.PROTOCOL_RESPONSE_INVALID,
+        RestCode.TRANSPORT_UNAVAILABLE,
+        RestCode.AUTH_REQUEST_BUILD_FAILED,
+    }
+    return {
+        RouteKey.SUBMIT_ORDER: frozenset(
+            {
+                RestCode.ORDER_ACK_MATCHED,
+                RestCode.ORDER_ACK_DELAYED,
+                RestCode.ORDER_ACK_LIVE_UNEXPECTED,
+                RestCode.ORDER_ACK_UNMATCHED,
+                RestCode.ORDER_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            }
+        ),
+        RouteKey.CANCEL_ORDER: frozenset(
+            {
+                RestCode.CANCEL_ACKNOWLEDGED,
+                RestCode.CANCEL_NOT_CONFIRMED,
+                RestCode.CANCEL_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            }
+        ),
+        RouteKey.HEARTBEAT: frozenset(
+            {
+                RestCode.HEARTBEAT_ACCEPTED,
+                RestCode.HEARTBEAT_ID_MISMATCH,
+                RestCode.HEARTBEAT_OUTCOME_UNKNOWN,
+                RestCode.AUTH_REJECTED,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            }
+        ),
+        RouteKey.READ_ORDER: frozenset(read_codes | {RestCode.READ_NOT_FOUND}),
+        RouteKey.READ_OPEN_ORDERS: frozenset(read_codes),
+        RouteKey.READ_TRADES: frozenset(read_codes),
+        RouteKey.READ_BALANCE_ALLOWANCE: frozenset(read_codes),
+        RouteKey.GEOBLOCK: frozenset(
+            {
+                RestCode.GEOBLOCK_OK,
+                RestCode.GEOBLOCK_FAILED,
+                RestCode.AUTH_REJECTED,
+                RestCode.PROTOCOL_RESPONSE_INVALID,
+                RestCode.AUTH_REQUEST_BUILD_FAILED,
+            }
+        ),
+    }[route]
+
+
+def expected_route_result_flags(
+    *,
+    route: RouteKey,
+    code: RestCode,
+    payload: RoutePublicPayload | None,
+) -> tuple[bool, bool]:
+    """Return the route-aware recovery and kill requirements for one result."""
+    authenticated_reads = {
+        RouteKey.READ_ORDER,
+        RouteKey.READ_OPEN_ORDERS,
+        RouteKey.READ_TRADES,
+        RouteKey.READ_BALANCE_ALLOWANCE,
+    }
+    if route in authenticated_reads:
+        if code in {RestCode.READ_OK, RestCode.READ_NOT_FOUND}:
+            return False, False
+        return True, True
+    if route is RouteKey.GEOBLOCK:
+        safe = (
+            code is RestCode.GEOBLOCK_OK
+            and isinstance(payload, GeoblockResult)
+            and not payload.blocked
+        )
+        return (False, False) if safe else (True, True)
+    if code in {RestCode.ORDER_ACK_MATCHED, RestCode.HEARTBEAT_ACCEPTED}:
+        return False, False
+    if code in {
+        RestCode.CANCEL_ACKNOWLEDGED,
+        RestCode.CANCEL_NOT_CONFIRMED,
+        RestCode.HEARTBEAT_ID_MISMATCH,
+    }:
+        return True, False
+    return True, True
+
+
 __all__ = [
     "ROUTE_SET_HASH",
     "ROUTE_SET_VERSION",
     "ROUTE_SPECS",
+    "AllowanceEntry",
     "BalanceAllowancePayload",
     "CancelOrderRequest",
     "CancellationPayload",
@@ -413,4 +546,7 @@ __all__ = [
     "SubmitOrderRequest",
     "TradeReadPayload",
     "TradesReadPayload",
+    "allowed_route_result_codes",
+    "expected_route_result_flags",
+    "validate_route_result_evidence",
 ]

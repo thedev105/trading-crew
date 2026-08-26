@@ -37,6 +37,9 @@ from polytrading.predictions.polymarket_execution.routes import (
     RouteKey,
     RoutePublicPayload,
     TradesReadPayload,
+    allowed_route_result_codes,
+    expected_route_result_flags,
+    validate_route_result_evidence,
 )
 
 MAX_FRAME_BYTES: Final = 1_048_576
@@ -453,47 +456,8 @@ class SanitizedOperationResult(_SignerRecord):
             or self.kill_required is None
         ):
             raise ValueError("REST result does not match operation")
-        read_codes = {
-            RestCode.READ_OK,
-            RestCode.READ_NOT_FOUND,
-            RestCode.READ_FAILED,
-            RestCode.RATE_LIMITED,
-            RestCode.AUTH_REJECTED,
-            RestCode.PROTOCOL_RESPONSE_INVALID,
-            RestCode.TRANSPORT_UNAVAILABLE,
-            RestCode.AUTH_REQUEST_BUILD_FAILED,
-        }
-        route_codes = {
-            RouteKey.SUBMIT_ORDER: {
-                RestCode.ORDER_ACK_MATCHED,
-                RestCode.ORDER_ACK_DELAYED,
-                RestCode.ORDER_ACK_LIVE_UNEXPECTED,
-                RestCode.ORDER_ACK_UNMATCHED,
-                RestCode.ORDER_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.CANCEL_ORDER: {
-                RestCode.CANCEL_ACKNOWLEDGED,
-                RestCode.CANCEL_NOT_CONFIRMED,
-                RestCode.CANCEL_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.HEARTBEAT: {
-                RestCode.HEARTBEAT_ACCEPTED,
-                RestCode.HEARTBEAT_ID_MISMATCH,
-                RestCode.HEARTBEAT_OUTCOME_UNKNOWN,
-                RestCode.AUTH_REJECTED,
-                RestCode.AUTH_REQUEST_BUILD_FAILED,
-            },
-            RouteKey.READ_ORDER: read_codes,
-            RouteKey.READ_OPEN_ORDERS: read_codes,
-            RouteKey.READ_TRADES: read_codes,
-            RouteKey.READ_BALANCE_ALLOWANCE: read_codes,
-        }
         assert self.route is not None
-        if self.result_code not in route_codes[self.route]:
+        if self.result_code not in allowed_route_result_codes(self.route):
             raise ValueError("REST code does not match route")
         expected_payload_type: type[object] | None = None
         if self.result_code in {
@@ -533,27 +497,18 @@ class SanitizedOperationResult(_SignerRecord):
         )
         if self.evidence_hashes != expected_hashes:
             raise ValueError("REST evidence hashes do not match")
-        if (self.result_code is RestCode.AUTH_REQUEST_BUILD_FAILED) != (self.attempts == 0):
-            raise ValueError("REST attempts do not match code")
-        no_recovery = {
-            RestCode.ORDER_ACK_MATCHED,
-            RestCode.HEARTBEAT_ACCEPTED,
-            RestCode.READ_OK,
-            RestCode.READ_NOT_FOUND,
-        }
-        no_kill = no_recovery | {
-            RestCode.CANCEL_ACKNOWLEDGED,
-            RestCode.CANCEL_NOT_CONFIRMED,
-            RestCode.HEARTBEAT_ID_MISMATCH,
-            RestCode.PROTOCOL_RESPONSE_INVALID,
-            RestCode.READ_FAILED,
-            RestCode.RATE_LIMITED,
-            RestCode.TRANSPORT_UNAVAILABLE,
-        }
-        expected_recovery = self.result_code not in no_recovery
-        if self.result_code is RestCode.CANCEL_ACKNOWLEDGED:
-            expected_recovery = True
-        expected_kill = self.result_code not in no_kill
+        assert self.attempts is not None
+        validate_route_result_evidence(
+            route=self.route,
+            code=self.result_code,
+            attempts=self.attempts,
+            request_body_hash=self.request_body_hash,
+        )
+        expected_recovery, expected_kill = expected_route_result_flags(
+            route=self.route,
+            code=self.result_code,
+            payload=self.public_payload,
+        )
         if (self.recovery_required, self.kill_required) != (
             expected_recovery,
             expected_kill,

@@ -29,6 +29,7 @@ from polytrading.predictions.execution.models import (
 )
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
+    MAX_FRAME_BYTES,
     CancelOrderPayload,
     HeartbeatPayload,
     ReadAccountPayload,
@@ -154,6 +155,7 @@ class _ReplayEntry:
 @dataclass(frozen=True, slots=True)
 class _VenueOrderBinding:
     intent_id: UUID
+    intent_fingerprint: str
     account_fingerprint: str
     envelope_digest: str
 
@@ -430,6 +432,7 @@ class SignerService:
                         )
                     if (
                         binding.intent_id != request.intent_id
+                        or binding.intent_fingerprint != request.intent_fingerprint
                         or binding.account_fingerprint != request.account_fingerprint
                     ):
                         return SignerResponse.rejected(
@@ -438,6 +441,17 @@ class SignerService:
                         )
                 handler = self._handler_for(request.payload)
                 result = handler(request.payload)
+                if type(result) is SanitizedOperationResult:
+                    try:
+                        result = SanitizedOperationResult.model_validate(
+                            result.model_dump(mode="python"),
+                            strict=True,
+                        )
+                    except Exception:
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "IPC_OPERATION_RESULT_INVALID",
+                        )
                 if (
                     type(result) is not SanitizedOperationResult
                     or result.operation is not request.operation
@@ -512,6 +526,12 @@ class SignerService:
         except Exception:
             sanitized = SignerResponse.rejected(response.request_id, "HANDLER_FAILED")
             return sanitized, canonical_response_bytes(sanitized)
+        if len(response_bytes) > MAX_FRAME_BYTES:
+            sanitized = SignerResponse.rejected(
+                response.request_id,
+                "IPC_OPERATION_RESULT_INVALID",
+            )
+            return sanitized, canonical_response_bytes(sanitized)
         for secret, _ in secrets:
             if secret in response_bytes:
                 sanitized = SignerResponse.rejected(
@@ -548,6 +568,7 @@ class SignerService:
             response.result.venue_order_id,
             _VenueOrderBinding(
                 intent_id=request.intent_id,
+                intent_fingerprint=request.payload.envelope.intent_fingerprint,
                 account_fingerprint=request.account_fingerprint,
                 envelope_digest=canonical_execution_hash(request.payload.envelope),
             ),
