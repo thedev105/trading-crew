@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraint
 
 POLYMARKET_PROTOCOL_VERSION = "polymarket-clob-2026-08-25-v1"
 _PROTOCOL_FIXTURE_NAME = "protocol_v1.json"
-_PROTOCOL_FIXTURE_SHA256 = "e45445d2e24914da900578dee6cf0014daecfcfd35c8159dc5dc368d779c2860"
+_PROTOCOL_FIXTURE_SHA256 = "5f39f5b87e1dac292d58464bf6c7e272708452be21ead2fd65d1ba6439647122"
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -108,7 +108,9 @@ class Route(_FixtureModel):
     query_fields: tuple[str, ...]
     request_fields: tuple[str, ...]
     compact_body_examples: tuple[str, ...]
+    response_body_shape: Literal["object", "array"]
     response_fields: tuple[str, ...]
+    response_item_fields: tuple[str, ...]
 
 
 class RouteCatalog(_FixtureModel):
@@ -331,26 +333,60 @@ def load_protocol_snapshot(root: Path | None = None) -> PolymarketProtocolSnapsh
     return snapshot
 
 
-def verify_protocol_sources(snapshot: PolymarketProtocolSnapshot) -> ProtocolReadiness:
-    """Verify the offline fixture trust root and every file it authenticates."""
-    changed_paths: list[str] = []
-    protocol_path = snapshot.fixture_root / _PROTOCOL_FIXTURE_NAME
-    try:
-        protocol_hash = sha256(protocol_path.read_bytes()).hexdigest()
-    except OSError:
-        protocol_hash = ""
-    if protocol_hash != _PROTOCOL_FIXTURE_SHA256:
-        changed_paths.append(_PROTOCOL_FIXTURE_NAME)
+def verify_protocol_sources(
+    snapshot: PolymarketProtocolSnapshot | None = None,
+    *,
+    root: Path | None = None,
+) -> ProtocolReadiness:
+    """Return fail-closed readiness without requiring fixture parsing to succeed first."""
+    if snapshot is not None and root is not None:
+        raise TypeError("pass either snapshot or root, not both")
+    fixture_root = (
+        snapshot.fixture_root
+        if snapshot is not None
+        else Path(root) if root is not None else bundled_fixture_path()
+    )
+    return _verify_fixture_root(fixture_root)
 
+
+def _verify_fixture_root(fixture_root: Path) -> ProtocolReadiness:
+    protocol_path = fixture_root / _PROTOCOL_FIXTURE_NAME
+    try:
+        protocol_bytes = protocol_path.read_bytes()
+    except OSError:
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
+    if sha256(protocol_bytes).hexdigest() != _PROTOCOL_FIXTURE_SHA256:
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
+
+    try:
+        snapshot = PolymarketProtocolSnapshot.model_validate_json(protocol_bytes, strict=True)
+    except ValueError:
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
+
+    changed_paths: list[str] = []
+    fixture_bytes: dict[str, bytes] = {}
     for fixture in snapshot.fixture_hashes:
-        fixture_path = snapshot.fixture_root / fixture.path
+        fixture_path = fixture_root / fixture.path
         try:
-            actual_hash = sha256(fixture_path.read_bytes()).hexdigest()
+            contents = fixture_path.read_bytes()
         except OSError:
-            actual_hash = ""
-        if actual_hash != fixture.sha256:
+            changed_paths.append(fixture.path)
+            continue
+        fixture_bytes[fixture.path] = contents
+        if sha256(contents).hexdigest() != fixture.sha256:
             changed_paths.append(fixture.path)
 
     if changed_paths:
         return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", tuple(changed_paths))
+
+    try:
+        SourceManifest.model_validate_json(
+            fixture_bytes[snapshot.source_manifest_path],
+            strict=True,
+        )
+    except (KeyError, ValueError):
+        return ProtocolReadiness(
+            "PROTOCOL_REVIEW_REQUIRED",
+            (snapshot.source_manifest_path,),
+        )
     return ProtocolReadiness("CURRENT", ())

@@ -73,10 +73,60 @@ def test_one_changed_fixture_byte_requires_review(tmp_path: Path, fixture_name: 
     path = copied / fixture_name
     path.write_bytes(path.read_bytes() + b" ")
 
-    readiness = verify_protocol_sources(load_protocol_snapshot(copied))
+    readiness = verify_protocol_sources(root=copied)
 
     assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
     assert fixture_name in readiness.changed_paths
+
+
+def test_readiness_fails_closed_when_protocol_root_is_missing(tmp_path: Path) -> None:
+    copied = copy_bundled_fixtures(tmp_path)
+    (copied / "protocol_v1.json").unlink()
+
+    readiness = verify_protocol_sources(root=copied)
+
+    assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
+    assert readiness.changed_paths == ("protocol_v1.json",)
+
+
+def test_readiness_fails_closed_when_protocol_root_is_malformed(tmp_path: Path) -> None:
+    copied = copy_bundled_fixtures(tmp_path)
+    (copied / "protocol_v1.json").write_bytes(b"{")
+
+    readiness = verify_protocol_sources(root=copied)
+
+    assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
+    assert readiness.changed_paths == ("protocol_v1.json",)
+
+
+def test_readiness_fails_closed_when_source_manifest_is_missing(tmp_path: Path) -> None:
+    copied = copy_bundled_fixtures(tmp_path)
+    (copied / "sources_v1.json").unlink()
+
+    readiness = verify_protocol_sources(root=copied)
+
+    assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
+    assert readiness.changed_paths == ("sources_v1.json",)
+
+
+def test_readiness_fails_closed_when_source_manifest_is_malformed(tmp_path: Path) -> None:
+    copied = copy_bundled_fixtures(tmp_path)
+    (copied / "sources_v1.json").write_bytes(b"{")
+
+    readiness = verify_protocol_sources(root=copied)
+
+    assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
+    assert readiness.changed_paths == ("sources_v1.json",)
+
+
+def test_readiness_fails_closed_when_child_vector_is_missing(tmp_path: Path) -> None:
+    copied = copy_bundled_fixtures(tmp_path)
+    (copied / "order_vectors_v1.json").unlink()
+
+    readiness = verify_protocol_sources(root=copied)
+
+    assert readiness.state == "PROTOCOL_REVIEW_REQUIRED"
+    assert readiness.changed_paths == ("order_vectors_v1.json",)
 
 
 def test_snapshot_load_is_strict_and_rejects_unknown_protocol_fields(tmp_path: Path) -> None:
@@ -209,3 +259,49 @@ def test_array_and_compact_object_route_payload_shapes_are_frozen() -> None:
     assert routes.cancel_orders.request_body_shape == "array_of_order_ids_1_to_3000"
     assert routes.cancel_order.compact_body_examples == ('{"orderID":"<order_id>"}',)
     assert routes.heartbeat.compact_body_examples == ('{"heartbeat_id":""}',)
+
+
+def test_list_routes_freeze_top_level_array_wire_item_schemas() -> None:
+    routes = load_protocol_snapshot().routes
+
+    assert routes.list_orders.response_body_shape == "array"
+    assert routes.list_orders.response_fields == ()
+    assert routes.list_orders.response_item_fields == (
+        "id",
+        "market",
+        "asset_id",
+        "owner",
+        "maker_address",
+        "side",
+        "price",
+        "original_size",
+        "size_matched",
+        "outcome",
+        "order_type",
+        "status",
+        "associate_trades",
+        "created_at",
+        "expiration",
+    )
+    assert routes.list_trades.response_body_shape == "array"
+    assert routes.list_trades.response_fields == ()
+    assert routes.list_trades.response_item_fields == (
+        "id",
+        "market",
+        "asset_id",
+        "owner",
+        "maker_address",
+        "taker_order_id",
+        "side",
+        "trader_side",
+        "price",
+        "size",
+        "outcome",
+        "status",
+        "fee_rate_bps",
+        "bucket_index",
+        "transaction_hash",
+        "maker_orders",
+        "match_time",
+        "last_update",
+    )

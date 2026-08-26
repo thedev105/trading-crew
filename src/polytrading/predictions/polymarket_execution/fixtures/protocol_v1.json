@@ -134,7 +134,9 @@
       "query_fields": [],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["apiKey", "secret", "passphrase"]
+      "response_body_shape": "object",
+      "response_fields": ["apiKey", "secret", "passphrase"],
+      "response_item_fields": []
     },
     "derive_api_key": {
       "host": "https://clob.polymarket.com",
@@ -145,7 +147,9 @@
       "query_fields": [],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["apiKey", "secret", "passphrase"]
+      "response_body_shape": "object",
+      "response_fields": ["apiKey", "secret", "passphrase"],
+      "response_item_fields": []
     },
     "order_book": {
       "host": "https://clob.polymarket.com",
@@ -156,7 +160,9 @@
       "query_fields": ["token_id"],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["asset_id", "bids", "asks", "min_order_size", "tick_size", "neg_risk"]
+      "response_body_shape": "object",
+      "response_fields": ["asset_id", "bids", "asks", "min_order_size", "tick_size", "neg_risk"],
+      "response_item_fields": []
     },
     "place_order": {
       "host": "https://clob.polymarket.com",
@@ -167,7 +173,9 @@
       "query_fields": [],
       "request_fields": ["deferExec", "order", "orderType", "owner"],
       "compact_body_examples": [],
-      "response_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"]
+      "response_body_shape": "object",
+      "response_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"],
+      "response_item_fields": []
     },
     "place_orders": {
       "host": "https://clob.polymarket.com",
@@ -178,7 +186,9 @@
       "query_fields": [],
       "request_fields": ["deferExec", "order", "orderType", "owner"],
       "compact_body_examples": [],
-      "response_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"]
+      "response_body_shape": "array",
+      "response_fields": [],
+      "response_item_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"]
     },
     "get_order": {
       "host": "https://clob.polymarket.com",
@@ -189,7 +199,9 @@
       "query_fields": [],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["id", "market", "asset_id", "owner", "maker_address", "side", "price", "original_size", "size_matched", "outcome", "order_type", "status", "associate_trades", "created_at", "expiration"]
+      "response_body_shape": "object",
+      "response_fields": ["id", "market", "asset_id", "owner", "maker_address", "side", "price", "original_size", "size_matched", "outcome", "order_type", "status", "associate_trades", "created_at", "expiration"],
+      "response_item_fields": []
     },
     "list_orders": {
       "host": "https://clob.polymarket.com",
@@ -200,7 +212,9 @@
       "query_fields": ["id", "market", "asset_id"],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["orders"]
+      "response_body_shape": "array",
+      "response_fields": [],
+      "response_item_fields": ["id", "market", "asset_id", "owner", "maker_address", "side", "price", "original_size", "size_matched", "outcome", "order_type", "status", "associate_trades", "created_at", "expiration"]
     },
     "list_trades": {
       "host": "https://clob.polymarket.com",
@@ -211,7 +225,9 @@
       "query_fields": ["id", "market", "asset_id", "maker_address", "after", "before"],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["trades"]
+      "response_body_shape": "array",
+      "response_fields": [],
+      "response_item_fields": ["id", "market", "asset_id", "owner", "maker_address", "taker_order_id", "side", "trader_side", "price", "size", "outcome", "status", "fee_rate_bps", "bucket_index", "transaction_hash", "maker_orders", "match_time", "last_update"]
     },
     "cancel_order": {
       "host": "https://clob.polymarket.com",
@@ -222,7 +238,9 @@
       "query_fields": [],
       "request_fields": ["orderID"],
       "compact_body_examples": ["{\"orderID\":\"<order_id>\"}"],
-      "response_fields": ["canceled", "not_canceled"]
+      "response_body_shape": "object",
+      "response_fields": ["canceled", "not_canceled"],
+      "response_item_fields": []
     },
     "cancel_orders": {
       "host": "https://clob.polymarket.com",
@@ -233,7 +251,9 @@
       "query_fields": [],
       "request_fields": ["array_item_order_id"],
       "compact_body_examples": ["[\"<order_id_1>\",\"<order_id_2>\"]"],
-      "response_fields": ["canceled", "not_canceled"]
+      "response_body_shape": "object",
+      "response_fields": ["canceled", "not_canceled"],
+      "response_item_fields": []
     },
     "cancel_market_orders": {
       "host": "https://clob.polymarket.com",
@@ -244,7 +264,9 @@
       "query_fields": [],
       "request_fields": ["asset_id", "market"],
       "compact_body_examples": ["{\"asset_id\":\"<token_id>\"}", "{\"market\":\"<condition_id>\"}"],
-      "response_fields": ["canceled", "not_canceled"]
+      "response_body_shape": "object",
+      "response_fields": ["canceled", "not_canceled"],
+      "response_item_fields": []
     },
     "cancel_all": {
       "host": "https://clob.polymarket.com",
@@ -255,7 +277,9 @@
       "query_fields": [],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["canceled", "not_canceled"]
+      "response_body_shape": "object",
+      "response_fields": ["canceled", "not_canceled"],
+      "response_item_fields": []
     },
     "heartbeat": {
       "host": "https://clob.polymarket.com",
@@ -266,7 +290,9 @@
       "query_fields": [],
       "request_fields": ["heartbeat_id"],
       "compact_body_examples": ["{\"heartbeat_id\":\"\"}"],
-      "response_fields": ["heartbeat_id"]
+      "response_body_shape": "object",
+      "response_fields": ["heartbeat_id"],
+      "response_item_fields": []
     },
     "geoblock": {
       "host": "https://polymarket.com",
@@ -277,7 +303,9 @@
       "query_fields": [],
       "request_fields": [],
       "compact_body_examples": [],
-      "response_fields": ["blocked", "ip", "country", "region"]
+      "response_body_shape": "object",
+      "response_fields": ["blocked", "ip", "country", "region"],
+      "response_item_fields": []
     }
   },
   "order_submission": {

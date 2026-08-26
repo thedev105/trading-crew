@@ -1,5 +1,6 @@
 import ast
 import importlib
+import json
 import pkgutil
 import shutil
 import subprocess
@@ -7,6 +8,8 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 from zipfile import ZipFile
+
+import pytest
 
 import polytrading
 import polytrading.trial
@@ -303,9 +306,11 @@ def test_every_public_trial_module_imports_without_authority_surfaces() -> None:
         assert _authority_source_violations(source) == (), module_name
 
 
-def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
-    source_checkout = tmp_path / "source"
-    wheel_directory = tmp_path / "wheels"
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    build_root = tmp_path_factory.mktemp("built-wheel")
+    source_checkout = build_root / "source"
+    wheel_directory = build_root / "wheels"
     shutil.copytree(
         Path.cwd(),
         source_checkout,
@@ -331,7 +336,10 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
         text=True,
         cwd=source_checkout,
     )
-    wheel = next(wheel_directory.glob("polytrading-*.whl"))
+    return next(wheel_directory.glob("polytrading-*.whl"))
+
+
+def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
     dossier_members = [
         "polytrading/carry/dossiers/hyperliquid-dydx-core-v1.json",
         "polytrading/carry/dossiers/lighter-dydx-core-v1.json",
@@ -350,7 +358,7 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
         "polytrading/predictions/polymarket_execution/fixtures/sources_v1.json",
     ]
 
-    with ZipFile(wheel) as archive:
+    with ZipFile(built_wheel) as archive:
         actual_json_members = [name for name in archive.namelist() if name.endswith(".json")]
         assert actual_json_members == json_members
         migration_members = [
@@ -404,3 +412,62 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
     assert candidate.counts.blocking == 0
     assert candidate.counts.missing_evidence == 0
     assert not Path("build").exists()
+
+
+def test_clean_installed_wheel_loads_current_polymarket_resources(
+    built_wheel: Path,
+    tmp_path: Path,
+) -> None:
+    installed_root = tmp_path / "installed"
+    outside_checkout = tmp_path / "outside"
+    installed_root.mkdir()
+    outside_checkout.mkdir()
+    with ZipFile(built_wheel) as archive:
+        archive.extractall(installed_root)
+
+    script = f"""
+import json
+from pathlib import Path
+import sys
+
+installed_root = Path({str(installed_root)!r}).resolve()
+sys.path.insert(0, str(installed_root))
+
+import polytrading
+from polytrading.predictions.polymarket_execution import (
+    bundled_fixture_path,
+    load_protocol_snapshot,
+    verify_protocol_sources,
+)
+
+fixture_root = bundled_fixture_path()
+snapshot = load_protocol_snapshot()
+readiness = verify_protocol_sources(root=fixture_root)
+print(json.dumps({{
+    "module_path": str(Path(polytrading.__file__).resolve()),
+    "version": snapshot.version,
+    "readiness": readiness.state,
+    "resources": sorted(path.name for path in fixture_root.iterdir()),
+}}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=outside_checkout,
+    )
+
+    payload = json.loads(result.stdout)
+    assert Path(payload["module_path"]).is_relative_to(installed_root.resolve())
+    assert payload == {
+        "module_path": payload["module_path"],
+        "version": "polymarket-clob-2026-08-25-v1",
+        "readiness": "CURRENT",
+        "resources": [
+            "event_vectors_v1.json",
+            "order_vectors_v1.json",
+            "protocol_v1.json",
+            "sources_v1.json",
+        ],
+    }
