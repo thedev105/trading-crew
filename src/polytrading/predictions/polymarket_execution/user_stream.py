@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from typing import Annotated, Literal, Protocol
+from threading import RLock
+from typing import Annotated, Literal, Protocol, Self
 from uuid import UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
@@ -76,7 +77,19 @@ class _UserSubscriptionTransport(Protocol):
 class _SignerUserStreamSession:
     """Signer-owned one-way authenticated subscription with sanitized evidence only."""
 
-    __slots__ = ("_attempted", "_evidence", "_read_guard", "_secrets", "_transport")
+    __slots__ = (
+        "_attempted",
+        "_evidence",
+        "_lock",
+        "_read_guard",
+        "_sealed",
+        "_secrets",
+        "_transport",
+    )
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("USER_SUBSCRIPTION_SESSION_NOT_SUBCLASSABLE") from None
 
     def __init__(
         self,
@@ -92,21 +105,50 @@ class _SignerUserStreamSession:
             raise TypeError("USER_SUBSCRIPTION_TRANSPORT_REQUIRED") from None
         if not callable(read_guard):
             raise TypeError("USER_SUBSCRIPTION_READ_GUARD_REQUIRED") from None
-        self._secrets = secrets
-        self._transport = transport
-        self._read_guard = read_guard
-        self._attempted = False
-        self._evidence: _UserSubscriptionEvidence | None = None
+        object.__setattr__(self, "_secrets", secrets)
+        object.__setattr__(self, "_transport", transport)
+        object.__setattr__(self, "_read_guard", read_guard)
+        object.__setattr__(self, "_attempted", False)
+        object.__setattr__(self, "_evidence", None)
+        object.__setattr__(self, "_lock", RLock())
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        if getattr(self, "_sealed", False):
+            raise AttributeError("USER_SUBSCRIPTION_SESSION_IMMUTABLE") from None
+        raise AttributeError("USER_SUBSCRIPTION_SESSION_IMMUTABLE") from None
 
     def __repr__(self) -> str:
         return "_SignerUserStreamSession(<redacted>)"
 
+    def __copy__(self) -> object:
+        raise UserStreamProtocolError() from None
+
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        del memo
+        raise UserStreamProtocolError() from None
+
+    def __reduce__(self) -> object:
+        raise UserStreamProtocolError() from None
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise UserStreamProtocolError() from None
+
+    def __getstate__(self) -> object:
+        raise UserStreamProtocolError() from None
+
     def open(self, *, observed_at: datetime) -> _UserSubscriptionEvidence:
+        with self._lock:
+            return self._open_serialized(observed_at=observed_at)
+
+    def _open_serialized(self, *, observed_at: datetime) -> _UserSubscriptionEvidence:
         if self._evidence is not None:
             return self._evidence
         if self._attempted:
             raise UserStreamProtocolError() from None
-        self._attempted = True
+        object.__setattr__(self, "_attempted", True)
         invalid = False
         normalized: datetime | None = None
         decision: AuthorityDecision | None = None
@@ -138,13 +180,14 @@ class _SignerUserStreamSession:
             invalid = True
         if invalid or frame is None or normalized is None:
             raise UserStreamProtocolError() from None
-        self._evidence = _UserSubscriptionEvidence(
+        evidence = _UserSubscriptionEvidence(
             frame_hash=sha256(frame).hexdigest(),
             protocol_version=load_protocol_snapshot().version,
             observed_at=normalized,
         )
+        object.__setattr__(self, "_evidence", evidence)
         frame = None
-        return self._evidence
+        return evidence
 
 
 def _subscription_secret_text(value: bytearray) -> str:
@@ -157,8 +200,33 @@ def _subscription_secret_text(value: bytearray) -> str:
     return text
 
 
+_WIRE_MODELS_SEALED = False
+
+
 class _WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        if _WIRE_MODELS_SEALED:
+            raise TypeError("USER_STREAM_WIRE_NOT_SUBCLASSABLE") from None
+        super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: object) -> Self:
+        del _fields_set, values
+        raise ValueError("USER_STREAM_WIRE_CONSTRUCTION_INVALID") from None
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        values = self.model_dump(mode="python")
+        if update is not None:
+            values.update(update)
+        return type(self).model_validate(values, strict=True)
 
 
 class _MakerOrderWire(_WireModel):
@@ -228,6 +296,7 @@ class _TradeWire(_WireModel):
     timestamp: _ASCII_INTEGER
 
 
+_WIRE_MODELS_SEALED = True
 _EVENT_ADAPTER = TypeAdapter(Annotated[_OrderWire | _TradeWire, Field(discriminator="event_type")])
 
 
@@ -278,29 +347,91 @@ class UserStreamHealth:
     required_reads: tuple[RouteKey, ...]
     next_ping_at: float
     pong_deadline_at: float | None
+    recovery_phase: Literal[
+        "NONE",
+        "READS_REQUIRED",
+        "DISCONNECTED_AWAITING_BOTH",
+        "DISCONNECTED_AWAITING_RECONNECT",
+        "DISCONNECTED_AWAITING_READS",
+    ] = "NONE"
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("USER_STREAM_HEALTH_NOT_SUBCLASSABLE") from None
 
     def __post_init__(self) -> None:
-        if self.status not in {"CONNECTED", "RECOVERY_REQUIRED"} or self.kill_reason not in {
-            None,
-            "USER_STREAM_DISCONNECTED",
-            "USER_STREAM_PROTOCOL_ERROR",
-            "USER_STREAM_PING_MISSED",
-            "USER_STREAM_PONG_MISSED",
-        }:
-            raise ValueError("USER_STREAM_HEALTH_INVALID") from None
-        normalized = normalize_utc_timestamp(self.observed_at)
-        monotonic = _finite_monotonic(self.monotonic_at)
-        next_ping = _finite_monotonic(self.next_ping_at)
-        if normalized != self.observed_at or next_ping < monotonic:
-            raise ValueError("USER_STREAM_HEALTH_INVALID") from None
-        if self.pong_deadline_at is not None:
-            pong_deadline = _finite_monotonic(self.pong_deadline_at)
-            if pong_deadline < monotonic:
-                raise ValueError("USER_STREAM_HEALTH_INVALID") from None
-        if self.status == "CONNECTED":
-            if self.kill_reason is not None or self.required_reads:
-                raise ValueError("USER_STREAM_HEALTH_INVALID") from None
-        elif self.kill_reason is None or self.required_reads != _RECOVERY_READS:
+        invalid = (
+            type(self) is not UserStreamHealth
+            or type(self.status) is not str
+            or type(self.observed_at) is not datetime
+            or type(self.monotonic_at) is not float
+            or type(self.kill_reason) not in {str, type(None)}
+            or type(self.required_reads) is not tuple
+            or any(type(route) is not RouteKey for route in self.required_reads)
+            or type(self.next_ping_at) is not float
+            or type(self.pong_deadline_at) not in {float, type(None)}
+            or type(self.recovery_phase) is not str
+        )
+        normalized: datetime | None = None
+        if not invalid:
+            try:
+                normalized = normalize_utc_timestamp(self.observed_at)
+            except Exception:
+                invalid = True
+        interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
+        if not invalid:
+            invalid = (
+                normalized != self.observed_at
+                or not math.isfinite(self.monotonic_at)
+                or self.monotonic_at < 0
+                or not math.isfinite(self.next_ping_at)
+                or self.next_ping_at < self.monotonic_at
+                or self.next_ping_at - self.monotonic_at > interval
+                or self.status not in {"CONNECTED", "RECOVERY_REQUIRED"}
+                or self.kill_reason
+                not in {
+                    None,
+                    "USER_STREAM_DISCONNECTED",
+                    "USER_STREAM_PROTOCOL_ERROR",
+                    "USER_STREAM_PING_MISSED",
+                    "USER_STREAM_PONG_MISSED",
+                }
+                or self.recovery_phase
+                not in {
+                    "NONE",
+                    "READS_REQUIRED",
+                    "DISCONNECTED_AWAITING_BOTH",
+                    "DISCONNECTED_AWAITING_RECONNECT",
+                    "DISCONNECTED_AWAITING_READS",
+                }
+            )
+        if not invalid and self.pong_deadline_at is not None:
+            invalid = (
+                not math.isfinite(self.pong_deadline_at)
+                or self.pong_deadline_at <= self.monotonic_at
+                or self.pong_deadline_at != self.next_ping_at
+            )
+        if not invalid and self.status == "CONNECTED":
+            invalid = (
+                self.kill_reason is not None
+                or self.required_reads != ()
+                or self.recovery_phase != "NONE"
+            )
+        elif not invalid:
+            invalid = (
+                self.kill_reason is None
+                or self.required_reads != _RECOVERY_READS
+                or self.pong_deadline_at is not None
+            )
+            if not invalid and self.kill_reason == "USER_STREAM_DISCONNECTED":
+                invalid = self.recovery_phase not in {
+                    "DISCONNECTED_AWAITING_BOTH",
+                    "DISCONNECTED_AWAITING_RECONNECT",
+                    "DISCONNECTED_AWAITING_READS",
+                }
+            elif not invalid:
+                invalid = self.recovery_phase != "READS_REQUIRED"
+        if invalid:
             raise ValueError("USER_STREAM_HEALTH_INVALID") from None
 
     @classmethod
@@ -310,6 +441,8 @@ class UserStreamHealth:
         *,
         monotonic_at: float = 0.0,
     ) -> UserStreamHealth:
+        if cls is not UserStreamHealth:
+            raise TypeError("USER_STREAM_HEALTH_NOT_SUBCLASSABLE") from None
         monotonic = _finite_monotonic(monotonic_at)
         return cls(
             status="CONNECTED",
@@ -319,6 +452,7 @@ class UserStreamHealth:
             required_reads=(),
             next_ping_at=monotonic + load_protocol_snapshot().websocket.ping_interval_seconds,
             pong_deadline_at=None,
+            recovery_phase="NONE",
         )
 
     def _kill(
@@ -343,6 +477,11 @@ class UserStreamHealth:
             required_reads=_RECOVERY_READS,
             next_ping_at=max(self.next_ping_at, monotonic),
             pong_deadline_at=None,
+            recovery_phase=(
+                "DISCONNECTED_AWAITING_BOTH"
+                if reason == "USER_STREAM_DISCONNECTED"
+                else "READS_REQUIRED"
+            ),
         )
 
     def on_disconnect(
@@ -378,8 +517,17 @@ class UserStreamHealth:
         monotonic = _finite_monotonic(monotonic_at)
         if monotonic < self.monotonic_at:
             raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
+        if self.status == "CONNECTED":
+            return self
         if self.status != "RECOVERY_REQUIRED":
             raise ValueError("USER_STREAM_RECOVERY_NOT_REQUIRED") from None
+        if self.recovery_phase == "DISCONNECTED_AWAITING_RECONNECT":
+            return type(self).connected(observed_at, monotonic_at=monotonic)
+        next_phase = (
+            "DISCONNECTED_AWAITING_READS"
+            if self.recovery_phase == "DISCONNECTED_AWAITING_BOTH"
+            else self.recovery_phase
+        )
         return type(self)(
             status=self.status,
             observed_at=normalize_utc_timestamp(observed_at),
@@ -388,6 +536,7 @@ class UserStreamHealth:
             required_reads=self.required_reads,
             next_ping_at=max(self.next_ping_at, monotonic),
             pong_deadline_at=None,
+            recovery_phase=next_phase,
         )
 
     def on_authoritative_reads_completed(
@@ -397,12 +546,32 @@ class UserStreamHealth:
         observed_at: datetime,
         monotonic_at: float,
     ) -> UserStreamHealth:
-        if self.status != "RECOVERY_REQUIRED" or reads != _RECOVERY_READS:
+        if reads != _RECOVERY_READS:
             raise ValueError("USER_STREAM_RECOVERY_READS_INCOMPLETE") from None
         monotonic = _finite_monotonic(monotonic_at)
         if monotonic < self.monotonic_at:
             raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
-        return type(self).connected(observed_at, monotonic_at=monotonic)
+        if self.status == "CONNECTED":
+            return self
+        if self.status != "RECOVERY_REQUIRED":
+            raise ValueError("USER_STREAM_RECOVERY_READS_INCOMPLETE") from None
+        if self.recovery_phase in {"READS_REQUIRED", "DISCONNECTED_AWAITING_READS"}:
+            return type(self).connected(observed_at, monotonic_at=monotonic)
+        next_phase = (
+            "DISCONNECTED_AWAITING_RECONNECT"
+            if self.recovery_phase == "DISCONNECTED_AWAITING_BOTH"
+            else self.recovery_phase
+        )
+        return type(self)(
+            status=self.status,
+            observed_at=normalize_utc_timestamp(observed_at),
+            monotonic_at=monotonic,
+            kill_reason=self.kill_reason,
+            required_reads=self.required_reads,
+            next_ping_at=max(self.next_ping_at, monotonic),
+            pong_deadline_at=None,
+            recovery_phase=next_phase,
+        )
 
     def _checked_observation(self, monotonic_at: float) -> float | None:
         try:
@@ -429,6 +598,7 @@ class UserStreamHealth:
             pong_deadline_at=(
                 self.pong_deadline_at if pong_deadline_at is False else pong_deadline_at
             ),
+            recovery_phase="NONE",
         )
 
     def ping_due(self, monotonic_at: float) -> bool:
@@ -438,7 +608,7 @@ class UserStreamHealth:
         return (
             self.status == "CONNECTED"
             and self.pong_deadline_at is None
-            and monotonic >= self.next_ping_at
+            and _ping_due(monotonic, self.next_ping_at)
         )
 
     def on_ping_sent(
@@ -457,9 +627,9 @@ class UserStreamHealth:
             )
         if self.status != "CONNECTED" or self.pong_deadline_at is not None:
             return self._kill("USER_STREAM_PROTOCOL_ERROR", observed_at, monotonic)
-        if monotonic > self.next_ping_at:
+        if _ping_missed(monotonic, self.next_ping_at):
             return self._kill("USER_STREAM_PING_MISSED", observed_at, monotonic)
-        if monotonic < self.next_ping_at:
+        if not _ping_due(monotonic, self.next_ping_at):
             return self._kill("USER_STREAM_PROTOCOL_ERROR", observed_at, monotonic)
         interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
         return self._advance_connected(
@@ -485,7 +655,7 @@ class UserStreamHealth:
             )
         if self.status != "CONNECTED" or self.pong_deadline_at is None:
             return self._kill("USER_STREAM_PROTOCOL_ERROR", observed_at, monotonic)
-        if monotonic > self.pong_deadline_at:
+        if _pong_missed(monotonic, self.pong_deadline_at):
             return self._kill("USER_STREAM_PONG_MISSED", observed_at, monotonic)
         return self._advance_connected(
             observed_at=observed_at,
@@ -526,9 +696,9 @@ class UserStreamHealth:
             )
         if self.status != "CONNECTED":
             return self
-        if self.pong_deadline_at is not None and monotonic >= self.pong_deadline_at:
+        if self.pong_deadline_at is not None and _pong_missed(monotonic, self.pong_deadline_at):
             return self._kill("USER_STREAM_PONG_MISSED", observed_at, monotonic)
-        if self.pong_deadline_at is None and monotonic >= self.next_ping_at:
+        if self.pong_deadline_at is None and _ping_missed(monotonic, self.next_ping_at):
             return self._kill("USER_STREAM_PING_MISSED", observed_at, monotonic)
         return self._advance_connected(
             observed_at=observed_at,
@@ -552,6 +722,38 @@ def _finite_monotonic(value: float) -> float:
     ):
         raise ValueError("USER_STREAM_MONOTONIC_INVALID") from None
     return float(value)
+
+
+def _ping_due(monotonic_at: float, deadline: float) -> bool:
+    return monotonic_at >= deadline
+
+
+def _ping_missed(monotonic_at: float, deadline: float) -> bool:
+    return monotonic_at > deadline
+
+
+def _pong_missed(monotonic_at: float, deadline: float) -> bool:
+    return monotonic_at >= deadline
+
+
+def _read_injected_monotonic(
+    clock: Callable[[], float],
+    *,
+    previous: float | None = None,
+) -> tuple[float, bool]:
+    invalid = False
+    observed = 0.0
+    try:
+        observed = _finite_monotonic(clock())
+    except Exception:
+        invalid = True
+    if invalid:
+        if previous is not None:
+            return previous, False
+        raise UserStreamProtocolError() from None
+    if previous is not None and observed < previous:
+        return previous, False
+    return observed, True
 
 
 def recovery_reads_after_stream_gap(health: UserStreamHealth) -> tuple[RouteKey, ...]:
@@ -580,7 +782,7 @@ class UserStreamParser:
             raise TypeError("USER_STREAM_MONOTONIC_CLOCK_REQUIRED") from None
         if type(max_event_identities) is not int or not 1 <= max_event_identities <= 10_000:
             raise ValueError("USER_STREAM_IDENTITY_LIMIT_INVALID") from None
-        initial_monotonic = _finite_monotonic(monotonic())
+        initial_monotonic, _ = _read_injected_monotonic(monotonic)
         self._health = UserStreamHealth.connected(
             connected_at,
             monotonic_at=initial_monotonic,
@@ -620,17 +822,18 @@ class UserStreamParser:
             self._kill_protocol(receipt_time)
             raise UserStreamProtocolError() from None
 
-        clock_invalid = False
-        try:
-            monotonic_at = self._monotonic()
-        except Exception:
-            clock_invalid = True
-            monotonic_at = float("nan")
+        monotonic_at, clock_valid = _read_injected_monotonic(
+            self._monotonic,
+            previous=self._health.monotonic_at,
+        )
+        if not clock_valid:
+            self._install_protocol_kill(receipt_time, monotonic_at=monotonic_at)
+            raise UserStreamProtocolError() from None
         self._health = self._health.on_event_observed(
             observed_at=receipt_time,
             monotonic_at=monotonic_at,
         )
-        if clock_invalid or self._health.kill_reason is not None:
+        if self._health.kill_reason is not None:
             raise UserStreamProtocolError() from None
 
         identity = (wire.event_type, wire.id, wire.timestamp)
@@ -654,10 +857,13 @@ class UserStreamParser:
         return event
 
     def _kill_protocol(self, observed_at: datetime) -> None:
-        try:
-            monotonic_at = _finite_monotonic(self._monotonic())
-        except Exception:
-            monotonic_at = self._health.monotonic_at
+        monotonic_at, _ = _read_injected_monotonic(
+            self._monotonic,
+            previous=self._health.monotonic_at,
+        )
+        self._install_protocol_kill(observed_at, monotonic_at=monotonic_at)
+
+    def _install_protocol_kill(self, observed_at: datetime, *, monotonic_at: float) -> None:
         try:
             normalized = normalize_utc_timestamp(observed_at)
         except Exception:
@@ -772,7 +978,7 @@ def parse_user_event(
         raw_event_hash=raw_event_hash,
         source_channel="polymarket-user",
         venue_trade_id=wire.id,
-        venue_order_id=wire.taker_order_id,
+        venue_order_id=wire.taker_order_id if wire.trader_side == "TAKER" else None,
         intent_id=None,
         original_venue_state=wire.status,
         normalized_state=state,

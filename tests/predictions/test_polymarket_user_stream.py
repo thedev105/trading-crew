@@ -1,6 +1,9 @@
+import copy
 import json
+import pickle
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from threading import Event, Thread
 
 import pytest
 
@@ -113,6 +116,39 @@ def test_all_six_frozen_trade_states_are_preserved_without_secret_owners(
     assert event.sequence_number is None
     assert event.intent_id is None
     assert "owner" not in event.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("maker_order_count", (0, 1, 2))
+def test_maker_trade_never_binds_the_counterparty_or_owner_derived_order(
+    maker_order_count: int,
+) -> None:
+    wire = json.loads(_trade_frame("MATCHED"))
+    maker_order = wire["maker_orders"][0]
+    owner_canary = "maker-owner-control-canary"
+    wire.update(
+        trader_side="MAKER",
+        taker_order_id="counterparty-taker-order",
+        owner=owner_canary,
+        trade_owner=owner_canary,
+        maker_orders=[
+            {
+                **maker_order,
+                "order_id": f"account-maker-order-{index}",
+                "owner": owner_canary,
+            }
+            for index in range(maker_order_count)
+        ],
+    )
+    frame = json.dumps(wire, separators=(",", ":"), sort_keys=True).encode()
+
+    event = parse_user_event(frame, receipt_time=NOW)
+
+    assert isinstance(event, VenueTradeEvent)
+    assert event.venue_order_id is None
+    rendered = event.model_dump_json()
+    assert "counterparty-taker-order" not in rendered
+    assert "account-maker-order" not in rendered
+    assert owner_canary not in rendered
 
 
 @pytest.mark.parametrize(
@@ -241,6 +277,37 @@ def test_malformed_unknown_oversized_or_nonbytes_frames_fail_closed(frame: objec
     assert "owner-control-canary" not in str(captured)
     assert captured.__cause__ is None
     assert captured.__context__ is None
+
+
+def test_private_wire_models_deny_construct_and_revalidate_copy_bypasses() -> None:
+    wire = user_stream_module._validated_wire(_trade_frame("MATCHED"))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^USER_STREAM_WIRE_CONSTRUCTION_INVALID$",
+    ):
+        type(wire).model_construct(
+            event_type="not-trade",
+            owner=object(),
+            trade_owner=object(),
+        )
+    for update in (
+        {"event_type": "not-trade"},
+        {"owner": object()},
+        {"maker_orders": []},
+    ):
+        with pytest.raises(ValueError):
+            wire.model_copy(update=update)
+    copied = wire.model_copy()
+    assert type(copied) is type(wire)
+    assert copied == wire
+
+
+def test_private_wire_models_deny_post_definition_subclasses() -> None:
+    with pytest.raises(TypeError, match=r"^USER_STREAM_WIRE_NOT_SUBCLASSABLE$"):
+
+        class ForkedTradeWire(user_stream_module._TradeWire):
+            pass
 
 
 def test_event_identity_is_deterministic_and_raw_evidence_bound() -> None:
@@ -394,6 +461,62 @@ def test_gap_with_invalid_or_failed_clock_still_fails_closed(bad_clock: object) 
     assert parser.health.monotonic_at == 0.0
 
 
+def test_regressing_gap_clock_installs_recovery_before_later_events() -> None:
+    ticks = iter((10.0, 5.0, 11.0))
+    parser = UserStreamParser(
+        connected_at=NOW,
+        monotonic=lambda: next(ticks),
+        max_event_identities=10,
+    )
+
+    parser.on_gap(observed_at=NOW + timedelta(seconds=1))
+
+    assert parser.health.status == "RECOVERY_REQUIRED"
+    assert parser.health.kill_reason == "USER_STREAM_PROTOCOL_ERROR"
+    assert parser.health.monotonic_at == 10.0
+    with pytest.raises(UserStreamProtocolError, match=r"^USER_STREAM_PROTOCOL_ERROR$"):
+        parser.parse(_trade_frame("MATCHED"), receipt_time=NOW + timedelta(seconds=2))
+
+
+def test_regressing_invalid_frame_clock_installs_recovery_before_later_events() -> None:
+    ticks = iter((10.0, 5.0, 11.0))
+    parser = UserStreamParser(
+        connected_at=NOW,
+        monotonic=lambda: next(ticks),
+        max_event_identities=10,
+    )
+
+    with pytest.raises(UserStreamProtocolError, match=r"^USER_STREAM_PROTOCOL_ERROR$"):
+        parser.parse(b"{", receipt_time=NOW + timedelta(seconds=1))
+
+    assert parser.health.status == "RECOVERY_REQUIRED"
+    assert parser.health.kill_reason == "USER_STREAM_PROTOCOL_ERROR"
+    assert parser.health.monotonic_at == 10.0
+    with pytest.raises(UserStreamProtocolError, match=r"^USER_STREAM_PROTOCOL_ERROR$"):
+        parser.parse(_trade_frame("MATCHED"), receipt_time=NOW + timedelta(seconds=2))
+
+
+def test_constructor_clock_exception_is_one_context_free_task9_error() -> None:
+    def failing_clock() -> float:
+        raise RuntimeError("constructor-clock-control-canary")
+
+    captured: UserStreamProtocolError | None = None
+    try:
+        UserStreamParser(
+            connected_at=NOW,
+            monotonic=failing_clock,
+            max_event_identities=10,
+        )
+    except UserStreamProtocolError as error:
+        captured = error
+
+    assert captured is not None
+    assert str(captured) == "USER_STREAM_PROTOCOL_ERROR"
+    assert "constructor-clock-control-canary" not in str(captured)
+    assert captured.__cause__ is None
+    assert captured.__context__ is None
+
+
 def test_disconnect_requires_authoritative_reads_before_resume() -> None:
     health = UserStreamHealth.connected(NOW).on_disconnect(NOW + timedelta(seconds=3))
 
@@ -441,6 +564,86 @@ def test_reconnect_cannot_resume_until_all_three_authoritative_reads_complete() 
     assert recovered.next_ping_at == 15.0
 
 
+def test_disconnect_reads_before_reconnect_remain_closed_and_are_idempotent() -> None:
+    disconnected = UserStreamHealth.connected(NOW, monotonic_at=0).on_disconnect(
+        NOW + timedelta(seconds=1),
+        monotonic_at=1,
+    )
+    reads = (
+        RouteKey.READ_OPEN_ORDERS,
+        RouteKey.READ_TRADES,
+        RouteKey.READ_BALANCE_ALLOWANCE,
+    )
+
+    reads_first = disconnected.on_authoritative_reads_completed(
+        reads,
+        observed_at=NOW + timedelta(seconds=2),
+        monotonic_at=2,
+    )
+    duplicate_reads = reads_first.on_authoritative_reads_completed(
+        reads,
+        observed_at=NOW + timedelta(seconds=3),
+        monotonic_at=3,
+    )
+
+    assert reads_first.status == duplicate_reads.status == "RECOVERY_REQUIRED"
+    assert reads_first.kill_reason == duplicate_reads.kill_reason == "USER_STREAM_DISCONNECTED"
+    recovered = duplicate_reads.on_reconnect(
+        NOW + timedelta(seconds=4),
+        monotonic_at=4,
+    )
+    assert recovered.status == "CONNECTED"
+    assert recovered.kill_reason is None
+    assert (
+        recovered.on_reconnect(
+            NOW + timedelta(seconds=5),
+            monotonic_at=5,
+        )
+        is recovered
+    )
+
+
+def test_disconnect_reconnect_before_reads_remains_closed_and_is_idempotent() -> None:
+    disconnected = UserStreamHealth.connected(NOW, monotonic_at=0).on_disconnect(
+        NOW + timedelta(seconds=1),
+        monotonic_at=1,
+    )
+
+    reconnect_first = disconnected.on_reconnect(
+        NOW + timedelta(seconds=2),
+        monotonic_at=2,
+    )
+    duplicate_reconnect = reconnect_first.on_reconnect(
+        NOW + timedelta(seconds=3),
+        monotonic_at=3,
+    )
+
+    assert reconnect_first.status == duplicate_reconnect.status == "RECOVERY_REQUIRED"
+    recovered = duplicate_reconnect.on_authoritative_reads_completed(
+        (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+        ),
+        observed_at=NOW + timedelta(seconds=4),
+        monotonic_at=4,
+    )
+    assert recovered.status == "CONNECTED"
+    assert recovered.kill_reason is None
+    assert (
+        recovered.on_authoritative_reads_completed(
+            (
+                RouteKey.READ_OPEN_ORDERS,
+                RouteKey.READ_TRADES,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+            ),
+            observed_at=NOW + timedelta(seconds=5),
+            monotonic_at=5,
+        )
+        is recovered
+    )
+
+
 def test_ping_pong_uses_one_fixed_ten_second_cadence() -> None:
     connected = UserStreamHealth.connected(NOW, monotonic_at=100)
 
@@ -470,10 +673,125 @@ def test_ping_pong_uses_one_fixed_ten_second_cadence() -> None:
     assert ponged.kill_reason is None
 
 
-def test_missed_ping_or_pong_deadline_requires_the_three_recovery_reads() -> None:
-    missed_ping = UserStreamHealth.connected(NOW, monotonic_at=0).check_deadlines(
+@pytest.mark.parametrize(
+    ("monotonic_at", "expected"),
+    ((9.999, False), (10.0, True), (10.001, True)),
+)
+def test_ping_due_uses_the_ruled_exact_cadence_boundary(
+    monotonic_at: float,
+    expected: bool,
+) -> None:
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+
+    assert connected.ping_due(monotonic_at) is expected
+
+
+@pytest.mark.parametrize(
+    ("monotonic_at", "expected_kill"),
+    (
+        (9.999, "USER_STREAM_PROTOCOL_ERROR"),
+        (10.0, None),
+        (10.001, "USER_STREAM_PING_MISSED"),
+    ),
+)
+def test_ping_send_uses_the_ruled_exact_cadence_boundary(
+    monotonic_at: float,
+    expected_kill: str | None,
+) -> None:
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+
+    result = connected.on_ping_sent(
+        b"PING",
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+
+    assert result.kill_reason == expected_kill
+
+
+@pytest.mark.parametrize(
+    ("monotonic_at", "expected_kill"),
+    ((9.999, None), (10.0, None), (10.001, "USER_STREAM_PING_MISSED")),
+)
+def test_ping_timer_and_event_observation_share_the_ruled_boundary(
+    monotonic_at: float,
+    expected_kill: str | None,
+) -> None:
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+
+    timer = connected.check_deadlines(
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+    event = connected.on_event_observed(
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+
+    assert timer.kill_reason == event.kill_reason == expected_kill
+
+
+@pytest.mark.parametrize(
+    ("monotonic_at", "expected_kill"),
+    (
+        (19.999, None),
+        (20.0, "USER_STREAM_PONG_MISSED"),
+        (20.001, "USER_STREAM_PONG_MISSED"),
+    ),
+)
+def test_pong_receive_uses_the_ruled_strict_deadline_boundary(
+    monotonic_at: float,
+    expected_kill: str | None,
+) -> None:
+    waiting = UserStreamHealth.connected(NOW, monotonic_at=0).on_ping_sent(
+        b"PING",
         observed_at=NOW + timedelta(seconds=10),
         monotonic_at=10,
+    )
+
+    result = waiting.on_pong(
+        b"PONG",
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+
+    assert result.kill_reason == expected_kill
+
+
+@pytest.mark.parametrize(
+    ("monotonic_at", "expected_kill"),
+    (
+        (19.999, None),
+        (20.0, "USER_STREAM_PONG_MISSED"),
+        (20.001, "USER_STREAM_PONG_MISSED"),
+    ),
+)
+def test_pong_timer_and_event_observation_share_the_ruled_boundary(
+    monotonic_at: float,
+    expected_kill: str | None,
+) -> None:
+    waiting = UserStreamHealth.connected(NOW, monotonic_at=0).on_ping_sent(
+        b"PING",
+        observed_at=NOW + timedelta(seconds=10),
+        monotonic_at=10,
+    )
+
+    timer = waiting.check_deadlines(
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+    event = waiting.on_event_observed(
+        observed_at=NOW + timedelta(seconds=monotonic_at),
+        monotonic_at=monotonic_at,
+    )
+
+    assert timer.kill_reason == event.kill_reason == expected_kill
+
+
+def test_missed_ping_or_pong_deadline_requires_the_three_recovery_reads() -> None:
+    missed_ping = UserStreamHealth.connected(NOW, monotonic_at=0).check_deadlines(
+        observed_at=NOW + timedelta(seconds=10.001),
+        monotonic_at=10.001,
     )
     waiting = UserStreamHealth.connected(NOW, monotonic_at=0).on_ping_sent(
         b"PING",
@@ -542,6 +860,77 @@ def test_health_state_and_kill_reason_are_closed_constants(
         )
 
 
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"required_reads": []},
+        {"monotonic_at": 0},
+        {"next_ping_at": 1e100},
+        {"pong_deadline_at": 1.0},
+        {
+            "status": "RECOVERY_REQUIRED",
+            "kill_reason": "USER_STREAM_PROTOCOL_ERROR",
+            "required_reads": (
+                RouteKey.READ_OPEN_ORDERS,
+                RouteKey.READ_TRADES,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+            ),
+            "pong_deadline_at": 5.0,
+            "recovery_phase": "READS_REQUIRED",
+        },
+    ),
+    ids=(
+        "mutable-read-list",
+        "non-float-monotonic",
+        "ping-beyond-one-cadence",
+        "pong-does-not-match-cadence",
+        "recovery-with-pending-pong",
+    ),
+)
+def test_user_stream_health_direct_constructor_rejects_impossible_or_mutable_state(
+    updates: dict[str, object],
+) -> None:
+    fields: dict[str, object] = {
+        "status": "CONNECTED",
+        "observed_at": NOW,
+        "monotonic_at": 0.0,
+        "kill_reason": None,
+        "required_reads": (),
+        "next_ping_at": 10.0,
+        "pong_deadline_at": None,
+        "recovery_phase": "NONE",
+    }
+    fields.update(updates)
+
+    with pytest.raises(ValueError, match=r"^USER_STREAM_HEALTH_INVALID$"):
+        UserStreamHealth(**fields)  # type: ignore[arg-type]
+
+
+def test_user_stream_health_denies_subclass_state_variants() -> None:
+    with pytest.raises(TypeError, match=r"^USER_STREAM_HEALTH_NOT_SUBCLASSABLE$"):
+
+        class ForkedHealth(UserStreamHealth):
+            pass
+
+
+def test_user_stream_health_factories_and_transitions_return_strict_immutable_values() -> None:
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+    waiting = connected.on_ping_sent(
+        b"PING",
+        observed_at=NOW + timedelta(seconds=10),
+        monotonic_at=10,
+    )
+    killed = waiting.on_disconnect(NOW + timedelta(seconds=11), monotonic_at=11)
+
+    for health in (connected, waiting, killed):
+        assert type(health) is UserStreamHealth
+        assert type(health.monotonic_at) is float
+        assert type(health.next_ping_at) is float
+        assert type(health.required_reads) is tuple
+    assert waiting.pong_deadline_at == waiting.next_ping_at == 20.0
+    assert killed.pong_deadline_at is None
+
+
 def test_private_signer_session_sends_exact_subscription_once_and_returns_only_hash() -> None:
     private_key = bytearray(b"k" * 32)
     api_key = bytearray(b"api-key-canary")
@@ -585,6 +974,141 @@ def test_private_signer_session_sends_exact_subscription_once_and_returns_only_h
     for canary in (api_key, api_secret, passphrase):
         assert bytes(canary) not in repr(first).encode()
         assert bytes(canary) not in repr(session).encode()
+    secrets.close()
+
+
+def test_private_signer_session_denies_state_copy_serialization_and_subclass_forks() -> None:
+    secrets = SecretMaterial(
+        bytearray(b"k" * 32),
+        bytearray(b"api-key-canary"),
+        bytearray(b"api-secret-canary"),
+        bytearray(b"passphrase-canary"),
+    )
+
+    class RejectUnexpectedSend:
+        def send_user_subscription(self, frame: bytes) -> None:
+            del frame
+            raise AssertionError("UNEXPECTED_SEND")
+
+    session = user_stream_module._SignerUserStreamSession(
+        secrets=secrets,
+        transport=RejectUnexpectedSend(),
+        read_guard=lambda observed_at: AuthorityDecision(True, None, ()),
+    )
+
+    for operation in (
+        lambda: copy.copy(session),
+        lambda: copy.deepcopy(session),
+        lambda: pickle.dumps(session),
+        session.__reduce__,
+        lambda: session.__reduce_ex__(pickle.HIGHEST_PROTOCOL),
+        session.__getstate__,
+    ):
+        with pytest.raises(UserStreamProtocolError, match=r"^USER_STREAM_PROTOCOL_ERROR$"):
+            operation()
+    with pytest.raises(AttributeError, match=r"^USER_SUBSCRIPTION_SESSION_IMMUTABLE$"):
+        session._attempted = False
+    with pytest.raises(TypeError, match=r"^USER_SUBSCRIPTION_SESSION_NOT_SUBCLASSABLE$"):
+
+        class ForkedSession(user_stream_module._SignerUserStreamSession):
+            pass
+
+    secrets.close()
+
+
+def test_concurrent_subscription_open_serializes_to_one_send_and_one_evidence() -> None:
+    secrets = SecretMaterial(
+        bytearray(b"k" * 32),
+        bytearray(b"api-key-canary"),
+        bytearray(b"api-secret-canary"),
+        bytearray(b"passphrase-canary"),
+    )
+    send_entered = Event()
+    release_send = Event()
+    second_started = Event()
+    second_finished = Event()
+    frames: list[bytes] = []
+    evidence: list[object] = []
+    errors: list[BaseException] = []
+
+    class BlockingTransport:
+        def send_user_subscription(self, frame: bytes) -> None:
+            frames.append(frame)
+            send_entered.set()
+            if not release_send.wait(timeout=2):
+                raise RuntimeError("test-send-release-timeout")
+
+    session = user_stream_module._SignerUserStreamSession(
+        secrets=secrets,
+        transport=BlockingTransport(),
+        read_guard=lambda observed_at: AuthorityDecision(True, None, ()),
+    )
+
+    def open_session(*, second: bool = False) -> None:
+        if second:
+            second_started.set()
+        try:
+            evidence.append(session.open(observed_at=NOW))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if second:
+                second_finished.set()
+
+    first = Thread(target=open_session)
+    second = Thread(target=lambda: open_session(second=True))
+    first.start()
+    assert send_entered.wait(timeout=2)
+    second.start()
+    assert second_started.wait(timeout=2)
+    second_finished.wait(timeout=0.1)
+    release_send.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(frames) == 1
+    assert len(evidence) == 2
+    assert evidence[0] is evidence[1]
+    secrets.close()
+
+
+def test_subscription_transport_reentrancy_cannot_send_a_second_frame() -> None:
+    secrets = SecretMaterial(
+        bytearray(b"k" * 32),
+        bytearray(b"api-key-canary"),
+        bytearray(b"api-secret-canary"),
+        bytearray(b"passphrase-canary"),
+    )
+    send_calls = 0
+    reentrant_errors: list[UserStreamProtocolError] = []
+    session: user_stream_module._SignerUserStreamSession
+
+    class ReentrantTransport:
+        def send_user_subscription(self, frame: bytes) -> None:
+            del frame
+            nonlocal send_calls
+            send_calls += 1
+            try:
+                session.open(observed_at=NOW)
+            except UserStreamProtocolError as error:
+                reentrant_errors.append(error)
+
+    session = user_stream_module._SignerUserStreamSession(
+        secrets=secrets,
+        transport=ReentrantTransport(),
+        read_guard=lambda observed_at: AuthorityDecision(True, None, ()),
+    )
+
+    first = session.open(observed_at=NOW)
+    second = session.open(observed_at=NOW + timedelta(seconds=1))
+
+    assert first is second
+    assert send_calls == 1
+    assert len(reentrant_errors) == 1
+    assert str(reentrant_errors[0]) == "USER_STREAM_PROTOCOL_ERROR"
     secrets.close()
 
 

@@ -111,6 +111,116 @@ def test_every_nonaccepted_task8_heartbeat_result_is_cancellation_uncertainty(
     )
 
 
+@pytest.mark.parametrize(
+    "code",
+    (
+        RestCode.HEARTBEAT_ID_MISMATCH,
+        RestCode.HEARTBEAT_OUTCOME_UNKNOWN,
+        RestCode.AUTH_REJECTED,
+        RestCode.AUTH_REQUEST_BUILD_FAILED,
+    ),
+)
+def test_later_accepted_heartbeat_cannot_clear_each_failure_family(
+    code: RestCode,
+) -> None:
+    confirmed = classify_heartbeat(
+        HeartbeatState.initial(),
+        _accepted_result("heartbeat-before-uncertainty"),
+        NOW,
+    )
+    uncertain = classify_heartbeat(confirmed, _failed_result(code), NOW)
+
+    later = classify_heartbeat(
+        uncertain,
+        _accepted_result("heartbeat-after-uncertainty"),
+        NOW,
+    )
+
+    assert later.status == "UNCERTAIN"
+    assert later.heartbeat_id == "heartbeat-before-uncertainty"
+    assert later.kill_reason == "HEARTBEAT_CANCELLATION_UNCERTAIN"
+    assert later.required_reads == (
+        RouteKey.READ_OPEN_ORDERS,
+        RouteKey.READ_TRADES,
+        RouteKey.READ_BALANCE_ALLOWANCE,
+    )
+
+
+@pytest.mark.parametrize(
+    "reads",
+    (
+        (RouteKey.READ_OPEN_ORDERS, RouteKey.READ_TRADES),
+        (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_TRADES,
+        ),
+        (
+            RouteKey.READ_TRADES,
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+        ),
+        (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+            RouteKey.READ_ORDER,
+        ),
+    ),
+    ids=("incomplete", "duplicate", "wrong-order", "additional"),
+)
+def test_heartbeat_recovery_rejects_any_nonexact_read_tuple(
+    reads: tuple[RouteKey, ...],
+) -> None:
+    confirmed = classify_heartbeat(
+        HeartbeatState.initial(),
+        _accepted_result("heartbeat-before-uncertainty"),
+        NOW,
+    )
+    uncertain = classify_heartbeat(
+        confirmed,
+        _failed_result(RestCode.HEARTBEAT_OUTCOME_UNKNOWN),
+        NOW,
+    )
+
+    with pytest.raises(ValueError, match=r"^HEARTBEAT_RECOVERY_READS_INCOMPLETE$"):
+        uncertain.on_authoritative_reads_completed(reads, observed_at=NOW)
+
+
+def test_exact_heartbeat_recovery_precedes_a_new_confirmation() -> None:
+    confirmed = classify_heartbeat(
+        HeartbeatState.initial(),
+        _accepted_result("heartbeat-before-uncertainty"),
+        NOW,
+    )
+    uncertain = classify_heartbeat(
+        confirmed,
+        _failed_result(RestCode.HEARTBEAT_OUTCOME_UNKNOWN),
+        NOW,
+    )
+
+    recovered = uncertain.on_authoritative_reads_completed(
+        (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+        ),
+        observed_at=NOW,
+    )
+
+    assert recovered.status == "RECOVERED"
+    assert recovered.heartbeat_id == "heartbeat-before-uncertainty"
+    assert recovered.kill_reason is None
+    assert recovered.required_reads == ()
+    after_recovery = classify_heartbeat(
+        recovered,
+        _accepted_result("heartbeat-after-recovery"),
+        NOW,
+    )
+    assert after_recovery.status == "CONFIRMED"
+    assert after_recovery.heartbeat_id == "heartbeat-after-recovery"
+
+
 def test_heartbeat_state_rejects_unreviewed_status_even_with_plausible_fields() -> None:
     with pytest.raises(ValueError, match=r"^HEARTBEAT_STATE_INVALID$"):
         HeartbeatState(
@@ -149,6 +259,66 @@ def test_confirmed_heartbeat_state_rejects_unvalidated_public_evidence(
             kill_reason=None,
             required_reads=(),
         )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"required_reads": []},
+        {"evidence_hashes": ("a" * 64, "b" * 64, "c" * 64)},
+        {"evidence_hashes": ["a" * 64, "b" * 64]},
+    ),
+    ids=("mutable-read-list", "unbounded-evidence", "mutable-evidence-list"),
+)
+def test_heartbeat_direct_constructor_rejects_mutable_or_unbounded_state(
+    updates: dict[str, object],
+) -> None:
+    fields: dict[str, object] = {
+        "status": "CONFIRMED",
+        "observed_at": NOW,
+        "heartbeat_id": "heartbeat-confirmed",
+        "evidence_hashes": ("a" * 64, "b" * 64),
+        "kill_reason": None,
+        "required_reads": (),
+    }
+    fields.update(updates)
+
+    with pytest.raises(ValueError, match=r"^HEARTBEAT_STATE_INVALID$"):
+        HeartbeatState(**fields)  # type: ignore[arg-type]
+
+
+def test_heartbeat_state_denies_subclass_state_variants() -> None:
+    with pytest.raises(TypeError, match=r"^HEARTBEAT_STATE_NOT_SUBCLASSABLE$"):
+
+        class ForkedHeartbeatState(HeartbeatState):
+            pass
+
+
+def test_heartbeat_factories_and_transitions_return_strict_immutable_values() -> None:
+    confirmed = classify_heartbeat(
+        HeartbeatState.initial(),
+        _accepted_result("heartbeat-before-uncertainty"),
+        NOW,
+    )
+    uncertain = classify_heartbeat(
+        confirmed,
+        _failed_result(RestCode.HEARTBEAT_OUTCOME_UNKNOWN),
+        NOW,
+    )
+    recovered = uncertain.on_authoritative_reads_completed(
+        (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+        ),
+        observed_at=NOW,
+    )
+
+    for state in (confirmed, uncertain, recovered):
+        assert type(state) is HeartbeatState
+        assert type(state.evidence_hashes) is tuple
+        assert type(state.required_reads) is tuple
+        assert len(state.evidence_hashes) <= 2
 
 
 @pytest.mark.parametrize(

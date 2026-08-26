@@ -23,69 +23,92 @@ _RECOVERY_READS = (
 
 @dataclass(frozen=True, slots=True)
 class HeartbeatState:
-    status: Literal["INITIAL", "CONFIRMED", "UNCERTAIN"]
+    status: Literal["INITIAL", "CONFIRMED", "UNCERTAIN", "RECOVERED"]
     observed_at: datetime | None
     heartbeat_id: str | None
     evidence_hashes: tuple[Sha256, ...]
     kill_reason: Literal["HEARTBEAT_CANCELLATION_UNCERTAIN"] | None
     required_reads: tuple[RouteKey, ...]
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("HEARTBEAT_STATE_NOT_SUBCLASSABLE") from None
+
     def __post_init__(self) -> None:
-        if self.status not in {"INITIAL", "CONFIRMED", "UNCERTAIN"}:
-            raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        if (
-            type(self.evidence_hashes) is not tuple
-            or any(
-                type(value) is not str
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-                for value in self.evidence_hashes
-            )
-            or self.evidence_hashes != tuple(sorted(set(self.evidence_hashes)))
-        ):
-            raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        if self.heartbeat_id is not None and (
-            type(self.heartbeat_id) is not str
-            or not 1 <= len(self.heartbeat_id) <= 256
-            or any(
-                ord(character) < 0x20 or ord(character) > 0x7E for character in self.heartbeat_id
-            )
-        ):
-            raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        if self.observed_at is not None and (
-            type(self.observed_at) is not datetime
-            or normalize_utc_timestamp(self.observed_at) != self.observed_at
-        ):
-            raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        if self.status == "INITIAL":
-            if any(
-                value
-                for value in (
-                    self.observed_at,
-                    self.heartbeat_id,
-                    self.evidence_hashes,
-                    self.kill_reason,
-                    self.required_reads,
+        invalid = (
+            type(self) is not HeartbeatState
+            or type(self.status) is not str
+            or type(self.observed_at) not in {datetime, type(None)}
+            or type(self.heartbeat_id) not in {str, type(None)}
+            or type(self.evidence_hashes) is not tuple
+            or any(type(value) is not str for value in self.evidence_hashes)
+            or type(self.kill_reason) not in {str, type(None)}
+            or type(self.required_reads) is not tuple
+            or any(type(route) is not RouteKey for route in self.required_reads)
+        )
+        normalized: datetime | None = None
+        if not invalid and self.observed_at is not None:
+            try:
+                normalized = normalize_utc_timestamp(self.observed_at)
+            except Exception:
+                invalid = True
+        if not invalid:
+            invalid = (
+                self.status not in {"INITIAL", "CONFIRMED", "UNCERTAIN", "RECOVERED"}
+                or len(self.evidence_hashes) > 2
+                or any(
+                    len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                    for value in self.evidence_hashes
                 )
-            ):
-                raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        elif self.status == "CONFIRMED":
-            if (
-                self.observed_at is None
-                or not self.heartbeat_id
+                or self.evidence_hashes != tuple(sorted(set(self.evidence_hashes)))
+                or (
+                    self.heartbeat_id is not None
+                    and (
+                        not 1 <= len(self.heartbeat_id) <= 256
+                        or any(
+                            ord(character) < 0x20 or ord(character) > 0x7E
+                            for character in self.heartbeat_id
+                        )
+                    )
+                )
+                or (self.observed_at is not None and normalized != self.observed_at)
+            )
+        if not invalid and self.status == "INITIAL":
+            invalid = (
+                self.observed_at is not None
+                or self.heartbeat_id is not None
+                or self.evidence_hashes != ()
                 or self.kill_reason is not None
-                or self.required_reads
-            ):
-                raise ValueError("HEARTBEAT_STATE_INVALID") from None
-        elif (
-            self.observed_at is None
-            or self.kill_reason != "HEARTBEAT_CANCELLATION_UNCERTAIN"
-            or self.required_reads != _RECOVERY_READS
-        ):
+                or self.required_reads != ()
+            )
+        elif not invalid and self.status == "CONFIRMED":
+            invalid = (
+                self.observed_at is None
+                or self.heartbeat_id is None
+                or len(self.evidence_hashes) != 2
+                or self.kill_reason is not None
+                or self.required_reads != ()
+            )
+        elif not invalid and self.status == "RECOVERED":
+            invalid = (
+                self.observed_at is None
+                or self.kill_reason is not None
+                or self.required_reads != ()
+            )
+        elif not invalid:
+            invalid = (
+                self.observed_at is None
+                or self.kill_reason != "HEARTBEAT_CANCELLATION_UNCERTAIN"
+                or self.required_reads != _RECOVERY_READS
+            )
+        if invalid:
             raise ValueError("HEARTBEAT_STATE_INVALID") from None
 
     @classmethod
     def initial(cls) -> HeartbeatState:
+        if cls is not HeartbeatState:
+            raise TypeError("HEARTBEAT_STATE_NOT_SUBCLASSABLE") from None
         return cls(
             status="INITIAL",
             observed_at=None,
@@ -103,6 +126,8 @@ class HeartbeatState:
         heartbeat_id: str,
         evidence_hashes: tuple[Sha256, ...],
     ) -> HeartbeatState:
+        if cls is not HeartbeatState or type(evidence_hashes) is not tuple:
+            raise ValueError("HEARTBEAT_STATE_INVALID") from None
         return cls(
             status="CONFIRMED",
             observed_at=normalize_utc_timestamp(observed_at),
@@ -120,6 +145,8 @@ class HeartbeatState:
         previous_heartbeat_id: str | None,
         evidence_hashes: tuple[Sha256, ...],
     ) -> HeartbeatState:
+        if cls is not HeartbeatState or type(evidence_hashes) is not tuple:
+            raise ValueError("HEARTBEAT_STATE_INVALID") from None
         return cls(
             status="UNCERTAIN",
             observed_at=normalize_utc_timestamp(observed_at),
@@ -127,6 +154,39 @@ class HeartbeatState:
             evidence_hashes=tuple(sorted(set(evidence_hashes))),
             kill_reason="HEARTBEAT_CANCELLATION_UNCERTAIN",
             required_reads=_RECOVERY_READS,
+        )
+
+    @classmethod
+    def recovered(
+        cls,
+        *,
+        observed_at: datetime,
+        heartbeat_id: str | None,
+        evidence_hashes: tuple[Sha256, ...],
+    ) -> HeartbeatState:
+        if cls is not HeartbeatState or type(evidence_hashes) is not tuple:
+            raise ValueError("HEARTBEAT_STATE_INVALID") from None
+        return cls(
+            status="RECOVERED",
+            observed_at=normalize_utc_timestamp(observed_at),
+            heartbeat_id=heartbeat_id,
+            evidence_hashes=tuple(sorted(set(evidence_hashes))),
+            kill_reason=None,
+            required_reads=(),
+        )
+
+    def on_authoritative_reads_completed(
+        self,
+        reads: tuple[RouteKey, ...],
+        *,
+        observed_at: datetime,
+    ) -> HeartbeatState:
+        if self.status != "UNCERTAIN" or reads != _RECOVERY_READS:
+            raise ValueError("HEARTBEAT_RECOVERY_READS_INCOMPLETE") from None
+        return HeartbeatState.recovered(
+            observed_at=observed_at,
+            heartbeat_id=self.heartbeat_id,
+            evidence_hashes=self.evidence_hashes,
         )
 
 
@@ -150,6 +210,8 @@ def classify_heartbeat(
     if result.code is RestCode.HEARTBEAT_ACCEPTED:
         if not isinstance(result.payload, HeartbeatAckPayload):
             raise ValueError("HEARTBEAT_RESULT_INVALID") from None
+        if previous.status == "UNCERTAIN":
+            return previous
         return HeartbeatState.confirmed(
             observed_at=observed_at,
             heartbeat_id=result.payload.heartbeat_id,
