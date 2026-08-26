@@ -228,6 +228,11 @@ def _protocol_units(value: Decimal, token_decimals: int) -> int:
     return int(scaled)
 
 
+def _maximum_protocol_units(value: Decimal, token_decimals: int) -> int:
+    scaled = value * (Decimal(10) ** token_decimals)
+    return int(scaled.to_integral_value(rounding=ROUND_DOWN))
+
+
 def order_amounts(
     *,
     side: OrderSide,
@@ -399,6 +404,13 @@ def _order_from_intent(
         )
     except OrderAmountError as error:
         raise OrderSigningError(str(error)) from error
+    if (
+        intent.side == "buy"
+        and intent.maximum_spend is not None
+        and maker_amount
+        > _maximum_protocol_units(intent.maximum_spend, snapshot.rounding.token_decimals)
+    ):
+        raise OrderSigningError("MAXIMUM_SPEND_EXCEEDED")
     try:
         token_id = int(intent.token_id)
     except ValueError as error:
@@ -501,6 +513,8 @@ def recover_order_signer(
     )
     if order.salt != envelope.salt or order.signature_type != envelope.signature_type:
         raise OrderSigningError("ENVELOPE_ORDER_MISMATCH")
+    if order.signature_type != 0:
+        raise OrderSigningError("SIGNATURE_CONTEXT_UNSUPPORTED")
     typed_data = order_typed_data(order, snapshot)
     if _stable_digest(typed_data["domain"]) != envelope.domain_fingerprint:
         raise OrderSigningError("DOMAIN_FINGERPRINT_MISMATCH")

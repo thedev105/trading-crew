@@ -24,6 +24,37 @@ TICK_AMOUNT_DECIMALS = {
     "0.001": 5,
     "0.0001": 6,
 }
+TICK_PRICE_DECIMALS = {
+    "0.1": 1,
+    "0.01": 2,
+    "0.005": 3,
+    "0.0025": 4,
+    "0.001": 3,
+    "0.0001": 4,
+}
+AMOUNT_COMBINATIONS = tuple(
+    (tick, side, kind) for tick in TICKS for side in ("buy", "sell") for kind in ("limit", "market")
+)
+EXACT_QUANTUM_AMOUNTS = {
+    ("buy", "limit"): (5_000, 10_000),
+    ("sell", "limit"): (10_000, 5_000),
+    ("buy", "market"): (10_000, 20_000),
+    ("sell", "market"): (10_000, 5_000),
+}
+MARKET_BELOW_PRICE_BOUNDARY_AMOUNTS = {
+    ("0.1", "buy"): (10_000, 25_000),
+    ("0.1", "sell"): (10_000, 4_000),
+    ("0.01", "buy"): (10_000, 20_500),
+    ("0.01", "sell"): (10_000, 4_900),
+    ("0.005", "buy"): None,
+    ("0.005", "sell"): None,
+    ("0.0025", "buy"): None,
+    ("0.0025", "sell"): None,
+    ("0.001", "buy"): (10_000, 20_050),
+    ("0.001", "sell"): (10_000, 4_990),
+    ("0.0001", "buy"): (10_000, 20_005),
+    ("0.0001", "sell"): (10_000, 4_999),
+}
 ZERO_BYTES32 = "0x" + "00" * 32
 
 
@@ -99,13 +130,69 @@ def test_all_frozen_amount_vectors_are_exercised_from_the_authenticated_fixture(
         ) == (int(vector["makerAmount"]), int(vector["takerAmount"]))
 
 
+@pytest.mark.parametrize(
+    ("tick", "side", "kind"),
+    AMOUNT_COMBINATIONS,
+    ids=("-".join(case) for case in AMOUNT_COMBINATIONS),
+)
+def test_every_frozen_tick_side_kind_combination_has_explicit_quantum_boundaries(
+    tick: str,
+    side: str,
+    kind: str,
+) -> None:
+    rounding = load_protocol_snapshot().rounding
+    expected = EXACT_QUANTUM_AMOUNTS[(side, kind)]
+    arguments = {
+        "side": side,
+        "price": Decimal("0.5"),
+        "tick_size": Decimal(tick),
+        "kind": kind,
+        "rounding": rounding,
+    }
+
+    with pytest.raises(OrderAmountError, match="ROUNDED_AMOUNT_INVALID"):
+        order_amounts(size=Decimal("0.009999"), **arguments)
+    assert order_amounts(size=Decimal("0.010000"), **arguments) == expected
+    assert order_amounts(size=Decimal("0.010001"), **arguments) == expected
+
+    price_quantum = Decimal(1).scaleb(-TICK_PRICE_DECIMALS[tick])
+    below_price = Decimal("0.5") - price_quantum / 10
+    above_price = Decimal("0.5") + price_quantum / 10
+    if kind == "limit":
+        with pytest.raises(OrderAmountError, match="PRICE_TICK_INVALID"):
+            order_amounts(
+                size=Decimal("0.01"),
+                price=below_price,
+                **{key: value for key, value in arguments.items() if key != "price"},
+            )
+        with pytest.raises(OrderAmountError, match="PRICE_TICK_INVALID"):
+            order_amounts(
+                size=Decimal("0.01"),
+                price=above_price,
+                **{key: value for key, value in arguments.items() if key != "price"},
+            )
+        return
+
+    below_expected = MARKET_BELOW_PRICE_BOUNDARY_AMOUNTS[(tick, side)]
+    price_arguments = {key: value for key, value in arguments.items() if key != "price"}
+    if below_expected is None:
+        with pytest.raises(OrderAmountError, match="PRICE_TICK_INVALID"):
+            order_amounts(size=Decimal("0.01"), price=below_price, **price_arguments)
+    else:
+        assert (
+            order_amounts(size=Decimal("0.01"), price=below_price, **price_arguments)
+            == below_expected
+        )
+    assert order_amounts(size=Decimal("0.01"), price=above_price, **price_arguments) == expected
+
+
 @given(
     tick=st.sampled_from(TICKS),
     side=st.sampled_from(("buy", "sell")),
     price_ticks=st.integers(min_value=1, max_value=9),
     size_cents=st.integers(min_value=1, max_value=10_000),
 )
-def test_limit_amount_property_covers_every_frozen_tick_and_side(
+def test_limit_amount_property_for_generated_frozen_tick_and_side(
     tick: str,
     side: str,
     price_ticks: int,
@@ -137,7 +224,7 @@ def test_limit_amount_property_covers_every_frozen_tick_and_side(
     price_ticks=st.integers(min_value=1, max_value=9),
     input_cents=st.integers(min_value=1, max_value=10_000),
 )
-def test_market_amount_property_covers_every_frozen_tick_and_side(
+def test_market_amount_property_for_generated_frozen_tick_and_side(
     tick: str,
     side: str,
     price_ticks: int,
@@ -249,13 +336,31 @@ def test_each_current_order_field_independently_changes_the_order_fingerprint(
     ) != order_fingerprint(baseline, snapshot)
 
 
-def test_chain_exchange_and_exchange_kind_independently_change_order_fingerprint() -> None:
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("name", "Changed Exchange"),
+        ("version", "3"),
+        ("chain_id", 1),
+    ),
+)
+def test_each_domain_identity_field_changes_order_fingerprint(
+    field: str,
+    changed: object,
+) -> None:
     snapshot = load_protocol_snapshot()
     baseline = _order()
-    changed_domain = snapshot.eip712.order_domain.model_copy(update={"chain_id": 1})
+    changed_domain = snapshot.eip712.order_domain.model_copy(update={field: changed})
     chain_snapshot = snapshot.model_copy(
         update={"eip712": snapshot.eip712.model_copy(update={"order_domain": changed_domain})}
     )
+
+    assert order_fingerprint(baseline, chain_snapshot) != order_fingerprint(baseline, snapshot)
+
+
+def test_verifying_contract_and_exchange_kind_change_order_fingerprint() -> None:
+    snapshot = load_protocol_snapshot()
+    baseline = _order()
     changed_addresses = snapshot.eip712.exchange_addresses.model_copy(
         update={"standard": "0x" + "33" * 20}
     )
@@ -266,7 +371,6 @@ def test_chain_exchange_and_exchange_kind_independently_change_order_fingerprint
     )
 
     original = order_fingerprint(baseline, snapshot)
-    assert order_fingerprint(baseline, chain_snapshot) != original
     assert order_fingerprint(baseline, address_snapshot) != original
     assert (
         order_fingerprint(

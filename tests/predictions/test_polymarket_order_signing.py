@@ -7,8 +7,9 @@ from hashlib import sha256
 from uuid import UUID
 
 import pytest
+from eth_account import Account
 
-from polytrading.predictions.execution.models import ExecutionIntent
+from polytrading.predictions.execution.models import ExecutionIntent, SignedOrderEnvelope
 from polytrading.predictions.polymarket_execution import load_protocol_snapshot
 from polytrading.predictions.polymarket_execution.order import (
     OrderSigningError,
@@ -53,6 +54,45 @@ def _wire_vector_order() -> PolymarketOrder:
         builder=message["builder"],
         expiration=0,
         exchange_kind="standard",
+    )
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _digest(value: object) -> str:
+    return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _envelope_with_signature_type(signature_type: int) -> SignedOrderEnvelope:
+    snapshot = load_protocol_snapshot()
+    envelope = sign_order(_intent(), PRIVATE_KEY, snapshot)
+    public_order = {
+        **json.loads(envelope.canonical_order_json),
+        "signatureType": signature_type,
+    }
+    if signature_type == 3:
+        return envelope.model_copy(
+            update={
+                "signature_type": signature_type,
+                "canonical_order_json": _canonical_json(public_order),
+            }
+        )
+    order = PolymarketOrder.from_public_order(public_order, exchange_kind="standard")
+    typed_data = order_typed_data(order, snapshot)
+    signature = (
+        "0x" + bytes(Account.sign_typed_data(PRIVATE_KEY, full_message=typed_data).signature).hex()
+    )
+    return envelope.model_copy(
+        update={
+            "signature_type": signature_type,
+            "public_signature": signature,
+            "domain_fingerprint": _digest(typed_data["domain"]),
+            "exact_body_hash": _digest({**public_order, "signature": signature}),
+            "order_fingerprint": order_fingerprint(order, snapshot),
+            "canonical_order_json": _canonical_json(public_order),
+        }
     )
 
 
@@ -213,6 +253,132 @@ def test_sign_recover_and_retry_are_byte_equivalent() -> None:
         PolymarketOrder.from_public_order(public_order, exchange_kind="standard"),
         snapshot,
     )
+
+
+def test_limit_buy_rejects_final_protocol_maker_amount_above_explicit_spend_cap() -> None:
+    intent = _intent(
+        base_size=Decimal("10"),
+        limit_price=Decimal("0.51"),
+        maximum_spend=Decimal("0.01"),
+    )
+
+    with pytest.raises(OrderSigningError, match="MAXIMUM_SPEND_EXCEEDED"):
+        sign_order(intent, PRIVATE_KEY, load_protocol_snapshot())
+
+
+@pytest.mark.parametrize(
+    ("maximum_spend", "exceeds_cap"),
+    (
+        (Decimal("5.099999"), True),
+        (Decimal("5.100000"), False),
+        (Decimal("5.100001"), False),
+    ),
+    ids=("one-protocol-unit-below", "exact", "one-protocol-unit-above"),
+)
+def test_limit_buy_spend_cap_uses_final_protocol_amount_quantum(
+    maximum_spend: Decimal,
+    exceeds_cap: bool,
+) -> None:
+    intent = _intent(base_size=Decimal("10"), maximum_spend=maximum_spend)
+
+    if exceeds_cap:
+        with pytest.raises(OrderSigningError, match="MAXIMUM_SPEND_EXCEEDED"):
+            sign_order(intent, PRIVATE_KEY, load_protocol_snapshot())
+        return
+
+    envelope = sign_order(intent, PRIVATE_KEY, load_protocol_snapshot())
+    assert json.loads(envelope.canonical_order_json)["makerAmount"] == "5100000"
+
+
+def test_market_buy_accepts_exact_final_protocol_maker_amount_cap() -> None:
+    envelope = sign_order(
+        _intent(base_size=None, maximum_spend=Decimal("5.10")),
+        PRIVATE_KEY,
+        load_protocol_snapshot(),
+    )
+
+    assert json.loads(envelope.canonical_order_json)["makerAmount"] == "5100000"
+
+
+@pytest.mark.parametrize("signature_type", (1, 2, 3))
+def test_recovery_rejects_every_non_eoa_signature_context(signature_type: int) -> None:
+    envelope = _envelope_with_signature_type(signature_type)
+
+    with pytest.raises(OrderSigningError, match="SIGNATURE_CONTEXT_UNSUPPORTED") as rejected:
+        recover_order_signer(envelope, load_protocol_snapshot())
+    assert rejected.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("field", "changed", "error_code"),
+    (
+        ("salt", 2, "ENVELOPE_ORDER_MISMATCH"),
+        ("maker", "0x" + "22" * 20, "PUBLIC_ORDER_INVALID"),
+        ("signer", "0x" + "22" * 20, "PUBLIC_ORDER_INVALID"),
+        ("tokenId", "217427", "ORDER_FINGERPRINT_MISMATCH"),
+        ("makerAmount", "5100001", "ORDER_FINGERPRINT_MISMATCH"),
+        ("takerAmount", "10000001", "ORDER_FINGERPRINT_MISMATCH"),
+        ("side", "SELL", "ORDER_FINGERPRINT_MISMATCH"),
+        ("signatureType", 1, "ENVELOPE_ORDER_MISMATCH"),
+        ("timestamp", "1787673600001", "ORDER_FINGERPRINT_MISMATCH"),
+        ("metadata", "0x" + "01" * 32, "ORDER_FINGERPRINT_MISMATCH"),
+        ("builder", "0x" + "01" * 32, "ORDER_FINGERPRINT_MISMATCH"),
+        ("expiration", "1", "ORDER_FINGERPRINT_MISMATCH"),
+    ),
+)
+def test_recovery_rejects_each_independently_mutated_public_order_field(
+    field: str,
+    changed: object,
+    error_code: str,
+) -> None:
+    snapshot = load_protocol_snapshot()
+    envelope = sign_order(_intent(), PRIVATE_KEY, snapshot)
+    public_order = {**json.loads(envelope.canonical_order_json), field: changed}
+    changed_envelope = envelope.model_copy(
+        update={"canonical_order_json": _canonical_json(public_order)}
+    )
+
+    with pytest.raises(OrderSigningError, match=error_code):
+        recover_order_signer(changed_envelope, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("name", "Changed Exchange"),
+        ("version", "3"),
+        ("chain_id", 1),
+    ),
+)
+def test_recovery_rejects_each_mutated_domain_identity_field(
+    field: str,
+    changed: object,
+) -> None:
+    snapshot = load_protocol_snapshot()
+    envelope = sign_order(_intent(), PRIVATE_KEY, snapshot)
+    changed_domain = snapshot.eip712.order_domain.model_copy(update={field: changed})
+    changed_snapshot = snapshot.model_copy(
+        update={"eip712": snapshot.eip712.model_copy(update={"order_domain": changed_domain})}
+    )
+
+    with pytest.raises(OrderSigningError, match="DOMAIN_FINGERPRINT_MISMATCH"):
+        recover_order_signer(envelope, changed_snapshot)
+
+
+def test_recovery_rejects_mutated_verifying_contract() -> None:
+    snapshot = load_protocol_snapshot()
+    envelope = sign_order(_intent(), PRIVATE_KEY, snapshot)
+    changed_addresses = snapshot.eip712.exchange_addresses.model_copy(
+        update={"standard": "0x" + "33" * 20}
+    )
+    changed_snapshot = snapshot.model_copy(
+        update={
+            "eip712": snapshot.eip712.model_copy(update={"exchange_addresses": changed_addresses})
+        }
+    )
+
+    with pytest.raises(OrderSigningError, match="EXCHANGE_FINGERPRINT_MISMATCH"):
+        recover_order_signer(envelope, changed_snapshot)
 
 
 def test_signing_negative_risk_binds_its_exchange_domain() -> None:
