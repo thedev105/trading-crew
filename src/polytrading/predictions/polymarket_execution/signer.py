@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
@@ -21,15 +22,11 @@ from polytrading.predictions.execution.authority import (
     verify_mutation_authority,
 )
 from polytrading.predictions.execution.models import (
+    ExecutionIntent,
     ExecutionOperation,
     canonical_execution_hash,
 )
-from polytrading.predictions.polymarket_execution.auth import (
-    ClobAuthError,
-    ClobCredentials,
-    L2AuthHeaders,
-    sign_l2_request,
-)
+from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     CancelOrderPayload,
     HeartbeatPayload,
@@ -38,6 +35,7 @@ from polytrading.predictions.polymarket_execution.ipc import (
     ReadTradesPayload,
     SanitizedOperationResult,
     SignedEnvelopeResult,
+    SignerErrorCode,
     SignerProtocolError,
     SignerRequest,
     SignerResponse,
@@ -77,63 +75,28 @@ _READ_OPERATIONS = frozenset(
 )
 
 
-class L2HeaderSigner(Protocol):
-    def __call__(
-        self,
-        *,
-        timestamp: str,
-        method: str,
-        route: str,
-        body: bytes,
-    ) -> L2AuthHeaders: ...
-
-
 class SubmitOrderHandler(Protocol):
-    def __call__(
-        self,
-        payload: SubmitOrderPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: SubmitOrderPayload) -> SanitizedOperationResult: ...
 
 
 class CancelOrderHandler(Protocol):
-    def __call__(
-        self,
-        payload: CancelOrderPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: CancelOrderPayload) -> SanitizedOperationResult: ...
 
 
 class HeartbeatHandler(Protocol):
-    def __call__(
-        self,
-        payload: HeartbeatPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: HeartbeatPayload) -> SanitizedOperationResult: ...
 
 
 class ReadOrdersHandler(Protocol):
-    def __call__(
-        self,
-        payload: ReadOrdersPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: ReadOrdersPayload) -> SanitizedOperationResult: ...
 
 
 class ReadTradesHandler(Protocol):
-    def __call__(
-        self,
-        payload: ReadTradesPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: ReadTradesPayload) -> SanitizedOperationResult: ...
 
 
 class ReadAccountHandler(Protocol):
-    def __call__(
-        self,
-        payload: ReadAccountPayload,
-        authenticate: L2HeaderSigner,
-    ) -> SanitizedOperationResult: ...
+    def __call__(self, payload: ReadAccountPayload) -> SanitizedOperationResult: ...
 
 
 AuthorityContextFactory = Callable[[SignerRequest, datetime], AuthorityContext]
@@ -143,7 +106,7 @@ SignerServiceFactory = Callable[[SecretMaterial], "SignerService"]
 
 @dataclass(frozen=True, slots=True)
 class SignerOperationHandlers:
-    """Typed pure handlers injected behind the signer authority boundary."""
+    """Typed handlers that must never re-enter their owning SignerService."""
 
     submit_order: SubmitOrderHandler
     cancel_order: CancelOrderHandler
@@ -159,6 +122,13 @@ class _ReplayEntry:
     response_bytes: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _VenueOrderBinding:
+    intent_id: UUID
+    account_fingerprint: str
+    envelope_digest: str
+
+
 class SignerService:
     """Validate, gate, sign, and dispatch one bounded signer request at a time."""
 
@@ -168,10 +138,12 @@ class SignerService:
         "_clock",
         "_closed",
         "_handlers",
+        "_lock",
         "_max_cache_entries",
         "_read_guard",
         "_secrets",
         "_snapshot",
+        "_venue_order_bindings",
     )
 
     def __init__(
@@ -193,29 +165,37 @@ class SignerService:
         self._authority_context_factory = authority_context_factory
         self._read_guard = read_guard
         self._handlers = handlers
+        self._lock = Lock()
         self._clock = clock
         self._max_cache_entries = max_cache_entries
         self._snapshot = snapshot or load_protocol_snapshot()
         self._cache: dict[UUID, _ReplayEntry] = {}
+        self._venue_order_bindings: dict[str, _VenueOrderBinding] = {}
         self._closed = False
 
     def close(self) -> None:
-        self._closed = True
-        self._secrets.close()
+        with self._lock:
+            self._closed = True
+            self._secrets.close()
 
     def handle_raw(self, payload: bytes) -> SignerResponse:
         """Parse one bounded wire payload without reflecting invalid input."""
         try:
             request = parse_signer_request(payload)
         except SignerProtocolError as error:
-            return SignerResponse.rejected(None, str(error))
+            with self._lock:
+                response, _ = self._sanitized_response_bytes(
+                    SignerResponse.rejected(None, str(error))
+                )
+            return response
         return self.handle(request)
 
     def _handle_raw_bytes(self, payload: bytes) -> bytes:
         try:
             request = parse_signer_request(payload)
         except SignerProtocolError as error:
-            return canonical_response_bytes(SignerResponse.rejected(None, str(error)))
+            with self._lock:
+                return self._response_bytes(SignerResponse.rejected(None, str(error)))
         return self._handle_bytes(request)
 
     def handle(self, request: SignerRequest) -> SignerResponse:
@@ -226,38 +206,56 @@ class SignerService:
         return SignerResponse.model_validate_json(response_bytes, strict=True)
 
     def _handle_bytes(self, request: SignerRequest) -> bytes:
+        """Atomically replay-check, gate, dispatch, scan, bind, and cache one request.
+
+        Injected synchronous handlers must not call back into this service.
+        """
+        with self._lock:
+            return self._handle_bytes_locked(request)
+
+    def _handle_bytes_locked(self, request: SignerRequest) -> bytes:
         request_id = request.request_id
         if type(request_id) is not UUID:
-            return canonical_response_bytes(SignerResponse.rejected(None, "IPC_REQUEST_INVALID"))
+            return self._response_bytes(SignerResponse.rejected(None, "IPC_REQUEST_INVALID"))
         cached = self._cache.get(request_id)
         try:
             request_bytes = canonical_request_bytes(request)
         except Exception:
             error_code = "IPC_REQUEST_COLLISION" if cached is not None else "IPC_REQUEST_INVALID"
-            return canonical_response_bytes(SignerResponse.rejected(request_id, error_code))
+            return self._response_bytes(SignerResponse.rejected(request_id, error_code))
         request_digest = sha256(request_bytes).digest()
         if cached is not None:
             if hmac.compare_digest(cached.request_digest, request_digest):
                 return cached.response_bytes
-            return canonical_response_bytes(
+            return self._response_bytes(
                 SignerResponse.rejected(request_id, "IPC_REQUEST_COLLISION")
             )
         if len(self._cache) >= self._max_cache_entries:
-            return canonical_response_bytes(
+            return self._response_bytes(
                 SignerResponse.rejected(request_id, "IPC_REPLAY_CACHE_FULL")
             )
 
         try:
             request = parse_signer_request(request_bytes)
         except SignerProtocolError as error:
-            response_bytes = canonical_response_bytes(
-                SignerResponse.rejected(request_id, str(error))
-            )
+            response_bytes = self._response_bytes(SignerResponse.rejected(request_id, str(error)))
             self._cache[request_id] = _ReplayEntry(request_digest, response_bytes)
             return response_bytes
 
         response = self._handle_uncached(request)
-        response_bytes = canonical_response_bytes(response)
+        response, response_bytes = self._sanitized_response_bytes(response)
+        binding = self._venue_order_binding(request, response)
+        if binding is not None:
+            venue_order_id, prospective = binding
+            existing = self._venue_order_bindings.get(venue_order_id)
+            if existing is not None and existing != prospective:
+                response = SignerResponse.rejected(
+                    request_id,
+                    "VENUE_ORDER_BINDING_COLLISION",
+                )
+                response, response_bytes = self._sanitized_response_bytes(response)
+            else:
+                self._venue_order_bindings[venue_order_id] = prospective
         self._cache[request_id] = _ReplayEntry(request_digest, response_bytes)
         return response_bytes
 
@@ -273,6 +271,15 @@ class SignerService:
         now = now.astimezone(UTC)
         if now >= request.deadline:
             return SignerResponse.rejected(request.request_id, "IPC_DEADLINE_EXPIRED")
+        intent = self._intent_for(request)
+        if intent is not None:
+            if now >= intent.deadline:
+                return SignerResponse.rejected(request.request_id, "INTENT_DEADLINE_EXPIRED")
+            if request.deadline > intent.deadline:
+                return SignerResponse.rejected(
+                    request.request_id,
+                    "REQUEST_DEADLINE_EXCEEDS_INTENT",
+                )
         if request.protocol_version != self._snapshot.version:
             return SignerResponse.rejected(request.request_id, "PROTOCOL_VERSION_MISMATCH")
         if not self._secret_account_matches(request.account_fingerprint):
@@ -284,10 +291,12 @@ class SignerService:
             decision = self._verify_read(request, now)
         else:
             return SignerResponse.rejected(request.request_id, "IPC_OPERATION_NOT_ALLOWED")
+        if isinstance(decision, str):
+            return SignerResponse.rejected(request.request_id, decision)
         if not decision.allowed:
             return SignerResponse.rejected(
                 request.request_id,
-                decision.reason or "IPC_AUTHORITY_FAILED",
+                decision.reason or "AUTHORITY_GATE_FAILED",
             )
         return self._dispatch(request)
 
@@ -297,72 +306,52 @@ class SignerService:
             private_key = bytes(self._secrets.private_key)
             address = Account.from_key(private_key).address
             decoded = bytes.fromhex(address[2:])
-        except (TypeError, ValueError):
+        except Exception:
             return False
         finally:
             private_key = None
         return hmac.compare_digest(sha256(decoded).hexdigest(), account_fingerprint)
 
-    def _verify_mutation(self, request: SignerRequest, now: datetime) -> AuthorityDecision:
+    def _verify_mutation(
+        self,
+        request: SignerRequest,
+        now: datetime,
+    ) -> AuthorityDecision | SignerErrorCode:
         try:
             context = self._authority_context_factory(request, now)
+            if type(context) is not AuthorityContext:
+                return "AUTHORITY_GATE_FAILED"
+            capability = context.verified_capability
+            manifest_hash = (
+                canonical_execution_hash(context.manifest) if context.manifest is not None else None
+            )
+            if context.account_fingerprint != request.account_fingerprint:
+                return AuthorityDecision(False, "CAPABILITY_ACCOUNT_MISMATCH", ())
+            if context.now != now:
+                return "AUTHORITY_CONTEXT_TIME_MISMATCH"
+            if (
+                context.manifest_record_hash != request.manifest_digest
+                or manifest_hash != request.manifest_digest
+            ):
+                return AuthorityDecision(False, "CAPABILITY_MANIFEST_MISMATCH", ())
+            if capability is None or capability.capability_digest != request.capability_digest:
+                return AuthorityDecision(False, "CAPABILITY_CANONICAL_BYTES_INVALID", ())
+            return verify_mutation_authority(context, request.operation)
         except Exception:
-            return AuthorityDecision(False, "CAPABILITY_MISSING", ())
-        if type(context) is not AuthorityContext:
-            return AuthorityDecision(False, "CAPABILITY_MISSING", ())
-        capability = context.verified_capability
-        manifest_hash = (
-            canonical_execution_hash(context.manifest) if context.manifest is not None else None
-        )
-        if context.account_fingerprint != request.account_fingerprint:
-            return AuthorityDecision(False, "CAPABILITY_ACCOUNT_MISMATCH", ())
-        if (
-            context.manifest_record_hash != request.manifest_digest
-            or manifest_hash != request.manifest_digest
-        ):
-            return AuthorityDecision(False, "CAPABILITY_MANIFEST_MISMATCH", ())
-        if capability is None or capability.capability_digest != request.capability_digest:
-            return AuthorityDecision(False, "CAPABILITY_CANONICAL_BYTES_INVALID", ())
-        return verify_mutation_authority(context, request.operation)
+            return "AUTHORITY_GATE_FAILED"
 
-    def _verify_read(self, request: SignerRequest, now: datetime) -> AuthorityDecision:
+    def _verify_read(
+        self,
+        request: SignerRequest,
+        now: datetime,
+    ) -> AuthorityDecision | SignerErrorCode:
         try:
             decision = self._read_guard(request, now)
         except Exception:
-            return AuthorityDecision(False, "ACCOUNT_SCOPE_EVIDENCE_MISSING", ())
-        if not isinstance(decision, AuthorityDecision):
-            return AuthorityDecision(False, "ACCOUNT_SCOPE_EVIDENCE_MISSING", ())
+            return "READ_GUARD_FAILED"
+        if type(decision) is not AuthorityDecision:
+            return "READ_GUARD_FAILED"
         return decision
-
-    def _l2_headers(
-        self,
-        *,
-        timestamp: str,
-        method: str,
-        route: str,
-        body: bytes,
-    ) -> L2AuthHeaders:
-        private_key: bytes | None = None
-        credentials: ClobCredentials | None = None
-        try:
-            private_key = bytes(self._secrets.private_key)
-            address = Account.from_key(private_key).address
-            credentials = ClobCredentials(
-                address=address,
-                api_key=bytes(self._secrets.api_key),
-                secret=bytes(self._secrets.api_secret),
-                passphrase=bytes(self._secrets.passphrase),
-            )
-            return sign_l2_request(
-                credentials,
-                timestamp=timestamp,
-                method=method,
-                route=route,
-                body=body,
-            )
-        finally:
-            credentials = None
-            private_key = None
 
     def _dispatch(self, request: SignerRequest) -> SignerResponse:
         try:
@@ -377,21 +366,127 @@ class SignerService:
                     envelope=envelope,
                 )
             else:
+                if isinstance(request.payload, SubmitOrderPayload):
+                    private_key = bytes(self._secrets.private_key)
+                    try:
+                        expected_envelope = sign_order(
+                            request.payload.intent,
+                            private_key,
+                            self._snapshot,
+                        )
+                    finally:
+                        private_key = b""
+                    if (
+                        expected_envelope != request.payload.envelope
+                        or expected_envelope.model_dump_json()
+                        != request.payload.envelope.model_dump_json()
+                    ):
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "ORDER_ENVELOPE_MISMATCH",
+                        )
+                if isinstance(request.payload, CancelOrderPayload):
+                    binding = self._venue_order_bindings.get(request.payload.venue_order_id)
+                    if binding is None:
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "CANCEL_ORDER_UNKNOWN",
+                        )
+                    if (
+                        binding.intent_id != request.intent_id
+                        or binding.account_fingerprint != request.account_fingerprint
+                    ):
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "CANCEL_ORDER_BINDING_MISMATCH",
+                        )
                 handler = self._handler_for(request.payload)
-                result = handler(request.payload, self._l2_headers)
+                result = handler(request.payload)
                 if (
                     type(result) is not SanitizedOperationResult
                     or result.operation is not request.operation
+                    or not self._result_matches_request(request, result)
                 ):
                     return SignerResponse.rejected(
                         request.request_id,
                         "IPC_OPERATION_RESULT_INVALID",
                     )
             return SignerResponse.accepted(request.request_id, result)
-        except (ClobAuthError, OrderSigningError) as error:
-            return SignerResponse.rejected(request.request_id, str(error))
+        except OrderSigningError:
+            return SignerResponse.rejected(request.request_id, "ORDER_SIGNING_FAILED")
+        except ClobAuthError:
+            return SignerResponse.rejected(request.request_id, "AUTH_HANDLER_FAILED")
         except Exception:
-            return SignerResponse.rejected(request.request_id, "IPC_OPERATION_FAILED")
+            return SignerResponse.rejected(request.request_id, "HANDLER_FAILED")
+
+    @staticmethod
+    def _intent_for(request: SignerRequest) -> ExecutionIntent | None:
+        if isinstance(request.payload, (SignOrderPayload, SubmitOrderPayload)):
+            return request.payload.intent
+        return None
+
+    @staticmethod
+    def _result_matches_request(
+        request: SignerRequest,
+        result: SanitizedOperationResult,
+    ) -> bool:
+        if isinstance(request.payload, CancelOrderPayload):
+            return result.venue_order_id == request.payload.venue_order_id
+        if (
+            isinstance(request.payload, ReadOrdersPayload)
+            and request.payload.venue_order_id is not None
+        ):
+            return result.venue_order_id == request.payload.venue_order_id
+        return True
+
+    def _sanitized_response_bytes(
+        self,
+        response: SignerResponse,
+    ) -> tuple[SignerResponse, bytes]:
+        try:
+            response_bytes = canonical_response_bytes(response)
+        except Exception:
+            sanitized = SignerResponse.rejected(response.request_id, "HANDLER_FAILED")
+            return sanitized, canonical_response_bytes(sanitized)
+        for value in (
+            self._secrets.private_key,
+            self._secrets.api_key,
+            self._secrets.api_secret,
+            self._secrets.passphrase,
+        ):
+            secret = bytes(value)
+            if secret and secret in response_bytes:
+                sanitized = SignerResponse.rejected(
+                    response.request_id,
+                    "SECRET_OUTPUT_DETECTED",
+                )
+                return sanitized, canonical_response_bytes(sanitized)
+        return response, response_bytes
+
+    def _response_bytes(self, response: SignerResponse) -> bytes:
+        return self._sanitized_response_bytes(response)[1]
+
+    @staticmethod
+    def _venue_order_binding(
+        request: SignerRequest,
+        response: SignerResponse,
+    ) -> tuple[str, _VenueOrderBinding] | None:
+        if (
+            not isinstance(request.payload, SubmitOrderPayload)
+            or not response.ok
+            or type(response.result) is not SanitizedOperationResult
+            or response.result.result_code != "SUBMIT_ORDER_OK"
+            or response.result.venue_order_id is None
+        ):
+            return None
+        return (
+            response.result.venue_order_id,
+            _VenueOrderBinding(
+                intent_id=request.intent_id,
+                account_fingerprint=request.account_fingerprint,
+                envelope_digest=canonical_execution_hash(request.payload.envelope),
+            ),
+        )
 
     def _handler_for(
         self,

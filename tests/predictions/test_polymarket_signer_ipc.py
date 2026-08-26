@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import io
+import json
 import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from multiprocessing import reduction
+from threading import Event, Lock
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import ValidationError
+from eth_account import Account
 
 from polytrading.predictions.execution.authority import AuthorityDecision
 from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
 from polytrading.predictions.polymarket_execution import signer as signer_module
+from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
     CancelOrderPayload,
@@ -29,9 +34,12 @@ from polytrading.predictions.polymarket_execution.ipc import (
     SignOrderPayload,
     SubmitOrderPayload,
     canonical_request_bytes,
+    parse_signer_request,
     read_frame,
     write_frame,
 )
+from polytrading.predictions.polymarket_execution.order import OrderSigningError, sign_order
+from polytrading.predictions.polymarket_execution.protocol import load_protocol_snapshot
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 from polytrading.predictions.polymarket_execution.signer import (
     SignerOperationHandlers,
@@ -44,7 +52,6 @@ from tests.predictions.test_execution_authority import (
     authority_context,
     verified_capability,
 )
-from tests.predictions.test_polymarket_auth import L2_SIGNATURE
 from tests.predictions.test_polymarket_order_signing import (
     ACCOUNT_FINGERPRINT,
     PRIVATE_KEY,
@@ -56,6 +63,7 @@ API_KEY = b"task-7-api-key"
 API_SECRET = b"dGFzay03LXNlY3JldA=="
 PASSPHRASE = b"task-7-passphrase"
 _CHILD_SECRET_MATERIAL: SecretMaterial | None = None
+_CANARY_ASSERTION_FAILED = "IPC_CANARY_DETECTED"
 
 
 class _ShortReader:
@@ -131,6 +139,14 @@ def _captured_protocol_error(operation: object) -> SignerProtocolError:
     if captured is None:
         raise AssertionError("IPC_PROTOCOL_ERROR_NOT_RAISED") from None
     return captured
+
+
+def _assert_canaries_absent(observed: str | bytes, *canaries: str | bytes) -> None:
+    observed_bytes = observed if type(observed) is bytes else observed.encode("utf-8")
+    for canary in canaries:
+        canary_bytes = canary if type(canary) is bytes else canary.encode("utf-8")
+        if canary_bytes in observed_bytes:
+            raise AssertionError(_CANARY_ASSERTION_FAILED) from None
 
 
 def test_frame_round_trip_uses_four_byte_big_endian_length() -> None:
@@ -230,7 +246,12 @@ def _payload(operation: ExecutionOperation) -> object:
         service = _service()
         signed = service.handle(_request(ExecutionOperation.SIGN_ORDER))
         assert isinstance(signed.result, SignedEnvelopeResult)
-        return SubmitOrderPayload(operation=operation, envelope=signed.result.envelope)
+        service.close()
+        return SubmitOrderPayload(
+            operation=operation,
+            intent=_intent(),
+            envelope=signed.result.envelope,
+        )
     if operation is ExecutionOperation.CANCEL_ORDER:
         return CancelOrderPayload(operation=operation, venue_order_id="order-1")
     if operation is ExecutionOperation.HEARTBEAT:
@@ -267,12 +288,18 @@ def _request(
 
 
 def _handlers(**overrides: object) -> SignerOperationHandlers:
-    def result(payload: object, authenticate: object) -> SanitizedOperationResult:
-        del authenticate
+    def result(payload: object) -> SanitizedOperationResult:
         operation = payload.operation  # type: ignore[attr-defined]
         return SanitizedOperationResult(
             operation=operation,
-            result_code="FIXTURE_OK",
+            result_code={
+                ExecutionOperation.SUBMIT_ORDER: "SUBMIT_ORDER_OK",
+                ExecutionOperation.CANCEL_ORDER: "CANCEL_ORDER_OK",
+                ExecutionOperation.HEARTBEAT: "HEARTBEAT_OK",
+                ExecutionOperation.READ_ORDERS: "READ_ORDERS_OK",
+                ExecutionOperation.READ_TRADES: "READ_TRADES_OK",
+                ExecutionOperation.READ_ACCOUNT: "READ_ACCOUNT_OK",
+            }[operation],
             evidence_hashes=(),
             venue_order_id="order-1"
             if operation
@@ -304,6 +331,11 @@ def _service(
     handlers: SignerOperationHandlers | None = None,
     max_cache_entries: int = 64,
     now: datetime = NOW,
+    context_now: datetime | None = None,
+    private_key: bytes = PRIVATE_KEY,
+    api_key: bytes = API_KEY,
+    api_secret: bytes = API_SECRET,
+    passphrase: bytes = PASSPHRASE,
 ) -> SignerService:
     def context_factory(request: SignerRequest, observed_at: datetime) -> object:
         if authority_calls is not None:
@@ -313,7 +345,7 @@ def _service(
             capability_digest=request.capability_digest,
         )
         return authority_context(
-            now=observed_at,
+            now=observed_at if context_now is None else context_now,
             account_fingerprint=request.account_fingerprint,
             account_scope_account_fingerprint=request.account_fingerprint,
             manifest_record_hash=request.manifest_digest,
@@ -328,10 +360,10 @@ def _service(
 
     return SignerService(
         secrets=SecretMaterial(
-            bytearray(PRIVATE_KEY),
-            bytearray(API_KEY),
-            bytearray(API_SECRET),
-            bytearray(PASSPHRASE),
+            bytearray(private_key),
+            bytearray(api_key),
+            bytearray(api_secret),
+            bytearray(passphrase),
         ),
         authority_context_factory=context_factory,  # type: ignore[arg-type]
         read_guard=read_guard,
@@ -362,14 +394,20 @@ def _child_service_factory(
             verified_capability=capability,
         )
 
-    def result(payload: object, authenticate: object) -> SanitizedOperationResult:
-        del authenticate
+    def result(payload: object) -> SanitizedOperationResult:
         operation = payload.operation  # type: ignore[attr-defined]
         if operation is crash_operation:
             raise SystemExit("SANITIZED_CHILD_CRASH")
         return SanitizedOperationResult(
             operation=operation,
-            result_code="CHILD_FIXTURE_OK",
+            result_code={
+                ExecutionOperation.SUBMIT_ORDER: "SUBMIT_ORDER_OK",
+                ExecutionOperation.CANCEL_ORDER: "CANCEL_ORDER_OK",
+                ExecutionOperation.HEARTBEAT: "HEARTBEAT_OK",
+                ExecutionOperation.READ_ORDERS: "READ_ORDERS_OK",
+                ExecutionOperation.READ_TRADES: "READ_TRADES_OK",
+                ExecutionOperation.READ_ACCOUNT: "READ_ACCOUNT_OK",
+            }[operation],
             evidence_hashes=(),
             venue_order_id="order-1"
             if operation
@@ -522,12 +560,11 @@ def test_request_and_response_have_exact_strict_public_field_allowlists() -> Non
     )
     raw = _request().model_dump(mode="json")
     raw["private_key"] = "private-key-canary"
-    with pytest.raises(ValidationError) as rejected:
+    with pytest.raises(SignerProtocolError) as rejected:
         SignerRequest.model_validate(raw)
+    assert str(rejected.value) == "IPC_MODEL_INVALID"
     assert "private-key-canary" not in str(rejected.value)
     assert "private-key-canary" not in repr(rejected.value)
-    assert "private-key-canary" not in str(rejected.value.errors())
-    assert "private-key-canary" not in rejected.value.json()
 
 
 @pytest.mark.parametrize("operation", tuple(ExecutionOperation))
@@ -541,8 +578,97 @@ def test_each_operation_requires_its_exact_discriminated_payload(
         if operation is not ExecutionOperation.READ_ACCOUNT
         else ExecutionOperation.READ_TRADES
     )
-    with pytest.raises(ValidationError, match="operation must match payload"):
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
         _request(operation, payload=_payload(different))
+
+
+def test_direct_nested_validation_and_bypass_surfaces_are_context_free() -> None:
+    canary = "nested-direct-validation-canary"
+    python_value = _request().model_dump(mode="python")
+    python_value["payload"]["intent"]["private_key"] = canary
+    json_value = _request().model_dump(mode="json")
+    json_value["payload"]["intent"]["private_key"] = canary
+    operations = (
+        lambda: SignerRequest(**python_value),
+        lambda: SignerRequest.model_validate(python_value),
+        lambda: SignerRequest.model_validate_json(
+            json.dumps(json_value, separators=(",", ":")),
+            strict=True,
+        ),
+        lambda: SignerRequest.model_construct(payload={"private_key": canary}),
+        lambda: _request().model_copy(update={"payload": {"private_key": canary}}),
+    )
+
+    for operation in operations:
+        error = _captured_protocol_error(operation)
+        assert str(error) == "IPC_MODEL_INVALID"
+        _assert_canaries_absent(str(error) + repr(error), canary)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+
+
+def test_direct_model_display_redacts_even_valid_public_canary_fields() -> None:
+    canary = API_KEY.decode()
+    result = SanitizedOperationResult(
+        operation=ExecutionOperation.SUBMIT_ORDER,
+        result_code="SUBMIT_ORDER_OK",
+        evidence_hashes=(),
+        venue_order_id=canary,
+    )
+
+    _assert_canaries_absent(str(result) + repr(result), canary)
+
+
+def test_arbitrary_result_and_error_codes_are_not_constructible() -> None:
+    operations = (
+        lambda: SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ACCOUNT,
+            result_code="ARBITRARY_RESULT_CODE",
+            evidence_hashes=(),
+        ),
+        lambda: SignerResponse.rejected(None, "ARBITRARY_ERROR_CODE"),
+    )
+
+    for operation in operations:
+        error = _captured_protocol_error(operation)
+        assert str(error) == "IPC_MODEL_INVALID"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    (
+        {
+            "operation": ExecutionOperation.SUBMIT_ORDER,
+            "result_code": "SUBMIT_ORDER_OK",
+            "evidence_hashes": (),
+            "venue_order_id": None,
+        },
+        {
+            "operation": ExecutionOperation.CANCEL_ORDER,
+            "result_code": "SUBMIT_ORDER_OK",
+            "evidence_hashes": (),
+            "venue_order_id": "order-1",
+        },
+        {
+            "operation": ExecutionOperation.HEARTBEAT,
+            "result_code": "HEARTBEAT_OK",
+            "evidence_hashes": (),
+            "heartbeat_id": "",
+        },
+        {
+            "operation": ExecutionOperation.READ_TRADES,
+            "result_code": "READ_TRADES_OK",
+            "evidence_hashes": (),
+            "venue_order_id": "order-1",
+        },
+    ),
+)
+def test_operation_results_enforce_exact_success_invariants(
+    fields: dict[str, object],
+) -> None:
+    error = _captured_protocol_error(lambda: SanitizedOperationResult(**fields))
+
+    assert str(error) == "IPC_MODEL_INVALID"
 
 
 def test_real_order_signer_returns_only_the_strict_public_envelope_result() -> None:
@@ -560,6 +686,172 @@ def test_real_order_signer_returns_only_the_strict_public_envelope_result() -> N
     service.close()
 
 
+def test_submit_payload_carries_the_source_intent_and_signed_envelope() -> None:
+    intent = _intent()
+    signed = _service().handle(_request(ExecutionOperation.SIGN_ORDER))
+    assert isinstance(signed.result, SignedEnvelopeResult)
+
+    payload = SubmitOrderPayload(
+        operation=ExecutionOperation.SUBMIT_ORDER,
+        intent=intent,
+        envelope=signed.result.envelope,
+    )
+
+    assert payload.intent == intent
+    assert payload.envelope == signed.result.envelope
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("foreign-relabelled", "signature", "fingerprint"),
+)
+def test_submit_rejects_foreign_relabelled_or_tampered_envelopes(tamper: str) -> None:
+    intent = _intent()
+    envelope = sign_order(intent, PRIVATE_KEY, load_protocol_snapshot())
+    if tamper == "foreign-relabelled":
+        foreign_intent = _intent(token_id="217427")
+        foreign = sign_order(foreign_intent, PRIVATE_KEY, load_protocol_snapshot())
+        envelope = foreign.model_copy(
+            update={
+                "intent_id": intent.intent_id,
+                "intent_fingerprint": intent.intent_fingerprint,
+            }
+        )
+    elif tamper == "signature":
+        replacement = "0" if envelope.public_signature[-1] != "0" else "1"
+        envelope = envelope.model_copy(
+            update={"public_signature": envelope.public_signature[:-1] + replacement}
+        )
+    else:
+        envelope = envelope.model_copy(update={"order_fingerprint": "f" * 64})
+    payload = SubmitOrderPayload(
+        operation=ExecutionOperation.SUBMIT_ORDER,
+        intent=intent,
+        envelope=envelope,
+    )
+    service = _service()
+
+    response = service.handle(
+        _request(
+            ExecutionOperation.SUBMIT_ORDER,
+            request_id=uuid4(),
+            payload=payload,
+        )
+    )
+
+    assert response.error_code == "ORDER_ENVELOPE_MISMATCH"
+    service.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (ExecutionOperation.SIGN_ORDER, ExecutionOperation.SUBMIT_ORDER),
+)
+def test_sign_and_submit_reject_an_expired_intent_even_with_a_fresh_outer_deadline(
+    operation: ExecutionOperation,
+) -> None:
+    service = _service(now=NOW + timedelta(seconds=6))
+    request = _request(
+        operation,
+        request_id=uuid4(),
+        deadline=NOW + timedelta(seconds=10),
+    )
+
+    response = service.handle(request)
+
+    assert response.error_code == "INTENT_DEADLINE_EXPIRED"
+    service.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (ExecutionOperation.SIGN_ORDER, ExecutionOperation.SUBMIT_ORDER),
+)
+def test_sign_and_submit_reject_an_outer_deadline_extension(
+    operation: ExecutionOperation,
+) -> None:
+    service = _service()
+    request = _request(
+        operation,
+        request_id=uuid4(),
+        deadline=NOW + timedelta(seconds=6),
+    )
+
+    response = service.handle(request)
+
+    assert response.error_code == "REQUEST_DEADLINE_EXCEEDS_INTENT"
+    service.close()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (ExecutionOperation.SIGN_ORDER, ExecutionOperation.SUBMIT_ORDER),
+)
+def test_sign_and_submit_require_authority_context_at_the_injected_now(
+    operation: ExecutionOperation,
+) -> None:
+    service = _service(context_now=NOW - timedelta(microseconds=1))
+
+    response = service.handle(_request(operation, request_id=uuid4()))
+
+    assert response.error_code == "AUTHORITY_CONTEXT_TIME_MISMATCH"
+    service.close()
+
+
+def test_submit_binds_venue_order_id_before_known_intent_cancellation() -> None:
+    cancel_calls = 0
+
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.CANCEL_ORDER,
+            result_code="CANCEL_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=payload.venue_order_id,
+        )
+
+    service = _service(handlers=_handlers(cancel_order=cancel))
+    submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+    cancelled = service.handle(_request(ExecutionOperation.CANCEL_ORDER, request_id=uuid4()))
+
+    assert submitted.ok is True
+    assert cancelled.ok is True
+    assert cancel_calls == 1
+    service.close()
+
+
+def test_unknown_or_foreign_intent_cancellation_never_dispatches() -> None:
+    cancel_calls = 0
+
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
+        nonlocal cancel_calls
+        cancel_calls += 1
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.CANCEL_ORDER,
+            result_code="CANCEL_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=payload.venue_order_id,
+        )
+
+    service = _service(handlers=_handlers(cancel_order=cancel))
+    unknown = service.handle(_request(ExecutionOperation.CANCEL_ORDER, request_id=uuid4()))
+    submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+    assert submitted.ok is True
+    foreign = service.handle(
+        _request(
+            ExecutionOperation.CANCEL_ORDER,
+            request_id=uuid4(),
+            intent_id=uuid4(),
+        )
+    )
+
+    assert unknown.error_code == "CANCEL_ORDER_UNKNOWN"
+    assert foreign.error_code == "CANCEL_ORDER_BINDING_MISMATCH"
+    assert cancel_calls == 0
+    service.close()
+
+
 def test_same_request_id_exact_retry_is_cached_but_changed_request_is_collision() -> None:
     authority_calls: list[UUID] = []
     service = _service(authority_calls=authority_calls)
@@ -567,12 +859,133 @@ def test_same_request_id_exact_retry_is_cached_but_changed_request_is_collision(
 
     first = service.handle(request)
     retry = service.handle(request)
-    changed = request.model_copy(update={"intent_fingerprint": "f" * 64})
+    changed = _request(
+        ExecutionOperation.READ_ACCOUNT,
+        request_id=request.request_id,
+    )
     collision = service.handle(changed)
 
     assert first.model_dump_json() == retry.model_dump_json()
     assert authority_calls == [request.request_id]
     assert collision.error_code == "IPC_REQUEST_COLLISION"
+    service.close()
+
+
+def test_concurrent_identical_requests_gate_and_dispatch_once() -> None:
+    entered = Event()
+    release = Event()
+    second_started = Event()
+    calls_lock = Lock()
+    handler_calls = 0
+
+    def read_account(payload: ReadAccountPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        with calls_lock:
+            handler_calls += 1
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("CONCURRENT_HANDLER_NOT_RELEASED")
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ACCOUNT,
+            result_code="READ_ACCOUNT_OK",
+            evidence_hashes=(),
+        )
+
+    service = _service(handlers=_handlers(read_account=read_account))
+    request = _request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(service.handle, request)
+        assert entered.wait(timeout=5)
+
+        def second_call() -> SignerResponse:
+            second_started.set()
+            return service.handle(request)
+
+        second_future = executor.submit(second_call)
+        assert second_started.wait(timeout=5)
+        release.set()
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert handler_calls == 1
+    service.close()
+
+
+def test_concurrent_changed_payload_collides_without_second_dispatch() -> None:
+    entered = Event()
+    release = Event()
+    second_started = Event()
+    calls_lock = Lock()
+    handler_calls = 0
+
+    def read_account(payload: ReadAccountPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        with calls_lock:
+            handler_calls += 1
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("CONCURRENT_HANDLER_NOT_RELEASED")
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ACCOUNT,
+            result_code="READ_ACCOUNT_OK",
+            evidence_hashes=(),
+        )
+
+    service = _service(handlers=_handlers(read_account=read_account))
+    first_request = _request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4())
+    changed_request = _request(
+        ExecutionOperation.READ_ACCOUNT,
+        request_id=first_request.request_id,
+        deadline=NOW + timedelta(seconds=4),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(service.handle, first_request)
+        assert entered.wait(timeout=5)
+
+        def second_call() -> SignerResponse:
+            second_started.set()
+            return service.handle(changed_request)
+
+        second_future = executor.submit(second_call)
+        assert second_started.wait(timeout=5)
+        release.set()
+        first = first_future.result(timeout=5)
+        collision = second_future.result(timeout=5)
+
+    assert first.ok is True
+    assert collision.error_code == "IPC_REQUEST_COLLISION"
+    assert handler_calls == 1
+    service.close()
+
+
+def test_handler_base_exception_releases_service_lock() -> None:
+    handler_calls = 0
+
+    def read_account(payload: ReadAccountPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        if handler_calls == 1:
+            raise SystemExit("SANITIZED_HANDLER_EXIT")
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ACCOUNT,
+            result_code="READ_ACCOUNT_OK",
+            evidence_hashes=(),
+        )
+
+    service = _service(handlers=_handlers(read_account=read_account))
+    with pytest.raises(SystemExit, match=r"^SANITIZED_HANDLER_EXIT$"):
+        service.handle(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4()))
+
+    response = service.handle(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4()))
+
+    assert response.ok is True
+    assert handler_calls == 2
     service.close()
 
 
@@ -616,6 +1029,10 @@ def test_every_uncached_mutation_uses_fresh_independent_authority(
 ) -> None:
     authority_calls: list[UUID] = []
     service = _service(authority_calls=authority_calls)
+    if operation is ExecutionOperation.CANCEL_ORDER:
+        submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+        assert submitted.ok is True
+        authority_calls.clear()
     request = _request(operation, request_id=uuid4())
 
     response = service.handle(request)
@@ -649,33 +1066,65 @@ def test_each_uncached_read_uses_only_the_fresh_account_bound_read_guard(
     service.close()
 
 
-def test_heartbeat_handler_uses_real_l2_signer_without_headers_crossing_ipc() -> None:
-    captured_signatures: list[str] = []
+@pytest.mark.parametrize(
+    "operation",
+    (
+        ExecutionOperation.SUBMIT_ORDER,
+        ExecutionOperation.CANCEL_ORDER,
+        ExecutionOperation.HEARTBEAT,
+        ExecutionOperation.READ_ORDERS,
+        ExecutionOperation.READ_TRADES,
+        ExecutionOperation.READ_ACCOUNT,
+    ),
+)
+def test_handlers_receive_only_their_exact_typed_payload(
+    operation: ExecutionOperation,
+) -> None:
+    captured_arguments: list[tuple[object, ...]] = []
 
-    def heartbeat(payload: HeartbeatPayload, authenticate: object) -> SanitizedOperationResult:
-        headers = authenticate(  # type: ignore[operator]
-            timestamp="1787673600",
-            method="POST",
-            route="/v1/heartbeats",
-            body=b'{"heartbeat_id":""}',
-        )
-        captured_signatures.append(headers.signature)
+    def handler(*arguments: object) -> SanitizedOperationResult:
+        captured_arguments.append(arguments)
         return SanitizedOperationResult(
-            operation=payload.operation,
-            result_code="HEARTBEAT_OK",
+            operation=operation,
+            result_code={
+                ExecutionOperation.SUBMIT_ORDER: "SUBMIT_ORDER_OK",
+                ExecutionOperation.CANCEL_ORDER: "CANCEL_ORDER_OK",
+                ExecutionOperation.HEARTBEAT: "HEARTBEAT_OK",
+                ExecutionOperation.READ_ORDERS: "READ_ORDERS_OK",
+                ExecutionOperation.READ_TRADES: "READ_TRADES_OK",
+                ExecutionOperation.READ_ACCOUNT: "READ_ACCOUNT_OK",
+            }[operation],
             evidence_hashes=(),
-            heartbeat_id="heartbeat-1",
+            venue_order_id="order-1"
+            if operation
+            in {
+                ExecutionOperation.SUBMIT_ORDER,
+                ExecutionOperation.CANCEL_ORDER,
+                ExecutionOperation.READ_ORDERS,
+            }
+            else None,
+            heartbeat_id="heartbeat-1" if operation is ExecutionOperation.HEARTBEAT else None,
         )
 
-    service = _service(handlers=_handlers(heartbeat=heartbeat))
+    handler_name = {
+        ExecutionOperation.SUBMIT_ORDER: "submit_order",
+        ExecutionOperation.CANCEL_ORDER: "cancel_order",
+        ExecutionOperation.HEARTBEAT: "heartbeat",
+        ExecutionOperation.READ_ORDERS: "read_orders",
+        ExecutionOperation.READ_TRADES: "read_trades",
+        ExecutionOperation.READ_ACCOUNT: "read_account",
+    }[operation]
+    service = _service(handlers=_handlers(**{handler_name: handler}))
+    if operation is ExecutionOperation.CANCEL_ORDER:
+        submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+        assert submitted.ok is True
 
-    response = service.handle(_request(ExecutionOperation.HEARTBEAT))
+    response = service.handle(_request(operation, request_id=uuid4()))
 
     assert response.ok is True
-    assert captured_signatures and captured_signatures != [L2_SIGNATURE]
-    rendered = response.model_dump_json()
-    for canary in (API_KEY, API_SECRET, PASSPHRASE):
-        assert canary.decode() not in rendered
+    assert len(captured_arguments) == 1
+    assert captured_arguments[0] == (captured_arguments[0][0],)
+    assert captured_arguments[0][0].operation is operation  # type: ignore[attr-defined]
     service.close()
 
 
@@ -704,9 +1153,9 @@ def test_unvalidated_model_copy_cannot_route_a_mutation_through_the_read_guard()
     read_calls: list[UUID] = []
     handler_calls = 0
 
-    def cancel(payload: CancelOrderPayload, authenticate: object) -> SanitizedOperationResult:
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
         nonlocal handler_calls
-        del payload, authenticate
+        del payload
         handler_calls += 1
         raise AssertionError("FORGED_REQUEST_DISPATCHED")
 
@@ -718,7 +1167,8 @@ def test_unvalidated_model_copy_cannot_route_a_mutation_through_the_read_guard()
     forged = _request(
         ExecutionOperation.CANCEL_ORDER,
         request_id=uuid4(),
-    ).model_copy(update={"operation": ExecutionOperation.READ_ACCOUNT})
+    )
+    object.__setattr__(forged, "operation", ExecutionOperation.READ_ACCOUNT)
 
     response = service.handle(forged)
 
@@ -748,21 +1198,153 @@ def test_malformed_or_resource_hostile_json_has_one_sanitized_response(raw: byte
     service.close()
 
 
+def _legal_size_huge_json_integer() -> bytes:
+    return b'{"schema_version":' + b"9" * 5_000 + b',"operation":"READ_ACCOUNT"}'
+
+
+def test_parser_translates_huge_json_integer_conversion_failure() -> None:
+    error = _captured_protocol_error(lambda: parse_signer_request(_legal_size_huge_json_integer()))
+
+    assert str(error) == "IPC_REQUEST_INVALID"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_handle_raw_translates_huge_json_integer_conversion_failure() -> None:
+    service = _service()
+
+    response = service.handle_raw(_legal_size_huge_json_integer())
+
+    assert response == SignerResponse.rejected(None, "IPC_REQUEST_INVALID")
+    service.close()
+
+
+def test_spawned_sidecar_translates_huge_json_integer_and_zeroizes() -> None:
+    process, request_write, response_read, audit_read = _spawn_signer()
+    write_frame(_FdStream(request_write), _legal_size_huge_json_integer())  # type: ignore[arg-type]
+
+    response_raw = read_frame(_FdStream(response_read))  # type: ignore[arg-type]
+    response = SignerResponse.model_validate_json(response_raw, strict=True)
+    exitcode, audit = _join_spawned(process, request_write, response_read, audit_read)
+
+    assert response == SignerResponse.rejected(None, "IPC_REQUEST_INVALID")
+    assert exitcode == 0
+    assert audit == b"1"
+
+
 def test_handler_and_authority_canaries_never_cross_response_or_log_boundary(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     canary = "signer-internal-canary"
 
-    def fail(payload: SubmitOrderPayload, authenticate: object) -> SanitizedOperationResult:
-        del payload, authenticate
+    def fail(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
         raise ValueError(canary)
 
     service = _service(handlers=_handlers(submit_order=fail))
     response = service.handle(_request(ExecutionOperation.SUBMIT_ORDER))
 
-    assert response.error_code == "IPC_OPERATION_FAILED"
+    assert response.error_code == "HANDLER_FAILED"
     assert canary not in response.model_dump_json()
     assert canary not in caplog.text
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("error", "error_code"),
+    (
+        (OrderSigningError("ORDER_ERROR_CANARY"), "ORDER_SIGNING_FAILED"),
+        (ClobAuthError("AUTH_ERROR_CANARY"), "AUTH_HANDLER_FAILED"),
+        (RuntimeError("HANDLER_ERROR_CANARY"), "HANDLER_FAILED"),
+    ),
+)
+def test_handler_exception_classes_map_to_constant_codes_without_reflection(
+    error: Exception,
+    error_code: str,
+) -> None:
+    def fail(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
+        raise error
+
+    service = _service(handlers=_handlers(submit_order=fail))
+
+    response = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+
+    assert response.error_code == error_code
+    _assert_canaries_absent(
+        response.model_dump_json(),
+        "ORDER_ERROR_CANARY",
+        "AUTH_ERROR_CANARY",
+        "HANDLER_ERROR_CANARY",
+    )
+    service.close()
+
+
+@pytest.mark.parametrize("secret_name", ("private_key", "api_key", "api_secret", "passphrase"))
+def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
+    secret_name: str,
+) -> None:
+    configured = {
+        "private_key": b"1" * 32,
+        "api_key": API_KEY,
+        "api_secret": API_SECRET,
+        "passphrase": PASSPHRASE,
+    }
+    private_key = configured["private_key"] if secret_name == "private_key" else PRIVATE_KEY
+    maker = Account.from_key(private_key).address
+    account_fingerprint = sha256(bytes.fromhex(maker[2:])).hexdigest()
+    intent = _intent(account_fingerprint=account_fingerprint)
+    envelope = sign_order(intent, private_key, load_protocol_snapshot())
+    canary = configured[secret_name]
+
+    def leak(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code="SUBMIT_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=canary.decode(),
+        )
+
+    secret_overrides = {
+        secret_name: configured[secret_name],
+        "private_key": private_key,
+    }
+    service = _service(
+        handlers=_handlers(submit_order=leak),
+        **secret_overrides,  # type: ignore[arg-type]
+    )
+    submitted = service.handle(
+        _request(
+            ExecutionOperation.SUBMIT_ORDER,
+            request_id=uuid4(),
+            intent_id=intent.intent_id,
+            intent_fingerprint=intent.intent_fingerprint,
+            account_fingerprint=account_fingerprint,
+            payload=SubmitOrderPayload(
+                operation=ExecutionOperation.SUBMIT_ORDER,
+                intent=intent,
+                envelope=envelope,
+            ),
+        )
+    )
+    cancelled = service.handle(
+        _request(
+            ExecutionOperation.CANCEL_ORDER,
+            request_id=uuid4(),
+            intent_id=intent.intent_id,
+            intent_fingerprint=intent.intent_fingerprint,
+            account_fingerprint=account_fingerprint,
+            payload=CancelOrderPayload(
+                operation=ExecutionOperation.CANCEL_ORDER,
+                venue_order_id=canary.decode(),
+            ),
+        )
+    )
+
+    assert submitted.error_code == "SECRET_OUTPUT_DETECTED"
+    _assert_canaries_absent(submitted.model_dump_json(), canary)
+    assert cancelled.error_code == "CANCEL_ORDER_UNKNOWN"
     service.close()
 
 
@@ -776,9 +1358,9 @@ def test_authority_factory_failure_is_sanitized_without_dispatch(
         del request, observed_at
         raise ValueError(canary)
 
-    def cancel(payload: CancelOrderPayload, authenticate: object) -> SanitizedOperationResult:
+    def cancel(payload: CancelOrderPayload) -> SanitizedOperationResult:
         nonlocal handler_calls
-        del payload, authenticate
+        del payload
         handler_calls += 1
         raise AssertionError("HANDLER_MUST_NOT_RUN")
 
@@ -797,7 +1379,7 @@ def test_authority_factory_failure_is_sanitized_without_dispatch(
 
     response = service.handle(_request(ExecutionOperation.CANCEL_ORDER))
 
-    assert response.error_code == "CAPABILITY_MISSING"
+    assert response.error_code == "AUTHORITY_GATE_FAILED"
     assert handler_calls == 0
     assert canary not in response.model_dump_json()
     assert canary not in caplog.text
@@ -820,7 +1402,42 @@ def test_malformed_authority_context_is_sanitized_without_dispatch() -> None:
 
     response = service.handle(_request())
 
-    assert response.error_code == "CAPABILITY_MISSING"
+    assert response.error_code == "AUTHORITY_GATE_FAILED"
+    service.close()
+
+
+def test_read_guard_failure_uses_a_constant_code_without_dispatch() -> None:
+    canary = "read-guard-canary"
+    handler_calls = 0
+
+    def fail_read_guard(request: SignerRequest, observed_at: datetime) -> AuthorityDecision:
+        del request, observed_at
+        raise ValueError(canary)
+
+    def read_account(payload: ReadAccountPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        raise AssertionError("READ_HANDLER_MUST_NOT_RUN")
+
+    service = SignerService(
+        secrets=SecretMaterial(
+            bytearray(PRIVATE_KEY),
+            bytearray(API_KEY),
+            bytearray(API_SECRET),
+            bytearray(PASSPHRASE),
+        ),
+        authority_context_factory=lambda request, observed_at: authority_context(),
+        read_guard=fail_read_guard,
+        handlers=_handlers(read_account=read_account),
+        clock=lambda: NOW,
+    )
+
+    response = service.handle(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4()))
+
+    assert response.error_code == "READ_GUARD_FAILED"
+    assert handler_calls == 0
+    _assert_canaries_absent(response.model_dump_json(), canary)
     service.close()
 
 
@@ -945,9 +1562,9 @@ def test_spawned_sidecar_deadline_is_deterministic_and_context_free() -> None:
 
 def test_spawned_sidecar_zeroizes_after_handler_crash() -> None:
     process, request_write, response_read, audit_read = _spawn_signer(
-        crash_operation=ExecutionOperation.CANCEL_ORDER
+        crash_operation=ExecutionOperation.READ_ACCOUNT
     )
-    request = _request(ExecutionOperation.CANCEL_ORDER)
+    request = _request(ExecutionOperation.READ_ACCOUNT)
     write_frame(_FdStream(request_write), canonical_request_bytes(request))  # type: ignore[arg-type]
     os.close(request_write)
     process.join(timeout=5)

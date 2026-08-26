@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, BinaryIO, Final, Literal, Self
+from typing import Annotated, BinaryIO, Final, Literal, Self, get_args
 from uuid import UUID
 
 from pydantic import (
@@ -19,6 +19,7 @@ from pydantic import (
 from pydantic.config import ExtraValues
 
 from polytrading.predictions.domain import PredictionRecord, Sha256, normalize_utc_timestamp
+from polytrading.predictions.execution.authority import AuthorityReason
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     ExecutionOperation,
@@ -29,7 +30,6 @@ from polytrading.predictions.polymarket_execution.protocol import POLYMARKET_PRO
 MAX_FRAME_BYTES: Final = 1_048_576
 _FRAME_HEADER_BYTES: Final = 4
 _MAX_JSON_DEPTH: Final = 32
-_StableCode = Annotated[str, StringConstraints(pattern=r"^[A-Z][A-Z0-9_]{0,63}$")]
 _PublicIdentifier = Annotated[
     str,
     StringConstraints(min_length=1, max_length=256, pattern=r"^[\x20-\x7e]+$"),
@@ -38,9 +38,84 @@ _HeartbeatIdentifier = Annotated[
     str,
     StringConstraints(max_length=256, pattern=r"^[\x20-\x7e]*$"),
 ]
+SignerResultCode = Literal[
+    "SUBMIT_ORDER_OK",
+    "CANCEL_ORDER_OK",
+    "HEARTBEAT_OK",
+    "READ_ORDERS_OK",
+    "READ_TRADES_OK",
+    "READ_ACCOUNT_OK",
+]
+SignerErrorCode = Literal[
+    "IPC_MODEL_INVALID",
+    "IPC_FRAME_BYTES_REQUIRED",
+    "IPC_FRAME_FLUSH_FAILED",
+    "IPC_FRAME_READ_FAILED",
+    "IPC_FRAME_SIZE_INVALID",
+    "IPC_FRAME_TRUNCATED",
+    "IPC_FRAME_WRITE_FAILED",
+    "IPC_REQUEST_INVALID",
+    "IPC_OPERATION_NOT_ALLOWED",
+    "IPC_SCHEMA_UNSUPPORTED",
+    "IPC_REQUEST_COLLISION",
+    "IPC_REPLAY_CACHE_FULL",
+    "IPC_SIGNER_CLOSED",
+    "IPC_CLOCK_INVALID",
+    "IPC_DEADLINE_EXPIRED",
+    "INTENT_DEADLINE_EXPIRED",
+    "REQUEST_DEADLINE_EXCEEDS_INTENT",
+    "PROTOCOL_VERSION_MISMATCH",
+    "ACCOUNT_FINGERPRINT_MISMATCH",
+    "AUTHORITY_CONTEXT_TIME_MISMATCH",
+    "AUTHORITY_GATE_FAILED",
+    "READ_GUARD_FAILED",
+    "ORDER_ENVELOPE_MISMATCH",
+    "CANCEL_ORDER_UNKNOWN",
+    "CANCEL_ORDER_BINDING_MISMATCH",
+    "VENUE_ORDER_BINDING_COLLISION",
+    "IPC_OPERATION_RESULT_INVALID",
+    "ORDER_SIGNING_FAILED",
+    "AUTH_HANDLER_FAILED",
+    "HANDLER_FAILED",
+    "SECRET_OUTPUT_DETECTED",
+    "IPC_SERVICE_INITIALIZATION_FAILED",
+    "SECRET_DESCRIPTOR_INVALID",
+    "SECRET_DESCRIPTOR_READ_FAILED",
+    "SECRET_DESCRIPTOR_SIZE_INVALID",
+    "SECRET_DESCRIPTOR_TRAILING_BYTES",
+    "SECRET_DESCRIPTOR_TRUNCATED",
+    "SECRET_PRIVATE_KEY_SIZE_INVALID",
+]
+_SIGNER_ERROR_CODES = frozenset(get_args(SignerErrorCode))
 
 
-class _SignerRecord(PredictionRecord):
+class SignerProtocolError(ValueError):
+    """A context-free signer protocol rejection identified by a closed stable code."""
+
+    def __init__(self, error_code: object) -> None:
+        closed_code = (
+            error_code
+            if type(error_code) is str and error_code in _SIGNER_ERROR_CODES
+            else "IPC_REQUEST_INVALID"
+        )
+        super().__init__(closed_code)
+
+
+class _SafeModelMetaclass(type(PredictionRecord)):
+    def __call__(cls, *args: object, **kwargs: object) -> object:
+        invalid = False
+        result: object | None = None
+        try:
+            result = super().__call__(*args, **kwargs)
+        except (ValidationError, ValueError, TypeError, OverflowError):
+            invalid = True
+        if invalid:
+            raise SignerProtocolError("IPC_MODEL_INVALID") from None
+        assert result is not None
+        return result
+
+
+class _SignerRecord(PredictionRecord, metaclass=_SafeModelMetaclass):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
@@ -60,27 +135,80 @@ class _SignerRecord(PredictionRecord):
         by_alias: bool | None = None,
         by_name: bool | None = None,
     ) -> Self:
-        """Redact forbidden direct-call inputs before Pydantic captures them."""
-        sanitized = cls._redact_forbidden_input(obj)
-        return super().model_validate(
-            sanitized,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
+        """Translate every direct Python validation failure to one constant error."""
+        invalid = False
+        result: Self | None = None
+        try:
+            result = super().model_validate(
+                obj,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except (ValidationError, ValueError, TypeError, OverflowError):
+            invalid = True
+        if invalid:
+            raise SignerProtocolError("IPC_MODEL_INVALID") from None
+        assert result is not None
+        return result
 
     @classmethod
-    def _redact_forbidden_input(cls, value: object) -> object:
-        if not isinstance(value, Mapping):
-            return value
-        if all(key in cls.model_fields for key in value):
-            return value
-        return {
-            key: item if key in cls.model_fields else "<redacted>" for key, item in value.items()
-        }
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        context: object | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Keep strict JSON semantics while sealing Pydantic's input-bearing errors."""
+        invalid = False
+        result: Self | None = None
+        try:
+            result = super().model_validate_json(
+                json_data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            )
+        except (ValidationError, ValueError, TypeError, OverflowError):
+            invalid = True
+        if invalid:
+            raise SignerProtocolError("IPC_MODEL_INVALID") from None
+        assert result is not None
+        return result
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: object) -> Self:
+        del _fields_set, values
+        raise SignerProtocolError("IPC_MODEL_INVALID") from None
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is None:
+            return super().model_copy(deep=deep)
+        values = self.model_dump(mode="python")
+        values.update(update)
+        return type(self).model_validate(values)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(<redacted>)"
+
+    __str__ = __repr__
+
+    def __repr_args__(self) -> list[tuple[str | None, object]]:
+        return []
 
 
 class SignOrderPayload(_SignerRecord):
@@ -90,6 +218,7 @@ class SignOrderPayload(_SignerRecord):
 
 class SubmitOrderPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.SUBMIT_ORDER]
+    intent: ExecutionIntent
     envelope: SignedOrderEnvelope
 
 
@@ -161,9 +290,15 @@ class SignerRequest(_SignerRecord):
             ):
                 raise ValueError("request does not match signed intent")
         if isinstance(self.payload, SubmitOrderPayload):
+            intent = self.payload.intent
             envelope = self.payload.envelope
             if (
-                envelope.intent_id != self.intent_id
+                intent.intent_id != self.intent_id
+                or intent.intent_fingerprint != self.intent_fingerprint
+                or intent.capability_fingerprint != self.capability_digest
+                or intent.account_fingerprint != self.account_fingerprint
+                or intent.protocol_version != self.protocol_version
+                or envelope.intent_id != self.intent_id
                 or envelope.intent_fingerprint != self.intent_fingerprint
                 or envelope.protocol_version != self.protocol_version
             ):
@@ -185,7 +320,7 @@ class SanitizedOperationResult(_SignerRecord):
         ExecutionOperation.READ_TRADES,
         ExecutionOperation.READ_ACCOUNT,
     ]
-    result_code: _StableCode
+    result_code: SignerResultCode
     evidence_hashes: tuple[Sha256, ...]
     venue_order_id: _PublicIdentifier | None = None
     heartbeat_id: _HeartbeatIdentifier | None = None
@@ -199,17 +334,27 @@ class SanitizedOperationResult(_SignerRecord):
 
     @model_validator(mode="after")
     def _operation_valid_identifiers(self) -> SanitizedOperationResult:
-        venue_id_operations = {
-            ExecutionOperation.SUBMIT_ORDER,
-            ExecutionOperation.CANCEL_ORDER,
-            ExecutionOperation.READ_ORDERS,
+        expected_codes: dict[ExecutionOperation, SignerResultCode] = {
+            ExecutionOperation.SUBMIT_ORDER: "SUBMIT_ORDER_OK",
+            ExecutionOperation.CANCEL_ORDER: "CANCEL_ORDER_OK",
+            ExecutionOperation.HEARTBEAT: "HEARTBEAT_OK",
+            ExecutionOperation.READ_ORDERS: "READ_ORDERS_OK",
+            ExecutionOperation.READ_TRADES: "READ_TRADES_OK",
+            ExecutionOperation.READ_ACCOUNT: "READ_ACCOUNT_OK",
         }
-        if self.operation not in venue_id_operations and self.venue_order_id is not None:
-            raise ValueError("venue_order_id is not valid for operation")
-        if self.operation is not ExecutionOperation.HEARTBEAT and self.heartbeat_id is not None:
-            raise ValueError("heartbeat_id is not valid for operation")
-        if self.operation is ExecutionOperation.CANCEL_ORDER and self.venue_order_id is None:
-            raise ValueError("cancel result requires venue_order_id")
+        if self.result_code != expected_codes[self.operation]:
+            raise ValueError("result code does not match operation")
+        if self.operation in {ExecutionOperation.SUBMIT_ORDER, ExecutionOperation.CANCEL_ORDER}:
+            if self.venue_order_id is None or self.heartbeat_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+        elif self.operation is ExecutionOperation.HEARTBEAT:
+            if not self.heartbeat_id or self.venue_order_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+        elif self.operation is ExecutionOperation.READ_ORDERS:
+            if self.heartbeat_id is not None:
+                raise ValueError("operation result identifiers are invalid")
+        elif self.venue_order_id is not None or self.heartbeat_id is not None:
+            raise ValueError("operation result identifiers are invalid")
         return self
 
 
@@ -224,7 +369,7 @@ class SignerResponse(_SignerRecord):
     request_id: UUID | None
     ok: bool
     result: SignerResult | None
-    error_code: _StableCode | None
+    error_code: SignerErrorCode | AuthorityReason | None
 
     @model_validator(mode="after")
     def _result_matches_status(self) -> SignerResponse:
@@ -246,7 +391,11 @@ class SignerResponse(_SignerRecord):
         )
 
     @classmethod
-    def rejected(cls, request_id: UUID | None, error_code: str) -> SignerResponse:
+    def rejected(
+        cls,
+        request_id: UUID | None,
+        error_code: SignerErrorCode | AuthorityReason,
+    ) -> SignerResponse:
         return cls(
             schema_version=1,
             request_id=request_id,
@@ -254,10 +403,6 @@ class SignerResponse(_SignerRecord):
             result=None,
             error_code=error_code,
         )
-
-
-class SignerProtocolError(ValueError):
-    """A context-free signer protocol rejection identified by a stable code."""
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -392,7 +537,9 @@ def parse_signer_request(payload: bytes) -> SignerRequest:
             object_pairs_hook=_unique_object,
             parse_constant=_reject_nonfinite,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except SignerProtocolError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, OverflowError):
         invalid_json = True
         decoded = None
     if invalid_json:
@@ -409,7 +556,7 @@ def parse_signer_request(payload: bytes) -> SignerRequest:
     invalid_request = False
     try:
         return SignerRequest.model_validate_json(payload, strict=True)
-    except ValidationError:
+    except SignerProtocolError:
         invalid_request = True
     if invalid_request:
         raise SignerProtocolError("IPC_REQUEST_INVALID") from None
@@ -426,9 +573,11 @@ __all__ = [
     "SanitizedOperationResult",
     "SignOrderPayload",
     "SignedEnvelopeResult",
+    "SignerErrorCode",
     "SignerProtocolError",
     "SignerRequest",
     "SignerResponse",
+    "SignerResultCode",
     "SubmitOrderPayload",
     "canonical_request_bytes",
     "canonical_response_bytes",
