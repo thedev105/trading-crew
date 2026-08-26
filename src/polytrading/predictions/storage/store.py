@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -26,6 +26,19 @@ from polytrading.predictions.domain import (
     TradeRecord,
 )
 from polytrading.predictions.economics_models import ScanReport
+from polytrading.predictions.execution.models import (
+    ActivationEvidence,
+    ExecutionIntent,
+    KillSwitchEvent,
+    LiveExecutionPlan,
+    LiveLedgerPosting,
+    LiveReconciliation,
+    ProtocolConformanceResult,
+    SignedOrderEnvelope,
+    VenueOrderEvent,
+    VenueTradeEvent,
+    canonical_execution_hash,
+)
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.proofs_models import ProofArtifact
@@ -186,6 +199,134 @@ class PredictionMarketStore:
             ],
         )
         return True
+
+    def append_execution_intent(self, record: ExecutionIntent) -> bool:
+        return self._append_hashed_record(
+            table="execution_intents",
+            identity_column="intent_id",
+            identity=record.intent_id,
+            columns=("intent_id", "plan_id", "account_fingerprint", "created_at", "deadline"),
+            values=(
+                record.intent_id,
+                record.plan_id,
+                record.account_fingerprint,
+                record.created_at,
+                record.deadline,
+            ),
+            record=record,
+        )
+
+    def append_live_execution_plan(self, record: LiveExecutionPlan) -> bool:
+        return self._append_hashed_record(
+            table="live_execution_plans",
+            identity_column="plan_id",
+            identity=record.plan_id,
+            columns=(
+                "plan_id",
+                "proposal_id",
+                "account_fingerprint",
+                "observed_at",
+                "information_cutoff",
+            ),
+            values=(
+                record.plan_id,
+                record.proposal_id,
+                record.account_fingerprint,
+                record.observed_at,
+                record.information_cutoff,
+            ),
+            record=record,
+        )
+
+    def append_signed_order_envelope(self, record: SignedOrderEnvelope) -> bool:
+        return self._append_hashed_record(
+            table="signed_order_envelopes",
+            identity_column="intent_id",
+            identity=record.intent_id,
+            columns=("intent_id",),
+            values=(record.intent_id,),
+            record=record,
+        )
+
+    def append_venue_order_event(self, record: VenueOrderEvent) -> bool:
+        return self._append_hashed_record(
+            table="venue_order_events",
+            identity_column="event_id",
+            identity=record.event_id,
+            columns=("event_id", "intent_id", "received_at"),
+            values=(record.event_id, record.intent_id, record.received_at),
+            record=record,
+        )
+
+    def append_venue_trade_event(self, record: VenueTradeEvent) -> bool:
+        return self._append_hashed_record(
+            table="venue_trade_events",
+            identity_column="trade_event_id",
+            identity=record.trade_event_id,
+            columns=("trade_event_id", "intent_id", "received_at"),
+            values=(record.trade_event_id, record.intent_id, record.received_at),
+            record=record,
+        )
+
+    def append_live_ledger_posting(self, record: LiveLedgerPosting) -> bool:
+        return self._append_hashed_record(
+            table="live_ledger_postings",
+            identity_column="posting_id",
+            identity=record.posting_id,
+            columns=("posting_id", "account_fingerprint", "intent_id", "occurred_at"),
+            values=(
+                record.posting_id,
+                record.account_fingerprint,
+                record.intent_id,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def append_live_reconciliation(self, record: LiveReconciliation) -> bool:
+        return self._append_hashed_record(
+            table="live_reconciliations",
+            identity_column="reconciliation_id",
+            identity=record.reconciliation_id,
+            columns=("reconciliation_id", "account_fingerprint", "observed_at"),
+            values=(record.reconciliation_id, record.account_fingerprint, record.observed_at),
+            record=record,
+        )
+
+    def append_kill_switch_event(self, record: KillSwitchEvent) -> bool:
+        return self._append_hashed_record(
+            table="execution_kill_events",
+            identity_column="kill_event_id",
+            identity=record.kill_event_id,
+            columns=("kill_event_id", "scope", "occurred_at"),
+            values=(record.kill_event_id, record.scope, record.occurred_at),
+            record=record,
+        )
+
+    def append_activation_evidence(self, record: ActivationEvidence) -> bool:
+        return self._append_hashed_record(
+            table="activation_evidence",
+            identity_column="activation_evidence_id",
+            identity=record.activation_evidence_id,
+            columns=("activation_evidence_id", "capability_digest", "verified_at", "expires_at"),
+            values=(
+                record.activation_evidence_id,
+                record.capability_digest,
+                record.verified_at,
+                record.expires_at,
+            ),
+            record=record,
+        )
+
+    def append_protocol_conformance_result(self, record: ProtocolConformanceResult) -> bool:
+        return self._append_hashed_record(
+            table="protocol_conformance_results",
+            identity_column="conformance_result_id",
+            identity=record.conformance_result_id,
+            columns=("conformance_result_id", "observed_at"),
+            values=(record.conformance_result_id, record.observed_at),
+            record=record,
+        )
 
     def append_venue_manifest(self, record: VenueManifest) -> bool:
         return self._append_keyed(
@@ -509,6 +650,212 @@ class PredictionMarketStore:
             [*insert_params, _canonical_json(record), _record_hash(record)],
         )
         return True
+
+    def _append_hashed_record(
+        self,
+        *,
+        table: str,
+        identity_column: str,
+        identity: UUID,
+        columns: tuple[str, ...],
+        values: tuple[Any, ...],
+        record: BaseModel,
+    ) -> bool:
+        existing = self._connection.execute(
+            f"SELECT record_hash FROM {table} WHERE {identity_column} = ?", [identity]
+        ).fetchone()
+        record_hash = canonical_execution_hash(record)
+        if existing is not None:
+            if record_hash != existing[0]:
+                raise ConflictingRecordError(
+                    f"conflicting {table} record for immutable identity {identity}"
+                )
+            return False
+        insert_columns = ", ".join((*columns, "record_json", "record_hash"))
+        placeholders = ", ".join("?" for _ in range(len(columns) + 2))
+        self._connection.execute(
+            f"INSERT INTO {table} ({insert_columns}) VALUES ({placeholders})",
+            [*values, _canonical_json(record), record_hash],
+        )
+        return True
+
+    def _verified_records[RecordT: BaseModel](
+        self,
+        *,
+        table: str,
+        model: type[RecordT],
+        where: str = "TRUE",
+        parameters: tuple[Any, ...] = (),
+        matches: Callable[[RecordT], bool],
+        sort_key: Callable[[RecordT], Any],
+        reverse: bool = False,
+    ) -> tuple[RecordT, ...]:
+        # The optional SQL predicate is reserved for storage-only metadata. Model-derived
+        # identities and cutoffs are applied below after strict re-parsing, so a corrupted
+        # index cannot reveal a record outside its own immutable semantics.
+        rows = self._connection.execute(
+            f"SELECT record_json, record_hash FROM {table} WHERE {where}",
+            parameters,
+        ).fetchall()
+        records: list[RecordT] = []
+        for row in rows:
+            try:
+                record = model.model_validate_json(row[0])
+            except (TypeError, ValueError) as error:
+                raise ConflictingRecordError(f"stored {table} record is invalid") from error
+            if canonical_execution_hash(record) != row[1]:
+                raise ConflictingRecordError(f"stored {table} failed its immutable record hash")
+            if matches(record):
+                records.append(record)
+        return tuple(sorted(records, key=sort_key, reverse=reverse))
+
+    def verified_live_execution_plan(
+        self, plan_id: UUID, as_of: datetime | None = None
+    ) -> LiveExecutionPlan | None:
+        records = self._verified_records(
+            table="live_execution_plans",
+            model=LiveExecutionPlan,
+            matches=lambda record: record.plan_id == plan_id
+            and (
+                as_of is None
+                or (record.observed_at <= as_of and record.information_cutoff <= as_of)
+            ),
+            sort_key=lambda record: (record.observed_at, record.plan_id),
+        )
+        return records[0] if records else None
+
+    def verified_execution_intent(
+        self, intent_id: UUID, as_of: datetime | None = None
+    ) -> ExecutionIntent | None:
+        records = self._verified_records(
+            table="execution_intents",
+            model=ExecutionIntent,
+            matches=lambda record: record.intent_id == intent_id
+            and (
+                as_of is None
+                or (record.created_at <= as_of and record.deadline >= as_of)
+            ),
+            sort_key=lambda record: (record.created_at, record.intent_id),
+        )
+        return records[0] if records else None
+
+    def verified_execution_intents_for_plan(
+        self, plan_id: UUID, as_of: datetime
+    ) -> tuple[ExecutionIntent, ...]:
+        return self._verified_records(
+            table="execution_intents",
+            model=ExecutionIntent,
+            matches=lambda record: record.plan_id == plan_id
+            and record.created_at <= as_of
+            and record.deadline >= as_of,
+            sort_key=lambda record: (record.created_at, record.intent_id),
+        )
+
+    def verified_signed_order_envelope(
+        self, intent_id: UUID, as_of: datetime | None = None
+    ) -> SignedOrderEnvelope | None:
+        where = "intent_id = ?"
+        parameters: tuple[Any, ...] = (intent_id,)
+        if as_of is not None:
+            where += " AND persisted_at <= ?"
+            parameters += (as_of,)
+        records = self._verified_records(
+            table="signed_order_envelopes",
+            model=SignedOrderEnvelope,
+            where=where,
+            parameters=parameters,
+            matches=lambda record: record.intent_id == intent_id,
+            sort_key=lambda record: record.intent_id,
+        )
+        return records[0] if records else None
+
+    def verified_venue_order_events_for_intent(
+        self, intent_id: UUID, as_of: datetime
+    ) -> tuple[VenueOrderEvent, ...]:
+        return self._verified_records(
+            table="venue_order_events",
+            model=VenueOrderEvent,
+            matches=lambda record: record.intent_id == intent_id and record.received_at <= as_of,
+            sort_key=lambda record: (record.received_at, record.event_id),
+        )
+
+    def latest_order_state(
+        self, intent_id: UUID, as_of: datetime | None = None
+    ) -> VenueOrderEvent | None:
+        records = self._verified_records(
+            table="venue_order_events",
+            model=VenueOrderEvent,
+            matches=lambda record: record.intent_id == intent_id
+            and (as_of is None or record.received_at <= as_of),
+            sort_key=lambda record: (record.received_at, record.event_id),
+            reverse=True,
+        )
+        return records[0] if records else None
+
+    def verified_venue_trade_events_for_intent(
+        self, intent_id: UUID, as_of: datetime
+    ) -> tuple[VenueTradeEvent, ...]:
+        return self._verified_records(
+            table="venue_trade_events",
+            model=VenueTradeEvent,
+            matches=lambda record: record.intent_id == intent_id and record.received_at <= as_of,
+            sort_key=lambda record: (record.received_at, record.trade_event_id),
+        )
+
+    def verified_live_ledger_postings_for_account(
+        self, account_fingerprint: str, as_of: datetime
+    ) -> tuple[LiveLedgerPosting, ...]:
+        return self._verified_records(
+            table="live_ledger_postings",
+            model=LiveLedgerPosting,
+            matches=lambda record: record.account_fingerprint == account_fingerprint
+            and record.occurred_at <= as_of,
+            sort_key=lambda record: (record.occurred_at, record.posting_id),
+        )
+
+    def verified_live_reconciliations_for_account(
+        self, account_fingerprint: str, as_of: datetime
+    ) -> tuple[LiveReconciliation, ...]:
+        return self._verified_records(
+            table="live_reconciliations",
+            model=LiveReconciliation,
+            matches=lambda record: record.account_fingerprint == account_fingerprint
+            and record.observed_at <= as_of,
+            sort_key=lambda record: (record.observed_at, record.reconciliation_id),
+        )
+
+    def verified_kill_switch_events(
+        self, scope: str, as_of: datetime
+    ) -> tuple[KillSwitchEvent, ...]:
+        return self._verified_records(
+            table="execution_kill_events",
+            model=KillSwitchEvent,
+            matches=lambda record: record.scope == scope and record.occurred_at <= as_of,
+            sort_key=lambda record: (record.occurred_at, record.kill_event_id),
+        )
+
+    def verified_activation_evidence(
+        self, capability_digest: str, as_of: datetime
+    ) -> ActivationEvidence | None:
+        records = self._verified_records(
+            table="activation_evidence",
+            model=ActivationEvidence,
+            matches=lambda record: record.capability_digest == capability_digest
+            and record.verified_at <= as_of,
+            sort_key=lambda record: (record.verified_at, record.activation_evidence_id),
+            reverse=True,
+        )
+        return records[0] if records else None
+
+    def verified_protocol_conformance_results(
+        self, as_of: datetime
+    ) -> tuple[ProtocolConformanceResult, ...]:
+        return self._verified_records(
+            table="protocol_conformance_results",
+            model=ProtocolConformanceResult,
+            matches=lambda record: record.observed_at <= as_of,
+            sort_key=lambda record: (record.observed_at, record.conformance_result_id),
+        )
 
     # -- cutoff-safe reads ----------------------------------------------
 
