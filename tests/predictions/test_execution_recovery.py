@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -15,6 +15,7 @@ from polytrading.predictions.execution.coordinator import (
 )
 from polytrading.predictions.execution.kill_switch import KillState
 from polytrading.predictions.execution.models import (
+    ExecutionIntent,
     LiveExecutionPlan,
     LiveLedgerPosting,
     LiveReconciliation,
@@ -1728,6 +1729,270 @@ def test_startup_blocks_unreconciled_or_out_of_cutoff_live_ledger_posting(
     assert report.blocked_intent_ids == ()
     assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
     assert restart.new_intents_blocked
+
+
+def _seed_reconciliation_history(
+    store: PredictionMarketStore,
+    *,
+    posting_time: datetime = NOW + timedelta(milliseconds=150),
+    related_order_id: str = "venue-order-1",
+    trade_time: datetime = NOW + timedelta(milliseconds=100),
+) -> tuple[LiveExecutionPlan, ExecutionIntent, LiveLedgerPosting]:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    ).submit_intent(intent)
+    for trade_id, raw_hash, received_at in (
+        ("trade-1", HASHES[11], trade_time),
+        ("settlement-evidence", HASHES[12], trade_time),
+    ):
+        store.append_venue_trade_event(
+            VenueTradeEvent(
+                schema_version=1,
+                trade_event_id=uuid4(),
+                venue="polymarket",
+                raw_event_hash=raw_hash,
+                source_channel="recovery_read",
+                venue_trade_id=trade_id,
+                venue_order_id=related_order_id,
+                intent_id=intent.intent_id,
+                original_venue_state=VenueTradeState.CONFIRMED.value,
+                normalized_state=VenueTradeState.CONFIRMED,
+                terminal=True,
+                venue_timestamp=received_at,
+                received_at=received_at,
+                sequence_number=None,
+                protocol_version=intent.protocol_version,
+            )
+        )
+    posting = LiveLedgerPosting(
+        schema_version=1,
+        posting_id=uuid4(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        intent_id=intent.intent_id,
+        venue_order_id=related_order_id,
+        venue_trade_id="trade-1",
+        settlement_hash=HASHES[12],
+        fee_hash=HASHES[13],
+        balance_evidence_hashes=(HASHES[9],),
+        debit_account="cash",
+        credit_account="position",
+        asset_id=intent.token_id,
+        debit_amount=Decimal("1"),
+        credit_amount=Decimal("0"),
+        occurred_at=posting_time,
+    )
+    store.append_live_ledger_posting(posting)
+    return plan, intent, posting
+
+
+def _append_complete_reconciliation(
+    store: PredictionMarketStore,
+    *,
+    observed_at: datetime,
+    posting_ids: tuple[UUID, ...],
+    order_hashes: tuple[str, ...] = (HASHES[10],),
+    trade_hashes: tuple[str, ...] = (HASHES[11], HASHES[12]),
+    fee_hashes: tuple[str, ...] = (HASHES[13],),
+    balance_hashes: tuple[str, ...] = (HASHES[9],),
+) -> None:
+    store.append_live_reconciliation(
+        LiveReconciliation(
+            schema_version=1,
+            reconciliation_id=uuid4(),
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            observed_at=observed_at,
+            complete=True,
+            differences=(),
+            evidence_hashes=tuple(sorted(fee_hashes)),
+            next_action=None,
+            venue_order_hashes=tuple(sorted(order_hashes)),
+            venue_trade_hashes=tuple(sorted(trade_hashes)),
+            balance_hashes=tuple(sorted(balance_hashes)),
+            expected_posting_ids=posting_ids,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "omitted_family",
+    ["order", "trade", "settlement", "fee", "balance"],
+)
+@pytest.mark.parametrize("malformed_position", ["first", "middle"])
+@pytest.mark.parametrize("malformation", ["omitted", "cross_bound"])
+def test_every_complete_reconciliation_closes_its_own_posting_evidence(
+    store: PredictionMarketStore,
+    omitted_family: str,
+    malformed_position: str,
+    malformation: str,
+) -> None:
+    plan, intent, posting = _seed_reconciliation_history(store)
+    first_fields = {
+        "order_hashes": (HASHES[10],),
+        "trade_hashes": (HASHES[11], HASHES[12]),
+        "fee_hashes": (HASHES[13],),
+        "balance_hashes": (HASHES[9],),
+    }
+    missing_value: tuple[str, ...] = ()
+    if malformation == "cross_bound":
+        if omitted_family == "order":
+            order_history = store.verified_venue_order_events_for_intent(
+                intent.intent_id,
+                NOW + timedelta(milliseconds=500),
+            )
+            missing_value = (
+                next(
+                    event.raw_event_hash
+                    for event in order_history
+                    if event.venue_order_id != posting.venue_order_id
+                ),
+            )
+        elif omitted_family == "trade":
+            missing_value = (HASHES[12],)
+        elif omitted_family == "settlement":
+            missing_value = (HASHES[11],)
+        elif omitted_family == "fee":
+            missing_value = (HASHES[9],)
+        else:
+            missing_value = (HASHES[13],)
+    if omitted_family == "order":
+        first_fields["order_hashes"] = missing_value
+    elif omitted_family in {"trade", "settlement"}:
+        first_fields["trade_hashes"] = missing_value
+    elif omitted_family == "fee":
+        first_fields["fee_hashes"] = missing_value
+    else:
+        first_fields["balance_hashes"] = missing_value
+    if malformed_position == "middle":
+        _append_complete_reconciliation(
+            store,
+            observed_at=NOW + timedelta(milliseconds=175),
+            posting_ids=(posting.posting_id,),
+        )
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=200),
+        posting_ids=(posting.posting_id,),
+        **first_fields,  # type: ignore[arg-type]
+    )
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=300),
+        posting_ids=(posting.posting_id,),
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+
+
+@pytest.mark.parametrize("future_reference", ["order", "trade"])
+def test_complete_reconciliation_rejects_future_cross_bound_reference(
+    store: PredictionMarketStore,
+    future_reference: str,
+) -> None:
+    if future_reference == "trade":
+        plan, intent, posting = _seed_reconciliation_history(
+            store,
+            posting_time=NOW + timedelta(milliseconds=100),
+            trade_time=NOW + timedelta(milliseconds=250),
+        )
+        first_order_hashes = (HASHES[10],)
+    else:
+        plan, intent, posting = _seed_reconciliation_history(
+            store,
+            posting_time=NOW + timedelta(milliseconds=100),
+            related_order_id="future-order",
+            trade_time=NOW + timedelta(milliseconds=100),
+        )
+        future_order = lifecycle_event(
+            intent,
+            VenueOrderState.ACK_MATCHED,
+            venue_order_id="future-order",
+            received_at=NOW + timedelta(milliseconds=250),
+        ).model_copy(update={"intent_id": intent.intent_id, "raw_event_hash": HASHES[14]})
+        store.append_venue_order_event(future_order)
+        first_order_hashes = ()
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=200),
+        posting_ids=(posting.posting_id,),
+        order_hashes=first_order_hashes,
+        trade_hashes=(),
+    )
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=300),
+        posting_ids=(posting.posting_id,),
+        order_hashes=(HASHES[14],) if future_reference == "order" else (HASHES[10],),
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+
+
+@pytest.mark.parametrize("checkpoint_shape", ["cumulative", "equal_time"])
+def test_valid_complete_reconciliations_close_each_bounded_snapshot(
+    store: PredictionMarketStore,
+    checkpoint_shape: str,
+) -> None:
+    plan, _intent, first_posting = _seed_reconciliation_history(store)
+    _append_complete_reconciliation(
+        store,
+        observed_at=NOW + timedelta(milliseconds=200),
+        posting_ids=(first_posting.posting_id,),
+    )
+    posting_ids = (first_posting.posting_id,)
+    observed_at = NOW + timedelta(milliseconds=200)
+    if checkpoint_shape == "cumulative":
+        second_posting = first_posting.model_copy(
+            update={
+                "posting_id": uuid4(),
+                "occurred_at": NOW + timedelta(milliseconds=250),
+            }
+        )
+        store.append_live_ledger_posting(second_posting)
+        posting_ids = (first_posting.posting_id, second_posting.posting_id)
+        observed_at = NOW + timedelta(milliseconds=300)
+    _append_complete_reconciliation(
+        store,
+        observed_at=observed_at,
+        posting_ids=posting_ids,
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.blocked_intent_ids == ()
 
 
 def test_startup_treats_plan_linked_wrong_account_intent_as_corruption(

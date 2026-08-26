@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import copy
 import pickle
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Lock, Thread
 from uuid import UUID, uuid4
@@ -782,6 +783,272 @@ def test_callback_owned_rest_result_alias_is_not_retained_for_classification(
     assert result.code is CoordinatorCode.SUBMITTED
     assert classified_results == [callback_result]
     assert classified_results[0] is not callback_result
+
+
+@pytest.mark.parametrize(
+    ("observed_offset_ms", "expected_code"),
+    [
+        (-1, CoordinatorCode.SIGNER_FAILED),
+        (0, CoordinatorCode.SUBMITTED),
+        (1, CoordinatorCode.SUBMITTED),
+        (2, CoordinatorCode.SUBMITTED),
+        (3, CoordinatorCode.SIGNER_FAILED),
+    ],
+    ids=("before-lower", "at-lower", "between", "at-upper", "after-upper"),
+)
+def test_submit_observation_is_within_its_exact_callback_interval(
+    store: PredictionMarketStore,
+    observed_offset_ms: int,
+    expected_code: CoordinatorCode,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self.latest = NOW - timedelta(milliseconds=2)
+
+        def __call__(self) -> datetime:
+            self.latest += timedelta(milliseconds=2)
+            return self.latest
+
+    clock = AdvancingClock()
+
+    class IntervalSigner(FakeSigner):
+        def submit(
+            self,
+            candidate: ExecutionIntent,
+            envelope: SignedOrderEnvelope,
+            candidate_evidence: PreflightEvidence,
+        ) -> RestResult:
+            del candidate, envelope, candidate_evidence
+            self.submit_calls += 1
+            return submit_result(RestCode.ORDER_ACK_MATCHED).model_copy(
+                update={"observed_at": clock.latest + timedelta(milliseconds=observed_offset_ms)}
+            )
+
+    signer = IntervalSigner()
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        signer,
+        clock=clock,
+    ).submit_intent(intent)
+
+    assert result.code is expected_code
+    assert signer.sign_calls == signer.submit_calls == 1
+    if expected_code is CoordinatorCode.SIGNER_FAILED:
+        assert result.state is VenueOrderState.UNKNOWN
+        assert result.kill_reason == RestCode.ORDER_OUTCOME_UNKNOWN.value
+    else:
+        assert result.state is VenueOrderState.ACK_MATCHED
+
+
+@pytest.mark.parametrize("observation", ["non_utc", "naive", "malformed", "hostile_timezone"])
+def test_submit_rejects_noncanonical_callback_observation(
+    store: PredictionMarketStore,
+    observation: str,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+
+    class HostileTimezone(tzinfo):
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            del value
+            raise RuntimeError("hostile timezone")
+
+        def dst(self, value: datetime | None) -> timedelta:
+            del value
+            raise RuntimeError("hostile timezone")
+
+    class ObservationSigner(FakeSigner):
+        def submit(
+            self,
+            candidate: ExecutionIntent,
+            envelope: SignedOrderEnvelope,
+            candidate_evidence: PreflightEvidence,
+        ) -> RestResult:
+            del candidate, envelope, candidate_evidence
+            self.submit_calls += 1
+            result = submit_result(RestCode.ORDER_ACK_MATCHED)
+            invalid_observation: object = {
+                "non_utc": NOW.astimezone(timezone(timedelta(hours=1))),
+                "naive": NOW.replace(tzinfo=None),
+                "malformed": "not-a-timestamp",
+                "hostile_timezone": datetime(2026, 8, 25, 16, tzinfo=HostileTimezone()),
+            }[observation]
+            object.__setattr__(result, "observed_at", invalid_observation)
+            return result
+
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        ObservationSigner(),
+    ).submit_intent(intent)
+
+    assert result.code is CoordinatorCode.SIGNER_FAILED
+    assert result.state is VenueOrderState.UNKNOWN
+    assert result.kill_reason == RestCode.ORDER_OUTCOME_UNKNOWN.value
+
+
+def test_submit_result_is_snapshotted_before_upper_clock_callback_mutates_alias(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+
+    class MutatingUpperClock:
+        def __init__(self) -> None:
+            self.returned_result: RestResult | None = None
+            self.mutate_on_next_call = False
+
+        def __call__(self) -> datetime:
+            if self.mutate_on_next_call:
+                assert self.returned_result is not None
+                object.__setattr__(self.returned_result, "observed_at", "mutated-after-return")
+                self.mutate_on_next_call = False
+            return NOW
+
+    clock = MutatingUpperClock()
+
+    class RetainingResultSigner(FakeSigner):
+        def submit(
+            self,
+            candidate: ExecutionIntent,
+            envelope: SignedOrderEnvelope,
+            candidate_evidence: PreflightEvidence,
+        ) -> RestResult:
+            del candidate, envelope, candidate_evidence
+            self.submit_calls += 1
+            result = submit_result(RestCode.ORDER_ACK_MATCHED)
+            clock.returned_result = result
+            clock.mutate_on_next_call = True
+            return result
+
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        RetainingResultSigner(),
+        clock=clock,
+    ).submit_intent(intent)
+
+    assert result.code is CoordinatorCode.SUBMITTED
+    assert result.state is VenueOrderState.ACK_MATCHED
+
+
+@pytest.mark.parametrize(
+    "mutation_boundary",
+    [
+        "sign_intent_init",
+        "sign_evidence_nested",
+        "submit_intent_setattr",
+        "submit_envelope_init",
+        "submit_evidence_init",
+    ],
+)
+def test_mutation_callbacks_receive_disposable_strict_inputs(
+    store: PredictionMarketStore,
+    mutation_boundary: str,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    original_intent = ExecutionIntent.model_validate(
+        intent.model_dump(mode="python"),
+        strict=True,
+    )
+    hostile_intent = execution_intent(plan, base_size=Decimal("9"))
+    expected_envelope = sign_order(intent, PRIVATE_KEY, load_protocol_snapshot())
+    hostile_envelope = sign_order(hostile_intent, PRIVATE_KEY, load_protocol_snapshot())
+    callback_objects: dict[str, list[object]] = {
+        "intent": [],
+        "evidence": [],
+        "envelope": [],
+    }
+
+    class RetainingAuthority(FakeAuthority):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inputs: list[tuple[ExecutionIntent, PreflightEvidence, ExecutionOperation]] = []
+
+        def snapshot(
+            self,
+            candidate: ExecutionIntent,
+            candidate_evidence: PreflightEvidence,
+            operation: ExecutionOperation,
+            now: datetime,
+        ) -> AuthorityContext:
+            self.inputs.append((candidate, candidate_evidence, operation))
+            return super().snapshot(candidate, candidate_evidence, operation, now)
+
+    class MutatingSigner(FakeSigner):
+        def sign(
+            self,
+            candidate: ExecutionIntent,
+            candidate_evidence: PreflightEvidence,
+        ) -> SignedOrderEnvelope:
+            self.sign_calls += 1
+            callback_objects["intent"].append(candidate)
+            callback_objects["evidence"].append(candidate_evidence)
+            if mutation_boundary == "sign_intent_init":
+                ExecutionIntent.__init__(
+                    candidate,
+                    **hostile_intent.model_dump(mode="python"),
+                )
+            elif mutation_boundary == "sign_evidence_nested":
+                object.__setattr__(candidate_evidence.plan, "maximum_size", Decimal("1"))
+            return expected_envelope
+
+        def submit(
+            self,
+            candidate: ExecutionIntent,
+            envelope: SignedOrderEnvelope,
+            candidate_evidence: PreflightEvidence,
+        ) -> RestResult:
+            self.submit_calls += 1
+            callback_objects["intent"].append(candidate)
+            callback_objects["envelope"].append(envelope)
+            callback_objects["evidence"].append(candidate_evidence)
+            if mutation_boundary == "submit_intent_setattr":
+                object.__setattr__(candidate, "base_size", Decimal("8"))
+            elif mutation_boundary == "submit_envelope_init":
+                SignedOrderEnvelope.__init__(
+                    envelope,
+                    **hostile_envelope.model_dump(mode="python"),
+                )
+            elif mutation_boundary == "submit_evidence_init":
+                PreflightEvidence.__init__(
+                    candidate_evidence,
+                    **preflight_evidence(plan, signer_healthy=False).model_dump(mode="python"),
+                )
+            return submit_result(RestCode.ORDER_ACK_MATCHED)
+
+    authority = RetainingAuthority()
+    signer = MutatingSigner()
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        signer,
+        authority=authority,
+    ).submit_intent(intent)
+
+    assert result.code is CoordinatorCode.SUBMITTED
+    assert result.state is VenueOrderState.ACK_MATCHED
+    assert signer.sign_calls == signer.submit_calls == 1
+    assert intent == original_intent
+    assert store.verified_execution_intent(intent.intent_id) == original_intent
+    assert store.verified_signed_order_envelope(intent.intent_id) == expected_envelope
+    sign_authority = next(
+        item for item in authority.inputs if item[2] is ExecutionOperation.SIGN_ORDER
+    )
+    submit_authority = next(
+        item for item in authority.inputs if item[2] is ExecutionOperation.SUBMIT_ORDER
+    )
+    assert sign_authority[0] == submit_authority[0] == original_intent
+    assert sign_authority[1].signer_healthy is submit_authority[1].signer_healthy is True
+    assert sign_authority[1].plan.maximum_size == plan.maximum_size
+    assert submit_authority[1].plan.maximum_size == plan.maximum_size
+    assert callback_objects["intent"][0] is not callback_objects["intent"][1]
+    assert callback_objects["evidence"][0] is not callback_objects["evidence"][1]
 
 
 def test_preflight_refusal_writes_nothing_and_never_calls_signer(

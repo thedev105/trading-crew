@@ -1796,7 +1796,11 @@ class ExecutionCoordinator:
 
     @staticmethod
     def _snapshot_rest_result(result: object) -> RestResult | None:
-        if type(result) is not RestResult:
+        if (
+            type(result) is not RestResult
+            or type(result.observed_at) is not datetime
+            or result.observed_at.tzinfo is not UTC
+        ):
             return None
         try:
             return RestResult.model_validate(
@@ -2024,12 +2028,22 @@ class ExecutionCoordinator:
                 for intent in intents:
                     forced_reasons.setdefault(intent.intent_id, account_block_reason)
             complete_reconciliations = tuple(
-                reconciliation for reconciliation in reconciliations if reconciliation.complete
+                sorted(
+                    (
+                        reconciliation
+                        for reconciliation in reconciliations
+                        if reconciliation.complete
+                    ),
+                    key=lambda reconciliation: (
+                        reconciliation.observed_at,
+                        reconciliation.reconciliation_id,
+                    ),
+                )
             )
             latest_complete = complete_reconciliations[-1] if complete_reconciliations else None
             posting_ids = {posting.posting_id for posting in postings}
-            reconciliation_references_postings = bool(
-                latest_complete is not None and latest_complete.expected_posting_ids
+            reconciliation_references_postings = any(
+                reconciliation.expected_posting_ids for reconciliation in complete_reconciliations
             )
             if (postings or reconciliation_references_postings) and (
                 latest_complete is None
@@ -2047,28 +2061,26 @@ class ExecutionCoordinator:
                 trade_events = tuple(
                     event for history in trade_histories.values() for event in history
                 )
-                known_order_hashes = {event.raw_event_hash for event in order_events}
-                known_trade_hashes = {event.raw_event_hash for event in trade_events}
-                relationally_closed = (
-                    set(latest_complete.venue_order_hashes) <= known_order_hashes
-                    and set(latest_complete.venue_trade_hashes) <= known_trade_hashes
-                )
+                relationally_closed = True
                 for reconciliation in complete_reconciliations:
-                    bounded_posting_ids = {
-                        posting.posting_id
+                    bounded_postings = tuple(
+                        posting
                         for posting in postings
                         if posting.occurred_at <= reconciliation.observed_at
-                    }
-                    bounded_order_hashes = {
-                        event.raw_event_hash
+                    )
+                    bounded_order_events = tuple(
+                        event
                         for event in order_events
                         if event.received_at <= reconciliation.observed_at
-                    }
-                    bounded_trade_hashes = {
-                        event.raw_event_hash
+                    )
+                    bounded_trade_events = tuple(
+                        event
                         for event in trade_events
                         if event.received_at <= reconciliation.observed_at
-                    }
+                    )
+                    bounded_posting_ids = {posting.posting_id for posting in bounded_postings}
+                    bounded_order_hashes = {event.raw_event_hash for event in bounded_order_events}
+                    bounded_trade_hashes = {event.raw_event_hash for event in bounded_trade_events}
                     if (
                         reconciliation.account_fingerprint != account_fingerprint
                         or set(reconciliation.expected_posting_ids) != bounded_posting_ids
@@ -2076,71 +2088,74 @@ class ExecutionCoordinator:
                         or not set(reconciliation.venue_trade_hashes) <= bounded_trade_hashes
                     ):
                         relationally_closed = False
-                for posting in postings:
-                    posting_intent = (
-                        None if posting.intent_id is None else intent_by_id.get(posting.intent_id)
-                    )
-                    related_orders = tuple(
-                        event
-                        for event in order_events
-                        if event.venue_order_id == posting.venue_order_id
-                    )
-                    related_trades = tuple(
-                        event
-                        for event in trade_events
-                        if event.venue_trade_id == posting.venue_trade_id
-                    )
-                    if (
-                        posting.account_fingerprint != account_fingerprint
-                        or (
-                            posting.intent_id is not None
-                            and (
-                                posting_intent is None
-                                or posting.asset_id != posting_intent.token_id
-                            )
+                    for posting in bounded_postings:
+                        posting_intent = (
+                            None
+                            if posting.intent_id is None
+                            else intent_by_id.get(posting.intent_id)
                         )
-                        or (
-                            posting.venue_order_id is not None
-                            and (
-                                posting_intent is None
-                                or len(related_orders) == 0
-                                or any(
-                                    event.intent_id != posting_intent.intent_id
-                                    for event in related_orders
+                        related_orders = tuple(
+                            event
+                            for event in bounded_order_events
+                            if event.venue_order_id == posting.venue_order_id
+                        )
+                        related_trades = tuple(
+                            event
+                            for event in bounded_trade_events
+                            if event.venue_trade_id == posting.venue_trade_id
+                        )
+                        if (
+                            posting.account_fingerprint != account_fingerprint
+                            or (
+                                posting.intent_id is not None
+                                and (
+                                    posting_intent is None
+                                    or posting_intent.created_at > reconciliation.observed_at
+                                    or posting.asset_id != posting_intent.token_id
                                 )
-                                or not {event.raw_event_hash for event in related_orders}
-                                <= set(latest_complete.venue_order_hashes)
                             )
-                        )
-                        or (
-                            posting.venue_trade_id is not None
-                            and (
-                                posting_intent is None
-                                or len(related_trades) == 0
-                                or any(
-                                    event.intent_id != posting_intent.intent_id
-                                    or (
-                                        posting.venue_order_id is not None
-                                        and event.venue_order_id != posting.venue_order_id
+                            or (
+                                posting.venue_order_id is not None
+                                and (
+                                    posting_intent is None
+                                    or len(related_orders) == 0
+                                    or any(
+                                        event.intent_id != posting_intent.intent_id
+                                        for event in related_orders
                                     )
-                                    for event in related_trades
+                                    or not {event.raw_event_hash for event in related_orders}
+                                    <= set(reconciliation.venue_order_hashes)
                                 )
-                                or not {event.raw_event_hash for event in related_trades}
-                                <= set(latest_complete.venue_trade_hashes)
                             )
-                        )
-                        or (
-                            posting.settlement_hash is not None
-                            and posting.settlement_hash not in latest_complete.venue_trade_hashes
-                        )
-                        or (
-                            posting.fee_hash is not None
-                            and posting.fee_hash not in latest_complete.evidence_hashes
-                        )
-                        or not set(posting.balance_evidence_hashes)
-                        <= set(latest_complete.balance_hashes)
-                    ):
-                        relationally_closed = False
+                            or (
+                                posting.venue_trade_id is not None
+                                and (
+                                    posting_intent is None
+                                    or len(related_trades) == 0
+                                    or any(
+                                        event.intent_id != posting_intent.intent_id
+                                        or (
+                                            posting.venue_order_id is not None
+                                            and event.venue_order_id != posting.venue_order_id
+                                        )
+                                        for event in related_trades
+                                    )
+                                    or not {event.raw_event_hash for event in related_trades}
+                                    <= set(reconciliation.venue_trade_hashes)
+                                )
+                            )
+                            or (
+                                posting.settlement_hash is not None
+                                and posting.settlement_hash not in reconciliation.venue_trade_hashes
+                            )
+                            or (
+                                posting.fee_hash is not None
+                                and posting.fee_hash not in reconciliation.evidence_hashes
+                            )
+                            or not set(posting.balance_evidence_hashes)
+                            <= set(reconciliation.balance_hashes)
+                        ):
+                            relationally_closed = False
                 if not relationally_closed:
                     account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
                     for intent in intents:
@@ -2362,26 +2377,36 @@ class ExecutionCoordinator:
     def submit_intent(self, intent: ExecutionIntent) -> SubmissionResult:
         """Durably claim, then sign and submit at most once for this database."""
 
+        try:
+            trusted_intent = ExecutionIntent.model_validate(
+                intent.model_dump(mode="python"),
+                strict=True,
+            )
+        except Exception:
+            return self._submission_result(
+                CoordinatorCode.PREFLIGHT_EVIDENCE_INVALID,
+                intent,
+            )
         now = self._now()
-        if not self._store.claim_execution_intent_submission(intent, now):
+        if not self._store.claim_execution_intent_submission(trusted_intent, now):
             try:
-                latest = self._store.latest_order_state(intent.intent_id)
+                latest = self._store.latest_order_state(trusted_intent.intent_id)
             except ConflictingRecordError:
                 latest = None
             if latest is None or latest.normalized_state is VenueOrderState.SUBMITTING:
-                return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, intent)
+                return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, trusted_intent)
             kill_reason = self._engage_kill(
                 trigger=CoordinatorCode.DUPLICATE_INTENT.value,
-                intent=intent,
+                intent=trusted_intent,
                 venue_order_id=latest.venue_order_id,
                 now=now,
             )
             return self._submission_result(
                 CoordinatorCode.DUPLICATE_INTENT,
-                intent,
+                trusted_intent,
                 kill_reason=kill_reason,
             )
-        return self._submit_claimed_intent(intent)
+        return self._submit_claimed_intent(trusted_intent)
 
     def _submit_claimed_intent(self, intent: ExecutionIntent) -> SubmissionResult:
         """Execute one already-claimed append-only submission lifecycle."""
@@ -2479,7 +2504,15 @@ class ExecutionCoordinator:
         sign_failed = False
         envelope: object = None
         try:
-            envelope = self._signer.sign(intent, evidence)
+            callback_intent = ExecutionIntent.model_validate(
+                intent.model_dump(mode="python"),
+                strict=True,
+            )
+            callback_evidence = PreflightEvidence.model_validate(
+                evidence.model_dump(mode="python"),
+                strict=True,
+            )
+            envelope = self._signer.sign(callback_intent, callback_evidence)
         except Exception:
             sign_failed = True
         if sign_failed or type(envelope) is not SignedOrderEnvelope:
@@ -2558,32 +2591,42 @@ class ExecutionCoordinator:
                 kill_reason=kill_reason,
             )
         transport_failed = False
-        result: object = None
+        raw_result: object = None
         try:
-            result = self._signer.submit(intent, envelope, evidence)
+            callback_intent = ExecutionIntent.model_validate(
+                intent.model_dump(mode="python"),
+                strict=True,
+            )
+            callback_envelope = SignedOrderEnvelope.model_validate(
+                envelope.model_dump(mode="python"),
+                strict=True,
+            )
+            callback_evidence = PreflightEvidence.model_validate(
+                evidence.model_dump(mode="python"),
+                strict=True,
+            )
+            lower_bound = self._now()
+            raw_result = self._signer.submit(
+                callback_intent,
+                callback_envelope,
+                callback_evidence,
+            )
         except Exception:
             transport_failed = True
-        now = self._now()
-        if type(result) is RestResult:
-            try:
-                result = RestResult.model_validate(
-                    result.model_dump(mode="python"),
-                    strict=True,
-                )
-            except Exception:
-                result = None
+        result = self._snapshot_rest_result(raw_result)
+        upper_bound = self._now()
         if (
             transport_failed
             or type(result) is not RestResult
-            or (type(result) is RestResult and result.route is not RouteKey.SUBMIT_ORDER)
-            or (type(result) is RestResult and result.observed_at > now)
+            or result.route is not RouteKey.SUBMIT_ORDER
+            or not lower_bound <= result.observed_at <= upper_bound
         ):
             return self._unknown_after_port_failure(
                 intent,
                 trigger="ORDER_OUTCOME_UNKNOWN",
-                now=now,
+                now=upper_bound,
             )
-        return self._classify_submit_result(intent, result, now)
+        return self._classify_submit_result(intent, result, upper_bound)
 
 
 __all__ = [
