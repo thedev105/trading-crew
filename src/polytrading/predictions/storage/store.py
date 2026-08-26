@@ -9,7 +9,7 @@ from hashlib import sha256
 from importlib import resources
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import duckdb
@@ -22,6 +22,7 @@ from polytrading.predictions.domain import (
     PredictionBookSnapshot,
     PredictionFeeRate,
     PredictionRawEnvelope,
+    PredictionRecord,
     PredictionVenue,
     RuleVersion,
     TradeRecord,
@@ -37,6 +38,7 @@ from polytrading.predictions.execution.models import (
     ProtocolConformanceResult,
     SignedOrderEnvelope,
     VenueOrderEvent,
+    VenueOrderState,
     VenueTradeEvent,
     canonical_execution_hash,
 )
@@ -72,6 +74,15 @@ def _order_event_sort_key(record: VenueOrderEvent) -> tuple[datetime, bool, int,
 
 class ConflictingRecordError(ValueError):
     """Raised when an immutable prediction-market identity is retried with different content."""
+
+
+class _ExecutionOperationClaim(PredictionRecord):
+    claim_key: str
+    intent_id: UUID
+    account_fingerprint: str
+    operation: Literal["SUBMIT_INTENT", "FIRST_FILL_REVALIDATION"]
+    occurrence_hash: str
+    claimed_at: datetime
 
 
 def _canonical_json(record: BaseModel) -> str:
@@ -134,11 +145,11 @@ def _verified_shadow_experiments(rows: list[tuple[Any, ...]]) -> tuple[ShadowExp
 
 class PredictionMarketStore:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        self._path = path
+        self._read_only = read_only
         self._connection = duckdb.connect(str(path), read_only=read_only)
         self._in_transaction = False
         self._execution_claim_lock = Lock()
-        self._execution_claims: set[UUID] = set()
-        self._execution_first_fill_claims: set[UUID] = set()
         try:
             if read_only:
                 self._verify_current_schema()
@@ -151,27 +162,162 @@ class PredictionMarketStore:
     def close(self) -> None:
         self._connection.close()
 
-    def claim_execution_intent_submission(self, intent_id: UUID) -> bool:
-        """Atomically acquire one permanent process-local claim for this store instance."""
+    def _claim_execution_operation(
+        self,
+        *,
+        intent: ExecutionIntent,
+        operation: Literal["SUBMIT_INTENT", "FIRST_FILL_REVALIDATION"],
+        occurrence_hash: str,
+        claimed_at: datetime,
+    ) -> bool:
+        if (
+            type(intent) is not ExecutionIntent
+            or type(occurrence_hash) is not str
+            or len(occurrence_hash) != 64
+            or any(character not in "0123456789abcdef" for character in occurrence_hash)
+            or type(claimed_at) is not datetime
+            or claimed_at.tzinfo is None
+            or claimed_at.utcoffset() is None
+        ):
+            raise ValueError("EXECUTION_OPERATION_CLAIM_INVALID") from None
+        claimed_at = claimed_at.astimezone(UTC)
+        claim_key = sha256(f"{operation}|{intent.intent_id}".encode()).hexdigest()
+        claim = _ExecutionOperationClaim(
+            claim_key=claim_key,
+            intent_id=intent.intent_id,
+            account_fingerprint=intent.account_fingerprint,
+            operation=operation,
+            occurrence_hash=occurrence_hash,
+            claimed_at=claimed_at,
+        )
 
-        if type(intent_id) is not UUID:
-            raise ValueError("EXECUTION_INTENT_CLAIM_INVALID") from None
         with self._execution_claim_lock:
-            if intent_id in self._execution_claims:
-                return False
-            self._execution_claims.add(intent_id)
-            return True
+            if self._in_transaction:
+                raise RuntimeError("execution operation claim requires its own transaction")
+            if self._read_only:
+                raise RuntimeError("execution operation claim requires a writable store")
+            with duckdb.connect(str(self._path)) as claim_connection:
+                try:
+                    claim_connection.execute(
+                        """
+                        INSERT INTO execution_operation_claims (
+                            claim_key, intent_id, account_fingerprint, operation,
+                            occurrence_hash, claimed_at, record_json, record_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            claim.claim_key,
+                            claim.intent_id,
+                            claim.account_fingerprint,
+                            claim.operation,
+                            claim.occurrence_hash,
+                            claim.claimed_at,
+                            _canonical_json(claim),
+                            canonical_execution_hash(claim),
+                        ],
+                    )
+                    return True
+                except duckdb.Error as error:
+                    existing = self._verified_execution_operation_claim(
+                        claim_key,
+                        connection=claim_connection,
+                    )
+                    if existing is None:
+                        raise ConflictingRecordError(
+                            "execution operation claim insertion conflicted without "
+                            "a verified winner"
+                        ) from error
+                    if (
+                        existing.intent_id != claim.intent_id
+                        or existing.account_fingerprint != claim.account_fingerprint
+                        or existing.operation != claim.operation
+                        or existing.occurrence_hash != claim.occurrence_hash
+                    ):
+                        raise ConflictingRecordError(
+                            "conflicting execution operation claim for immutable identity"
+                        ) from error
+                    return False
 
-    def claim_execution_first_fill(self, intent_id: UUID) -> bool:
-        """Atomically claim one transient-callback first-fill identity for this process."""
+    def _verified_execution_operation_claim(
+        self,
+        claim_key: str,
+        *,
+        connection: duckdb.DuckDBPyConnection | None = None,
+    ) -> _ExecutionOperationClaim | None:
+        selected = self._connection if connection is None else connection
+        rows = selected.execute(
+            """
+            SELECT claim_key, CAST(intent_id AS VARCHAR), account_fingerprint,
+                   operation, occurrence_hash, epoch_us(claimed_at), record_json, record_hash
+            FROM execution_operation_claims
+            WHERE claim_key = ? OR TRY(json_extract_string(record_json, '$.claim_key')) = ?
+            """,
+            [claim_key, claim_key],
+        ).fetchall()
+        records: list[_ExecutionOperationClaim] = []
+        for row in rows:
+            try:
+                record = _ExecutionOperationClaim.model_validate_json(row[-2])
+            except (TypeError, ValueError) as error:
+                raise ConflictingRecordError(
+                    "stored execution operation claim is invalid"
+                ) from error
+            if canonical_execution_hash(record) != row[-1]:
+                raise ConflictingRecordError(
+                    "stored execution operation claim failed its immutable record hash"
+                )
+            if tuple(row[:-2]) != (
+                record.claim_key,
+                str(record.intent_id),
+                record.account_fingerprint,
+                record.operation,
+                record.occurrence_hash,
+                _epoch_us(record.claimed_at),
+            ):
+                raise ConflictingRecordError(
+                    "stored execution operation claim indexed columns do not match"
+                )
+            if record.claim_key == claim_key:
+                records.append(record)
+        if len(records) > 1:
+            raise ConflictingRecordError("duplicate execution operation claim identity")
+        return records[0] if records else None
 
-        if type(intent_id) is not UUID:
+    def claim_execution_intent_submission(
+        self,
+        intent: ExecutionIntent,
+        claimed_at: datetime,
+    ) -> bool:
+        """Durably claim the one submission mutation for an immutable intent."""
+
+        return self._claim_execution_operation(
+            intent=intent,
+            operation="SUBMIT_INTENT",
+            occurrence_hash=intent.intent_fingerprint,
+            claimed_at=claimed_at,
+        )
+
+    def claim_execution_first_fill(
+        self,
+        intent: ExecutionIntent,
+        event: VenueOrderEvent,
+        claimed_at: datetime,
+    ) -> bool:
+        """Durably claim the first-fill revalidation for an exact correlated event."""
+
+        if (
+            type(event) is not VenueOrderEvent
+            or event.intent_id != intent.intent_id
+            or event.normalized_state
+            not in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
+        ):
             raise ValueError("EXECUTION_FIRST_FILL_CLAIM_INVALID") from None
-        with self._execution_claim_lock:
-            if intent_id in self._execution_first_fill_claims:
-                return False
-            self._execution_first_fill_claims.add(intent_id)
-            return True
+        return self._claim_execution_operation(
+            intent=intent,
+            operation="FIRST_FILL_REVALIDATION",
+            occurrence_hash=canonical_execution_hash(event),
+            claimed_at=claimed_at,
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[PredictionMarketStore]:
@@ -1011,6 +1157,43 @@ class PredictionMarketStore:
                 _epoch_us(record.deadline),
             ),
             matches=lambda record: record.plan_id == plan_id and record.created_at <= as_of,
+            sort_key=lambda record: (record.created_at, record.intent_id),
+        )
+
+    def verified_execution_intent_history_for_account(
+        self,
+        account_fingerprint: str,
+        as_of: datetime,
+    ) -> tuple[ExecutionIntent, ...]:
+        """Return verified account intent history independently of plan discovery."""
+
+        return self._verified_records(
+            table="execution_intents",
+            model=ExecutionIntent,
+            candidate_where=(
+                "(account_fingerprint = ? OR TRY(json_extract_string(record_json, "
+                "'$.account_fingerprint')) = ?) AND (created_at <= ? OR "
+                "TRY_CAST(TRY(json_extract_string(record_json, '$.created_at')) "
+                "AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(account_fingerprint, account_fingerprint, as_of, as_of),
+            index_columns=(
+                "CAST(intent_id AS VARCHAR)",
+                "CAST(plan_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(created_at)",
+                "epoch_us(deadline)",
+            ),
+            indexed_values=lambda record: (
+                str(record.intent_id),
+                str(record.plan_id),
+                record.account_fingerprint,
+                _epoch_us(record.created_at),
+                _epoch_us(record.deadline),
+            ),
+            matches=lambda record: (
+                record.account_fingerprint == account_fingerprint and record.created_at <= as_of
+            ),
             sort_key=lambda record: (record.created_at, record.intent_id),
         )
 

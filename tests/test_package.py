@@ -388,6 +388,7 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
             "polytrading/predictions/storage/schema/006_shadow_core.sql",
             "polytrading/predictions/storage/schema/007_experiments.sql",
             "polytrading/predictions/storage/schema/008_live_execution.sql",
+            "polytrading/predictions/storage/schema/009_execution_operation_claims.sql",
         ]
         prediction_web_asset_members = {
             name

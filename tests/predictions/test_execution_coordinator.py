@@ -471,6 +471,50 @@ def test_separate_coordinators_on_one_store_share_the_permanent_claim(
     ) == (VenueOrderState.SUBMITTING, VenueOrderState.ACK_MATCHED)
 
 
+def test_separate_coordinators_and_stores_on_one_path_share_durable_claim(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "two-store-claims.duckdb"
+    stores = (PredictionMarketStore(path), PredictionMarketStore(path))
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    signer = FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED))
+    executors = tuple(
+        coordinator(store, FakePreflight(preflight_evidence(plan)), signer) for store in stores
+    )
+    start = Barrier(3)
+    results: list[SubmissionResult] = []
+    failures: list[BaseException] = []
+    result_lock = Lock()
+
+    def submit(executor: ExecutionCoordinator) -> None:
+        start.wait()
+        try:
+            result = executor.submit_intent(intent)
+            with result_lock:
+                results.append(result)
+        except BaseException as error:
+            with result_lock:
+                failures.append(error)
+
+    threads = tuple(Thread(target=submit, args=(executor,)) for executor in executors)
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert sorted(result.code for result in results) == [
+        CoordinatorCode.DUPLICATE_INTENT,
+        CoordinatorCode.SUBMITTED,
+    ]
+    assert signer.sign_calls == signer.submit_calls == 1
+    assert all(not store._in_transaction for store in stores)
+    for store in stores:
+        store.close()
+
+
 @pytest.mark.parametrize("callback", ["preflight", "authority", "signer"])
 def test_recursive_submission_fails_immediately_without_callback_lock_or_transaction(
     store: PredictionMarketStore,
@@ -497,7 +541,7 @@ def test_recursive_submission_fails_immediately_without_callback_lock_or_transac
             now: datetime,
         ) -> AuthorityContext:
             executor = holder["executor"]
-            assert not executor._submission_claim_lock.locked()
+            assert not store._execution_claim_lock.locked()
             assert not store._in_transaction
             if callback == "authority" and not recursive:
                 recursive.append(executor.submit_intent(candidate))
@@ -510,7 +554,7 @@ def test_recursive_submission_fails_immediately_without_callback_lock_or_transac
             candidate_evidence: PreflightEvidence,
         ) -> SignedOrderEnvelope:
             executor = holder["executor"]
-            assert not executor._submission_claim_lock.locked()
+            assert not store._execution_claim_lock.locked()
             assert not store._in_transaction
             if callback == "signer" and not recursive:
                 recursive.append(executor.submit_intent(candidate))

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Lock, Thread
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import duckdb
 import pytest
@@ -34,20 +34,30 @@ from tests.predictions.store_helpers import raw_envelope
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
 
 
-def test_process_local_execution_claim_is_atomic_and_permanent(tmp_path: Path) -> None:
-    store = PredictionMarketStore(tmp_path / "claims.duckdb")
-    intent_id = uuid4()
+def test_durable_execution_claim_is_atomic_across_store_instances_and_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "claims.duckdb"
+    first_store = PredictionMarketStore(path)
+    second_store = PredictionMarketStore(path)
+    _, intent, _, order_event, *_ = execution_records()
+    order_event = order_event.model_copy(
+        update={"normalized_state": VenueOrderState.PARTIALLY_FILLED}
+    )
     start = Barrier(3)
     results: list[bool] = []
     result_lock = Lock()
 
-    def claim() -> None:
+    def claim(store: PredictionMarketStore) -> None:
         start.wait()
-        acquired = store.claim_execution_intent_submission(intent_id)
+        acquired = store.claim_execution_intent_submission(intent, NOW)
         with result_lock:
             results.append(acquired)
 
-    threads = (Thread(target=claim), Thread(target=claim))
+    threads = (
+        Thread(target=claim, args=(first_store,)),
+        Thread(target=claim, args=(second_store,)),
+    )
     for thread in threads:
         thread.start()
     start.wait()
@@ -55,10 +65,56 @@ def test_process_local_execution_claim_is_atomic_and_permanent(tmp_path: Path) -
         thread.join()
 
     assert sorted(results) == [False, True]
-    assert store.claim_execution_intent_submission(intent_id) is False
-    assert store.claim_execution_first_fill(intent_id) is True
-    assert store.claim_execution_first_fill(intent_id) is False
-    store.close()
+    assert first_store.claim_execution_intent_submission(intent, NOW) is False
+    assert first_store.claim_execution_first_fill(intent, order_event, NOW) is True
+    assert second_store.claim_execution_first_fill(intent, order_event, NOW) is False
+    first_store.close()
+    second_store.close()
+
+    reopened = PredictionMarketStore(path)
+    assert reopened.claim_execution_intent_submission(intent, NOW) is False
+    assert reopened.claim_execution_first_fill(intent, order_event, NOW) is False
+    reopened.close()
+
+
+def test_execution_claim_rejects_same_key_with_different_occurrence(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "claims.duckdb")
+    _, intent, _, order_event, *_ = execution_records()
+    order_event = order_event.model_copy(
+        update={"normalized_state": VenueOrderState.PARTIALLY_FILLED}
+    )
+    conflicting_event = order_event.model_copy(update={"raw_event_hash": "f" * 64})
+
+    assert store.claim_execution_first_fill(intent, order_event, NOW)
+    with pytest.raises(ConflictingRecordError, match="execution operation claim"):
+        store.claim_execution_first_fill(intent, conflicting_event, NOW)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("record_hash", "0" * 64),
+        ("account_fingerprint", "9" * 64),
+        ("record_json", "{"),
+    ],
+)
+def test_execution_claim_duplicate_detects_index_json_or_hash_corruption(
+    tmp_path: Path,
+    column: str,
+    value: str,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "claims.duckdb")
+    _, intent, *_ = execution_records()
+    assert store.claim_execution_intent_submission(intent, NOW)
+    store._connection.execute(
+        f"UPDATE execution_operation_claims SET {column} = ?",
+        [value],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="execution operation claim"):
+        store.claim_execution_intent_submission(intent, NOW)
 
 
 def execution_records() -> tuple[
@@ -208,7 +264,7 @@ def execution_records() -> tuple[
     )
 
 
-def test_migration_008_creates_all_execution_tables(tmp_path: Path) -> None:
+def test_migration_009_creates_all_execution_tables(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     names = {
         row[0]
@@ -227,6 +283,7 @@ def test_migration_008_creates_all_execution_tables(tmp_path: Path) -> None:
         "execution_kill_events",
         "activation_evidence",
         "protocol_conformance_results",
+        "execution_operation_claims",
     } <= names
 
 
@@ -269,6 +326,9 @@ def test_verified_execution_records_round_trip_through_named_queries(tmp_path: P
     assert store.verified_live_execution_plan(plan.plan_id, NOW) == plan
     assert store.verified_execution_intent(intent.intent_id, NOW) == intent
     assert store.verified_execution_intents_for_plan(plan.plan_id, NOW) == (intent,)
+    assert store.verified_execution_intent_history_for_account(intent.account_fingerprint, NOW) == (
+        intent,
+    )
     assert store.verified_signed_order_envelope(intent.intent_id) == envelope
     assert store.verified_venue_order_events_for_intent(intent.intent_id, NOW) == (order_event,)
     assert store.verified_venue_trade_events_for_intent(intent.intent_id, NOW) == (trade_event,)
@@ -328,6 +388,25 @@ def test_verified_execution_reads_exclude_later_events_and_expired_intents(tmp_p
         store.verified_execution_intent(intent.intent_id, NOW - timedelta(microseconds=1))
 
 
+def test_account_intent_history_finds_orphan_and_detects_index_corruption(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    intent = ExecutionIntent.model_validate(execution_intent_fields(created_at=NOW))
+    assert store.append_execution_intent(intent)
+
+    assert store.verified_execution_intent_history_for_account(
+        intent.account_fingerprint,
+        NOW,
+    ) == (intent,)
+    store._connection.execute(
+        "UPDATE execution_intents SET account_fingerprint = ? WHERE intent_id = ?",
+        ["9" * 64, intent.intent_id],
+    )
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_execution_intent_history_for_account(intent.account_fingerprint, NOW)
+
+
 def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
     tmp_path: Path,
 ) -> None:
@@ -362,7 +441,7 @@ def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
     versions = store._connection.execute(
         "SELECT version FROM schema_migrations ORDER BY version"
     ).fetchall()
-    assert versions[-1] == (8,)
+    assert versions[-1] == (9,)
 
 
 def test_reopened_read_only_store_verifies_execution_readiness(tmp_path: Path) -> None:

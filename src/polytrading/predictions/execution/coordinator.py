@@ -12,7 +12,6 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from hashlib import sha256
 from itertools import pairwise
-from threading import Lock
 from types import MappingProxyType
 from typing import Literal, Protocol, Self
 from uuid import UUID, uuid5
@@ -435,7 +434,6 @@ class ExecutionCoordinator:
     __slots__ = (
         "_account_fingerprint",
         "_account_reader",
-        "_active_submission_claims",
         "_authority",
         "_clock",
         "_initialized",
@@ -445,8 +443,6 @@ class ExecutionCoordinator:
         "_recovering",
         "_signer",
         "_store",
-        "_submission_claim_lock",
-        "_submission_claims",
         "_test_only_kill_state",
     )
 
@@ -487,9 +483,6 @@ class ExecutionCoordinator:
         object.__setattr__(self, "_clock", clock)
         object.__setattr__(self, "_test_only_kill_state", test_only_kill_state)
         object.__setattr__(self, "_prepared", MappingProxyType({}))
-        object.__setattr__(self, "_submission_claim_lock", Lock())
-        object.__setattr__(self, "_submission_claims", set())
-        object.__setattr__(self, "_active_submission_claims", set())
         object.__setattr__(self, "_recovering", False)
         object.__setattr__(self, "_last_received_at", None)
 
@@ -1062,11 +1055,6 @@ class ExecutionCoordinator:
             )
         except Exception:
             event = None
-        first_fill_claimed = (
-            event is not None
-            and event.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
-            and self._store.claim_execution_first_fill(intent.intent_id)
-        )
         try:
             history = self._store.verified_venue_order_events_for_intent(
                 intent.intent_id,
@@ -1136,18 +1124,24 @@ class ExecutionCoordinator:
             lineage_hashes=tuple(sorted(set((*event.lineage_hashes, event.raw_event_hash)))),
         )
         self._store.append_venue_order_event(correlated)
-        first_fill = (
-            correlated.normalized_state
-            in {
-                VenueOrderState.PARTIALLY_FILLED,
-                VenueOrderState.FILLED,
-            }
-            and first_fill_claimed
-            and not any(
-                prior.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
-                for prior in history
-            )
+        first_fill_candidate = correlated.normalized_state in {
+            VenueOrderState.PARTIALLY_FILLED,
+            VenueOrderState.FILLED,
+        } and not any(
+            prior.normalized_state in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
+            for prior in history
         )
+        first_fill = False
+        if first_fill_candidate:
+            try:
+                first_fill = self._store.claim_execution_first_fill(intent, correlated, now)
+            except ConflictingRecordError:
+                return self._contradictory_order_event(
+                    intent,
+                    correlated,
+                    known_order_ids,
+                    now,
+                )
         decision = None
         kill_reason = None
         if first_fill:
@@ -1156,10 +1150,22 @@ class ExecutionCoordinator:
             outcome: object = None
             if evidence is not None:
                 try:
+                    callback_plan = LiveExecutionPlan.model_validate(
+                        evidence.plan.model_dump(mode="python"),
+                        strict=True,
+                    )
+                    callback_intent = ExecutionIntent.model_validate(
+                        intent.model_dump(mode="python"),
+                        strict=True,
+                    )
+                    callback_event = VenueOrderEvent.model_validate(
+                        correlated.model_dump(mode="python"),
+                        strict=True,
+                    )
                     outcome = self._preflight.revalidate_after_fill(
-                        evidence.plan,
-                        intent,
-                        correlated,
+                        callback_plan,
+                        callback_intent,
+                        callback_event,
                         now,
                     )
                 except Exception:
@@ -1188,11 +1194,13 @@ class ExecutionCoordinator:
         account_fingerprint: Sha256,
         as_of: datetime,
     ) -> tuple[ExecutionIntent, ...]:
-        intents: dict[UUID, ExecutionIntent] = {}
-        for plan in self._store.verified_live_execution_plans_for_account(
+        plans = self._store.verified_live_execution_plans_for_account(
             account_fingerprint,
             as_of,
-        ):
+        )
+        plan_by_id = {plan.plan_id: plan for plan in plans}
+        plan_intents: dict[UUID, ExecutionIntent] = {}
+        for plan in plans:
             for intent in self._store.verified_execution_intent_history_for_plan(
                 plan.plan_id,
                 as_of,
@@ -1205,10 +1213,33 @@ class ExecutionCoordinator:
                     or intent.capability_fingerprint != plan.capability_fingerprint
                 ):
                     raise ConflictingRecordError("plan-linked intent identity mismatch")
-                intents[intent.intent_id] = intent
+                existing = plan_intents.get(intent.intent_id)
+                if existing is not None and existing != intent:
+                    raise ConflictingRecordError("intent appears under conflicting plans")
+                plan_intents[intent.intent_id] = intent
+        account_intents = {
+            intent.intent_id: intent
+            for intent in self._store.verified_execution_intent_history_for_account(
+                account_fingerprint,
+                as_of,
+            )
+        }
+        if set(plan_intents) != set(account_intents):
+            raise ConflictingRecordError("account plan and intent histories do not close")
+        for intent_id, intent in account_intents.items():
+            plan = plan_by_id.get(intent.plan_id)
+            if (
+                plan is None
+                or plan_intents[intent_id] != intent
+                or intent.account_fingerprint != account_fingerprint
+                or intent.account_fingerprint != plan.account_fingerprint
+                or intent.venue != plan.venue
+                or intent.capability_fingerprint != plan.capability_fingerprint
+            ):
+                raise ConflictingRecordError("account intent has no exact verified plan")
         return tuple(
             sorted(
-                intents.values(),
+                account_intents.values(),
                 key=lambda intent: (intent.created_at, intent.intent_id),
             )
         )
@@ -1242,30 +1273,75 @@ class ExecutionCoordinator:
         return evidence
 
     @staticmethod
-    def _order_read_fill_state(
+    def _frozen_order_read_amounts(
         intent: ExecutionIntent,
+        envelope: SignedOrderEnvelope,
         item: OrderReadPayload,
-    ) -> VenueOrderState | None:
+    ) -> tuple[Decimal, Decimal] | None:
         try:
+            public_order = json.loads(envelope.canonical_order_json)
             original = Decimal(item.original_size)
             matched = Decimal(item.size_matched)
             price = Decimal(item.price)
-        except InvalidOperation:
+            maker_amount = Decimal(public_order["makerAmount"]) / Decimal(1_000_000)
+            taker_amount = Decimal(public_order["takerAmount"]) / Decimal(1_000_000)
+            public_maker = public_order["maker"]
+            public_signer = public_order["signer"]
+            public_side = public_order["side"]
+            public_token = public_order["tokenId"]
+            public_timestamp = str(int(public_order["timestamp"]) // 1000)
+            public_expiration = str(int(public_order["expiration"]))
+            maker_fingerprint = sha256(bytes.fromhex(public_maker[2:])).hexdigest()
+            signer_fingerprint = sha256(bytes.fromhex(public_signer[2:])).hexdigest()
+        except (InvalidOperation, KeyError, TypeError, ValueError):
             return None
+        base_amount = taker_amount if intent.side.upper() == "BUY" else maker_amount
+        quote_amount = maker_amount if intent.side.upper() == "BUY" else taker_amount
+        envelope_price = quote_amount / base_amount
         if (
-            item.asset_id != intent.token_id
+            envelope.intent_id != intent.intent_id
+            or envelope.intent_fingerprint != intent.intent_fingerprint
+            or envelope.protocol_version != intent.protocol_version
+            or item.asset_id != intent.token_id
+            or str(public_token) != intent.token_id
             or item.side != intent.side.upper()
+            or public_side != intent.side.upper()
+            or item.maker_address.lower() != public_maker.lower()
+            or public_signer.lower() != public_maker.lower()
+            or maker_fingerprint != intent.account_fingerprint
+            or signer_fingerprint != intent.account_fingerprint
             or price != intent.limit_price
+            or envelope_price != intent.limit_price
             or item.order_type.upper() != intent.order_type.value
+            or item.created_at != public_timestamp
+            or item.expiration != public_expiration
             or original <= 0
             or matched < 0
             or matched > original
+            or original != base_amount
             or (intent.base_size is not None and original != intent.base_size)
         ):
             return None
-        if matched == original:
-            return VenueOrderState.FILLED
-        if matched > 0:
+        return original, matched
+
+    @classmethod
+    def _order_read_fill_state(
+        cls,
+        intent: ExecutionIntent,
+        envelope: SignedOrderEnvelope,
+        item: OrderReadPayload,
+    ) -> VenueOrderState | None:
+        amounts = cls._frozen_order_read_amounts(intent, envelope, item)
+        if amounts is None:
+            return None
+        original, matched = amounts
+        if item.status == "MATCHED":
+            if matched == original:
+                return VenueOrderState.FILLED
+            if matched > 0:
+                return VenueOrderState.PARTIALLY_FILLED
+            return None
+        if item.status == "LIVE" and 0 < matched < original:
             return VenueOrderState.PARTIALLY_FILLED
         return None
 
@@ -1303,7 +1379,13 @@ class ExecutionCoordinator:
         matches = tuple(item for item in payload.items if item.id == venue_order_id)
         if len(matches) != 1:
             return False
-        state = self._order_read_fill_state(intent, matches[0])
+        try:
+            envelope = self._store.verified_signed_order_envelope(intent.intent_id)
+        except ConflictingRecordError:
+            return False
+        if envelope is None:
+            return False
+        state = self._order_read_fill_state(intent, envelope, matches[0])
         return state is not None and self._append_recovered_order_state(
             intent,
             state,
@@ -1473,18 +1555,48 @@ class ExecutionCoordinator:
         try:
             history = self._store.verified_venue_order_events_for_intent(
                 intent.intent_id,
-                datetime.max.replace(tzinfo=UTC),
+                now,
             )
         except ConflictingRecordError:
             return False, False, CoordinatorCode.ORDER_EVENT_CONTRADICTION.value
+        try:
+            envelope = self._store.verified_signed_order_envelope(intent.intent_id)
+        except ConflictingRecordError:
+            return False, False, CoordinatorCode.ENVELOPE_COLLISION.value
+        if (
+            envelope is None
+            or envelope.intent_id != intent.intent_id
+            or envelope.intent_fingerprint != intent.intent_fingerprint
+            or envelope.protocol_version != intent.protocol_version
+        ):
+            return False, False, CoordinatorCode.ENVELOPE_COLLISION.value
         acknowledgements = tuple(
             event
             for event in history
             if event.original_venue_state == RestCode.CANCEL_ACKNOWLEDGED.value
         )
         acknowledgement = acknowledgements[0] if len(acknowledgements) == 1 else None
+        acknowledgement_index = (
+            history.index(acknowledgement) if acknowledgement is not None else None
+        )
+        expected_acknowledgement_id = (
+            uuid5(
+                _COORDINATOR_NAMESPACE,
+                "|".join(
+                    (
+                        "cancel-ack",
+                        str(intent.intent_id),
+                        venue_order_id,
+                        *acknowledgement.lineage_hashes,
+                    )
+                ),
+            )
+            if acknowledgement is not None
+            else None
+        )
         if acknowledgements and (
             acknowledgement is None
+            or acknowledgement.event_id != expected_acknowledgement_id
             or acknowledgement.venue != intent.venue
             or acknowledgement.intent_id != intent.intent_id
             or acknowledgement.venue_order_id != venue_order_id
@@ -1493,51 +1605,74 @@ class ExecutionCoordinator:
             or acknowledgement.protocol_version != intent.protocol_version
             or acknowledgement.source_channel != "recovery_cancel_ack"
             or acknowledgement.raw_event_hash not in acknowledgement.lineage_hashes
+            or not 1 <= len(acknowledgement.lineage_hashes) <= 2
+            or acknowledgement.received_at > now
+            or acknowledgement_index is None
+            or acknowledgement_index == 0
+            or history[acknowledgement_index - 1].normalized_state
+            is not VenueOrderState.CANCEL_PENDING
+            or history[acknowledgement_index - 1].received_at >= acknowledgement.received_at
         ):
             return False, False, CoordinatorCode.ORDER_EVENT_CONTRADICTION.value
 
         if acknowledgement is None:
-            try:
-                envelope = self._store.verified_signed_order_envelope(intent.intent_id)
-            except ConflictingRecordError:
-                return False, False, CoordinatorCode.ENVELOPE_COLLISION.value
-            evidence = self._recovery_evidence(intent, self._now())
+            mutation_now = self._now()
+            if self._killed(mutation_now):
+                return False, False, CoordinatorCode.EXECUTION_KILL_ENGAGED.value
+            evidence = self._recovery_evidence(intent, mutation_now)
+            mutation_now = self._now()
+            if self._killed(mutation_now):
+                return False, False, CoordinatorCode.EXECUTION_KILL_ENGAGED.value
             if envelope is None or evidence is None:
                 return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
-            authority_now = self._now()
             if self._evidence_code(
-                intent, evidence, authority_now
+                intent, evidence, mutation_now
             ) is not None or not self._authority_allowed(
                 intent,
                 evidence,
                 ExecutionOperation.CANCEL_ORDER,
-                authority_now,
+                mutation_now,
             ):
                 return False, False, CoordinatorCode.AUTHORITY_DENIED.value
             # Reconstruct and revalidate after the injected authority callback.
             authority_now = self._now()
+            if self._killed(authority_now):
+                return False, False, CoordinatorCode.EXECUTION_KILL_ENGAGED.value
             evidence = self._prepared_evidence(intent.intent_id)
             if evidence is None or self._evidence_code(intent, evidence, authority_now) is not None:
                 return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
+            cancel_now = self._now()
+            if self._killed(cancel_now):
+                return False, False, CoordinatorCode.EXECUTION_KILL_ENGAGED.value
+            evidence = self._prepared_evidence(intent.intent_id)
+            if evidence is None or self._evidence_code(intent, evidence, cancel_now) is not None:
+                return False, False, CoordinatorCode.RECOVERY_BLOCKED.value
             outcome: object = None
             try:
+                callback_intent = ExecutionIntent.model_validate(
+                    intent.model_dump(mode="python"),
+                    strict=True,
+                )
+                callback_envelope = SignedOrderEnvelope.model_validate(
+                    envelope.model_dump(mode="python"),
+                    strict=True,
+                )
+                callback_evidence = PreflightEvidence.model_validate(
+                    evidence.model_dump(mode="python"),
+                    strict=True,
+                )
                 outcome = self._signer.cancel(
-                    intent,
-                    envelope,
+                    callback_intent,
+                    callback_envelope,
                     venue_order_id,
-                    evidence,
+                    callback_evidence,
                 )
             except Exception:
                 return False, False, RestCode.CANCEL_OUTCOME_UNKNOWN.value
+            outcome = self._snapshot_rest_result(outcome)
             outcome_now = self._now()
-            if type(outcome) is RestResult:
-                try:
-                    outcome = RestResult.model_validate(
-                        outcome.model_dump(mode="python"),
-                        strict=True,
-                    )
-                except Exception:
-                    outcome = None
+            if self._killed(outcome_now):
+                return False, False, CoordinatorCode.EXECUTION_KILL_ENGAGED.value
             if (
                 type(outcome) is not RestResult
                 or outcome.route is not RouteKey.CANCEL_ORDER
@@ -1545,7 +1680,7 @@ class ExecutionCoordinator:
                 or type(outcome.payload) is not CancellationPayload
                 or outcome.payload.order_id != venue_order_id
                 or outcome.payload.confirmation_required is not True
-                or outcome.observed_at > outcome_now
+                or not cancel_now <= outcome.observed_at <= outcome_now
                 or (outcome.raw_body_hash is None and outcome.request_body_hash is None)
             ):
                 reason = (
@@ -1599,25 +1734,22 @@ class ExecutionCoordinator:
         previous_received_at = self._last_received_at
         if previous_received_at is None or previous_received_at < acknowledgement.received_at:
             object.__setattr__(self, "_last_received_at", acknowledgement.received_at)
-        confirmation: object = None
-        try:
-            confirmation = self._account_reader.read_order(venue_order_id)
-        except Exception:
-            return False, True, RestCode.CANCEL_NOT_CONFIRMED.value
+        confirmation, confirmation_lower, confirmation_upper = self._bounded_recovery_read(
+            lambda: self._account_reader.read_order(venue_order_id)
+        )
         if (
             not self._valid_recovery_read(
                 confirmation,
                 RouteKey.READ_ORDER,
                 OrderReadPayload,
-                now,
+                confirmation_lower,
+                confirmation_upper,
             )
             or type(confirmation) is not RestResult
             or type(confirmation.payload) is not OrderReadPayload
             or confirmation.payload.id != venue_order_id
             or confirmation.payload.status != "CANCELED"
-            or confirmation.payload.asset_id != intent.token_id
-            or confirmation.payload.side != intent.side.upper()
-            or Decimal(confirmation.payload.price) != intent.limit_price
+            or self._frozen_order_read_amounts(intent, envelope, confirmation.payload) is None
             or confirmation.raw_body_hash is None
         ):
             reason = (
@@ -1649,17 +1781,44 @@ class ExecutionCoordinator:
         result: object,
         route: RouteKey,
         payload_type: type[object],
-        now: datetime,
+        lower_bound: datetime,
+        upper_bound: datetime,
     ) -> bool:
         return (
             type(result) is RestResult
             and result.route is route
             and result.code is RestCode.READ_OK
             and type(result.payload) is payload_type
-            and result.observed_at <= now
+            and lower_bound <= result.observed_at <= upper_bound
             and result.recovery_required is False
             and result.kill_required is False
         )
+
+    @staticmethod
+    def _snapshot_rest_result(result: object) -> RestResult | None:
+        if type(result) is not RestResult:
+            return None
+        try:
+            return RestResult.model_validate(
+                result.model_dump(mode="python"),
+                strict=True,
+            )
+        except Exception:
+            return None
+
+    def _bounded_recovery_read(
+        self,
+        operation: object,
+    ) -> tuple[RestResult | None, datetime, datetime]:
+        lower_bound = self._now()
+        raw_result: object = None
+        try:
+            raw_result = operation()  # type: ignore[operator]
+        except Exception:
+            raw_result = None
+        result = self._snapshot_rest_result(raw_result)
+        upper_bound = self._now()
+        return result, lower_bound, upper_bound
 
     def recover_account(
         self,
@@ -1717,25 +1876,27 @@ class ExecutionCoordinator:
         startup: bool,
     ) -> RecoveryReport:
 
-        now = self._now()
         read_routes = list(_BASE_RECOVERY_READS)
         outcomes: list[object] = []
+        read_bounds: list[tuple[datetime, datetime]] = []
         for operation in (
             self._account_reader.read_open_orders,
             self._account_reader.read_trades,
             self._account_reader.read_balance_allowance,
         ):
-            try:
-                outcomes.append(operation())
-            except Exception:
-                outcomes.append(None)
+            outcome, lower_bound, upper_bound = self._bounded_recovery_read(operation)
+            outcomes.append(outcome)
+            read_bounds.append((lower_bound, upper_bound))
+
+        now = read_bounds[-1][1]
 
         reads_valid = all(
-            self._valid_recovery_read(result, route, payload_type, now)
-            for result, route, payload_type in zip(
+            self._valid_recovery_read(result, route, payload_type, lower_bound, upper_bound)
+            for result, route, payload_type, (lower_bound, upper_bound) in zip(
                 outcomes,
                 read_routes,
                 (OrdersReadPayload, TradesReadPayload, BalanceAllowancePayload),
+                read_bounds,
                 strict=True,
             )
         )
@@ -1773,6 +1934,8 @@ class ExecutionCoordinator:
                 uncertainty_reason = CoordinatorCode.RECOVERY_BLOCKED.value
 
         forced_reasons: dict[UUID, str] = {}
+        order_histories: dict[UUID, tuple[VenueOrderEvent, ...]] = {}
+        trade_histories: dict[UUID, tuple[VenueTradeEvent, ...]] = {}
         for intent in intents:
             try:
                 trade_history = self._store.verified_venue_trade_events_for_intent(
@@ -1782,6 +1945,7 @@ class ExecutionCoordinator:
             except ConflictingRecordError:
                 forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                 continue
+            trade_histories[intent.intent_id] = trade_history
             if startup:
                 try:
                     order_history = self._store.verified_venue_order_events_for_intent(
@@ -1791,10 +1955,12 @@ class ExecutionCoordinator:
                 except ConflictingRecordError:
                     forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                     continue
-                if not order_history or order_history[-1].normalized_state in {
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                }:
+                order_histories[intent.intent_id] = order_history
+                if not order_history or any(
+                    event.normalized_state
+                    in {VenueOrderState.PARTIALLY_FILLED, VenueOrderState.FILLED}
+                    for event in order_history
+                ):
                     forced_reasons[intent.intent_id] = CoordinatorCode.RECOVERY_BLOCKED.value
                     continue
             unresolved_trade = next(
@@ -1853,7 +2019,7 @@ class ExecutionCoordinator:
                 reconciliations = ()
                 postings = ()
                 account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
-            if reconciliations and not reconciliations[-1].complete:
+            if any(not reconciliation.complete for reconciliation in reconciliations):
                 account_block_reason = "RECONCILIATION_INCOMPLETE"
                 for intent in intents:
                     forced_reasons.setdefault(intent.intent_id, account_block_reason)
@@ -1873,6 +2039,112 @@ class ExecutionCoordinator:
                 account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
                 for intent in intents:
                     forced_reasons.setdefault(intent.intent_id, account_block_reason)
+            if latest_complete is not None:
+                intent_by_id = {intent.intent_id: intent for intent in intents}
+                order_events = tuple(
+                    event for history in order_histories.values() for event in history
+                )
+                trade_events = tuple(
+                    event for history in trade_histories.values() for event in history
+                )
+                known_order_hashes = {event.raw_event_hash for event in order_events}
+                known_trade_hashes = {event.raw_event_hash for event in trade_events}
+                relationally_closed = (
+                    set(latest_complete.venue_order_hashes) <= known_order_hashes
+                    and set(latest_complete.venue_trade_hashes) <= known_trade_hashes
+                )
+                for reconciliation in complete_reconciliations:
+                    bounded_posting_ids = {
+                        posting.posting_id
+                        for posting in postings
+                        if posting.occurred_at <= reconciliation.observed_at
+                    }
+                    bounded_order_hashes = {
+                        event.raw_event_hash
+                        for event in order_events
+                        if event.received_at <= reconciliation.observed_at
+                    }
+                    bounded_trade_hashes = {
+                        event.raw_event_hash
+                        for event in trade_events
+                        if event.received_at <= reconciliation.observed_at
+                    }
+                    if (
+                        reconciliation.account_fingerprint != account_fingerprint
+                        or set(reconciliation.expected_posting_ids) != bounded_posting_ids
+                        or not set(reconciliation.venue_order_hashes) <= bounded_order_hashes
+                        or not set(reconciliation.venue_trade_hashes) <= bounded_trade_hashes
+                    ):
+                        relationally_closed = False
+                for posting in postings:
+                    posting_intent = (
+                        None if posting.intent_id is None else intent_by_id.get(posting.intent_id)
+                    )
+                    related_orders = tuple(
+                        event
+                        for event in order_events
+                        if event.venue_order_id == posting.venue_order_id
+                    )
+                    related_trades = tuple(
+                        event
+                        for event in trade_events
+                        if event.venue_trade_id == posting.venue_trade_id
+                    )
+                    if (
+                        posting.account_fingerprint != account_fingerprint
+                        or (
+                            posting.intent_id is not None
+                            and (
+                                posting_intent is None
+                                or posting.asset_id != posting_intent.token_id
+                            )
+                        )
+                        or (
+                            posting.venue_order_id is not None
+                            and (
+                                posting_intent is None
+                                or len(related_orders) == 0
+                                or any(
+                                    event.intent_id != posting_intent.intent_id
+                                    for event in related_orders
+                                )
+                                or not {event.raw_event_hash for event in related_orders}
+                                <= set(latest_complete.venue_order_hashes)
+                            )
+                        )
+                        or (
+                            posting.venue_trade_id is not None
+                            and (
+                                posting_intent is None
+                                or len(related_trades) == 0
+                                or any(
+                                    event.intent_id != posting_intent.intent_id
+                                    or (
+                                        posting.venue_order_id is not None
+                                        and event.venue_order_id != posting.venue_order_id
+                                    )
+                                    for event in related_trades
+                                )
+                                or not {event.raw_event_hash for event in related_trades}
+                                <= set(latest_complete.venue_trade_hashes)
+                            )
+                        )
+                        or (
+                            posting.settlement_hash is not None
+                            and posting.settlement_hash not in latest_complete.venue_trade_hashes
+                        )
+                        or (
+                            posting.fee_hash is not None
+                            and posting.fee_hash not in latest_complete.evidence_hashes
+                        )
+                        or not set(posting.balance_evidence_hashes)
+                        <= set(latest_complete.balance_hashes)
+                    ):
+                        relationally_closed = False
+                if not relationally_closed:
+                    account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
+                    for intent in intents:
+                        forced_reasons.setdefault(intent.intent_id, account_block_reason)
         if forced_reasons:
             first_forced = next(intent for intent in intents if intent.intent_id in forced_reasons)
             self._engage_kill(
@@ -2088,22 +2360,20 @@ class ExecutionCoordinator:
         )
 
     def submit_intent(self, intent: ExecutionIntent) -> SubmissionResult:
-        """Claim permanently, then sign and submit at most once for this coordinator."""
+        """Durably claim, then sign and submit at most once for this database."""
 
-        with self._submission_claim_lock:
-            already_claimed = intent.intent_id in self._submission_claims
-            active = intent.intent_id in self._active_submission_claims
-            if not already_claimed:
-                self._submission_claims.add(intent.intent_id)
-                self._active_submission_claims.add(intent.intent_id)
-        if already_claimed:
-            if active:
+        now = self._now()
+        if not self._store.claim_execution_intent_submission(intent, now):
+            try:
+                latest = self._store.latest_order_state(intent.intent_id)
+            except ConflictingRecordError:
+                latest = None
+            if latest is None or latest.normalized_state is VenueOrderState.SUBMITTING:
                 return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, intent)
-            now = self._now()
             kill_reason = self._engage_kill(
                 trigger=CoordinatorCode.DUPLICATE_INTENT.value,
                 intent=intent,
-                venue_order_id=None,
+                venue_order_id=latest.venue_order_id,
                 now=now,
             )
             return self._submission_result(
@@ -2111,15 +2381,7 @@ class ExecutionCoordinator:
                 intent,
                 kill_reason=kill_reason,
             )
-        if not self._store.claim_execution_intent_submission(intent.intent_id):
-            with self._submission_claim_lock:
-                self._active_submission_claims.discard(intent.intent_id)
-            return self._submission_result(CoordinatorCode.DUPLICATE_INTENT, intent)
-        try:
-            return self._submit_claimed_intent(intent)
-        finally:
-            with self._submission_claim_lock:
-                self._active_submission_claims.discard(intent.intent_id)
+        return self._submit_claimed_intent(intent)
 
     def _submit_claimed_intent(self, intent: ExecutionIntent) -> SubmissionResult:
         """Execute one already-claimed append-only submission lifecycle."""

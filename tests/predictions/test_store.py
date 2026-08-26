@@ -73,9 +73,10 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "execution_kill_events",
         "activation_evidence",
         "protocol_conformance_results",
+        "execution_operation_claims",
         "schema_migrations",
     } <= tables
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     perpetual_futures_tables = {
         "raw_envelopes",
         "instrument_specs",

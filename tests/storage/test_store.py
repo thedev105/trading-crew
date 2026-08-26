@@ -440,7 +440,7 @@ def test_read_write_open_rejects_a_prediction_store_database_without_mutating_it
         ).fetchall()
     assert "prediction_raw_envelopes" in tables
     assert "raw_envelopes" not in tables
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
 
 
 def test_migration_sql_is_available_as_packaged_data() -> None:

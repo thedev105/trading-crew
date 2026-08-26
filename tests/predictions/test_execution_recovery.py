@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -45,6 +45,7 @@ from tests.predictions.test_execution_coordinator import (
     FakeAuthority,
     FakePreflight,
     FakeSigner,
+    engage_durable_kill,
     execution_intent,
     execution_plan,
     lifecycle_event,
@@ -73,7 +74,7 @@ def read_result(route: RouteKey, payload: object) -> RestResult:
     return RestResult(
         route=route,
         code=RestCode.READ_OK,
-        observed_at=NOW + timedelta(milliseconds=250),
+        observed_at=NOW + timedelta(milliseconds=500),
         raw_body_hash=HASHES[10],
         request_body_hash=None,
         attempts=1,
@@ -92,7 +93,7 @@ def failed_read_result(route: RouteKey, code: RestCode) -> RestResult:
     return RestResult(
         route=route,
         code=code,
-        observed_at=NOW + timedelta(milliseconds=250),
+        observed_at=NOW + timedelta(milliseconds=500),
         raw_body_hash=HASHES[10],
         request_body_hash=None,
         attempts=1,
@@ -110,23 +111,25 @@ def order_read(
     original_size: str = "10",
     size_matched: str = "10",
     status: str = "MATCHED",
+    maker_address: str = SIGNER_ADDRESS,
+    order_type: str = "FAK",
 ) -> OrderReadPayload:
     return OrderReadPayload(
         kind="ORDER_READ",
         id=order_id,
         market="condition-1",
         asset_id=asset_id,
-        maker_address=SIGNER_ADDRESS,
+        maker_address=maker_address,
         side="BUY",
         price=price,
         original_size=original_size,
         size_matched=size_matched,
         outcome="YES",
-        order_type="FAK",
+        order_type=order_type,
         status=status,
         associate_trades=(),
         created_at="1787673600",
-        expiration="1787677200",
+        expiration="0",
     )
 
 
@@ -276,7 +279,7 @@ def cancellation_result(order_id: str = "venue-order-1") -> RestResult:
     return RestResult(
         route=RouteKey.CANCEL_ORDER,
         code=RestCode.CANCEL_ACKNOWLEDGED,
-        observed_at=NOW + timedelta(milliseconds=250),
+        observed_at=NOW + timedelta(milliseconds=500),
         raw_body_hash=HASHES[11],
         request_body_hash=HASHES[12],
         attempts=1,
@@ -295,7 +298,7 @@ def cancellation_failure(code: RestCode) -> RestResult:
     return RestResult(
         route=RouteKey.CANCEL_ORDER,
         code=code,
-        observed_at=NOW + timedelta(milliseconds=250),
+        observed_at=NOW + timedelta(milliseconds=500),
         raw_body_hash=HASHES[11],
         request_body_hash=HASHES[12],
         attempts=1,
@@ -321,6 +324,62 @@ def recovering_coordinator(
         clock=lambda: NOW + timedelta(milliseconds=500),
         test_only_kill_state=KillState(engaged=False, latest_event=None),
     )
+
+
+def test_recovery_snapshots_each_read_before_later_callback_alias_mutation(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+
+    class AliasingReader(RecordingAccountReader):
+        def read_trades(self) -> RestResult:
+            object.__setattr__(self.orders, "route", RouteKey.READ_TRADES)
+            return super().read_trades()
+
+    reader = AliasingReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=()))
+
+    report = recovering_coordinator(store, reader, FakeSigner(), plan).recover_account(
+        ACCOUNT_FINGERPRINT
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert reader.calls == list(report.reads)
+
+
+def test_recovery_accepts_observations_inside_each_natural_read_interval(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    reader = RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=()))
+    reader.orders = reader.orders.model_copy(
+        update={"observed_at": NOW + timedelta(milliseconds=200)}
+    )
+    reader.trades = reader.trades.model_copy(
+        update={"observed_at": NOW + timedelta(milliseconds=400)}
+    )
+    reader.balance = reader.balance.model_copy(
+        update={"observed_at": NOW + timedelta(milliseconds=600)}
+    )
+    samples = iter(NOW + timedelta(milliseconds=value) for value in (100, 300, 300, 500, 500, 700))
+    last = NOW + timedelta(milliseconds=700)
+
+    def advancing_clock() -> datetime:
+        return next(samples, last)
+
+    executor = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(),
+        account_reader=reader,
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=advancing_clock,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+
+    report = executor.recover_account(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
 
 
 @pytest.mark.parametrize("response_was_accepted", [False, True])
@@ -428,6 +487,55 @@ def test_known_venue_id_and_exact_order_read_recovers_a_full_fill(
     assert report.blocked_intent_ids == ()
     assert store.latest_order_state(intent.intent_id).normalized_state is VenueOrderState.FILLED  # type: ignore[union-attr]
     assert recovery_signer.sign_calls == recovery_signer.submit_calls == 0
+
+
+@pytest.mark.parametrize(
+    "order_update",
+    [
+        {"status": "LIVE"},
+        {"status": "CANCELED"},
+        {"status": "UNKNOWN"},
+        {"maker_address": "0x" + "44" * 20},
+    ],
+)
+def test_known_order_read_rejects_status_or_maker_contradictions_without_persistence(
+    store: PredictionMarketStore,
+    order_update: dict[str, str],
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_DELAYED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    exact = order_read(
+        order_id="venue-order-1",
+        asset_id=intent.token_id,
+        price=str(intent.limit_price),
+    ).model_copy(update=order_update)
+    reader = RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=(exact,)))
+
+    report = recovering_coordinator(store, reader, FakeSigner(), plan).recover_account(
+        ACCOUNT_FINGERPRINT
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert tuple(
+        event.normalized_state
+        for event in store.verified_venue_order_events_for_intent(
+            intent.intent_id,
+            NOW + timedelta(seconds=1),
+        )
+    ) == (VenueOrderState.SUBMITTING, VenueOrderState.ACK_DELAYED)
 
 
 def test_unique_maker_trade_correlation_persists_trade_and_recovers_fill(
@@ -699,15 +807,30 @@ def test_ambiguous_duplicate_maker_correlation_stays_blocked_without_guessing(
 
 
 @pytest.mark.parametrize(
-    ("confirming_status", "expected_code", "expected_state"),
+    ("confirming_update", "expected_code", "expected_state"),
     [
-        ("CANCELED", CoordinatorCode.RECOVERY_COMPLETE, VenueOrderState.CANCELLED),
-        ("LIVE", CoordinatorCode.RECOVERY_BLOCKED, VenueOrderState.CANCEL_PENDING),
+        ({}, CoordinatorCode.RECOVERY_COMPLETE, VenueOrderState.CANCELLED),
+        ({"status": "LIVE"}, CoordinatorCode.RECOVERY_BLOCKED, VenueOrderState.CANCEL_PENDING),
+        (
+            {"maker_address": "0x" + "44" * 20},
+            CoordinatorCode.RECOVERY_BLOCKED,
+            VenueOrderState.CANCEL_PENDING,
+        ),
+        (
+            {"original_size": "11"},
+            CoordinatorCode.RECOVERY_BLOCKED,
+            VenueOrderState.CANCEL_PENDING,
+        ),
+        (
+            {"order_type": "FOK"},
+            CoordinatorCode.RECOVERY_BLOCKED,
+            VenueOrderState.CANCEL_PENDING,
+        ),
     ],
 )
 def test_cancellation_retries_only_bound_order_and_requires_confirming_order_read(
     store: PredictionMarketStore,
-    confirming_status: str,
+    confirming_update: dict[str, str],
     expected_code: CoordinatorCode,
     expected_state: VenueOrderState,
 ) -> None:
@@ -716,7 +839,7 @@ def test_cancellation_retries_only_bound_order_and_requires_confirming_order_rea
     first = ExecutionCoordinator(
         store=store,
         preflight=FakePreflight(preflight_evidence(plan)),
-        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_LIVE_UNEXPECTED)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
         account_reader=RecordingAccountReader(
             orders=OrdersReadPayload(kind="ORDERS_READ", items=())
         ),
@@ -725,7 +848,7 @@ def test_cancellation_retries_only_bound_order_and_requires_confirming_order_rea
         clock=lambda: NOW,
         test_only_kill_state=KillState(engaged=False, latest_event=None),
     )
-    assert first.submit_intent(intent).state is VenueOrderState.ACK_LIVE_UNEXPECTED
+    assert first.submit_intent(intent).state is VenueOrderState.ACK_MATCHED
     assert (
         first.apply_order_event(
             intent,
@@ -749,8 +872,8 @@ def test_cancellation_retries_only_bound_order_and_requires_confirming_order_rea
         asset_id=intent.token_id,
         price=str(intent.limit_price),
         size_matched="0",
-        status=confirming_status,
-    )
+        status="CANCELED",
+    ).model_copy(update=confirming_update)
     reader = RecordingAccountReader(
         orders=OrdersReadPayload(kind="ORDERS_READ", items=(open_order,)),
         order=read_result(RouteKey.READ_ORDER, confirming_order),
@@ -774,6 +897,107 @@ def test_cancellation_retries_only_bound_order_and_requires_confirming_order_rea
     latest = store.latest_order_state(intent.intent_id)
     assert latest is not None
     assert latest.normalized_state is expected_state
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_cancel_calls"),
+    [("evidence", 0), ("authority", 0), ("cancel_result", 1)],
+)
+def test_durable_kill_wins_at_every_cancel_callback_boundary(
+    store: PredictionMarketStore,
+    boundary: str,
+    expected_cancel_calls: int,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    first.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCEL_PENDING,
+            received_at=NOW + timedelta(milliseconds=100),
+        ),
+    )
+    reader = RecordingAccountReader(
+        orders=OrdersReadPayload(
+            kind="ORDERS_READ",
+            items=(
+                order_read(
+                    order_id="venue-order-1",
+                    asset_id=intent.token_id,
+                    price=str(intent.limit_price),
+                    size_matched="0",
+                    status="LIVE",
+                ),
+            ),
+        ),
+        order=read_result(
+            RouteKey.READ_ORDER,
+            order_read(
+                order_id="venue-order-1",
+                asset_id=intent.token_id,
+                price=str(intent.limit_price),
+                size_matched="0",
+                status="CANCELED",
+            ),
+        ),
+    )
+
+    class KillingPreflight(FakePreflight):
+        def validate(self, candidate, now):  # type: ignore[no-untyped-def]
+            result = super().validate(candidate, now)
+            if boundary == "evidence":
+                engage_durable_kill(store, candidate, occurred_at=now)
+            return result
+
+    class KillingAuthority(FakeAuthority):
+        def snapshot(self, candidate, evidence, operation, now):  # type: ignore[no-untyped-def]
+            result = super().snapshot(candidate, evidence, operation, now)
+            if boundary == "authority":
+                engage_durable_kill(store, candidate, occurred_at=now)
+            return result
+
+    class KillingSigner(CancellationSigner):
+        def cancel(self, candidate, envelope, order_id, evidence):  # type: ignore[no-untyped-def]
+            result = super().cancel(candidate, envelope, order_id, evidence)
+            if boundary == "cancel_result":
+                engage_durable_kill(store, intent, occurred_at=NOW + timedelta(milliseconds=500))
+            return result
+
+    signer = KillingSigner(cancellation_result())
+    executor = ExecutionCoordinator(
+        store=store,
+        preflight=KillingPreflight(preflight_evidence(plan)),
+        signer=signer,
+        account_reader=reader,
+        authority=KillingAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW + timedelta(milliseconds=500),
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+
+    report = executor.recover_account(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert signer.cancel_calls == expected_cancel_calls
+    assert RouteKey.READ_ORDER not in reader.calls
+    assert (
+        store.latest_order_state(intent.intent_id).normalized_state
+        is VenueOrderState.CANCEL_PENDING
+    )  # type: ignore[union-attr]
 
 
 def test_ambiguous_cancel_outcome_preserves_exact_reason_without_confirming_read(
@@ -1093,6 +1317,60 @@ def test_startup_conservatively_blocks_every_persisted_first_fill(
     assert preflight.revalidate_calls == 1
 
 
+def test_startup_blocks_any_prior_fill_even_when_latest_order_state_is_terminal(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    executor = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    executor.submit_intent(intent)
+    executor.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.PARTIALLY_FILLED,
+            received_at=NOW + timedelta(milliseconds=100),
+        ),
+    )
+    executor.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCEL_PENDING,
+            received_at=NOW + timedelta(milliseconds=200),
+        ),
+    )
+    executor.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCELLED,
+            received_at=NOW + timedelta(milliseconds=300),
+        ),
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (intent.intent_id,)
+
+
 def test_cancel_ack_is_durable_before_confirmation_and_never_reissued_after_restart(
     store: PredictionMarketStore,
 ) -> None:
@@ -1184,6 +1462,75 @@ def test_cancel_ack_is_durable_before_confirmation_and_never_reissued_after_rest
     assert restart_signer.cancel_calls == 0
     assert restart_reader.calls.count(RouteKey.READ_ORDER) == 1
     assert store.latest_order_state(intent.intent_id).normalized_state is VenueOrderState.CANCELLED  # type: ignore[union-attr]
+
+
+def test_forged_cancel_acknowledgement_identity_blocks_without_cancel_or_read(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    first = ExecutionCoordinator(
+        store=store,
+        preflight=FakePreflight(preflight_evidence(plan)),
+        signer=FakeSigner(submit_result(RestCode.ORDER_ACK_MATCHED)),
+        account_reader=RecordingAccountReader(
+            orders=OrdersReadPayload(kind="ORDERS_READ", items=())
+        ),
+        authority=FakeAuthority(),
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        clock=lambda: NOW,
+        test_only_kill_state=KillState(engaged=False, latest_event=None),
+    )
+    first.submit_intent(intent)
+    first.apply_order_event(
+        intent,
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCEL_PENDING,
+            received_at=NOW + timedelta(milliseconds=100),
+        ),
+    )
+    store.append_venue_order_event(
+        lifecycle_event(
+            intent,
+            VenueOrderState.CANCEL_PENDING,
+            received_at=NOW + timedelta(milliseconds=200),
+        ).model_copy(
+            update={
+                "intent_id": intent.intent_id,
+                "original_venue_state": RestCode.CANCEL_ACKNOWLEDGED.value,
+                "source_channel": "recovery_cancel_ack",
+                "raw_event_hash": HASHES[11],
+                "lineage_hashes": tuple(sorted((HASHES[11], HASHES[12]))),
+            }
+        )
+    )
+    reader = RecordingAccountReader(
+        orders=OrdersReadPayload(kind="ORDERS_READ", items=()),
+        order=read_result(
+            RouteKey.READ_ORDER,
+            order_read(
+                order_id="venue-order-1",
+                asset_id=intent.token_id,
+                price=str(intent.limit_price),
+                size_matched="0",
+                status="CANCELED",
+            ),
+        ),
+    )
+    signer = CancellationSigner(cancellation_result())
+
+    report = recovering_coordinator(store, reader, signer, plan).recover_account(
+        ACCOUNT_FINGERPRINT
+    )
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert signer.cancel_calls == 0
+    assert RouteKey.READ_ORDER not in reader.calls
+    assert (
+        store.latest_order_state(intent.intent_id).normalized_state
+        is VenueOrderState.CANCEL_PENDING
+    )  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -1404,6 +1751,76 @@ def test_startup_treats_plan_linked_wrong_account_intent_as_corruption(
     assert report.blocked_intent_ids == ()
     assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
     assert restart.new_intents_blocked
+
+
+def test_startup_treats_account_intent_without_plan_as_corruption(
+    store: PredictionMarketStore,
+) -> None:
+    orphan = execution_intent(execution_plan())
+    store.append_execution_intent(orphan)
+    restart = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        execution_plan(),
+    )
+
+    report = restart.recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == ()
+    assert restart.new_intents_blocked
+
+
+def test_startup_blocks_covered_posting_with_orphan_relationships(
+    store: PredictionMarketStore,
+) -> None:
+    posting_id = uuid4()
+    store.append_live_ledger_posting(
+        LiveLedgerPosting(
+            schema_version=1,
+            posting_id=posting_id,
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            intent_id=uuid4(),
+            venue_order_id="orphan-order",
+            venue_trade_id="orphan-trade",
+            settlement_hash=HASHES[11],
+            fee_hash=HASHES[12],
+            balance_evidence_hashes=(HASHES[9],),
+            debit_account="cash",
+            credit_account="position",
+            asset_id="wrong-asset",
+            debit_amount=Decimal("1"),
+            credit_amount=Decimal("0"),
+            occurred_at=NOW + timedelta(milliseconds=100),
+        )
+    )
+    store.append_live_reconciliation(
+        LiveReconciliation(
+            schema_version=1,
+            reconciliation_id=uuid4(),
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            observed_at=NOW + timedelta(milliseconds=200),
+            complete=True,
+            differences=(),
+            evidence_hashes=(HASHES[12],),
+            next_action=None,
+            venue_order_hashes=(HASHES[10],),
+            venue_trade_hashes=(HASHES[11],),
+            balance_hashes=(HASHES[9],),
+            expected_posting_ids=(posting_id,),
+        )
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        execution_plan(),
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
 
 
 def test_startup_store_corruption_engages_account_kill_without_trusting_bad_identity(
