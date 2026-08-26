@@ -1,0 +1,586 @@
+"""Capability-gated local signer service with no built-in network or persistence."""
+
+from __future__ import annotations
+
+import hmac
+import os
+import select
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
+from typing import Protocol
+from uuid import UUID
+
+from eth_account import Account
+
+from polytrading.predictions.execution.authority import (
+    AuthorityContext,
+    AuthorityDecision,
+    verify_mutation_authority,
+)
+from polytrading.predictions.execution.models import (
+    ExecutionOperation,
+    canonical_execution_hash,
+)
+from polytrading.predictions.polymarket_execution.auth import (
+    ClobAuthError,
+    ClobCredentials,
+    L2AuthHeaders,
+    sign_l2_request,
+)
+from polytrading.predictions.polymarket_execution.ipc import (
+    CancelOrderPayload,
+    HeartbeatPayload,
+    ReadAccountPayload,
+    ReadOrdersPayload,
+    ReadTradesPayload,
+    SanitizedOperationResult,
+    SignedEnvelopeResult,
+    SignerProtocolError,
+    SignerRequest,
+    SignerResponse,
+    SignOrderPayload,
+    SubmitOrderPayload,
+    canonical_request_bytes,
+    canonical_response_bytes,
+    parse_signer_request,
+    read_frame,
+    write_frame,
+)
+from polytrading.predictions.polymarket_execution.order import OrderSigningError, sign_order
+from polytrading.predictions.polymarket_execution.protocol import (
+    PolymarketProtocolSnapshot,
+    load_protocol_snapshot,
+)
+from polytrading.predictions.polymarket_execution.secrets import (
+    SecretBoundaryError,
+    SecretMaterial,
+    read_secret_descriptors,
+)
+
+_MUTATING_OPERATIONS = frozenset(
+    {
+        ExecutionOperation.SIGN_ORDER,
+        ExecutionOperation.SUBMIT_ORDER,
+        ExecutionOperation.CANCEL_ORDER,
+        ExecutionOperation.HEARTBEAT,
+    }
+)
+_READ_OPERATIONS = frozenset(
+    {
+        ExecutionOperation.READ_ORDERS,
+        ExecutionOperation.READ_TRADES,
+        ExecutionOperation.READ_ACCOUNT,
+    }
+)
+
+
+class L2HeaderSigner(Protocol):
+    def __call__(
+        self,
+        *,
+        timestamp: str,
+        method: str,
+        route: str,
+        body: bytes,
+    ) -> L2AuthHeaders: ...
+
+
+class SubmitOrderHandler(Protocol):
+    def __call__(
+        self,
+        payload: SubmitOrderPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+class CancelOrderHandler(Protocol):
+    def __call__(
+        self,
+        payload: CancelOrderPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+class HeartbeatHandler(Protocol):
+    def __call__(
+        self,
+        payload: HeartbeatPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+class ReadOrdersHandler(Protocol):
+    def __call__(
+        self,
+        payload: ReadOrdersPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+class ReadTradesHandler(Protocol):
+    def __call__(
+        self,
+        payload: ReadTradesPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+class ReadAccountHandler(Protocol):
+    def __call__(
+        self,
+        payload: ReadAccountPayload,
+        authenticate: L2HeaderSigner,
+    ) -> SanitizedOperationResult: ...
+
+
+AuthorityContextFactory = Callable[[SignerRequest, datetime], AuthorityContext]
+ReadGuard = Callable[[SignerRequest, datetime], AuthorityDecision]
+SignerServiceFactory = Callable[[SecretMaterial], "SignerService"]
+
+
+@dataclass(frozen=True, slots=True)
+class SignerOperationHandlers:
+    """Typed pure handlers injected behind the signer authority boundary."""
+
+    submit_order: SubmitOrderHandler
+    cancel_order: CancelOrderHandler
+    heartbeat: HeartbeatHandler
+    read_orders: ReadOrdersHandler
+    read_trades: ReadTradesHandler
+    read_account: ReadAccountHandler
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayEntry:
+    request_digest: bytes
+    response_bytes: bytes
+
+
+class SignerService:
+    """Validate, gate, sign, and dispatch one bounded signer request at a time."""
+
+    __slots__ = (
+        "_authority_context_factory",
+        "_cache",
+        "_clock",
+        "_closed",
+        "_handlers",
+        "_max_cache_entries",
+        "_read_guard",
+        "_secrets",
+        "_snapshot",
+    )
+
+    def __init__(
+        self,
+        *,
+        secrets: SecretMaterial,
+        authority_context_factory: AuthorityContextFactory,
+        read_guard: ReadGuard,
+        handlers: SignerOperationHandlers,
+        clock: Callable[[], datetime],
+        max_cache_entries: int = 1024,
+        snapshot: PolymarketProtocolSnapshot | None = None,
+    ) -> None:
+        if type(secrets) is not SecretMaterial:
+            raise TypeError("SECRET_MATERIAL_REQUIRED")
+        if type(max_cache_entries) is not int or not 1 <= max_cache_entries <= 10_000:
+            raise ValueError("IPC_REPLAY_CACHE_SIZE_INVALID")
+        self._secrets = secrets
+        self._authority_context_factory = authority_context_factory
+        self._read_guard = read_guard
+        self._handlers = handlers
+        self._clock = clock
+        self._max_cache_entries = max_cache_entries
+        self._snapshot = snapshot or load_protocol_snapshot()
+        self._cache: dict[UUID, _ReplayEntry] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+        self._secrets.close()
+
+    def handle_raw(self, payload: bytes) -> SignerResponse:
+        """Parse one bounded wire payload without reflecting invalid input."""
+        try:
+            request = parse_signer_request(payload)
+        except SignerProtocolError as error:
+            return SignerResponse.rejected(None, str(error))
+        return self.handle(request)
+
+    def _handle_raw_bytes(self, payload: bytes) -> bytes:
+        try:
+            request = parse_signer_request(payload)
+        except SignerProtocolError as error:
+            return canonical_response_bytes(SignerResponse.rejected(None, str(error)))
+        return self._handle_bytes(request)
+
+    def handle(self, request: SignerRequest) -> SignerResponse:
+        """Return a cached exact response or process one fresh validated request."""
+        if type(request) is not SignerRequest:
+            return SignerResponse.rejected(None, "IPC_REQUEST_INVALID")
+        response_bytes = self._handle_bytes(request)
+        return SignerResponse.model_validate_json(response_bytes, strict=True)
+
+    def _handle_bytes(self, request: SignerRequest) -> bytes:
+        request_id = request.request_id
+        if type(request_id) is not UUID:
+            return canonical_response_bytes(SignerResponse.rejected(None, "IPC_REQUEST_INVALID"))
+        cached = self._cache.get(request_id)
+        try:
+            request_bytes = canonical_request_bytes(request)
+        except Exception:
+            error_code = "IPC_REQUEST_COLLISION" if cached is not None else "IPC_REQUEST_INVALID"
+            return canonical_response_bytes(SignerResponse.rejected(request_id, error_code))
+        request_digest = sha256(request_bytes).digest()
+        if cached is not None:
+            if hmac.compare_digest(cached.request_digest, request_digest):
+                return cached.response_bytes
+            return canonical_response_bytes(
+                SignerResponse.rejected(request_id, "IPC_REQUEST_COLLISION")
+            )
+        if len(self._cache) >= self._max_cache_entries:
+            return canonical_response_bytes(
+                SignerResponse.rejected(request_id, "IPC_REPLAY_CACHE_FULL")
+            )
+
+        try:
+            request = parse_signer_request(request_bytes)
+        except SignerProtocolError as error:
+            response_bytes = canonical_response_bytes(
+                SignerResponse.rejected(request_id, str(error))
+            )
+            self._cache[request_id] = _ReplayEntry(request_digest, response_bytes)
+            return response_bytes
+
+        response = self._handle_uncached(request)
+        response_bytes = canonical_response_bytes(response)
+        self._cache[request_id] = _ReplayEntry(request_digest, response_bytes)
+        return response_bytes
+
+    def _handle_uncached(self, request: SignerRequest) -> SignerResponse:
+        if self._closed:
+            return SignerResponse.rejected(request.request_id, "IPC_SIGNER_CLOSED")
+        try:
+            now = self._clock()
+        except Exception:
+            return SignerResponse.rejected(request.request_id, "IPC_CLOCK_INVALID")
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            return SignerResponse.rejected(request.request_id, "IPC_CLOCK_INVALID")
+        now = now.astimezone(UTC)
+        if now >= request.deadline:
+            return SignerResponse.rejected(request.request_id, "IPC_DEADLINE_EXPIRED")
+        if request.protocol_version != self._snapshot.version:
+            return SignerResponse.rejected(request.request_id, "PROTOCOL_VERSION_MISMATCH")
+        if not self._secret_account_matches(request.account_fingerprint):
+            return SignerResponse.rejected(request.request_id, "ACCOUNT_FINGERPRINT_MISMATCH")
+
+        if request.operation in _MUTATING_OPERATIONS:
+            decision = self._verify_mutation(request, now)
+        elif request.operation in _READ_OPERATIONS:
+            decision = self._verify_read(request, now)
+        else:
+            return SignerResponse.rejected(request.request_id, "IPC_OPERATION_NOT_ALLOWED")
+        if not decision.allowed:
+            return SignerResponse.rejected(
+                request.request_id,
+                decision.reason or "IPC_AUTHORITY_FAILED",
+            )
+        return self._dispatch(request)
+
+    def _secret_account_matches(self, account_fingerprint: str) -> bool:
+        private_key: bytes | None = None
+        try:
+            private_key = bytes(self._secrets.private_key)
+            address = Account.from_key(private_key).address
+            decoded = bytes.fromhex(address[2:])
+        except (TypeError, ValueError):
+            return False
+        finally:
+            private_key = None
+        return hmac.compare_digest(sha256(decoded).hexdigest(), account_fingerprint)
+
+    def _verify_mutation(self, request: SignerRequest, now: datetime) -> AuthorityDecision:
+        try:
+            context = self._authority_context_factory(request, now)
+        except Exception:
+            return AuthorityDecision(False, "CAPABILITY_MISSING", ())
+        if type(context) is not AuthorityContext:
+            return AuthorityDecision(False, "CAPABILITY_MISSING", ())
+        capability = context.verified_capability
+        manifest_hash = (
+            canonical_execution_hash(context.manifest) if context.manifest is not None else None
+        )
+        if context.account_fingerprint != request.account_fingerprint:
+            return AuthorityDecision(False, "CAPABILITY_ACCOUNT_MISMATCH", ())
+        if (
+            context.manifest_record_hash != request.manifest_digest
+            or manifest_hash != request.manifest_digest
+        ):
+            return AuthorityDecision(False, "CAPABILITY_MANIFEST_MISMATCH", ())
+        if capability is None or capability.capability_digest != request.capability_digest:
+            return AuthorityDecision(False, "CAPABILITY_CANONICAL_BYTES_INVALID", ())
+        return verify_mutation_authority(context, request.operation)
+
+    def _verify_read(self, request: SignerRequest, now: datetime) -> AuthorityDecision:
+        try:
+            decision = self._read_guard(request, now)
+        except Exception:
+            return AuthorityDecision(False, "ACCOUNT_SCOPE_EVIDENCE_MISSING", ())
+        if not isinstance(decision, AuthorityDecision):
+            return AuthorityDecision(False, "ACCOUNT_SCOPE_EVIDENCE_MISSING", ())
+        return decision
+
+    def _l2_headers(
+        self,
+        *,
+        timestamp: str,
+        method: str,
+        route: str,
+        body: bytes,
+    ) -> L2AuthHeaders:
+        private_key: bytes | None = None
+        credentials: ClobCredentials | None = None
+        try:
+            private_key = bytes(self._secrets.private_key)
+            address = Account.from_key(private_key).address
+            credentials = ClobCredentials(
+                address=address,
+                api_key=bytes(self._secrets.api_key),
+                secret=bytes(self._secrets.api_secret),
+                passphrase=bytes(self._secrets.passphrase),
+            )
+            return sign_l2_request(
+                credentials,
+                timestamp=timestamp,
+                method=method,
+                route=route,
+                body=body,
+            )
+        finally:
+            credentials = None
+            private_key = None
+
+    def _dispatch(self, request: SignerRequest) -> SignerResponse:
+        try:
+            if isinstance(request.payload, SignOrderPayload):
+                private_key = bytes(self._secrets.private_key)
+                try:
+                    envelope = sign_order(request.payload.intent, private_key, self._snapshot)
+                finally:
+                    private_key = b""
+                result = SignedEnvelopeResult(
+                    operation=ExecutionOperation.SIGN_ORDER,
+                    envelope=envelope,
+                )
+            else:
+                handler = self._handler_for(request.payload)
+                result = handler(request.payload, self._l2_headers)
+                if (
+                    type(result) is not SanitizedOperationResult
+                    or result.operation is not request.operation
+                ):
+                    return SignerResponse.rejected(
+                        request.request_id,
+                        "IPC_OPERATION_RESULT_INVALID",
+                    )
+            return SignerResponse.accepted(request.request_id, result)
+        except (ClobAuthError, OrderSigningError) as error:
+            return SignerResponse.rejected(request.request_id, str(error))
+        except Exception:
+            return SignerResponse.rejected(request.request_id, "IPC_OPERATION_FAILED")
+
+    def _handler_for(
+        self,
+        payload: SubmitOrderPayload
+        | CancelOrderPayload
+        | HeartbeatPayload
+        | ReadOrdersPayload
+        | ReadTradesPayload
+        | ReadAccountPayload,
+    ) -> (
+        SubmitOrderHandler
+        | CancelOrderHandler
+        | HeartbeatHandler
+        | ReadOrdersHandler
+        | ReadTradesHandler
+        | ReadAccountHandler
+    ):
+        if isinstance(payload, SubmitOrderPayload):
+            return self._handlers.submit_order
+        if isinstance(payload, CancelOrderPayload):
+            return self._handlers.cancel_order
+        if isinstance(payload, HeartbeatPayload):
+            return self._handlers.heartbeat
+        if isinstance(payload, ReadOrdersPayload):
+            return self._handlers.read_orders
+        if isinstance(payload, ReadTradesPayload):
+            return self._handlers.read_trades
+        return self._handlers.read_account
+
+
+class _DeadlineFdStream:
+    __slots__ = ("_deadline", "_descriptor", "_monotonic")
+
+    def __init__(
+        self,
+        descriptor: int,
+        *,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> None:
+        self._descriptor = descriptor
+        self._deadline = deadline
+        self._monotonic = monotonic
+        os.set_blocking(descriptor, False)
+
+    def _remaining(self) -> float:
+        remaining = self._deadline - self._monotonic()
+        if remaining <= 0:
+            raise OSError("IPC_DEADLINE_REACHED")
+        return remaining
+
+    def read(self, size: int = -1) -> bytes:
+        readable, _, _ = select.select(
+            (self._descriptor,),
+            (),
+            (),
+            self._remaining(),
+        )
+        if not readable:
+            raise OSError("IPC_DEADLINE_REACHED")
+        return os.read(self._descriptor, size)
+
+    def write(self, value: bytes) -> int:
+        _, writable, _ = select.select(
+            (),
+            (self._descriptor,),
+            (),
+            self._remaining(),
+        )
+        if not writable:
+            raise OSError("IPC_DEADLINE_REACHED")
+        return os.write(self._descriptor, value)
+
+    def flush(self) -> None:
+        return None
+
+
+def _close_descriptors(*descriptors: int) -> None:
+    for descriptor in tuple(dict.fromkeys(descriptors)):
+        try:
+            os.close(descriptor)
+        except OSError:
+            continue
+
+
+def _write_sidecar_response(stream: _DeadlineFdStream, response: SignerResponse) -> bool:
+    try:
+        write_frame(stream, canonical_response_bytes(response))  # type: ignore[arg-type]
+    except SignerProtocolError:
+        return False
+    return True
+
+
+def run_signer_sidecar(
+    *,
+    request_fd: int,
+    response_fd: int,
+    secret_descriptors: tuple[int, int, int, int],
+    service_factory: SignerServiceFactory,
+    max_requests: int = 1024,
+    max_lifetime_seconds: float = 300,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Run the internal bounded local sidecar; never registered as a CLI entry point."""
+    all_descriptors = (request_fd, response_fd, *secret_descriptors)
+    secrets: SecretMaterial | None = None
+    service: object | None = None
+    secret_loader_called = False
+    try:
+        if (
+            type(request_fd) is not int
+            or type(response_fd) is not int
+            or len(secret_descriptors) != 4
+            or any(type(descriptor) is not int or descriptor < 0 for descriptor in all_descriptors)
+            or len(set(all_descriptors)) != len(all_descriptors)
+        ):
+            return
+        if type(max_requests) is not int or not 1 <= max_requests <= 10_000:
+            return
+        if type(max_lifetime_seconds) not in (int, float) or not 0 < max_lifetime_seconds <= 3600:
+            return
+        started = monotonic()
+        deadline = started + max_lifetime_seconds
+        request_stream = _DeadlineFdStream(
+            request_fd,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        response_stream = _DeadlineFdStream(
+            response_fd,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        try:
+            for descriptor in secret_descriptors:
+                os.set_blocking(descriptor, False)
+        except OSError:
+            _write_sidecar_response(
+                response_stream,
+                SignerResponse.rejected(None, "SECRET_DESCRIPTOR_READ_FAILED"),
+            )
+            return
+        secret_loader_called = True
+        try:
+            secrets = read_secret_descriptors(*secret_descriptors)
+        except SecretBoundaryError as error:
+            _write_sidecar_response(
+                response_stream,
+                SignerResponse.rejected(None, str(error)),
+            )
+            return
+        try:
+            service = service_factory(secrets)
+        except Exception:
+            _write_sidecar_response(
+                response_stream,
+                SignerResponse.rejected(None, "IPC_SERVICE_INITIALIZATION_FAILED"),
+            )
+            return
+        if type(service) is not SignerService:
+            _write_sidecar_response(
+                response_stream,
+                SignerResponse.rejected(None, "IPC_SERVICE_INITIALIZATION_FAILED"),
+            )
+            return
+
+        for _ in range(max_requests):
+            try:
+                payload = read_frame(request_stream)  # type: ignore[arg-type]
+            except SignerProtocolError as error:
+                _write_sidecar_response(
+                    response_stream,
+                    SignerResponse.rejected(None, str(error)),
+                )
+                return
+            response_bytes = service._handle_raw_bytes(payload)
+            try:
+                write_frame(response_stream, response_bytes)  # type: ignore[arg-type]
+            except SignerProtocolError:
+                return
+    finally:
+        if type(service) is SignerService:
+            service.close()
+        if secrets is not None:
+            secrets.close()
+        descriptors_to_close = (request_fd, response_fd)
+        if not secret_loader_called:
+            descriptors_to_close += secret_descriptors
+        _close_descriptors(*descriptors_to_close)
+
+
+__all__ = ["SignerOperationHandlers", "SignerService"]
