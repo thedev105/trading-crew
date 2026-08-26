@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "normalization": {
+    "input": "raw_response_body_bytes",
+    "encoding": "UTF-8",
+    "transformations": ["CRLF_TO_LF"],
+    "strip_or_reflow": false
+  },
+  "sources": [
+    {
+      "source_id": "polymarket_api_getting_started",
+      "canonical_url": "https://docs.polymarket.com/getting-started/api",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "032d1475be0f58473955f9dc044ab73806c0f734e5b823c90fb9751e624818d1",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "authentication_and_api_surfaces",
+      "derived_files": ["protocol_v1.json"]
+    },
+    {
+      "source_id": "polymarket_place_orders",
+      "canonical_url": "https://docs.polymarket.com/trading/place-orders",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "258b23a52c0c5949cfb2393aca627544029d20824a1825bf84074217928a1e11",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "order_domain_payload_rounding_and_acknowledgements",
+      "derived_files": ["protocol_v1.json", "order_vectors_v1.json", "event_vectors_v1.json"]
+    },
+    {
+      "source_id": "polymarket_manage_orders",
+      "canonical_url": "https://docs.polymarket.com/trading/manage-orders",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "348b90c982aeb822345791304724d958816bc47b1cae0c4ed6861d7034bacef4",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "reads_cancellations_and_authoritative_heartbeat_contract",
+      "derived_files": ["protocol_v1.json", "event_vectors_v1.json"]
+    },
+    {
+      "source_id": "polymarket_realtime_order_updates",
+      "canonical_url": "https://docs.polymarket.com/trading/realtime-order-updates",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "b54f6a355d93eb4f83a7734da4f2fb32bdd7737d90a954c796f52b3eba1818d7",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "authenticated_user_stream_and_event_states",
+      "derived_files": ["protocol_v1.json", "event_vectors_v1.json"]
+    },
+    {
+      "source_id": "polymarket_generated_heartbeat_reference",
+      "canonical_url": "https://docs.polymarket.com/api-reference/trade/send-heartbeat",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "dd6ec5e859ba43353bb0a70de56f7aaa57c83a803175a2b43aa5b387535d36be",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "conflicting_stale_generated_heartbeat_reference",
+      "derived_files": ["protocol_v1.json"]
+    },
+    {
+      "source_id": "polymarket_geoblock",
+      "canonical_url": "https://docs.polymarket.com/api-reference/geoblock",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "080e785817f8298c07bcf51d896efcf9a09e54d716fc5bba99bacb4334b8c2a1",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": null,
+      "role": "geographic_eligibility_contract",
+      "derived_files": ["protocol_v1.json"]
+    },
+    {
+      "source_id": "polymarket_v2_client_endpoints",
+      "canonical_url": "https://raw.githubusercontent.com/Polymarket/py-clob-client-v2/main/py_clob_client_v2/endpoints.py",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "f75a6ea6fdd22b7b327556ea24e028976d0e1f5b4c57739bb25546218e2d40dc",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": "215fc63a8fd6ec3a10c7edb73997c9772d8686d3",
+      "role": "heartbeat_conflict_resolution_route_evidence",
+      "derived_files": ["protocol_v1.json"]
+    },
+    {
+      "source_id": "polymarket_v2_client_heartbeat",
+      "canonical_url": "https://raw.githubusercontent.com/Polymarket/py-clob-client-v2/main/py_clob_client_v2/client.py",
+      "retrieved_at": "2026-08-25T00:00:00Z",
+      "normalized_content_sha256": "66604f43bf37f8482f3f50674b9f3e3834ff13ef83722c00c69520e37052bd3a",
+      "protocol_fixture_version": "polymarket-clob-2026-08-25-v1",
+      "implementation_revision": "task-4-r1",
+      "upstream_revision": "215fc63a8fd6ec3a10c7edb73997c9772d8686d3",
+      "role": "heartbeat_conflict_resolution_compact_body_evidence",
+      "derived_files": ["protocol_v1.json"]
+    }
+  ]
+}

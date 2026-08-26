@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "duckdb==1.5.4",
+  "eth-account==0.13.7",
   "httpx==0.28.1",
   "pydantic==2.13.4",
   "scikit-learn==1.9.0",
@@ -35,6 +36,7 @@ where = ["src"]
 "polytrading.web.assets" = ["*.html", "*.css", "*.js"]
 "polytrading.carry.dossiers" = ["*.json"]
 "polytrading.predictions.storage.schema" = ["*.sql"]
+"polytrading.predictions.polymarket_execution" = ["fixtures/*.json"]
 "polytrading.predictions.web_assets" = ["*.html", "*.css", "*.js"]
 
 [tool.pytest.ini_options]

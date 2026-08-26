@@ -1,0 +1,370 @@
+{
+  "schema_version": 1,
+  "version": "polymarket-clob-2026-08-25-v1",
+  "chain_id": 137,
+  "source_manifest_path": "sources_v1.json",
+  "eip712": {
+    "order_domain": {
+      "name": "Polymarket CTF Exchange",
+      "version": "2",
+      "chainId": 137,
+      "verifyingContract": "<exchange_address>"
+    },
+    "order_primary_type": "Order",
+    "order_fields": [
+      {"name": "salt", "type": "uint256"},
+      {"name": "maker", "type": "address"},
+      {"name": "signer", "type": "address"},
+      {"name": "tokenId", "type": "uint256"},
+      {"name": "makerAmount", "type": "uint256"},
+      {"name": "takerAmount", "type": "uint256"},
+      {"name": "side", "type": "uint8"},
+      {"name": "signatureType", "type": "uint8"},
+      {"name": "timestamp", "type": "uint256"},
+      {"name": "metadata", "type": "bytes32"},
+      {"name": "builder", "type": "bytes32"}
+    ],
+    "exchange_addresses": {
+      "standard": "0xE111180000d2663C0091e4f400237545B87B996B",
+      "negative_risk": "0xe2222d279d744050d28e00520010520000310F59"
+    },
+    "wallets": [
+      {
+        "wallet": "EOA",
+        "signature_type": 0,
+        "maker_address_rule": "eoa_address",
+        "signer_address_rule": "eoa_address",
+        "signing_primary_type": "Order",
+        "signature_encoding": "standard_eip712"
+      },
+      {
+        "wallet": "PROXY",
+        "signature_type": 1,
+        "maker_address_rule": "proxy_wallet_address",
+        "signer_address_rule": "account_signer_address",
+        "signing_primary_type": "Order",
+        "signature_encoding": "standard_eip712"
+      },
+      {
+        "wallet": "SAFE",
+        "signature_type": 2,
+        "maker_address_rule": "safe_wallet_address",
+        "signer_address_rule": "account_signer_address",
+        "signing_primary_type": "Order",
+        "signature_encoding": "standard_eip712"
+      },
+      {
+        "wallet": "DEPOSIT",
+        "signature_type": 3,
+        "maker_address_rule": "deposit_wallet_address",
+        "signer_address_rule": "deposit_wallet_address",
+        "signing_primary_type": "TypedDataSign",
+        "signature_encoding": "erc7739_wrapped"
+      }
+    ],
+    "deposit_wallet_wrapper": {
+      "typed_data_primary_type": "TypedDataSign",
+      "typed_data_fields": [
+        {"name": "contents", "type": "Order"},
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+        {"name": "verifyingContract", "type": "address"},
+        {"name": "salt", "type": "bytes32"}
+      ],
+      "message_domain": {
+        "name": "DepositWallet",
+        "version": "1",
+        "chainId": 137,
+        "verifyingContract": "<maker_address>",
+        "salt": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "order_type_string": "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)",
+      "domain_type_string": "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+      "signature_segments": [
+        "inner_signature",
+        "exchange_app_domain_separator",
+        "order_contents_hash",
+        "order_type_utf8_bytes",
+        "order_type_utf8_byte_length_as_uint16"
+      ]
+    }
+  },
+  "authentication": {
+    "clob_auth": {
+      "domain": {"name": "ClobAuthDomain", "version": "1", "chainId": 137},
+      "primary_type": "ClobAuth",
+      "fields": [
+        {"name": "address", "type": "address"},
+        {"name": "timestamp", "type": "string"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "message", "type": "string"}
+      ],
+      "message": "This message attests that I control the given wallet",
+      "default_nonce": 0,
+      "l1_headers": ["POLY_ADDRESS", "POLY_SIGNATURE", "POLY_TIMESTAMP", "POLY_NONCE"]
+    },
+    "l2": {
+      "headers": [
+        "POLY_ADDRESS",
+        "POLY_SIGNATURE",
+        "POLY_TIMESTAMP",
+        "POLY_API_KEY",
+        "POLY_PASSPHRASE"
+      ],
+      "preimage_components": [
+        "unix_timestamp_seconds",
+        "uppercase_http_method",
+        "route_path_without_query",
+        "exact_serialized_request_body_if_present"
+      ],
+      "body_omission_rule": "omit_component_when_request_has_no_body",
+      "algorithm": "HMAC-SHA256",
+      "secret_decoding": "base64",
+      "signature_encoding": "urlsafe_base64_with_padding"
+    }
+  },
+  "routes": {
+    "create_api_key": {
+      "host": "https://clob.polymarket.com",
+      "method": "POST",
+      "path": "/auth/api-key",
+      "auth_level": "L1",
+      "request_body_shape": "none",
+      "query_fields": [],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["apiKey", "secret", "passphrase"]
+    },
+    "derive_api_key": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/auth/derive-api-key",
+      "auth_level": "L1",
+      "request_body_shape": "none",
+      "query_fields": [],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["apiKey", "secret", "passphrase"]
+    },
+    "order_book": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/book",
+      "auth_level": "PUBLIC",
+      "request_body_shape": "none",
+      "query_fields": ["token_id"],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["asset_id", "bids", "asks", "min_order_size", "tick_size", "neg_risk"]
+    },
+    "place_order": {
+      "host": "https://clob.polymarket.com",
+      "method": "POST",
+      "path": "/order",
+      "auth_level": "L2_AND_ORDER_SIGNATURE",
+      "request_body_shape": "order_envelope_object",
+      "query_fields": [],
+      "request_fields": ["deferExec", "order", "orderType", "owner"],
+      "compact_body_examples": [],
+      "response_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"]
+    },
+    "place_orders": {
+      "host": "https://clob.polymarket.com",
+      "method": "POST",
+      "path": "/orders",
+      "auth_level": "L2_AND_ORDER_SIGNATURE",
+      "request_body_shape": "array_of_order_envelopes_1_to_15",
+      "query_fields": [],
+      "request_fields": ["deferExec", "order", "orderType", "owner"],
+      "compact_body_examples": [],
+      "response_fields": ["success", "errorMsg", "orderID", "status", "makingAmount", "takingAmount", "transactionsHashes", "tradeIDs"]
+    },
+    "get_order": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/data/order/{order_id}",
+      "auth_level": "L2",
+      "request_body_shape": "none",
+      "query_fields": [],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["id", "market", "asset_id", "owner", "maker_address", "side", "price", "original_size", "size_matched", "outcome", "order_type", "status", "associate_trades", "created_at", "expiration"]
+    },
+    "list_orders": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/data/orders",
+      "auth_level": "L2",
+      "request_body_shape": "none",
+      "query_fields": ["id", "market", "asset_id"],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["orders"]
+    },
+    "list_trades": {
+      "host": "https://clob.polymarket.com",
+      "method": "GET",
+      "path": "/data/trades",
+      "auth_level": "L2",
+      "request_body_shape": "none",
+      "query_fields": ["id", "market", "asset_id", "maker_address", "after", "before"],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["trades"]
+    },
+    "cancel_order": {
+      "host": "https://clob.polymarket.com",
+      "method": "DELETE",
+      "path": "/order",
+      "auth_level": "L2",
+      "request_body_shape": "object",
+      "query_fields": [],
+      "request_fields": ["orderID"],
+      "compact_body_examples": ["{\"orderID\":\"<order_id>\"}"],
+      "response_fields": ["canceled", "not_canceled"]
+    },
+    "cancel_orders": {
+      "host": "https://clob.polymarket.com",
+      "method": "DELETE",
+      "path": "/orders",
+      "auth_level": "L2",
+      "request_body_shape": "array_of_order_ids_1_to_3000",
+      "query_fields": [],
+      "request_fields": ["array_item_order_id"],
+      "compact_body_examples": ["[\"<order_id_1>\",\"<order_id_2>\"]"],
+      "response_fields": ["canceled", "not_canceled"]
+    },
+    "cancel_market_orders": {
+      "host": "https://clob.polymarket.com",
+      "method": "DELETE",
+      "path": "/cancel-market-orders",
+      "auth_level": "L2",
+      "request_body_shape": "object_with_at_least_one_filter",
+      "query_fields": [],
+      "request_fields": ["asset_id", "market"],
+      "compact_body_examples": ["{\"asset_id\":\"<token_id>\"}", "{\"market\":\"<condition_id>\"}"],
+      "response_fields": ["canceled", "not_canceled"]
+    },
+    "cancel_all": {
+      "host": "https://clob.polymarket.com",
+      "method": "DELETE",
+      "path": "/cancel-all",
+      "auth_level": "L2",
+      "request_body_shape": "none",
+      "query_fields": [],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["canceled", "not_canceled"]
+    },
+    "heartbeat": {
+      "host": "https://clob.polymarket.com",
+      "method": "POST",
+      "path": "/v1/heartbeats",
+      "auth_level": "L2",
+      "request_body_shape": "object",
+      "query_fields": [],
+      "request_fields": ["heartbeat_id"],
+      "compact_body_examples": ["{\"heartbeat_id\":\"\"}"],
+      "response_fields": ["heartbeat_id"]
+    },
+    "geoblock": {
+      "host": "https://polymarket.com",
+      "method": "GET",
+      "path": "/api/geoblock",
+      "auth_level": "PUBLIC",
+      "request_body_shape": "none",
+      "query_fields": [],
+      "request_fields": [],
+      "compact_body_examples": [],
+      "response_fields": ["blocked", "ip", "country", "region"]
+    }
+  },
+  "order_submission": {
+    "allowed_order_types": ["FAK", "FOK"],
+    "order_type_semantics": {
+      "FAK": "fill_available_immediately_cancel_remainder",
+      "FOK": "fill_entire_order_immediately_or_none"
+    },
+    "side_encodings": {"BUY": 0, "SELL": 1},
+    "typed_order_fields": ["salt", "maker", "signer", "tokenId", "makerAmount", "takerAmount", "side", "signatureType", "timestamp", "metadata", "builder"],
+    "posted_order_fields": ["builder", "expiration", "maker", "makerAmount", "metadata", "salt", "side", "signature", "signatureType", "signer", "takerAmount", "timestamp", "tokenId"],
+    "outer_payload_fields": ["deferExec", "order", "orderType", "owner"],
+    "market_order_expiration": "0",
+    "acknowledgement_states": ["live", "matched", "delayed", "unmatched"],
+    "fee_rate_binding": {
+      "state": "ABSENT_SUPERSEDED",
+      "signed_order_field": null,
+      "posted_order_field": null,
+      "evidence_location": "preflight_risk_evidence_only",
+      "source_id": "polymarket_place_orders"
+    }
+  },
+  "rounding": {
+    "token_decimals": 6,
+    "tick_size_rules": [
+      {"tick_size": "0.1", "price_decimals": 1, "size_decimals": 2, "amount_decimals": 3},
+      {"tick_size": "0.01", "price_decimals": 2, "size_decimals": 2, "amount_decimals": 4},
+      {"tick_size": "0.005", "price_decimals": 3, "size_decimals": 2, "amount_decimals": 5},
+      {"tick_size": "0.0025", "price_decimals": 4, "size_decimals": 2, "amount_decimals": 6},
+      {"tick_size": "0.001", "price_decimals": 3, "size_decimals": 2, "amount_decimals": 5},
+      {"tick_size": "0.0001", "price_decimals": 4, "size_decimals": 2, "amount_decimals": 6}
+    ],
+    "limit_rules": [
+      "price_has_no_more_than_price_decimals",
+      "share_quantity_rounds_down_to_size_decimals",
+      "usd_amount_rounds_up_to_amount_decimals_plus_four_then_down_to_amount_decimals_if_needed",
+      "BUY_makerAmount_is_usd_and_takerAmount_is_shares",
+      "SELL_makerAmount_is_shares_and_takerAmount_is_usd"
+    ],
+    "market_rules": [
+      "price_and_input_amount_round_down_to_configured_decimals",
+      "calculated_takerAmount_rounds_up_to_amount_decimals_plus_four_then_to_amount_decimals",
+      "BUY_makerAmount_is_usd_and_takerAmount_is_usd_divided_by_maximum_price_shares",
+      "SELL_makerAmount_is_shares_and_takerAmount_is_shares_times_minimum_price_usd"
+    ]
+  },
+  "websocket": {
+    "url": "wss://ws-subscriptions-clob.polymarket.com/ws/user",
+    "subscription_type": "user",
+    "authentication_fields": ["apiKey", "secret", "passphrase"],
+    "optional_market_filter_field": "markets",
+    "ping": "PING",
+    "pong": "PONG",
+    "ping_interval_seconds": 10,
+    "event_discriminator": "event_type",
+    "order_event_types": ["PLACEMENT", "UPDATE", "CANCELLATION"]
+  },
+  "heartbeat": {
+    "initial_compact_body": "{\"heartbeat_id\":\"\"}",
+    "subsequent_body_rule": "compact_json_with_latest_returned_heartbeat_id",
+    "response_fields": ["heartbeat_id"],
+    "cadence_seconds": 5,
+    "cancellation_timeout_seconds": 10,
+    "cancellation_check_interval_seconds": 5,
+    "invalid_id_status": 400,
+    "invalid_id_response_fields": ["error_msg", "heartbeat_id"],
+    "invalid_id_retry_rule": "sign_a_new_request_with_the_expected_heartbeat_id",
+    "conflict_resolution": {
+      "authoritative_route": "/v1/heartbeats",
+      "authoritative_guide_source_id": "polymarket_manage_orders",
+      "maintained_client_source_ids": ["polymarket_v2_client_endpoints", "polymarket_v2_client_heartbeat"],
+      "stale_generated_route": "/heartbeats",
+      "stale_generated_source_id": "polymarket_generated_heartbeat_reference",
+      "resolution": "detailed_guide_and_maintained_v2_client_override_stale_generated_reference"
+    }
+  },
+  "geoblock": {
+    "response_fields": ["blocked", "ip", "country", "region"],
+    "blocked_type": "boolean",
+    "country_format": "ISO_3166_1_ALPHA_2",
+    "region_format": "region_or_state_code",
+    "placement_rule": "blocked_true_forbids_order_placement"
+  },
+  "trade_states": ["MATCHED_NOT_BROADCASTED", "MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"],
+  "fixture_hashes": [
+    {"path": "sources_v1.json", "sha256": "aada11555f9af22558eff9e630297255993f98a5cb7ef3635c322b5f0d5098e3"},
+    {"path": "order_vectors_v1.json", "sha256": "d54ec792ecdb3a2258f9a52f5a4536def03f9313c0f862d468de0591ac3b92f0"},
+    {"path": "event_vectors_v1.json", "sha256": "537fa154c2f0d00b58dc887a10d79eb2703a47a22d54c6e8070ebd787894f1a0"}
+  ]
+}

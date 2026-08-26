@@ -332,14 +332,27 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
         cwd=source_checkout,
     )
     wheel = next(wheel_directory.glob("polytrading-*.whl"))
-    members = [
+    dossier_members = [
         "polytrading/carry/dossiers/hyperliquid-dydx-core-v1.json",
         "polytrading/carry/dossiers/lighter-dydx-core-v1.json",
     ]
+    json_members = [
+        *dossier_members,
+        (
+            "polytrading/predictions/polymarket_execution/fixtures/"
+            "event_vectors_v1.json"
+        ),
+        (
+            "polytrading/predictions/polymarket_execution/fixtures/"
+            "order_vectors_v1.json"
+        ),
+        "polytrading/predictions/polymarket_execution/fixtures/protocol_v1.json",
+        "polytrading/predictions/polymarket_execution/fixtures/sources_v1.json",
+    ]
 
     with ZipFile(wheel) as archive:
-        dossier_members = [name for name in archive.namelist() if name.endswith(".json")]
-        assert dossier_members == members
+        actual_json_members = [name for name in archive.namelist() if name.endswith(".json")]
+        assert actual_json_members == json_members
         migration_members = [
             name
             for name in archive.namelist()
@@ -381,7 +394,7 @@ def test_built_wheel_contains_valid_contract_dossier(tmp_path: Path) -> None:
         }
         dossiers = tuple(
             ContractCompatibilityDossier.model_validate_json(archive.read(member))
-            for member in members
+            for member in dossier_members
         )
 
     legacy, candidate = (evaluate_dossier(dossier) for dossier in dossiers)
