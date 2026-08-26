@@ -820,14 +820,63 @@ class PredictionMarketStore:
                 _epoch_us(record.observed_at),
                 _epoch_us(record.information_cutoff),
             ),
-            matches=lambda record: record.plan_id == plan_id
-            and (
-                as_of is None
-                or (record.observed_at <= as_of and record.information_cutoff <= as_of)
+            matches=lambda record: (
+                record.plan_id == plan_id
+                and (
+                    as_of is None
+                    or (record.observed_at <= as_of and record.information_cutoff <= as_of)
+                )
             ),
             sort_key=lambda record: (record.observed_at, record.plan_id),
         )
         return records[0] if records else None
+
+    def verified_live_execution_plans_for_account(
+        self,
+        account_fingerprint: str,
+        as_of: datetime,
+    ) -> tuple[LiveExecutionPlan, ...]:
+        """Return all strictly verified account plans visible at one cutoff."""
+
+        return self._verified_records(
+            table="live_execution_plans",
+            model=LiveExecutionPlan,
+            candidate_where=(
+                "(account_fingerprint = ? OR json_extract_string(record_json, "
+                "'$.account_fingerprint') = ?) AND (observed_at <= ? OR "
+                "CAST(json_extract_string(record_json, '$.observed_at') AS TIMESTAMPTZ) <= ?) "
+                "AND (information_cutoff <= ? OR CAST(json_extract_string(record_json, "
+                "'$.information_cutoff') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(
+                account_fingerprint,
+                account_fingerprint,
+                as_of,
+                as_of,
+                as_of,
+                as_of,
+            ),
+            index_columns=(
+                "CAST(plan_id AS VARCHAR)",
+                "CAST(proposal_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(observed_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=lambda record: (
+                str(record.plan_id),
+                str(record.proposal_id),
+                record.account_fingerprint,
+                _epoch_us(record.observed_at),
+                _epoch_us(record.information_cutoff),
+            ),
+            matches=lambda record: (
+                record.account_fingerprint == account_fingerprint
+                and record.observed_at <= as_of
+                and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (record.observed_at, record.plan_id),
+        )
 
     def verified_execution_intent(
         self, intent_id: UUID, as_of: datetime | None = None
@@ -861,10 +910,9 @@ class PredictionMarketStore:
                 _epoch_us(record.created_at),
                 _epoch_us(record.deadline),
             ),
-            matches=lambda record: record.intent_id == intent_id
-            and (
-                as_of is None
-                or (record.created_at <= as_of and record.deadline >= as_of)
+            matches=lambda record: (
+                record.intent_id == intent_id
+                and (as_of is None or (record.created_at <= as_of and record.deadline >= as_of))
             ),
             sort_key=lambda record: (record.created_at, record.intent_id),
         )
@@ -898,9 +946,45 @@ class PredictionMarketStore:
                 _epoch_us(record.created_at),
                 _epoch_us(record.deadline),
             ),
-            matches=lambda record: record.plan_id == plan_id
-            and record.created_at <= as_of
-            and record.deadline >= as_of,
+            matches=lambda record: (
+                record.plan_id == plan_id
+                and record.created_at <= as_of
+                and record.deadline >= as_of
+            ),
+            sort_key=lambda record: (record.created_at, record.intent_id),
+        )
+
+    def verified_execution_intent_history_for_plan(
+        self,
+        plan_id: UUID,
+        as_of: datetime,
+    ) -> tuple[ExecutionIntent, ...]:
+        """Return verified intent history without dropping expired unresolved work."""
+
+        return self._verified_records(
+            table="execution_intents",
+            model=ExecutionIntent,
+            candidate_where=(
+                "(plan_id = ? OR json_extract_string(record_json, '$.plan_id') = ?) "
+                "AND (created_at <= ? OR CAST(json_extract_string(record_json, "
+                "'$.created_at') AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(plan_id, str(plan_id), as_of, as_of),
+            index_columns=(
+                "CAST(intent_id AS VARCHAR)",
+                "CAST(plan_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(created_at)",
+                "epoch_us(deadline)",
+            ),
+            indexed_values=lambda record: (
+                str(record.intent_id),
+                str(record.plan_id),
+                record.account_fingerprint,
+                _epoch_us(record.created_at),
+                _epoch_us(record.deadline),
+            ),
+            matches=lambda record: record.plan_id == plan_id and record.created_at <= as_of,
             sort_key=lambda record: (record.created_at, record.intent_id),
         )
 
@@ -976,8 +1060,9 @@ class PredictionMarketStore:
                 None if record.intent_id is None else str(record.intent_id),
                 _epoch_us(record.received_at),
             ),
-            matches=lambda record: record.intent_id == intent_id
-            and (as_of is None or record.received_at <= as_of),
+            matches=lambda record: (
+                record.intent_id == intent_id and (as_of is None or record.received_at <= as_of)
+            ),
             sort_key=_order_event_sort_key,
             reverse=True,
         )
@@ -1033,8 +1118,9 @@ class PredictionMarketStore:
                 None if record.intent_id is None else str(record.intent_id),
                 _epoch_us(record.occurred_at),
             ),
-            matches=lambda record: record.account_fingerprint == account_fingerprint
-            and record.occurred_at <= as_of,
+            matches=lambda record: (
+                record.account_fingerprint == account_fingerprint and record.occurred_at <= as_of
+            ),
             sort_key=lambda record: (record.occurred_at, record.posting_id),
         )
 
@@ -1060,8 +1146,9 @@ class PredictionMarketStore:
                 record.account_fingerprint,
                 _epoch_us(record.observed_at),
             ),
-            matches=lambda record: record.account_fingerprint == account_fingerprint
-            and record.observed_at <= as_of,
+            matches=lambda record: (
+                record.account_fingerprint == account_fingerprint and record.observed_at <= as_of
+            ),
             sort_key=lambda record: (record.observed_at, record.reconciliation_id),
         )
 
@@ -1115,8 +1202,9 @@ class PredictionMarketStore:
                 _epoch_us(record.verified_at),
                 None if record.expires_at is None else _epoch_us(record.expires_at),
             ),
-            matches=lambda record: record.capability_digest == capability_digest
-            and record.verified_at <= as_of,
+            matches=lambda record: (
+                record.capability_digest == capability_digest and record.verified_at <= as_of
+            ),
             sort_key=lambda record: (record.verified_at, record.activation_evidence_id),
             reverse=True,
         )

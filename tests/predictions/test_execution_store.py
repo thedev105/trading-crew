@@ -307,9 +307,7 @@ def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
     with duckdb.connect(str(path)) as connection:
         for version, migration in PredictionMarketStore._migration_entries()[:7]:
             connection.execute(migration.read_text(encoding="utf-8"))
-            connection.execute(
-                "INSERT INTO schema_migrations VALUES (?, ?)", [version, NOW]
-            )
+            connection.execute("INSERT INTO schema_migrations VALUES (?, ?)", [version, NOW])
         envelope = raw_envelope()
         connection.execute(
             "INSERT INTO prediction_raw_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -484,3 +482,139 @@ def test_order_history_uses_sequence_number_before_uuid_for_equal_timestamps(
 
     assert store.verified_venue_order_events_for_intent(intent.intent_id, NOW) == (first, second)
     assert store.latest_order_state(intent.intent_id, NOW) == second
+
+
+def test_verified_execution_plans_for_account_isolated_cutoff_ordered_and_verified(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    first, *_ = execution_records()
+    second = first.model_copy(
+        update={
+            "plan_id": UUID("00000000-0000-4000-8000-000000000002"),
+            "observed_at": NOW,
+        }
+    )
+    other = first.model_copy(
+        update={
+            "plan_id": UUID("00000000-0000-4000-8000-000000000003"),
+            "account_fingerprint": "9" * 64,
+        }
+    )
+    future = first.model_copy(
+        update={
+            "plan_id": UUID("00000000-0000-4000-8000-000000000004"),
+            "observed_at": NOW + timedelta(seconds=1),
+            "information_cutoff": NOW + timedelta(seconds=1),
+            "book_deadline": NOW + timedelta(seconds=2),
+            "proof_deadline": NOW + timedelta(seconds=2),
+            "economics_deadline": NOW + timedelta(seconds=2),
+            "account_deadline": NOW + timedelta(seconds=2),
+            "geoblock_deadline": NOW + timedelta(seconds=2),
+        }
+    )
+    for plan in (first, second, other, future):
+        store.append_live_execution_plan(plan)
+
+    expected = tuple(sorted((first, second), key=lambda plan: (plan.observed_at, plan.plan_id)))
+    assert (
+        store.verified_live_execution_plans_for_account(first.account_fingerprint, NOW) == expected
+    )
+    assert store.verified_live_execution_plans_for_account(other.account_fingerprint, NOW) == (
+        other,
+    )
+
+    store._connection.execute(
+        "UPDATE live_execution_plans SET account_fingerprint = ? WHERE plan_id = ?",
+        ["8" * 64, first.plan_id],
+    )
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_live_execution_plans_for_account(first.account_fingerprint, NOW)
+
+
+def test_execution_intent_history_includes_expired_but_excludes_future_and_other_plans(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, intent, *_ = execution_records()
+    expired_cutoff = intent.deadline + timedelta(seconds=1)
+    future = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            created_at=expired_cutoff + timedelta(seconds=1),
+            deadline=expired_cutoff + timedelta(seconds=2),
+        )
+    )
+    other_plan = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=UUID("99999999-9999-4999-8999-999999999999"),
+        )
+    )
+    for candidate in (intent, future, other_plan):
+        store.append_execution_intent(candidate)
+
+    assert store.verified_execution_intent_history_for_plan(
+        plan.plan_id,
+        expired_cutoff,
+    ) == (intent,)
+
+
+def test_execution_intent_history_orders_equal_times_by_intent_id_and_detects_corruption(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, first, *_ = execution_records()
+    second = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            leg_sequence=1,
+            token_id=plan.token_ids[1],
+            order_type=plan.leg_order_types[1],
+            limit_price=plan.limit_prices[1],
+            fee_rate_bps_cap=plan.fee_rate_bps_caps[1],
+            created_at=first.created_at,
+            deadline=first.deadline,
+        )
+    )
+    store.append_execution_intent(first)
+    store.append_execution_intent(second)
+    expected = tuple(sorted((first, second), key=lambda item: (item.created_at, item.intent_id)))
+    assert store.verified_execution_intent_history_for_plan(plan.plan_id, NOW) == expected
+
+    store._connection.execute(
+        "UPDATE execution_intents SET created_at = ? WHERE intent_id = ?",
+        [NOW - timedelta(seconds=1), first.intent_id],
+    )
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_execution_intent_history_for_plan(plan.plan_id, NOW)
+
+
+def test_account_plan_history_detects_indexed_time_corruption(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, *_ = execution_records()
+    store.append_live_execution_plan(plan)
+    store._connection.execute(
+        "UPDATE live_execution_plans SET observed_at = ? WHERE plan_id = ?",
+        [plan.observed_at - timedelta(seconds=1), plan.plan_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_live_execution_plans_for_account(
+            plan.account_fingerprint,
+            NOW,
+        )
+
+
+def test_execution_intent_history_detects_indexed_identity_corruption(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, intent, *_ = execution_records()
+    store.append_execution_intent(intent)
+    store._connection.execute(
+        "UPDATE execution_intents SET plan_id = ? WHERE intent_id = ?",
+        [UUID("99999999-9999-4999-8999-999999999999"), intent.intent_id],
+    )
+
+    with pytest.raises(ConflictingRecordError, match="indexed columns"):
+        store.verified_execution_intent_history_for_plan(plan.plan_id, NOW)
