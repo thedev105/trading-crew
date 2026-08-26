@@ -15,6 +15,12 @@ from polytrading.predictions.polymarket_execution.auth import (
     sign_clob_auth,
     sign_l2_request,
 )
+from tests.predictions.test_polymarket_auth import (
+    _assert_canaries_absent,
+    _assert_context_free,
+    _assert_sensitive_distinct,
+    _assert_sensitive_equal,
+)
 
 PRIVATE_KEY = bytes.fromhex("00" * 31 + "01")
 OTHER_PRIVATE_KEY = bytes.fromhex("00" * 31 + "02")
@@ -69,7 +75,10 @@ def test_each_clob_auth_message_scalar_changes_the_l1_signature(
     arguments[field] = changed
 
     changed_signature = sign_clob_auth(**arguments)  # type: ignore[arg-type]
-    assert changed_signature != sign_clob_auth(PRIVATE_KEY, TIMESTAMP, snapshot)
+    _assert_sensitive_distinct(
+        changed_signature,
+        sign_clob_auth(PRIVATE_KEY, TIMESTAMP, snapshot),
+    )
 
 
 def test_wallet_address_is_signed_by_clob_auth() -> None:
@@ -78,7 +87,7 @@ def test_wallet_address_is_signed_by_clob_auth() -> None:
     first = sign_clob_auth(PRIVATE_KEY, TIMESTAMP, snapshot)
     second = sign_clob_auth(OTHER_PRIVATE_KEY, TIMESTAMP, snapshot)
 
-    assert first != second
+    _assert_sensitive_distinct(first, second)
     typed_data = clob_auth_typed_data(
         Account.from_key(OTHER_PRIVATE_KEY).address,
         TIMESTAMP,
@@ -108,10 +117,9 @@ def test_each_clob_auth_domain_field_changes_the_l1_signature(
     changed_authentication = snapshot.authentication.model_copy(update={"clob_auth": changed_clob})
     changed_snapshot = snapshot.model_copy(update={"authentication": changed_authentication})
 
-    assert sign_clob_auth(PRIVATE_KEY, TIMESTAMP, changed_snapshot) != sign_clob_auth(
-        PRIVATE_KEY,
-        TIMESTAMP,
-        snapshot,
+    _assert_sensitive_distinct(
+        sign_clob_auth(PRIVATE_KEY, TIMESTAMP, changed_snapshot),
+        sign_clob_auth(PRIVATE_KEY, TIMESTAMP, snapshot),
     )
 
 
@@ -126,10 +134,9 @@ def test_frozen_clob_auth_attestation_message_is_signed() -> None:
         }
     )
 
-    assert sign_clob_auth(PRIVATE_KEY, TIMESTAMP, changed_snapshot) != sign_clob_auth(
-        PRIVATE_KEY,
-        TIMESTAMP,
-        snapshot,
+    _assert_sensitive_distinct(
+        sign_clob_auth(PRIVATE_KEY, TIMESTAMP, changed_snapshot),
+        sign_clob_auth(PRIVATE_KEY, TIMESTAMP, snapshot),
     )
 
 
@@ -173,7 +180,7 @@ def test_clob_auth_fields_fail_closed_before_eth_account(
     with pytest.raises(ClobAuthError, match=error_code) as rejected:
         clob_auth_typed_data(**arguments)  # type: ignore[arg-type]
     assert str(rejected.value) == error_code
-    assert rejected.value.__cause__ is None
+    _assert_context_free(rejected.value)
 
 
 @pytest.mark.parametrize(
@@ -223,7 +230,7 @@ def test_l2_preimage_fields_fail_closed_with_stable_sanitized_errors(
     with pytest.raises(ClobAuthError, match=error_code) as rejected:
         l2_preimage(**arguments)  # type: ignore[arg-type]
     assert str(rejected.value) == error_code
-    assert rejected.value.__cause__ is None
+    _assert_context_free(rejected.value)
 
 
 def test_every_exact_body_byte_participates_in_l2_signature() -> None:
@@ -233,7 +240,7 @@ def test_every_exact_body_byte_participates_in_l2_signature() -> None:
 
     for index in range(len(body)):
         changed = body[:index] + bytes((body[index] ^ 1,)) + body[index + 1 :]
-        assert _l2_signature(credentials, body=changed) != baseline
+        _assert_sensitive_distinct(_l2_signature(credentials, body=changed), baseline)
 
 
 @given(
@@ -257,10 +264,10 @@ def test_timestamp_route_method_and_secret_participate_in_l2_signature() -> None
     credentials = _credentials()
     baseline = _l2_signature(credentials)
 
-    assert _l2_signature(credentials, timestamp="1787673601") != baseline
-    assert _l2_signature(credentials, method="DELETE") != baseline
-    assert _l2_signature(credentials, route="/orders") != baseline
-    assert _l2_signature(_credentials(secret=OTHER_SECRET)) != baseline
+    _assert_sensitive_distinct(_l2_signature(credentials, timestamp="1787673601"), baseline)
+    _assert_sensitive_distinct(_l2_signature(credentials, method="DELETE"), baseline)
+    _assert_sensitive_distinct(_l2_signature(credentials, route="/orders"), baseline)
+    _assert_sensitive_distinct(_l2_signature(_credentials(secret=OTHER_SECRET)), baseline)
 
 
 def test_address_api_key_and_passphrase_are_emitted_but_not_signed() -> None:
@@ -286,9 +293,9 @@ def test_address_api_key_and_passphrase_are_emitted_but_not_signed() -> None:
             route="/order",
             body=b"{}",
         )
-        assert result.signature == baseline.signature
-        assert result[header] == expected
-        assert dict(result) != dict(baseline)
+        _assert_sensitive_equal(result.signature, baseline.signature)
+        _assert_sensitive_equal(result[header], expected)
+        _assert_sensitive_distinct(dict(result), dict(baseline))
 
 
 def test_secret_is_signed_but_never_emitted_as_a_header() -> None:
@@ -307,7 +314,7 @@ def test_secret_is_signed_but_never_emitted_as_a_header() -> None:
         body=b"{}",
     )
 
-    assert changed.signature != baseline.signature
+    _assert_sensitive_distinct(changed.signature, baseline.signature)
     assert set(changed) == {
         "POLY_ADDRESS",
         "POLY_SIGNATURE",
@@ -315,5 +322,5 @@ def test_secret_is_signed_but_never_emitted_as_a_header() -> None:
         "POLY_API_KEY",
         "POLY_PASSPHRASE",
     }
-    assert SECRET.decode("ascii") not in dict(changed).values()
-    assert OTHER_SECRET.decode("ascii") not in dict(changed).values()
+    emitted_values = "\x00".join(dict(changed).values())
+    _assert_canaries_absent(emitted_values, SECRET, OTHER_SECRET)

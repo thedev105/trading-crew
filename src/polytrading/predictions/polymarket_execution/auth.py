@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import re
 from collections.abc import Iterator, Mapping
+from contextlib import suppress
 from typing import Final
 
 from eth_account import Account
@@ -92,11 +93,14 @@ class ClobCredentials:
     __str__ = __repr__
 
     def __reduce__(self) -> object:
-        raise TypeError("CLOB_CREDENTIALS_NOT_SERIALIZABLE") from None
+        raise ClobAuthError("CLOB_CREDENTIALS_NOT_SERIALIZABLE") from None
 
     def __reduce_ex__(self, protocol: int) -> object:
         del protocol
-        raise TypeError("CLOB_CREDENTIALS_NOT_SERIALIZABLE") from None
+        raise ClobAuthError("CLOB_CREDENTIALS_NOT_SERIALIZABLE") from None
+
+    def __getstate__(self) -> object:
+        raise ClobAuthError("CLOB_CREDENTIALS_NOT_SERIALIZABLE") from None
 
 
 class L2AuthHeaders(Mapping[str, str]):
@@ -113,7 +117,13 @@ class L2AuthHeaders(Mapping[str, str]):
         api_key: str,
         passphrase: str,
     ) -> None:
-        values = (address, signature, timestamp, api_key, passphrase)
+        values = (
+            _validated_evm_address(address, "L2_HEADER_ADDRESS_INVALID"),
+            _validated_l2_signature(signature),
+            _validated_ascii_integer(timestamp, "L2_HEADER_TIMESTAMP_INVALID"),
+            _validated_header_text(api_key, "L2_HEADER_API_KEY_INVALID"),
+            _validated_header_text(passphrase, "L2_HEADER_PASSPHRASE_INVALID"),
+        )
         object.__setattr__(
             self,
             "_headers",
@@ -147,6 +157,16 @@ class L2AuthHeaders(Mapping[str, str]):
 
     __str__ = __repr__
 
+    def __reduce__(self) -> object:
+        raise ClobAuthError("L2_AUTH_HEADERS_NOT_SERIALIZABLE") from None
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise ClobAuthError("L2_AUTH_HEADERS_NOT_SERIALIZABLE") from None
+
+    def __getstate__(self) -> object:
+        raise ClobAuthError("L2_AUTH_HEADERS_NOT_SERIALIZABLE") from None
+
 
 def _validated_evm_address(value: object, error_code: str) -> str:
     if type(value) is not str or _EVM_ADDRESS.fullmatch(value) is None:
@@ -157,6 +177,7 @@ def _validated_evm_address(value: object, error_code: str) -> str:
 def _validated_ascii_integer(value: object, error_code: str) -> str:
     if (
         type(value) is not str
+        or not 0 < len(value) <= _MAX_HEADER_VALUE_BYTES
         or not value.isascii()
         or _ASCII_UNSIGNED_INTEGER.fullmatch(value) is None
     ):
@@ -180,6 +201,35 @@ def _validated_header_bytes(value: object, error_code: str) -> bytes:
     return value
 
 
+def _validated_header_text(value: object, error_code: str) -> str:
+    if (
+        type(value) is not str
+        or not 0 < len(value) <= _MAX_HEADER_VALUE_BYTES
+        or not value.isascii()
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+    ):
+        raise ClobAuthError(error_code) from None
+    return value
+
+
+def _validated_l2_signature(value: object) -> str:
+    if type(value) is not str or len(value) != 44 or not value.isascii():
+        raise ClobAuthError("L2_HEADER_SIGNATURE_INVALID") from None
+    encoded = value.encode("ascii")
+    if _CANONICAL_URLSAFE_BASE64.fullmatch(encoded) is None:
+        raise ClobAuthError("L2_HEADER_SIGNATURE_INVALID") from None
+    decoded: bytes | None = None
+    with suppress(Exception):
+        decoded = base64.urlsafe_b64decode(encoded)
+    if (
+        decoded is None
+        or len(decoded) != hashlib.sha256().digest_size
+        or not hmac.compare_digest(base64.urlsafe_b64encode(decoded), encoded)
+    ):
+        raise ClobAuthError("L2_HEADER_SIGNATURE_INVALID") from None
+    return value
+
+
 def _decode_secret(value: object) -> bytes:
     if (
         type(value) is not bytes
@@ -187,11 +237,14 @@ def _decode_secret(value: object) -> bytes:
         or _CANONICAL_URLSAFE_BASE64.fullmatch(value) is None
     ):
         raise ClobAuthError("CREDENTIAL_SECRET_INVALID") from None
-    try:
+    decoded: bytes | None = None
+    with suppress(Exception):
         decoded = base64.urlsafe_b64decode(value)
-    except Exception:
-        raise ClobAuthError("CREDENTIAL_SECRET_INVALID") from None
-    if not decoded or not hmac.compare_digest(base64.urlsafe_b64encode(decoded), value):
+    if (
+        decoded is None
+        or not decoded
+        or not hmac.compare_digest(base64.urlsafe_b64encode(decoded), value)
+    ):
         raise ClobAuthError("CREDENTIAL_SECRET_INVALID") from None
     return decoded
 
@@ -246,11 +299,14 @@ def sign_clob_auth(
     """Sign and self-recover one frozen ClobAuth message with eth-account."""
     if type(private_key) is not bytes or len(private_key) != 32:
         raise ClobAuthError("PRIVATE_KEY_INVALID") from None
-    try:
+    account = None
+    with suppress(Exception):
         account = Account.from_key(private_key)
-    except Exception:
+    if account is None:
         raise ClobAuthError("PRIVATE_KEY_INVALID") from None
     typed_data = clob_auth_typed_data(account.address, timestamp, snapshot, nonce=nonce)
+    signature: str | None = None
+    recovered: str | None = None
     try:
         signed = Account.sign_typed_data(private_key, full_message=typed_data)
         signature = "0x" + bytes(signed.signature).hex()
@@ -259,8 +315,10 @@ def sign_clob_auth(
             signature=signature,
         )
     except Exception:
+        pass
+    if signature is None or recovered is None:
         raise ClobAuthError("CLOB_AUTH_SIGNING_FAILED") from None
-    if recovered.casefold() != account.address.casefold():
+    if type(recovered) is not str or recovered.casefold() != account.address.casefold():
         raise ClobAuthError("CLOB_AUTH_RECOVERY_FAILED") from None
     return signature
 
