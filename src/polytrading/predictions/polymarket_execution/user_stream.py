@@ -67,24 +67,62 @@ def _normalize_task9_datetime(value: object, *, error_code: str) -> datetime:
     return normalized
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class _UserSubscriptionEvidence:
     frame_hash: Sha256
     protocol_version: str
     observed_at: datetime
+    _initialized: bool = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        frame_hash: Sha256,
+        protocol_version: str,
+        observed_at: datetime,
+    ) -> None:
+        try:
+            object.__getattribute__(self, "_initialized")
+        except AttributeError:
+            pass
+        else:
+            raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+        normalized_observed_at = _normalize_task9_datetime(
+            observed_at,
+            error_code="USER_SUBSCRIPTION_EVIDENCE_INVALID",
+        )
         if (
-            len(self.frame_hash) != 64
-            or any(character not in "0123456789abcdef" for character in self.frame_hash)
-            or self.protocol_version != load_protocol_snapshot().version
-            or _normalize_task9_datetime(
-                self.observed_at,
-                error_code="USER_SUBSCRIPTION_EVIDENCE_INVALID",
-            )
-            != self.observed_at
+            type(frame_hash) is not str
+            or len(frame_hash) != 64
+            or any(character not in "0123456789abcdef" for character in frame_hash)
+            or type(protocol_version) is not str
+            or protocol_version != load_protocol_snapshot().version
         ):
             raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+        object.__setattr__(self, "_initialized", True)
+        object.__setattr__(self, "frame_hash", frame_hash)
+        object.__setattr__(self, "protocol_version", protocol_version)
+        object.__setattr__(self, "observed_at", normalized_observed_at)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("USER_SUBSCRIPTION_EVIDENCE_NOT_SUBCLASSABLE") from None
+
+    def __copy__(self) -> object:
+        raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        del memo
+        raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+
+    def __reduce__(self) -> object:
+        raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
+
+    def __getstate__(self) -> object:
+        raise ValueError("USER_SUBSCRIPTION_EVIDENCE_INVALID") from None
 
 
 class _UserSubscriptionTransport(Protocol):
@@ -401,6 +439,7 @@ class UserStreamHealth:
         "DISCONNECTED_AWAITING_READS",
     ] = "NONE"
     _initialized: bool = field(init=False, repr=False, compare=False)
+    _pending_ping_sent_at: float | None = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -436,15 +475,20 @@ class UserStreamHealth:
             initialized = True
         if initialized:
             raise ValueError("USER_STREAM_HEALTH_INVALID") from None
+        normalized_observed_at = _normalize_task9_datetime(
+            observed_at,
+            error_code="USER_STREAM_HEALTH_INVALID",
+        )
         object.__setattr__(self, "_initialized", True)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "observed_at", normalized_observed_at)
         object.__setattr__(self, "monotonic_at", monotonic_at)
         object.__setattr__(self, "kill_reason", kill_reason)
         object.__setattr__(self, "required_reads", required_reads)
         object.__setattr__(self, "next_ping_at", next_ping_at)
         object.__setattr__(self, "pong_deadline_at", pong_deadline_at)
         object.__setattr__(self, "recovery_phase", recovery_phase)
+        object.__setattr__(self, "_pending_ping_sent_at", None)
         self.__post_init__()
 
     def __init_subclass__(cls, **kwargs: object) -> None:
@@ -463,21 +507,12 @@ class UserStreamHealth:
             or type(self.next_ping_at) is not float
             or type(self.pong_deadline_at) not in {float, type(None)}
             or type(self.recovery_phase) is not str
+            or type(self._pending_ping_sent_at) not in {float, type(None)}
         )
-        normalized: datetime | None = None
-        if not invalid:
-            try:
-                normalized = _normalize_task9_datetime(
-                    self.observed_at,
-                    error_code="USER_STREAM_HEALTH_INVALID",
-                )
-            except Exception:
-                invalid = True
         interval = float(load_protocol_snapshot().websocket.ping_interval_seconds)
         if not invalid:
             invalid = (
-                normalized != self.observed_at
-                or not math.isfinite(self.monotonic_at)
+                not math.isfinite(self.monotonic_at)
                 or self.monotonic_at < 0
                 or not math.isfinite(self.next_ping_at)
                 or self.next_ping_at < self.monotonic_at
@@ -502,10 +537,21 @@ class UserStreamHealth:
             )
         if not invalid and self.pong_deadline_at is not None:
             invalid = (
-                not math.isfinite(self.pong_deadline_at)
+                self._pending_ping_sent_at is None
+                or not math.isfinite(self.pong_deadline_at)
                 or self.pong_deadline_at <= self.monotonic_at
                 or self.pong_deadline_at != self.next_ping_at
             )
+            if not invalid and self._pending_ping_sent_at is not None:
+                invalid = (
+                    not math.isfinite(self._pending_ping_sent_at)
+                    or self._pending_ping_sent_at < 0
+                    or self._pending_ping_sent_at > self.monotonic_at
+                    or self.pong_deadline_at - self._pending_ping_sent_at != interval
+                    or self._pending_ping_sent_at + interval != self.pong_deadline_at
+                )
+        elif not invalid:
+            invalid = self._pending_ping_sent_at is not None
         if not invalid and self.status == "CONNECTED":
             invalid = (
                 self.kill_reason is not None
@@ -567,9 +613,9 @@ class UserStreamHealth:
     ) -> UserStreamHealth:
         if self.status == "RECOVERY_REQUIRED":
             return self
-        monotonic = _finite_monotonic(monotonic_at)
-        if monotonic < self.monotonic_at:
-            raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
+        monotonic = self._checked_observation(monotonic_at)
+        if monotonic is None:
+            monotonic = self.monotonic_at
         return type(self)(
             status="RECOVERY_REQUIRED",
             observed_at=_normalize_task9_datetime(
@@ -618,9 +664,13 @@ class UserStreamHealth:
         *,
         monotonic_at: float,
     ) -> UserStreamHealth:
-        monotonic = _finite_monotonic(monotonic_at)
-        if monotonic < self.monotonic_at:
-            raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
+        monotonic = self._checked_observation(monotonic_at)
+        if monotonic is None:
+            return self._kill(
+                "USER_STREAM_PROTOCOL_ERROR",
+                observed_at,
+                self.monotonic_at,
+            )
         if self.status == "CONNECTED":
             return self
         if self.status != "RECOVERY_REQUIRED":
@@ -655,9 +705,13 @@ class UserStreamHealth:
     ) -> UserStreamHealth:
         if reads != _RECOVERY_READS:
             raise ValueError("USER_STREAM_RECOVERY_READS_INCOMPLETE") from None
-        monotonic = _finite_monotonic(monotonic_at)
-        if monotonic < self.monotonic_at:
-            raise ValueError("USER_STREAM_MONOTONIC_REGRESSION") from None
+        monotonic = self._checked_observation(monotonic_at)
+        if monotonic is None:
+            return self._kill(
+                "USER_STREAM_PROTOCOL_ERROR",
+                observed_at,
+                self.monotonic_at,
+            )
         if self.status == "CONNECTED":
             return self
         if self.status != "RECOVERY_REQUIRED":
@@ -697,8 +751,13 @@ class UserStreamHealth:
         monotonic_at: float,
         next_ping_at: float | None = None,
         pong_deadline_at: float | None | Literal[False] = False,
+        pending_ping_sent_at: float | None | Literal[False] = False,
     ) -> UserStreamHealth:
-        return type(self)(
+        deadline = self.pong_deadline_at if pong_deadline_at is False else pong_deadline_at
+        ping_sent_at = (
+            self._pending_ping_sent_at if pending_ping_sent_at is False else pending_ping_sent_at
+        )
+        health = type(self)(
             status="CONNECTED",
             observed_at=_normalize_task9_datetime(
                 observed_at,
@@ -708,11 +767,19 @@ class UserStreamHealth:
             kill_reason=None,
             required_reads=(),
             next_ping_at=self.next_ping_at if next_ping_at is None else next_ping_at,
-            pong_deadline_at=(
-                self.pong_deadline_at if pong_deadline_at is False else pong_deadline_at
-            ),
+            pong_deadline_at=None,
             recovery_phase="NONE",
         )
+        if deadline is None:
+            if ping_sent_at is not None:
+                raise ValueError("USER_STREAM_HEALTH_INVALID") from None
+            return health
+        if ping_sent_at is None:
+            raise ValueError("USER_STREAM_HEALTH_INVALID") from None
+        object.__setattr__(health, "_pending_ping_sent_at", ping_sent_at)
+        object.__setattr__(health, "pong_deadline_at", deadline)
+        health.__post_init__()
+        return health
 
     def ping_due(self, monotonic_at: float) -> bool:
         monotonic = _finite_monotonic(monotonic_at)
@@ -759,6 +826,7 @@ class UserStreamHealth:
             monotonic_at=monotonic,
             next_ping_at=next_ping_at,
             pong_deadline_at=pong_deadline_at,
+            pending_ping_sent_at=monotonic,
         )
 
     def on_pong(
@@ -783,6 +851,7 @@ class UserStreamHealth:
             observed_at=observed_at,
             monotonic_at=monotonic,
             pong_deadline_at=None,
+            pending_ping_sent_at=None,
         )
 
     def on_event_observed(
@@ -836,14 +905,16 @@ _RECOVERY_READS = (
 
 
 def _finite_monotonic(value: float) -> float:
-    if (
-        type(value) not in {int, float}
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value < 0
-    ):
+    invalid = type(value) not in {int, float} or isinstance(value, bool)
+    monotonic = 0.0
+    if not invalid:
+        try:
+            monotonic = float(value)
+        except (OverflowError, ValueError):
+            invalid = True
+    if invalid or not math.isfinite(monotonic) or monotonic < 0:
         raise ValueError("USER_STREAM_MONOTONIC_INVALID") from None
-    return float(value)
+    return monotonic
 
 
 def _representable_cadence_after(monotonic_at: float) -> float:

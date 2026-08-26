@@ -43,6 +43,28 @@ class _HostileTimezone(tzinfo):
 HOSTILE_TIME = datetime(2026, 8, 25, 16, tzinfo=_HostileTimezone())
 
 
+class _FailAfterTimezone(tzinfo):
+    def __init__(self, allowed_calls: int) -> None:
+        self._allowed_calls = allowed_calls
+        self.calls = 0
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        del value
+        self.calls += 1
+        if self.calls > self._allowed_calls:
+            raise RuntimeError(f"stateful-time-control-canary-{self.calls}")
+        return timedelta(0)
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        return timedelta(0)
+
+
+def _fail_after_time(allowed_calls: int) -> tuple[datetime, _FailAfterTimezone]:
+    timezone = _FailAfterTimezone(allowed_calls)
+    return datetime(2026, 8, 25, 16, tzinfo=timezone), timezone
+
+
 def _trade_frame(status: str = "RETRYING") -> bytes:
     vectors = json.loads(
         (bundled_fixture_path() / "event_vectors_v1.json").read_text(encoding="utf-8")
@@ -985,6 +1007,90 @@ def test_user_stream_health_direct_constructor_rejects_impossible_or_mutable_sta
         UserStreamHealth(**fields)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("monotonic_at", "next_ping_at"),
+    ((0.0, 10.0), (10.0, 20.0)),
+    ids=("fabricated-first-cycle-pong", "fabricated-later-cycle-pong"),
+)
+def test_direct_health_constructor_rejects_every_pending_pong_claim(
+    monotonic_at: float,
+    next_ping_at: float,
+) -> None:
+    with pytest.raises(ValueError, match=r"^USER_STREAM_HEALTH_INVALID$") as rejected:
+        UserStreamHealth(
+            status="CONNECTED",
+            observed_at=NOW,
+            monotonic_at=monotonic_at,
+            kill_reason=None,
+            required_reads=(),
+            next_ping_at=next_ping_at,
+            pong_deadline_at=next_ping_at,
+            recovery_phase="NONE",
+        )
+
+    assert rejected.value.__cause__ is None
+    assert rejected.value.__context__ is None
+
+
+def test_only_ping_transitions_create_and_preserve_pending_pong_lineage() -> None:
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+    first_waiting = connected.on_ping_sent(
+        b"PING",
+        observed_at=NOW,
+        monotonic_at=10,
+    )
+    first_observed = first_waiting.on_event_observed(
+        observed_at=NOW,
+        monotonic_at=15,
+    )
+    first_ponged = first_observed.on_pong(
+        b"PONG",
+        observed_at=NOW,
+        monotonic_at=19.999,
+    )
+    later_waiting = first_ponged.on_ping_sent(
+        b"PING",
+        observed_at=NOW,
+        monotonic_at=20,
+    )
+    later_observed = later_waiting.on_event_observed(
+        observed_at=NOW,
+        monotonic_at=25,
+    )
+
+    assert first_waiting.pong_deadline_at == first_observed.pong_deadline_at == 20.0
+    assert first_observed.next_ping_at == 20.0
+    assert first_ponged.pong_deadline_at is None
+    assert later_waiting.pong_deadline_at == later_observed.pong_deadline_at == 30.0
+    assert later_observed.next_ping_at == 30.0
+
+
+def test_pending_pong_reinitialization_cannot_forge_or_clear_lineage_for_aliases() -> None:
+    waiting = UserStreamHealth.connected(NOW, monotonic_at=0).on_ping_sent(
+        b"PING",
+        observed_at=NOW,
+        monotonic_at=10,
+    )
+    alias = waiting
+
+    with pytest.raises(ValueError, match=r"^USER_STREAM_HEALTH_INVALID$"):
+        waiting.__init__(
+            status="CONNECTED",
+            observed_at=NOW,
+            monotonic_at=10.0,
+            kill_reason=None,
+            required_reads=(),
+            next_ping_at=20.0,
+            pong_deadline_at=None,
+            recovery_phase="NONE",
+        )
+
+    assert alias.pong_deadline_at == 20.0
+    accepted = alias.on_pong(b"PONG", observed_at=NOW, monotonic_at=19.999)
+    assert accepted.status == "CONNECTED"
+    assert accepted.pong_deadline_at is None
+
+
 def test_user_stream_health_denies_subclass_state_variants() -> None:
     with pytest.raises(TypeError, match=r"^USER_STREAM_HEALTH_NOT_SUBCLASSABLE$"):
 
@@ -1072,6 +1178,118 @@ def test_cadence_arithmetic_failure_installs_recovery_at_float_boundary() -> Non
     )
 
 
+def test_huge_integer_monotonic_is_context_free_for_factories_and_helpers() -> None:
+    huge_monotonic = 10**10_000
+    operations = (
+        lambda: UserStreamHealth.connected(NOW, monotonic_at=huge_monotonic),
+        lambda: UserStreamHealth.connected(NOW, monotonic_at=0).ping_due(huge_monotonic),
+    )
+
+    for operation in operations:
+        captured: ValueError | None = None
+        try:
+            operation()
+        except ValueError as error:
+            captured = error
+
+        assert captured is not None
+        assert type(captured) is ValueError
+        assert str(captured) == "USER_STREAM_MONOTONIC_INVALID"
+        assert captured.__cause__ is None
+        assert captured.__context__ is None
+
+
+def test_huge_integer_observation_fails_closed_at_last_valid_monotonic_time() -> None:
+    huge_monotonic = 10**10_000
+    connected = UserStreamHealth.connected(NOW, monotonic_at=0)
+    waiting = connected.on_ping_sent(b"PING", observed_at=NOW, monotonic_at=10)
+    transitions = (
+        (connected.on_disconnect, 0.0),
+        (connected.on_protocol_error, 0.0),
+        (
+            lambda observed_at, monotonic_at: connected.on_ping_sent(
+                b"PING",
+                observed_at=observed_at,
+                monotonic_at=monotonic_at,
+            ),
+            0.0,
+        ),
+        (
+            lambda observed_at, monotonic_at: waiting.on_pong(
+                b"PONG",
+                observed_at=observed_at,
+                monotonic_at=monotonic_at,
+            ),
+            10.0,
+        ),
+        (
+            lambda observed_at, monotonic_at: connected.on_event_observed(
+                observed_at=observed_at,
+                monotonic_at=monotonic_at,
+            ),
+            0.0,
+        ),
+        (
+            lambda observed_at, monotonic_at: connected.check_deadlines(
+                observed_at=observed_at,
+                monotonic_at=monotonic_at,
+            ),
+            0.0,
+        ),
+    )
+
+    for transition, expected_monotonic in transitions:
+        failed = transition(NOW, monotonic_at=huge_monotonic)
+        assert failed.status == "RECOVERY_REQUIRED"
+        assert failed.monotonic_at == expected_monotonic
+        assert failed.required_reads == (
+            RouteKey.READ_OPEN_ORDERS,
+            RouteKey.READ_TRADES,
+            RouteKey.READ_BALANCE_ALLOWANCE,
+        )
+
+
+def test_huge_integer_recovery_observation_cannot_clear_existing_kill() -> None:
+    huge_monotonic = 10**10_000
+    recovery = UserStreamHealth.connected(NOW, monotonic_at=0).on_disconnect(
+        NOW,
+        monotonic_at=1,
+    )
+    transitions = (
+        lambda: recovery.on_reconnect(NOW, monotonic_at=huge_monotonic),
+        lambda: recovery.on_authoritative_reads_completed(
+            (
+                RouteKey.READ_OPEN_ORDERS,
+                RouteKey.READ_TRADES,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+            ),
+            observed_at=NOW,
+            monotonic_at=huge_monotonic,
+        ),
+    )
+
+    for transition in transitions:
+        assert transition() is recovery
+
+
+def test_huge_injected_monotonic_installs_parser_recovery_without_overflow() -> None:
+    ticks = iter((0.0, 10**10_000))
+    parser = UserStreamParser(connected_at=NOW, monotonic=lambda: next(ticks))
+
+    with pytest.raises(UserStreamProtocolError, match=r"^USER_STREAM_PROTOCOL_ERROR$") as error:
+        parser.parse(_trade_frame(), receipt_time=NOW)
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert parser.health.status == "RECOVERY_REQUIRED"
+    assert parser.health.monotonic_at == 0.0
+    assert parser.health.required_reads == (
+        RouteKey.READ_OPEN_ORDERS,
+        RouteKey.READ_TRADES,
+        RouteKey.READ_BALANCE_ALLOWANCE,
+    )
+
+
 def test_health_factory_and_transition_hide_hostile_timezone_callbacks() -> None:
     connected = UserStreamHealth.connected(NOW, monotonic_at=0)
 
@@ -1091,6 +1309,117 @@ def test_health_factory_and_transition_hide_hostile_timezone_callbacks() -> None
         assert captured.__cause__ is None
         assert captured.__context__ is None
         assert connected.status == "CONNECTED"
+
+
+@pytest.mark.parametrize("allowed_calls", (2, 3))
+def test_health_direct_constructor_discards_stateful_timezone_after_normalization(
+    allowed_calls: int,
+) -> None:
+    observed_at, timezone = _fail_after_time(allowed_calls)
+
+    health = UserStreamHealth(
+        status="CONNECTED",
+        observed_at=observed_at,
+        monotonic_at=0.0,
+        kill_reason=None,
+        required_reads=(),
+        next_ping_at=10.0,
+        pong_deadline_at=None,
+        recovery_phase="NONE",
+    )
+
+    assert health.observed_at == NOW
+    assert health.observed_at.tzinfo is UTC
+    assert timezone.calls == 2
+
+
+@pytest.mark.parametrize("allowed_calls", (0, 1))
+def test_health_direct_constructor_sanitizes_stateful_timezone_normalization_failure(
+    allowed_calls: int,
+) -> None:
+    observed_at, _ = _fail_after_time(allowed_calls)
+    captured: ValueError | None = None
+
+    try:
+        UserStreamHealth(
+            status="CONNECTED",
+            observed_at=observed_at,
+            monotonic_at=0.0,
+            kill_reason=None,
+            required_reads=(),
+            next_ping_at=10.0,
+            pong_deadline_at=None,
+            recovery_phase="NONE",
+        )
+    except ValueError as error:
+        captured = error
+
+    assert captured is not None
+    assert type(captured) is ValueError
+    assert str(captured) == "USER_STREAM_HEALTH_INVALID"
+    assert "stateful-time-control-canary" not in str(captured)
+    assert captured.__cause__ is None
+    assert captured.__context__ is None
+
+
+@pytest.mark.parametrize("allowed_calls", (2, 3))
+def test_health_factories_and_transitions_store_only_canonical_stateful_time(
+    allowed_calls: int,
+) -> None:
+    operations = (
+        lambda observed_at: UserStreamHealth.connected(observed_at, monotonic_at=0),
+        lambda observed_at: UserStreamHealth.connected(NOW, monotonic_at=0).on_disconnect(
+            observed_at,
+            monotonic_at=1,
+        ),
+        lambda observed_at: UserStreamHealth.connected(NOW, monotonic_at=0).on_protocol_error(
+            observed_at,
+            monotonic_at=1,
+        ),
+        lambda observed_at: (
+            UserStreamHealth.connected(NOW, monotonic_at=0)
+            .on_disconnect(NOW, monotonic_at=1)
+            .on_reconnect(observed_at, monotonic_at=2)
+        ),
+        lambda observed_at: (
+            UserStreamHealth.connected(NOW, monotonic_at=0)
+            .on_protocol_error(NOW, monotonic_at=1)
+            .on_authoritative_reads_completed(
+                (
+                    RouteKey.READ_OPEN_ORDERS,
+                    RouteKey.READ_TRADES,
+                    RouteKey.READ_BALANCE_ALLOWANCE,
+                ),
+                observed_at=observed_at,
+                monotonic_at=2,
+            )
+        ),
+        lambda observed_at: UserStreamHealth.connected(NOW, monotonic_at=0).on_ping_sent(
+            b"PING",
+            observed_at=observed_at,
+            monotonic_at=10,
+        ),
+        lambda observed_at: (
+            UserStreamHealth.connected(NOW, monotonic_at=0)
+            .on_ping_sent(b"PING", observed_at=NOW, monotonic_at=10)
+            .on_pong(b"PONG", observed_at=observed_at, monotonic_at=11)
+        ),
+        lambda observed_at: UserStreamHealth.connected(NOW, monotonic_at=0).on_event_observed(
+            observed_at=observed_at,
+            monotonic_at=1,
+        ),
+        lambda observed_at: UserStreamHealth.connected(NOW, monotonic_at=0).check_deadlines(
+            observed_at=observed_at,
+            monotonic_at=1,
+        ),
+    )
+
+    for operation in operations:
+        observed_at, timezone = _fail_after_time(allowed_calls)
+        health = operation(observed_at)
+        assert health.observed_at == NOW
+        assert health.observed_at.tzinfo is UTC
+        assert timezone.calls == 2
 
 
 def test_parser_construction_hides_hostile_timezone_callbacks() -> None:
@@ -1151,6 +1480,94 @@ def test_private_signer_session_sends_exact_subscription_once_and_returns_only_h
     for canary in (api_key, api_secret, passphrase):
         assert bytes(canary) not in repr(first).encode()
         assert bytes(canary) not in repr(session).encode()
+    secrets.close()
+
+
+@pytest.mark.parametrize(
+    ("frame_hash", "protocol_version"),
+    (("b" * 64, "polymarket-clob-2026-08-25-v1"), ("invalid", "invalid")),
+    ids=("valid-replay", "raising-replay"),
+)
+def test_cached_subscription_evidence_initialization_is_one_shot_before_writes(
+    frame_hash: str,
+    protocol_version: str,
+) -> None:
+    secrets = SecretMaterial(
+        bytearray(b"k" * 32),
+        bytearray(b"api-key-canary"),
+        bytearray(b"api-secret-canary"),
+        bytearray(b"passphrase-canary"),
+    )
+    send_calls = 0
+
+    class RecordingTransport:
+        def send_user_subscription(self, frame: bytes) -> None:
+            del frame
+            nonlocal send_calls
+            send_calls += 1
+
+    session = user_stream_module._SignerUserStreamSession(
+        secrets=secrets,
+        transport=RecordingTransport(),
+        read_guard=lambda observed_at: AuthorityDecision(True, None, ()),
+    )
+    evidence = session.open(observed_at=NOW)
+    original = (evidence.frame_hash, evidence.protocol_version, evidence.observed_at)
+
+    with pytest.raises(ValueError, match=r"^USER_SUBSCRIPTION_EVIDENCE_INVALID$") as rejected:
+        evidence.__init__(
+            frame_hash=frame_hash,
+            protocol_version=protocol_version,
+            observed_at=NOW + timedelta(seconds=1),
+        )
+
+    assert rejected.value.__cause__ is None
+    assert rejected.value.__context__ is None
+    assert (evidence.frame_hash, evidence.protocol_version, evidence.observed_at) == original
+    assert session.open(observed_at=NOW + timedelta(seconds=2)) is evidence
+    assert send_calls == 1
+    secrets.close()
+
+
+def test_cached_subscription_evidence_denies_copy_serialization_and_subclass_forks() -> None:
+    secrets = SecretMaterial(
+        bytearray(b"k" * 32),
+        bytearray(b"api-key-canary"),
+        bytearray(b"api-secret-canary"),
+        bytearray(b"passphrase-canary"),
+    )
+
+    class RecordingTransport:
+        def send_user_subscription(self, frame: bytes) -> None:
+            del frame
+
+    session = user_stream_module._SignerUserStreamSession(
+        secrets=secrets,
+        transport=RecordingTransport(),
+        read_guard=lambda observed_at: AuthorityDecision(True, None, ()),
+    )
+    evidence = session.open(observed_at=NOW)
+    operations = (
+        lambda: copy.copy(evidence),
+        lambda: copy.deepcopy(evidence),
+        lambda: pickle.dumps(evidence),
+        evidence.__reduce__,
+        lambda: evidence.__reduce_ex__(pickle.HIGHEST_PROTOCOL),
+        evidence.__getstate__,
+    )
+
+    for operation in operations:
+        with pytest.raises(ValueError, match=r"^USER_SUBSCRIPTION_EVIDENCE_INVALID$"):
+            operation()
+    for attribute in ("frame_hash", "_initialized", "not_an_evidence_attribute"):
+        with pytest.raises(AttributeError):
+            delattr(evidence, attribute)
+    with pytest.raises(TypeError, match=r"^USER_SUBSCRIPTION_EVIDENCE_NOT_SUBCLASSABLE$"):
+
+        class ForkedEvidence(user_stream_module._UserSubscriptionEvidence):
+            pass
+
+    assert session.open(observed_at=NOW + timedelta(seconds=1)) is evidence
     secrets.close()
 
 

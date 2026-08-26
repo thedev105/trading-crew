@@ -30,6 +30,28 @@ class _HostileTimezone(tzinfo):
 HOSTILE_TIME = datetime(2026, 8, 25, 16, tzinfo=_HostileTimezone())
 
 
+class _FailAfterTimezone(tzinfo):
+    def __init__(self, allowed_calls: int) -> None:
+        self._allowed_calls = allowed_calls
+        self.calls = 0
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        del value
+        self.calls += 1
+        if self.calls > self._allowed_calls:
+            raise RuntimeError(f"stateful-time-control-canary-{self.calls}")
+        return timedelta(0)
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        return timedelta(0)
+
+
+def _fail_after_time(allowed_calls: int) -> tuple[datetime, _FailAfterTimezone]:
+    timezone = _FailAfterTimezone(allowed_calls)
+    return datetime(2026, 8, 25, 16, tzinfo=timezone), timezone
+
+
 def test_accepted_heartbeat_confirms_only_the_returned_identifier() -> None:
     previous = HeartbeatState.initial()
     result = RestResult(
@@ -448,6 +470,102 @@ def test_heartbeat_classifier_hides_hostile_timezone_callbacks() -> None:
     assert "public-time-control-canary" not in str(captured)
     assert captured.__cause__ is None
     assert captured.__context__ is None
+
+
+@pytest.mark.parametrize("allowed_calls", (2, 3))
+def test_heartbeat_direct_constructor_discards_stateful_timezone_after_normalization(
+    allowed_calls: int,
+) -> None:
+    observed_at, timezone = _fail_after_time(allowed_calls)
+
+    state = HeartbeatState(
+        status="CONFIRMED",
+        observed_at=observed_at,
+        heartbeat_id="heartbeat-confirmed",
+        evidence_hashes=("a" * 64,),
+        kill_reason=None,
+        required_reads=(),
+    )
+
+    assert state.observed_at == NOW
+    assert state.observed_at.tzinfo is UTC
+    assert timezone.calls == 2
+
+
+@pytest.mark.parametrize("allowed_calls", (0, 1))
+def test_heartbeat_direct_constructor_sanitizes_stateful_timezone_normalization_failure(
+    allowed_calls: int,
+) -> None:
+    observed_at, _ = _fail_after_time(allowed_calls)
+    captured: ValueError | None = None
+
+    try:
+        HeartbeatState(
+            status="CONFIRMED",
+            observed_at=observed_at,
+            heartbeat_id="heartbeat-confirmed",
+            evidence_hashes=("a" * 64,),
+            kill_reason=None,
+            required_reads=(),
+        )
+    except ValueError as error:
+        captured = error
+
+    assert captured is not None
+    assert type(captured) is ValueError
+    assert str(captured) == "HEARTBEAT_STATE_INVALID"
+    assert "stateful-time-control-canary" not in str(captured)
+    assert captured.__cause__ is None
+    assert captured.__context__ is None
+
+
+@pytest.mark.parametrize("allowed_calls", (2, 3))
+def test_heartbeat_factories_transitions_and_classifier_store_only_canonical_stateful_time(
+    allowed_calls: int,
+) -> None:
+    uncertain = HeartbeatState.uncertain(
+        observed_at=NOW,
+        previous_heartbeat_id="heartbeat-before-uncertainty",
+        evidence_hashes=("a" * 64,),
+    )
+    operations = (
+        lambda observed_at: HeartbeatState.confirmed(
+            observed_at=observed_at,
+            heartbeat_id="heartbeat-confirmed",
+            evidence_hashes=("a" * 64,),
+        ),
+        lambda observed_at: HeartbeatState.uncertain(
+            observed_at=observed_at,
+            previous_heartbeat_id="heartbeat-before-uncertainty",
+            evidence_hashes=("a" * 64,),
+        ),
+        lambda observed_at: HeartbeatState.recovered(
+            observed_at=observed_at,
+            heartbeat_id="heartbeat-before-uncertainty",
+            evidence_hashes=("a" * 64,),
+        ),
+        lambda observed_at: uncertain.on_authoritative_reads_completed(
+            (
+                RouteKey.READ_OPEN_ORDERS,
+                RouteKey.READ_TRADES,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+            ),
+            observed_at=observed_at,
+        ),
+        lambda observed_at: classify_heartbeat(
+            HeartbeatState.initial(),
+            _accepted_result(),
+            observed_at,
+        ),
+    )
+
+    for operation in operations:
+        observed_at, timezone = _fail_after_time(allowed_calls)
+        state = operation(observed_at)
+        assert state.observed_at == NOW
+        assert state.observed_at is not None
+        assert state.observed_at.tzinfo is UTC
+        assert timezone.calls == 2
 
 
 @pytest.mark.parametrize(

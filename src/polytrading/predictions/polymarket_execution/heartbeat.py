@@ -62,9 +62,17 @@ class HeartbeatState:
             initialized = True
         if initialized:
             raise ValueError("HEARTBEAT_STATE_INVALID") from None
+        normalized_observed_at = (
+            None
+            if observed_at is None
+            else _normalize_heartbeat_datetime(
+                observed_at,
+                error_code="HEARTBEAT_STATE_INVALID",
+            )
+        )
         object.__setattr__(self, "_initialized", True)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "observed_at", normalized_observed_at)
         object.__setattr__(self, "heartbeat_id", heartbeat_id)
         object.__setattr__(self, "evidence_hashes", evidence_hashes)
         object.__setattr__(self, "kill_reason", kill_reason)
@@ -87,15 +95,6 @@ class HeartbeatState:
             or type(self.required_reads) is not tuple
             or any(type(route) is not RouteKey for route in self.required_reads)
         )
-        normalized: datetime | None = None
-        if not invalid and self.observed_at is not None:
-            try:
-                normalized = _normalize_heartbeat_datetime(
-                    self.observed_at,
-                    error_code="HEARTBEAT_STATE_INVALID",
-                )
-            except Exception:
-                invalid = True
         if not invalid:
             invalid = (
                 self.status not in {"INITIAL", "CONFIRMED", "UNCERTAIN", "RECOVERED"}
@@ -116,7 +115,6 @@ class HeartbeatState:
                         )
                     )
                 )
-                or (self.observed_at is not None and normalized != self.observed_at)
             )
         if not invalid and self.status == "INITIAL":
             invalid = (
