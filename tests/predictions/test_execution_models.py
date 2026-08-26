@@ -9,6 +9,7 @@ from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     ImmediateOrderType,
+    LiveExecutionPlan,
     LiveLedgerPosting,
     LiveReconciliation,
     SignedOrderEnvelope,
@@ -18,7 +19,7 @@ from polytrading.predictions.execution.models import (
     VenueTradeState,
     deterministic_intent_id,
 )
-from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.execution_helpers import execution_intent_fields, live_execution_plan_fields
 
 
 def test_intent_accepts_only_immediate_order_types() -> None:
@@ -53,6 +54,50 @@ def test_signed_envelope_rejects_a_mismatched_intent_fingerprint() -> None:
             order_fingerprint="3" * 64,
             signer_version="1",
             canonical_order_json="{}",
+        )
+
+
+@pytest.mark.parametrize(
+    "secret_field",
+    ("apiSecret", "headers", "authenticatedFrame", "capabilityBytes"),
+)
+def test_signed_envelope_rejects_nonpublic_order_json_fields(secret_field: str) -> None:
+    intent = ExecutionIntent(**execution_intent_fields())
+    with pytest.raises(ValidationError, match="public order fields"):
+        SignedOrderEnvelope(
+            schema_version=1,
+            intent_id=intent.intent_id,
+            intent_fingerprint=intent.intent_fingerprint,
+            protocol_version="polymarket-clob-2026-08-25-v1",
+            salt=1,
+            signature_type=0,
+            public_signature="0x" + "11" * 65,
+            domain_fingerprint="1" * 64,
+            exact_body_hash="2" * 64,
+            order_fingerprint="3" * 64,
+            signer_version="1",
+            canonical_order_json=f'{{"{secret_field}":"secret-canary"}}',
+        )
+
+
+def test_live_execution_plan_accepts_only_polymarket_immediate_legs() -> None:
+    plan = LiveExecutionPlan(**live_execution_plan_fields())
+    assert plan.venue is PredictionVenue.POLYMARKET
+    assert plan.leg_order_types == (ImmediateOrderType.FAK, ImmediateOrderType.FOK)
+    with pytest.raises(ValidationError):
+        LiveExecutionPlan(**live_execution_plan_fields(venue=PredictionVenue.KALSHI))
+    with pytest.raises(ValidationError):
+        LiveExecutionPlan(**live_execution_plan_fields(leg_order_types=("GTC", "FOK")))
+
+
+def test_live_execution_plan_rejects_misaligned_or_stale_leg_evidence() -> None:
+    with pytest.raises(ValidationError, match="align"):
+        LiveExecutionPlan(**live_execution_plan_fields(limit_prices=(Decimal("0.51"),)))
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        LiveExecutionPlan(**live_execution_plan_fields(book_deadline=datetime(2026, 8, 25, 16)))
+    with pytest.raises(ValidationError, match="freshness deadlines"):
+        LiveExecutionPlan(
+            **live_execution_plan_fields(book_deadline=datetime(2026, 8, 25, 16, tzinfo=UTC))
         )
 
 

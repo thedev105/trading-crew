@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
@@ -23,17 +24,21 @@ PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 _INTENT_NAMESPACE = UUID("b59d5b2a-94e6-4a5e-b184-327132349d5e")
-_SENSITIVE_ORDER_TERMS = (
-    "private_key",
-    "private key",
-    "api_secret",
-    "api secret",
-    "passphrase",
-    "authorization",
-    "auth header",
-    "websocket frame",
-    "capability_bundle",
+_PUBLIC_ORDER_ADDRESS_FIELDS = frozenset({"maker", "signer", "taker"})
+_PUBLIC_ORDER_INTEGER_FIELDS = frozenset(
+    {
+        "salt",
+        "tokenId",
+        "makerAmount",
+        "takerAmount",
+        "expiration",
+        "nonce",
+        "feeRateBps",
+        "signatureType",
+    }
 )
+_PUBLIC_ORDER_FIELDS = _PUBLIC_ORDER_ADDRESS_FIELDS | _PUBLIC_ORDER_INTEGER_FIELDS | {"side"}
+_EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
 class ImmediateOrderType(StrEnum):
@@ -272,10 +277,25 @@ class SignedOrderEnvelope(_ExecutionRecord):
             raise ValueError("canonical_order_json must contain JSON") from error
         if not isinstance(payload, dict):
             raise ValueError("canonical_order_json must contain an object")
-        if any(term in value.lower() for term in _SENSITIVE_ORDER_TERMS):
-            raise ValueError("canonical_order_json must not contain secret material")
         if value != _canonical_json(payload):
             raise ValueError("canonical_order_json must use canonical JSON")
+        if not payload:
+            return value
+        if set(payload) != _PUBLIC_ORDER_FIELDS:
+            raise ValueError("canonical_order_json must contain only public order fields")
+        for field in _PUBLIC_ORDER_ADDRESS_FIELDS:
+            address = payload[field]
+            if not isinstance(address, str) or _EVM_ADDRESS.fullmatch(address) is None:
+                raise ValueError(f"canonical_order_json {field} must be an EVM address")
+        for field in _PUBLIC_ORDER_INTEGER_FIELDS:
+            number = payload[field]
+            if not (
+                (type(number) is int and number >= 0)
+                or (isinstance(number, str) and number.isdecimal())
+            ):
+                raise ValueError(f"canonical_order_json {field} must be a nonnegative integer")
+        if type(payload["side"]) is not bool:
+            raise ValueError("canonical_order_json side must be a boolean")
         return value
 
     @model_validator(mode="after")
