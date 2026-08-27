@@ -384,10 +384,7 @@ def sign_l2_request(
 
 __all__ = [
     "ClobAuthError",
-    "ClobCredentials",
     "L2AuthHeaders",
     "clob_auth_typed_data",
     "l2_preimage",
-    "sign_clob_auth",
-    "sign_l2_request",
 ]

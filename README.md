@@ -1323,3 +1323,13 @@ run at least **30 additional calendar days** of queue-aware shadow execution wit
 reconciliation. A dense fixture, repeated replay, more proposals in one day, or a favorable paper
 result cannot compress either elapsed-time gate. Any later execution work remains a separate
 increment requiring its own evidence checkpoint and explicit authorization.
+
+### Polymarket execution hardening remains `LIVE_DISABLED`
+
+The authenticated Polymarket protocol is implemented for offline conformance and recovery proof,
+but production has no capability issuer, live action, activation command, or kill-clear path. Run
+the offline check with `.venv/bin/polytrading predictions execution conformance polymarket --db
+var/prediction-markets.duckdb --format json`; inspect the loopback-only read-only Market Atlas with
+`.venv/bin/polytrading predictions dashboard --db var/prediction-markets.duckdb --port 8787`; and
+see the full [execution-hardening and recovery runbook](docs/predictions/polymarket-execution-hardening.md)
+for boundaries, recovery semantics, and the still-unsatisfied evidence and approval gates.

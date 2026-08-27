@@ -347,11 +347,7 @@ def test_non_polymarket_manifest_cannot_cross_the_authority_boundary() -> None:
             "CAPABILITY_NONCE_REPLAYED",
         ),
         (
-            {
-                "revoked_capability_ids": frozenset(
-                    {UUID("11111111-1111-4111-8111-111111111111")}
-                )
-            },
+            {"revoked_capability_ids": frozenset({UUID("11111111-1111-4111-8111-111111111111")})},
             "CAPABILITY_REVOKED",
         ),
         ({"geoblock_evidence_hash": None}, "GEOBLOCK_EVIDENCE_MISSING"),
@@ -515,9 +511,7 @@ def test_complete_capability_failure_order_is_stable() -> None:
     for reason, capability_repair, context_repair in repairs:
         assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).reason == reason
         capability = capability.model_copy(update=capability_repair)
-        context = context.model_copy(
-            update={"verified_capability": capability, **context_repair}
-        )
+        context = context.model_copy(update={"verified_capability": capability, **context_repair})
     assert verify_mutation_authority(context, ExecutionOperation.SUBMIT_ORDER).allowed is True
 
 
@@ -542,9 +536,12 @@ def test_every_mutation_operation_requires_the_full_gate_with_zero_notional(
 ) -> None:
     context = authority_context(requested_notional=Decimal("0"))
     assert verify_mutation_authority(context, operation).allowed is True
-    assert verify_mutation_authority(
-        context.model_copy(update={"kill_engaged": True}), operation
-    ).reason == "EXECUTION_KILL_ENGAGED"
+    assert (
+        verify_mutation_authority(
+            context.model_copy(update={"kill_engaged": True}), operation
+        ).reason
+        == "EXECUTION_KILL_ENGAGED"
+    )
 
 
 def test_each_boundary_evaluates_the_snapshot_without_a_cached_pass() -> None:
@@ -553,17 +550,13 @@ def test_each_boundary_evaluates_the_snapshot_without_a_cached_pass() -> None:
     assert coordinator_context == signer_context
     assert coordinator_context is not signer_context
 
-    coordinator = verify_mutation_authority(
-        coordinator_context, ExecutionOperation.SUBMIT_ORDER
-    )
+    coordinator = verify_mutation_authority(coordinator_context, ExecutionOperation.SUBMIT_ORDER)
     signer = verify_mutation_authority(signer_context, ExecutionOperation.SUBMIT_ORDER)
     assert coordinator.allowed is True
     assert signer.allowed is True
 
     fresh_signer_context = authority_context(kill_engaged=True)
-    fresh_signer = verify_mutation_authority(
-        fresh_signer_context, ExecutionOperation.SUBMIT_ORDER
-    )
+    fresh_signer = verify_mutation_authority(fresh_signer_context, ExecutionOperation.SUBMIT_ORDER)
     assert fresh_signer.reason == "EXECUTION_KILL_ENGAGED"
 
 

@@ -1021,7 +1021,7 @@ def _build_request(
 
 
 class HttpxPolymarketRestTransport:
-    """Execute closed typed requests through an exclusively owned HTTP client."""
+    """Retain socket-free offline request proofs while live transport is unavailable."""
 
     __slots__ = ("_client", "_clock", "_retry_policy", "_sleeper", "_timestamp")
 
@@ -1034,19 +1034,13 @@ class HttpxPolymarketRestTransport:
         sleeper: AsyncSleeper | None = None,
         timeouts: RestTimeouts | None = None,
     ) -> None:
-        self._initialize(
-            transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False),
-            timestamp=timestamp,
-            clock=clock,
-            retry_policy=retry_policy,
-            sleeper=sleeper,
-            timeouts=timeouts,
-        )
+        del timestamp, clock, retry_policy, sleeper, timeouts
+        raise ClobAuthError("LIVE_TRANSPORT_UNAVAILABLE") from None
 
     @classmethod
     def _for_test(
         cls,
-        transport: httpx.AsyncBaseTransport,
+        transport: httpx.MockTransport,
         *,
         timestamp: Callable[[], str],
         clock: Callable[[], datetime],
@@ -1055,8 +1049,8 @@ class HttpxPolymarketRestTransport:
         timeouts: RestTimeouts | None = None,
     ) -> Self:
         """Construct with an explicitly trusted fake transport for offline tests only."""
-        if not isinstance(transport, httpx.AsyncBaseTransport):
-            raise TypeError("HTTPX_ASYNC_TRANSPORT_REQUIRED")
+        if type(transport) is not httpx.MockTransport:
+            raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")
         instance = cls.__new__(cls)
         instance._initialize(
             transport=transport,
@@ -1071,13 +1065,15 @@ class HttpxPolymarketRestTransport:
     def _initialize(
         self,
         *,
-        transport: httpx.AsyncBaseTransport,
+        transport: httpx.MockTransport,
         timestamp: Callable[[], str],
         clock: Callable[[], datetime],
         retry_policy: ReadRetryPolicy | None,
         sleeper: AsyncSleeper | None,
         timeouts: RestTimeouts | None,
     ) -> None:
+        if type(transport) is not httpx.MockTransport:
+            raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")
         checked_timeouts = timeouts or RestTimeouts()
         if not isinstance(checked_timeouts, RestTimeouts):
             raise TypeError("REST_TIMEOUTS_REQUIRED")
@@ -1524,15 +1520,12 @@ class SignerRestHandlers:
 __all__ = [
     "MAX_ARRAY_ITEMS",
     "MAX_RESPONSE_BYTES",
-    "HttpxPolymarketRestTransport",
-    "PolymarketRestTransport",
     "ReadRetryPolicy",
     "RestCode",
     "RestResult",
     "RestTimeouts",
     "RestrictedGeoblockEvidence",
     "RestrictedGeoblockResponse",
-    "SignerRestHandlers",
     "classify_order_ack",
     "sanitize_venue_error",
 ]

@@ -14,6 +14,10 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
+from polytrading.predictions.polymarket_execution import auth as auth_module
+from polytrading.predictions.polymarket_execution import order as order_module
+from polytrading.predictions.polymarket_execution import rest as rest_module
+from polytrading.predictions.polymarket_execution import routes as routes_module
 from polytrading.predictions.polymarket_execution.auth import (
     ClobAuthError,
     ClobCredentials,
@@ -86,6 +90,63 @@ def clob_credentials() -> ClobCredentials:
         secret=base64.urlsafe_b64encode(b"task8-hmac-secret"),
         passphrase=b"task8-passphrase",
     )
+
+
+def test_live_disabled_ordinary_transport_constructor_is_stably_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def socket_capable_transport_must_not_be_constructed(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("SOCKET_CAPABLE_TRANSPORT_CONSTRUCTION_ATTEMPTED")
+
+    monkeypatch.setattr(
+        httpx, "AsyncHTTPTransport", socket_capable_transport_must_not_be_constructed
+    )
+
+    with pytest.raises(ClobAuthError, match=r"^LIVE_TRANSPORT_UNAVAILABLE$"):
+        HttpxPolymarketRestTransport(
+            timestamp=lambda: TIMESTAMP,
+            clock=lambda: NOW,
+        )
+
+
+def test_test_transport_seam_requires_exact_mock_transport() -> None:
+    class NonMockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            del request
+            raise AssertionError("NON_MOCK_TRANSPORT_MUST_NOT_RUN")
+
+    try:
+        transport = HttpxPolymarketRestTransport._for_test(
+            NonMockTransport(),
+            timestamp=lambda: TIMESTAMP,
+            clock=lambda: NOW,
+        )
+    except TypeError as error:
+        assert str(error) == "HTTPX_MOCK_TRANSPORT_REQUIRED"
+    else:
+        asyncio.run(transport.aclose())
+        pytest.fail("NON_MOCK_TRANSPORT_ACCEPTED")
+
+
+def test_sensitive_execution_building_blocks_are_not_declared_public() -> None:
+    forbidden_exports = {
+        auth_module: {"ClobCredentials", "sign_clob_auth", "sign_l2_request"},
+        order_module: {"sign_order"},
+        rest_module: {
+            "HttpxPolymarketRestTransport",
+            "PolymarketRestTransport",
+            "SignerRestHandlers",
+        },
+        routes_module: {
+            "CancelOrderRequest",
+            "HeartbeatRequest",
+            "SubmitOrderRequest",
+        },
+    }
+
+    for module, forbidden in forbidden_exports.items():
+        assert forbidden.isdisjoint(module.__all__), module.__name__
 
 
 def test_route_set_is_the_exact_frozen_execution_allowlist() -> None:
@@ -1679,7 +1740,7 @@ def test_redirect_is_rejected_without_following_the_location() -> None:
 
 
 @pytest.mark.parametrize("variable", ("SSL_CERT_FILE", "SSL_CERT_DIR"))
-def test_production_transport_ignores_ambient_tls_trust(
+def test_live_disabled_transport_rejects_before_ambient_tls_trust(
     variable: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1689,21 +1750,17 @@ def test_production_transport_ignores_ambient_tls_trust(
     monkeypatch.delenv(other_variable, raising=False)
     monkeypatch.setenv(variable, hostile_path)
 
-    if variable == "SSL_CERT_DIR":
-        create_default_context = ssl.create_default_context
+    def reject_tls_context(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("TLS_CONTEXT_CONSTRUCTION_ATTEMPTED")
 
-        def reject_ambient_capath(*args, **kwargs):
-            if kwargs.get("capath") == hostile_path:
-                raise FileNotFoundError("ambient certificate directory was read")
-            return create_default_context(*args, **kwargs)
+    monkeypatch.setattr(ssl, "create_default_context", reject_tls_context)
 
-        monkeypatch.setattr(ssl, "create_default_context", reject_ambient_capath)
-
-    transport = HttpxPolymarketRestTransport(
-        timestamp=lambda: TIMESTAMP,
-        clock=lambda: NOW,
-    )
-    asyncio.run(transport.aclose())
+    with pytest.raises(ClobAuthError, match=r"^LIVE_TRANSPORT_UNAVAILABLE$"):
+        HttpxPolymarketRestTransport(
+            timestamp=lambda: TIMESTAMP,
+            clock=lambda: NOW,
+        )
 
 
 def test_trusted_transport_test_seam_uses_exclusively_owned_bounded_client() -> None:

@@ -545,6 +545,5 @@ __all__ = [
     "order_fingerprint",
     "order_typed_data",
     "recover_order_signer",
-    "sign_order",
     "stable_order_salt",
 ]

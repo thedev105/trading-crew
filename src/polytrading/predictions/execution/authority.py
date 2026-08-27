@@ -166,9 +166,7 @@ class ExecutionCapability(_CapabilityFields):
 
     @property
     def canonical_unsigned_bundle(self) -> bytes:
-        payload: Mapping[str, object] = self.model_dump(
-            mode="json", exclude={"detached_signature"}
-        )
+        payload: Mapping[str, object] = self.model_dump(mode="json", exclude={"detached_signature"})
         return json.dumps(
             payload,
             ensure_ascii=False,
