@@ -8,6 +8,18 @@ const CONNECTION_STATES = new Set([CONNECTED, DEGRADED, STALE, DISCONNECTED, INC
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const PROTOTYPE_META_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const INCONSISTENT_FINANCIAL_FIELDS = new Set([
+  "capacity",
+  "capacity_usd",
+  "conservative_surplus_usd",
+  "live_pnl_usd",
+  "minimum_basket_payout",
+  "paper_pnl",
+  "paper_pnl_usd",
+  "realized_pnl_usd",
+  "reconciled_paper_pnl_usd",
+  "surplus",
+]);
 
 function invalidSnapshot(detail) {
   const error = new Error(`INVALID_SNAPSHOT:${detail}`);
@@ -331,11 +343,7 @@ function redactedSnapshot(snapshot) {
       let projectedValue;
       if (key === "pnl_publishable") {
         projectedValue = false;
-      } else if (
-        key === "conservative_surplus_usd" ||
-        key === "capacity_usd" ||
-        key.toLowerCase().includes("pnl")
-      ) {
+      } else if (INCONSISTENT_FINANCIAL_FIELDS.has(key)) {
         projectedValue = null;
       } else {
         projectedValue = redact(item);

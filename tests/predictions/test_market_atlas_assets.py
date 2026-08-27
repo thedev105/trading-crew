@@ -188,6 +188,98 @@ def valid_snapshot() -> dict[str, object]:
     }
 
 
+FINANCIAL_CANARIES = {
+    "opportunity_surplus": "12012.51",
+    "opportunity_capacity": "23023.62",
+    "live_pnl": "34034.73",
+    "shadow_aggregate_pnl": "45045.84",
+    "shadow_row_pnl": "56056.95",
+    "shadow_second_row_pnl": "-11011.11",
+    "proof_minimum_payout": "67067.16",
+    "scan_surplus": "78078.27",
+    "scan_capacity": "89089.38",
+}
+
+
+def financial_canary_snapshot() -> dict[str, object]:
+    snapshot = valid_snapshot()
+    cutoff = str(snapshot["as_of"])
+    candidate_id = "00000000-0000-0000-0000-000000000001"
+    proof_id = "00000000-0000-0000-0000-000000000003"
+
+    snapshot["proofs"] = {
+        "schema_version": 1,
+        "total": 1,
+        "by_status": {"proof_ready": 1},
+        "by_template": {"logical_implication@1": 1},
+        "latest": [
+            {
+                "schema_version": 1,
+                "proof_id": proof_id,
+                "candidate_id": candidate_id,
+                "template": "logical_implication@1",
+                "status": "proof_ready",
+                "rejection_reason": None,
+                "minimum_basket_payout": FINANCIAL_CANARIES["proof_minimum_payout"],
+                "observed_at": cutoff,
+            }
+        ],
+    }
+    snapshot["scans"] = {
+        "schema_version": 1,
+        "total": 1,
+        "by_decision": {"SHADOW_CANDIDATE": 1},
+        "latest": [
+            {
+                "schema_version": 1,
+                "candidate_id": candidate_id,
+                "decision": "SHADOW_CANDIDATE",
+                "reason": "SCAN_SHADOW_CANDIDATE",
+                "surplus": FINANCIAL_CANARIES["scan_surplus"],
+                "capacity": FINANCIAL_CANARIES["scan_capacity"],
+                "as_of": cutoff,
+            }
+        ],
+    }
+    snapshot["shadow"] = {
+        "schema_version": 1,
+        "proposals_total": 2,
+        "by_terminal_state": {"reconciled": 2},
+        "reconciled_count": 2,
+        "reconciled_paper_pnl_usd": FINANCIAL_CANARIES["shadow_aggregate_pnl"],
+        "unreconciled_count": 0,
+        "latest": [
+            {
+                "schema_version": 1,
+                "proposal_id": "00000000-0000-0000-0000-000000000005",
+                "candidate_id": candidate_id,
+                "current_state": "reconciled",
+                "scenario_id": "SCENARIO_RECORDED",
+                "quantity": "3.25",
+                "paper_pnl": FINANCIAL_CANARIES["shadow_row_pnl"],
+                "observed_at": cutoff,
+            },
+            {
+                "schema_version": 1,
+                "proposal_id": "00000000-0000-0000-0000-000000000004",
+                "candidate_id": candidate_id,
+                "current_state": "reconciled",
+                "scenario_id": "SCENARIO_RECORDED",
+                "quantity": "4.50",
+                "paper_pnl": FINANCIAL_CANARIES["shadow_second_row_pnl"],
+                "observed_at": cutoff,
+            },
+        ],
+        "experiments_by_family": {},
+    }
+    opportunity = snapshot["opportunities"][0]  # type: ignore[index]
+    opportunity["proof_id"] = proof_id
+    opportunity["conservative_surplus_usd"] = FINANCIAL_CANARIES["opportunity_surplus"]
+    opportunity["capacity_usd"] = FINANCIAL_CANARIES["opportunity_capacity"]
+    snapshot["live_ledger"]["realized_pnl_usd"] = FINANCIAL_CANARIES["live_pnl"]  # type: ignore[index]
+    return snapshot
+
+
 def test_market_atlas_has_exactly_five_primary_views() -> None:
     parser = parsed_index()
 
@@ -603,6 +695,58 @@ def test_store_recursively_redacts_aggregate_and_row_level_pnl(tmp_path: Path) -
         assert.equal(state.displaySnapshot.shadow.latest[0].paper_pnl, null);
         assert.equal(state.displaySnapshot.shadow.latest[0].live_pnl_usd, null);
         assert.equal(state.displaySnapshot.shadow.latest[0].nested.paper_pnl_usd, null);
+        """
+    )
+
+
+def test_store_redacts_current_and_legacy_financial_schema_without_losing_evidence(
+    tmp_path: Path,
+) -> None:
+    uri = module_uri(tmp_path, "store.js")
+    snapshot = financial_canary_snapshot()
+    canary_pattern = "|".join(re.escape(value) for value in FINANCIAL_CANARIES.values())
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ createSnapshotStore, INCONSISTENT }} from {json.dumps(uri)};
+
+        const store = createSnapshotStore({{ scheduleNotification: (callback) => callback() }});
+        store.replaceSnapshot({json.dumps(snapshot)});
+        store.setConnectionState(INCONSISTENT, "REVISION_MISMATCH");
+        const state = store.getState();
+        const display = state.displaySnapshot;
+        const renderedSurface = JSON.stringify(display);
+
+        assert.doesNotMatch(renderedSurface, /{canary_pattern}/);
+        assert.equal(display.live_ledger.pnl_publishable, false);
+        assert.equal(display.live_ledger.realized_pnl_usd, null);
+        assert.equal(display.shadow.reconciled_paper_pnl_usd, null);
+        assert.deepEqual(display.shadow.latest.map((row) => row.paper_pnl), [null, null]);
+        assert.equal(display.opportunities[0].conservative_surplus_usd, null);
+        assert.equal(display.opportunities[0].capacity_usd, null);
+        assert.equal(display.proofs.latest[0].minimum_basket_payout, null);
+        assert.equal(display.scans.latest[0].surplus, null);
+        assert.equal(display.scans.latest[0].capacity, null);
+
+        assert.equal(display.proofs.total, 1);
+        assert.equal(display.proofs.latest[0].proof_id, "00000000-0000-0000-0000-000000000003");
+        assert.equal(display.proofs.latest[0].candidate_id, "00000000-0000-0000-0000-000000000001");
+        assert.equal(display.proofs.latest[0].status, "proof_ready");
+        assert.equal(display.proofs.latest[0].observed_at, "2026-08-16T12:00:00Z");
+        assert.equal(display.scans.total, 1);
+        assert.equal(display.scans.latest[0].decision, "SHADOW_CANDIDATE");
+        assert.equal(display.scans.latest[0].reason, "SCAN_SHADOW_CANDIDATE");
+        assert.equal(display.scans.latest[0].as_of, "2026-08-16T12:00:00Z");
+        assert.deepEqual(display.shadow.latest.map((row) => row.quantity), ["3.25", "4.50"]);
+        assert.deepEqual(
+          display.shadow.latest.map((row) => row.current_state),
+          ["reconciled", "reconciled"],
+        );
+        assert.equal(display.live_ledger.posting_count, 4);
+        assert.equal(display.live_ledger.reconciliation_count, 1);
+        assert.equal(display.opportunities[0].candidate_id, "00000000-0000-0000-0000-000000000001");
+        assert.deepEqual(display.opportunities[0].evidence_hashes, ["b".repeat(64)]);
+        assert.equal(state.financialsHidden, true);
         """
     )
 
@@ -1357,7 +1501,8 @@ def test_app_bootstrap_navigation_state_rendering_and_abort_cleanup(
         "charts.js",
         "views.js",
     )
-    snapshot = json.dumps(valid_snapshot())
+    snapshot = json.dumps(financial_canary_snapshot())
+    canary_pattern = "|".join(re.escape(value) for value in FINANCIAL_CANARIES.values())
     run_node_module_test(
         f"""
         import assert from "node:assert/strict";
@@ -1453,6 +1598,7 @@ def test_app_bootstrap_navigation_state_rendering_and_abort_cleanup(
           addEventListener(name, listener) {{ windowListeners.set(name, listener); }},
           removeEventListener(name) {{ windowListeners.delete(name); }},
         }};
+        globalThis.document = documentRef;
         const frames = [];
         let streamClosed = false;
         let streamSignal;
@@ -1472,7 +1618,10 @@ def test_app_bootstrap_navigation_state_rendering_and_abort_cleanup(
           now: () => Date.parse("2026-08-16T12:00:05Z"),
         }});
         const flushFrames = () => {{ while (frames.length) frames.shift()(); }};
-        const textTree = (node) => [node.textContent, ...node.children.map(textTree)].join(" ");
+        const textTree = (node) => typeof node === "string"
+          ? node
+          : [node.textContent, ...node.children.map(textTree)].join(" ");
+        const allDomText = () => [...ids.values()].map(textTree).join(" ");
         await app.ready;
         flushFrames();
 
@@ -1497,6 +1646,9 @@ def test_app_bootstrap_navigation_state_rendering_and_abort_cleanup(
         assert.deepEqual(tabs[1].focusOptions, {{ preventScroll: true }});
         assert.equal(ids.get("view-title").textContent, "Markets");
         assert.match(textTree(viewRoot), /Ranked opportunities/);
+        assert.match(textTree(viewRoot), /12012[.]51/);
+        assert.match(textTree(viewRoot), /23023[.]62/);
+        assert.match(allDomText(), /56056[.]95/);
 
         tabs[1].emit("keydown", {{ key: "End", preventDefault: () => undefined }});
         flushFrames();
@@ -1519,11 +1671,23 @@ def test_app_bootstrap_navigation_state_rendering_and_abort_cleanup(
         flushFrames();
         assert.equal(ids.get("connection-overlay").hidden, false);
 
-        app.selectView("ledger");
         app.store.setConnectionState("INCONSISTENT", "REVISION_MISMATCH");
+        assert.doesNotMatch(
+          JSON.stringify(app.store.getState().displaySnapshot),
+          /{canary_pattern}/,
+        );
+        for (const view of ["overview", "markets", "execution", "ledger", "evidence"]) {{
+          app.selectView(view);
+          flushFrames();
+          assert.match(textTree(viewRoot), /financial values are suppressed/);
+          assert.doesNotMatch(allDomText(), /{canary_pattern}/);
+        }}
+        app.selectView("ledger");
         flushFrames();
         assert.match(textTree(viewRoot), /Financial totals hidden/);
-        assert.doesNotMatch(textTree(viewRoot), /7.75/);
+        assert.match(allDomText(), /proof_ready/);
+        assert.match(allDomText(), /SHADOW_CANDIDATE/);
+        assert.match(allDomText(), /reconciled not available/);
 
         windowListeners.get("pagehide")();
         assert.equal(streamSignal.aborted, true);
