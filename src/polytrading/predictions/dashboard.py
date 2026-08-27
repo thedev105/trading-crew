@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
@@ -15,6 +16,7 @@ from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.dashboard_models import (
     CandidateListing,
     CandidateSummary,
+    DashboardRecord,
     EvidenceStatus,
     ExecutionReadinessSummary,
     ExecutionTimelineEntry,
@@ -49,7 +51,7 @@ from polytrading.predictions.polymarket_execution import (
     load_protocol_snapshot,
     verify_protocol_sources,
 )
-from polytrading.predictions.proofs_models import ProofArtifact
+from polytrading.predictions.proofs_models import APPROVED_PROOF_TEMPLATES, ProofArtifact
 from polytrading.predictions.shadow_ledger import (
     LedgerPosting,
     ShadowReconciliation,
@@ -313,8 +315,8 @@ class PredictionDashboardBuilder:
             if event.scope not in account_scopes
         )
 
-        if len(timeline) > _MAX_SAFETY_RECORDS:
-            raise ValueError("dashboard execution timeline limit exceeded")
+        if len(timeline) > _MAX_EXECUTION_TIMELINE_SHOWN:
+            raise ValueError("dashboard execution timeline exceeds 500 complete facts")
         timeline.sort(key=lambda item: (item.occurred_at, item.record_id), reverse=True)
 
         unmet_gates = {"CAPABILITY_VERIFIER_NOT_CONFIGURED", "EXECUTION_KILL_ENGAGED"}
@@ -373,7 +375,7 @@ class PredictionDashboardBuilder:
         return (
             readiness,
             self._market_atlas_opportunities(as_of),
-            tuple(timeline[:_MAX_EXECUTION_TIMELINE_SHOWN]),
+            tuple(timeline),
             ledger,
             evidence,
         )
@@ -389,6 +391,12 @@ class PredictionDashboardBuilder:
             raise ValueError("duplicate candidate identity in opportunity evidence")
         if any(proof.candidate_id not in candidates_by_id for proof in proofs):
             raise ValueError("proof references an unavailable candidate")
+        if any(
+            candidates_by_id[proof.candidate_id].information_cutoff > proof.information_cutoff
+            or candidates_by_id[proof.candidate_id].observed_at > proof.observed_at
+            for proof in proofs
+        ):
+            raise ValueError("candidate and proof temporal order is invalid")
         if any(report.candidate_id not in candidates_by_id for report in reports):
             raise ValueError("scan report references an unavailable candidate")
         proofs_by_id = {proof.proof_id: proof for proof in proofs}
@@ -405,6 +413,11 @@ class PredictionDashboardBuilder:
                 proof = proofs_by_id.get(report.proof_id)
                 if proof is None or proof.candidate_id != report.candidate_id:
                     raise ValueError("scan report references an unavailable proof")
+                if (
+                    proof.information_cutoff > report.as_of
+                    or proof.observed_at > report.observed_at
+                ):
+                    raise ValueError("proof and scan report temporal order is invalid")
             economics = None if report is None else report.economics
             evidence_records = tuple(
                 record for record in (candidate, proof, report) if record is not None
@@ -478,7 +491,7 @@ class PredictionDashboardBuilder:
         by_template: dict[str, int] = {}
         for proof in proofs:
             _increment(by_status, proof.status)
-            _increment(by_template, proof.template)
+            _increment(by_template, _public_proof_template(proof.template))
 
         # Same newest-first/cap-at-20 contract as `_candidate_summary` above: the
         # store returns proofs oldest-first, so reverse the newest slice for display.
@@ -517,12 +530,12 @@ class PredictionDashboardBuilder:
 
         experiments = self._store.verified_shadow_experiments_as_of(as_of)
         experiments_by_proposal: dict[UUID, ShadowExperiment] = {}
-        experiments_by_family: dict[str, int] = {}
+        experiment_count = 0
         for experiment in experiments:
             if experiment.proposal_id in experiments_by_proposal:
                 raise ValueError("multiple shadow experiments exist for one proposal")
             experiments_by_proposal[experiment.proposal_id] = experiment
-            _increment(experiments_by_family, experiment.family_id)
+            experiment_count += 1
 
         listings: list[ShadowListing] = []
         by_current_state: dict[str, int] = {}
@@ -576,7 +589,7 @@ class PredictionDashboardBuilder:
                     proposal_id=plan.proposal_id,
                     candidate_id=plan.candidate_id,
                     current_state=current_state,
-                    scenario_id=scenario_id,
+                    scenario_id=None if scenario_id is None else "SCENARIO_RECORDED",
                     quantity=plan.max_quantity,
                     paper_pnl=paper_pnl,
                     observed_at=events[-1].occurred_at,
@@ -588,7 +601,9 @@ class PredictionDashboardBuilder:
 
         listings.sort(key=lambda item: (item.observed_at, item.proposal_id), reverse=True)
         by_current_state = dict(sorted(by_current_state.items()))
-        experiments_by_family = dict(sorted(experiments_by_family.items()))
+        experiments_by_family = (
+            {} if experiment_count == 0 else {"EXPERIMENT_FAMILY_RECORDED": experiment_count}
+        )
         proposals_total = len(listings)
         reconciled_count = by_current_state.get("reconciled", 0)
         return ShadowSummary(
@@ -795,7 +810,7 @@ def _proof_listing(proof: ProofArtifact) -> ProofListing:
         schema_version=1,
         proof_id=proof.proof_id,
         candidate_id=proof.candidate_id,
-        template=proof.template,
+        template=_public_proof_template(proof.template),
         status=proof.status,
         rejection_reason=proof.rejection_reason,
         minimum_basket_payout=proof.minimum_basket_payout,
@@ -809,11 +824,19 @@ def _scan_listing(report: ScanReport) -> ScanListing:
         schema_version=1,
         candidate_id=report.candidate_id,
         decision=report.decision,
-        reason=report.reason,
+        reason={
+            "INSUFFICIENT_EVIDENCE": "SCAN_INSUFFICIENT_EVIDENCE",
+            "REJECTED": "SCAN_REJECTED",
+            "SHADOW_CANDIDATE": "SCAN_SHADOW_CANDIDATE",
+        }[report.decision],
         surplus=None if economics is None else economics.conservative_surplus_usd,
         capacity=None if economics is None else economics.capacity_usd_at_current_depth,
         as_of=report.as_of,
     )
+
+
+def _public_proof_template(template: str) -> str:
+    return template if template in APPROVED_PROOF_TEMPLATES else "UNAPPROVED_TEMPLATE"
 
 
 def render_prediction_dashboard_json(snapshot: PredictionDashboardSnapshot) -> bytes:
@@ -834,7 +857,7 @@ def build_prediction_dashboard_snapshot(
 
 
 def _json_value(value: Any) -> Any:
-    if isinstance(value, BaseModel):
+    if isinstance(value, BaseModel | DashboardRecord):
         return _json_value(value.model_dump())
     if isinstance(value, datetime):
         return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -844,7 +867,7 @@ def _json_value(value: Any) -> Any:
         return str(value)
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: _json_value(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_json_value(item) for item in value]

@@ -1,4 +1,5 @@
 import json
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -7,7 +8,7 @@ from typing import cast
 from uuid import UUID
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from polytrading.predictions.candidates_models import CandidateDisposition, RelationshipType
 from polytrading.predictions.dashboard import (
@@ -53,7 +54,7 @@ def shadow_listing(**overrides: object) -> ShadowListing:
         "proposal_id": UUID(int=1),
         "candidate_id": UUID(int=101),
         "current_state": ShadowState.RECONCILED,
-        "scenario_id": "baseline",
+        "scenario_id": "SCENARIO_RECORDED",
         "quantity": Decimal("10"),
         "paper_pnl": Decimal("-2.50"),
         "observed_at": NOW,
@@ -71,7 +72,7 @@ def shadow_summary(**overrides: object) -> ShadowSummary:
         "reconciled_paper_pnl_usd": Decimal("-2.50"),
         "unreconciled_count": 0,
         "latest": (shadow_listing(),),
-        "experiments_by_family": {"cross-venue-equivalence-v1": 1},
+        "experiments_by_family": {"EXPERIMENT_FAMILY_RECORDED": 1},
     }
     values.update(overrides)
     return ShadowSummary(**values)
@@ -524,10 +525,10 @@ def test_snapshot_shadow_summary_uses_each_cutoff_safe_event_derived_state(
     assert summary.unreconciled_count == 4
     assert [item.current_state for item in summary.latest] == list(states)
     assert [item.scenario_id for item in summary.latest] == [
-        "scenario-1",
-        "scenario-2",
-        "scenario-3",
-        "scenario-4",
+        "SCENARIO_RECORDED",
+        "SCENARIO_RECORDED",
+        "SCENARIO_RECORDED",
+        "SCENARIO_RECORDED",
     ]
     assert all(item.paper_pnl is None for item in summary.latest)
 
@@ -545,7 +546,7 @@ def test_snapshot_shadow_state_stops_at_the_latest_event_at_or_before_cutoff(
 
     assert listing.current_state is ShadowState.FIRST_LEG_SIMULATED
     assert listing.observed_at == NOW
-    assert listing.scenario_id == "baseline"
+    assert listing.scenario_id == "SCENARIO_RECORDED"
 
 
 def test_snapshot_shadow_omits_plans_not_known_by_the_cutoff(tmp_path: Path) -> None:
@@ -630,10 +631,7 @@ def test_snapshot_shadow_exposes_pnl_only_from_complete_reconciled_evidence(
     assert summary.reconciled_count == 2
     assert summary.unreconciled_count == 1
     assert summary.reconciled_paper_pnl_usd == Decimal("-0.20")
-    assert summary.experiments_by_family == {
-        "cross-venue-equivalence-v1": 2,
-        "unknown-outcomes-v1": 1,
-    }
+    assert summary.experiments_by_family == {"EXPERIMENT_FAMILY_RECORDED": 3}
     listings = {item.proposal_id: item for item in summary.latest}
     assert listings[UUID(int=1)].paper_pnl == Decimal("-0.20")
     assert listings[UUID(int=2)].paper_pnl == Decimal("0")
@@ -1505,7 +1503,7 @@ def test_snapshot_scans_summary_counts_match_seeded_scans(tmp_path: Path) -> Non
     listing = snapshot.scans.latest[0]
     assert listing.candidate_id == UUID(int=301)
     assert listing.decision == "REJECTED"
-    assert listing.reason == "economics unfavorable"
+    assert listing.reason == "SCAN_REJECTED"
     assert listing.surplus is None
     assert listing.capacity is None
     assert listing.as_of == NOW
@@ -1558,6 +1556,95 @@ def test_snapshot_scans_latest_is_newest_first_and_capped_at_twenty(tmp_path: Pa
     as_ofs = [listing.as_of for listing in snapshot.scans.latest]
     assert as_ofs == sorted(as_ofs, reverse=True)
     assert snapshot.scans.latest[0].candidate_id == UUID(int=424)
+
+
+def test_scan_reason_and_rejected_proof_template_are_mapped_to_closed_codes(
+    tmp_path: Path,
+) -> None:
+    canary = "authorization=Bearer-private-key signed-body account geographic-ip raw-request"
+    candidate = candidate_relationship(
+        observed_at=NOW - timedelta(minutes=3),
+        information_cutoff=NOW - timedelta(minutes=3),
+    )
+    proof = proof_artifact(
+        candidate_id=candidate.candidate_id,
+        template=canary,
+        status="rejected",
+        rejection_reason="TEMPLATE_NOT_APPROVED",
+        terminal_states=(),
+        minimum_basket_payout=None,
+        maximum_basket_payout=None,
+        observed_at=NOW - timedelta(minutes=2),
+        information_cutoff=NOW - timedelta(minutes=2),
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        decision="REJECTED",
+        reason=canary,
+        as_of=NOW - timedelta(minutes=1),
+        observed_at=NOW - timedelta(minutes=1),
+    )
+    store = PredictionMarketStore(tmp_path / "closed-public-codes.duckdb")
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "closed-public-codes.duckdb").build(NOW)
+    rendered = render_prediction_dashboard_json(snapshot).decode()
+
+    assert snapshot.scans.latest[0].reason == "SCAN_REJECTED"
+    assert snapshot.proofs.latest[0].template == "UNAPPROVED_TEMPLATE"
+    assert snapshot.proofs.by_template == {"UNAPPROVED_TEMPLATE": 1}
+    assert canary not in snapshot.model_dump_json()
+    assert canary not in rendered
+
+
+def test_shadow_scenario_and_experiment_family_are_mapped_to_closed_codes(
+    tmp_path: Path,
+) -> None:
+    canary = "authorization=Bearer-private-key signed-body account geographic-ip raw-request"
+    store = PredictionMarketStore(tmp_path / "closed-shadow-codes.duckdb")
+    plan = shadow_plan(observed_at=NOW - timedelta(minutes=10))
+    events = tuple(
+        event.model_copy(update={"scenario_id": canary}) if event.sequence >= 4 else event
+        for event in reconciled_execution_events(
+            plan,
+            ShadowState.COMPLETE,
+            terminal_at=NOW - timedelta(minutes=1),
+        )
+    )
+    fees = shadow_fees(plan)
+    postings = postings_for_events(plan, events, fees)
+    reconciliation = reconcile_proposal(plan, events, postings, fees)
+    reconciled_event = reconciled_event_for(plan, events, reconciliation).model_copy(
+        update={"scenario_id": canary}
+    )
+    append_plan_and_events(store, plan, (*events, reconciled_event))
+    for posting in postings:
+        store.append_ledger_posting(posting)
+    store.append_reconciliation(reconciliation)
+    store.append_shadow_experiment(
+        shadow_experiment(
+            plan,
+            observed_at=reconciliation.observed_at,
+            terminal_state=ShadowState.RECONCILED,
+            paper_pnl_usd=proposal_paper_pnl(
+                postings,
+                reconciliation,
+                (*events, reconciled_event),
+            ),
+            reconciled=True,
+            family_id=canary,
+            scenario_id=canary,
+        )
+    )
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "closed-shadow-codes.duckdb").build(NOW)
+
+    assert snapshot.shadow.latest[0].scenario_id == "SCENARIO_RECORDED"
+    assert snapshot.shadow.experiments_by_family == {"EXPERIMENT_FAMILY_RECORDED": 1}
+    assert canary not in snapshot.model_dump_json()
 
 
 def _append_live_dashboard_execution_bundle(store: PredictionMarketStore) -> str:
@@ -1786,6 +1873,89 @@ def test_public_dashboard_mappings_are_detached_deeply_immutable_and_json_compat
         copied.counts["new"] = 1
 
 
+def test_finalized_publication_tree_has_no_mutable_or_pydantic_backing(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_market(market_record(retrieved_at=NOW))
+    store.append_book_snapshot(prediction_book_snapshot(outcome_token_id="111"))
+    _append_live_dashboard_execution_bundle(store)
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+    def assert_sealed(value: object) -> None:
+        assert not isinstance(value, (BaseModel, dict, list, set))
+        if isinstance(value, tuple | frozenset):
+            for item in value:
+                assert_sealed(item)
+        elif isinstance(value, dashboard_models.DashboardRecord):
+            for field_name in value.model_dump(mode="python"):
+                assert_sealed(getattr(value, field_name))
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                assert_sealed(key)
+                assert_sealed(item)
+
+    import polytrading.predictions.dashboard_models as dashboard_models
+
+    assert_sealed(snapshot)
+
+
+def test_base_descriptors_cannot_mutate_or_fork_finalized_public_values(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _append_live_dashboard_execution_bundle(store)
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    canonical = snapshot.model_dump_json()
+    revision = snapshot.revision_id
+
+    with pytest.raises((TypeError, AttributeError)):
+        dict.__setitem__(snapshot.evidence_counts.counts, "descriptor_mutation", 1)
+
+    targets = (
+        snapshot,
+        snapshot.health,
+        snapshot.evidence_counts,
+        snapshot.execution_readiness,
+        snapshot.candidates,
+        snapshot.proofs,
+        snapshot.scans,
+        snapshot.shadow,
+        snapshot.live_ledger,
+        snapshot.evidence_status,
+        *snapshot.execution_timeline,
+    )
+    for target in targets:
+        values = target.model_dump(mode="python")
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.__init__(target, **values)
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.model_copy(target, update={"schema_version": 2})
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.copy(target, update={"schema_version": 2})
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.model_construct.__func__(type(target), **values)
+
+    assert snapshot.model_dump_json() == canonical
+    assert snapshot.revision_id == revision == snapshot.deterministic_revision_id()
+
+
+def test_reachable_legacy_values_retain_validated_copy_and_construct_compatibility(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_market(market_record(retrieved_at=NOW))
+    store.append_book_snapshot(prediction_book_snapshot(outcome_token_id="111"))
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    legacy_values = (snapshot.health, *snapshot.health.venues, *snapshot.markets, *snapshot.books)
+
+    for value in legacy_values:
+        copied = value.model_copy()
+        reconstructed = type(value).model_construct(**value.model_dump(mode="python"))
+        assert not isinstance(copied, BaseModel)
+        assert not isinstance(reconstructed, BaseModel)
+        assert copied.model_dump_json() == value.model_dump_json()
+        assert reconstructed.model_dump_json() == value.model_dump_json()
+        with pytest.raises(ValidationError):
+            value.model_copy(update={"schema_version": 2})
+
+
 def test_finalized_snapshot_rejects_stale_caller_supplied_revision(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
@@ -1890,11 +2060,15 @@ def test_market_atlas_conformance_is_fixed_and_bound_to_current_protocol_hashes(
 def test_market_atlas_opportunity_binds_report_to_its_exact_proof_not_latest_proof(
     tmp_path: Path,
 ) -> None:
-    candidate = candidate_relationship(observed_at=NOW - timedelta(minutes=3))
+    candidate = candidate_relationship(
+        observed_at=NOW - timedelta(minutes=3),
+        information_cutoff=NOW - timedelta(minutes=3),
+    )
     proof_a = proof_artifact(
         proof_id=UUID(int=8101),
         candidate_id=candidate.candidate_id,
         observed_at=NOW - timedelta(minutes=2),
+        information_cutoff=NOW - timedelta(minutes=2),
     )
     proof_b = proof_artifact(
         proof_id=UUID(int=8102),
@@ -1922,6 +2096,102 @@ def test_market_atlas_opportunity_binds_report_to_its_exact_proof_not_latest_pro
         canonical_execution_hash(report),
     }
     assert set(snapshot.opportunities[0].evidence_hashes) == expected
+
+
+@pytest.mark.parametrize(
+    ("candidate_times", "proof_times", "report_times"),
+    [
+        ((-1, -1), (-2, -2), (0, 0)),
+        ((-3, -3), (-1, -1), (-2, 0)),
+        ((-3, -3), (0, -2), (0, -1)),
+    ],
+)
+def test_market_atlas_rejects_temporally_inverted_candidate_proof_report_chain(
+    candidate_times: tuple[int, int],
+    proof_times: tuple[int, int],
+    report_times: tuple[int, int],
+    tmp_path: Path,
+) -> None:
+    candidate = candidate_relationship(
+        observed_at=NOW + timedelta(minutes=candidate_times[0]),
+        information_cutoff=NOW + timedelta(minutes=candidate_times[1]),
+    )
+    proof = proof_artifact(
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW + timedelta(minutes=proof_times[0]),
+        information_cutoff=NOW + timedelta(minutes=proof_times[1]),
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        as_of=NOW + timedelta(minutes=report_times[0]),
+        observed_at=NOW + timedelta(minutes=report_times[1]),
+    )
+    store = PredictionMarketStore(tmp_path / "inverted-opportunity.duckdb")
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+
+    with pytest.raises(ValueError, match="temporal"):
+        PredictionDashboardBuilder(store, tmp_path / "inverted-opportunity.duckdb").build(NOW)
+
+
+def _append_execution_timeline_facts(
+    store: PredictionMarketStore,
+    *,
+    plan_count: int,
+) -> None:
+    from polytrading.predictions.execution.models import KillSwitchEvent, LiveExecutionPlan
+    from tests.predictions.execution_helpers import live_execution_plan_fields
+
+    account_fingerprint = "c" * 64
+    for index in range(plan_count):
+        store.append_live_execution_plan(
+            LiveExecutionPlan.model_validate(
+                live_execution_plan_fields(
+                    plan_id=UUID(int=90_000 + index),
+                    proposal_id=UUID(int=91_000 + index),
+                    candidate_id=UUID(int=92_000 + index),
+                    account_fingerprint=account_fingerprint,
+                    observed_at=NOW - timedelta(minutes=2),
+                    information_cutoff=NOW - timedelta(minutes=3),
+                    book_deadline=NOW + timedelta(minutes=5),
+                    proof_deadline=NOW + timedelta(minutes=5),
+                    economics_deadline=NOW + timedelta(minutes=5),
+                    account_deadline=NOW + timedelta(minutes=5),
+                    geoblock_deadline=NOW + timedelta(minutes=5),
+                )
+            )
+        )
+    store.append_kill_switch_event(
+        KillSwitchEvent(
+            schema_version=1,
+            kill_event_id=UUID(int=93_000),
+            trigger="RECOVERY_REQUIRED",
+            scope=account_fingerprint,
+            source_intent_id=None,
+            source_order_id=None,
+            prior_state=True,
+            occurred_at=NOW - timedelta(minutes=1),
+        )
+    )
+
+
+def test_execution_timeline_accepts_exactly_five_hundred_complete_facts(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "timeline-500.duckdb")
+    _append_execution_timeline_facts(store, plan_count=499)
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "timeline-500.duckdb").build(NOW)
+
+    assert len(snapshot.execution_timeline) == 500
+
+
+def test_execution_timeline_rejects_five_hundred_one_complete_facts(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "timeline-501.duckdb")
+    _append_execution_timeline_facts(store, plan_count=500)
+
+    with pytest.raises(ValueError, match=r"timeline.*500"):
+        PredictionDashboardBuilder(store, tmp_path / "timeline-501.duckdb").build(NOW)
 
 
 @pytest.mark.parametrize(

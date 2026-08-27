@@ -9,7 +9,10 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.predictions.domain import PredictionVenue
-from polytrading.predictions.execution.ledger import AuthoritativeTradeEconomics
+from polytrading.predictions.execution.ledger import (
+    AuthoritativeTradeEconomics,
+    postings_for_confirmed_trades,
+)
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -892,11 +895,16 @@ def test_verified_live_account_discovery_revalidates_every_account_bearing_famil
     tmp_path: Path,
 ) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
-    plan, intent, economics, posting, reconciliation = _relational_execution_records()
+    plan, intent, order, trade, economics, postings, reconciliation = (
+        _canonical_reconciliation_bundle()
+    )
     store.append_live_execution_plan(plan)
     store.append_execution_intent(intent)
+    store.append_venue_order_event(order)
+    store.append_venue_trade_event(trade)
     store.append_authoritative_trade_economics(economics)
-    store.append_live_ledger_posting(posting)
+    for posting in postings:
+        store.append_live_ledger_posting(posting)
     store.append_live_reconciliation(reconciliation)
 
     assert store.verified_live_execution_account_fingerprints(economics.information_cutoff) == (
@@ -1215,6 +1223,264 @@ def test_verified_account_discovery_rejects_cross_account_venue_identity_reuse(
 
     with pytest.raises(ConflictingRecordError, match="account"):
         store.verified_live_execution_account_fingerprints(NOW)
+
+
+@pytest.mark.parametrize("family", ["order", "trade"])
+def test_verified_account_discovery_rejects_same_account_venue_identity_reuse(
+    family: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"same-account-{family}-identity.duckdb")
+    plan = LiveExecutionPlan.model_validate(live_execution_plan_fields())
+    intent_a = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+        )
+    )
+    intent_b = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+            leg_sequence=1,
+            token_id="217427",
+        )
+    )
+    source_order = execution_records()[3]
+    order_a = source_order.model_copy(
+        update={"event_id": UUID(int=86_003), "intent_id": intent_a.intent_id}
+    )
+    order_b = source_order.model_copy(
+        update={
+            "event_id": UUID(int=86_004),
+            "raw_event_hash": "8" * 64,
+            "intent_id": intent_b.intent_id,
+            "venue_order_id": "order-2" if family == "trade" else order_a.venue_order_id,
+        }
+    )
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent_a)
+    store.append_execution_intent(intent_b)
+    store.append_venue_order_event(order_a)
+    store.append_venue_order_event(order_b)
+    if family == "trade":
+        source_trade = execution_records()[4]
+        for event_id, raw_hash, intent, order in (
+            (UUID(int=86_005), "9" * 64, intent_a, order_a),
+            (UUID(int=86_006), "a" * 64, intent_b, order_b),
+        ):
+            store.append_venue_trade_event(
+                source_trade.model_copy(
+                    update={
+                        "trade_event_id": event_id,
+                        "raw_event_hash": raw_hash,
+                        "intent_id": intent.intent_id,
+                        "venue_order_id": order.venue_order_id,
+                    }
+                )
+            )
+
+    with pytest.raises(ConflictingRecordError, match="intent"):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+def _canonical_reconciliation_bundle() -> tuple[
+    LiveExecutionPlan,
+    ExecutionIntent,
+    VenueOrderEvent,
+    VenueTradeEvent,
+    AuthoritativeTradeEconomics,
+    tuple[LiveLedgerPosting, ...],
+    LiveReconciliation,
+]:
+    plan, _source_intent, _envelope, order, trade, *_ = execution_records()
+    intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+        )
+    )
+    order = order.model_copy(update={"intent_id": intent.intent_id})
+    trade = trade.model_copy(update={"intent_id": intent.intent_id})
+    economics = authoritative_economics(
+        intent,
+        source_hash="8" * 64,
+        occurred_at=NOW + timedelta(seconds=1),
+        information_cutoff=NOW + timedelta(seconds=3),
+    )
+    trade = trade.model_copy(
+        update={
+            "normalized_state": VenueTradeState.CONFIRMED,
+            "original_venue_state": VenueTradeState.CONFIRMED.value,
+            "terminal": True,
+            "raw_event_hash": economics.trade_event_hash,
+            "venue_timestamp": economics.occurred_at,
+            "received_at": NOW + timedelta(seconds=2),
+        }
+    )
+    postings = postings_for_confirmed_trades((intent,), (trade,), (economics,))
+    economics_hashes = tuple(
+        sorted(
+            {
+                economics.economics_fingerprint,
+                economics.fee_hash,
+                economics.settlement_hash,
+                economics.source_hash,
+            }
+        )
+    )
+    reconciliation = LiveReconciliation(
+        schema_version=1,
+        reconciliation_id=UUID(int=86_100),
+        account_fingerprint=plan.account_fingerprint,
+        observed_at=economics.information_cutoff,
+        complete=True,
+        differences=(),
+        evidence_hashes=economics_hashes,
+        next_action=None,
+        venue_order_hashes=(order.raw_event_hash,),
+        venue_trade_hashes=(trade.raw_event_hash,),
+        balance_hashes=economics.balance_evidence_hashes,
+        allowance_hashes=("a" * 64,),
+        expected_posting_ids=tuple(sorted(posting.posting_id for posting in postings)),
+        lineage_hashes=(economics.economics_fingerprint,),
+    )
+    return plan, intent, order, trade, economics, postings, reconciliation
+
+
+def _append_canonical_reconciliation_bundle(
+    store: PredictionMarketStore,
+    *,
+    postings: tuple[LiveLedgerPosting, ...],
+    reconciliation: LiveReconciliation,
+) -> None:
+    plan, intent, order, trade, economics, _canonical, _closed = _canonical_reconciliation_bundle()
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_venue_order_event(order)
+    store.append_venue_trade_event(trade)
+    store.append_authoritative_trade_economics(economics)
+    for posting in postings:
+        store.append_live_ledger_posting(posting)
+    store.append_live_reconciliation(reconciliation)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_posting",
+        "extra_posting",
+        "future_posting",
+        "missing_trade_hash",
+        "unsupported_trade_hash",
+        "missing_economics_hash",
+        "overlapping_families",
+        "noncanonical_posting",
+        "lineage_outside_families",
+    ],
+)
+def test_verified_reconciliation_requires_own_cut_canonical_typed_closure(
+    defect: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"reconciliation-{defect}.duckdb")
+    _plan, _intent, _order, _trade, economics, postings, reconciliation = (
+        _canonical_reconciliation_bundle()
+    )
+    if defect == "missing_posting":
+        reconciliation = reconciliation.model_copy(
+            update={"expected_posting_ids": reconciliation.expected_posting_ids[1:]}
+        )
+    elif defect == "extra_posting":
+        reconciliation = reconciliation.model_copy(
+            update={"expected_posting_ids": (*reconciliation.expected_posting_ids, UUID(int=9))}
+        )
+    elif defect == "future_posting":
+        reconciliation = reconciliation.model_copy(
+            update={"observed_at": economics.occurred_at - timedelta(microseconds=1)}
+        )
+    elif defect == "missing_trade_hash":
+        reconciliation = reconciliation.model_copy(update={"venue_trade_hashes": ()})
+    elif defect == "unsupported_trade_hash":
+        reconciliation = reconciliation.model_copy(update={"venue_trade_hashes": ("f" * 64,)})
+    elif defect == "missing_economics_hash":
+        reconciliation = reconciliation.model_copy(
+            update={"evidence_hashes": reconciliation.evidence_hashes[1:]}
+        )
+    elif defect == "overlapping_families":
+        reconciliation = reconciliation.model_copy(
+            update={"allowance_hashes": (reconciliation.balance_hashes[0],)}
+        )
+    elif defect == "noncanonical_posting":
+        postings = (
+            postings[0].model_copy(update={"debit_account": "cash:USDC"}),
+            *postings[1:],
+        )
+    elif defect == "lineage_outside_families":
+        postings = (
+            postings[0].model_copy(
+                update={"lineage_hashes": (*postings[0].lineage_hashes, "f" * 64)}
+            ),
+            *postings[1:],
+        )
+    _append_canonical_reconciliation_bundle(
+        store,
+        postings=postings,
+        reconciliation=reconciliation,
+    )
+
+    with pytest.raises(ConflictingRecordError, match="reconciliation"):
+        store.verified_live_execution_account_fingerprints(NOW + timedelta(seconds=4))
+
+
+def test_verified_reconciliation_accepts_canonical_own_cut_closure(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "canonical-reconciliation.duckdb")
+    plan, _intent, _order, _trade, _economics, postings, reconciliation = (
+        _canonical_reconciliation_bundle()
+    )
+    _append_canonical_reconciliation_bundle(
+        store,
+        postings=postings,
+        reconciliation=reconciliation,
+    )
+
+    assert store.verified_live_execution_account_fingerprints(NOW + timedelta(seconds=4)) == (
+        plan.account_fingerprint,
+    )
+
+
+def test_standalone_economics_remains_visible_but_cannot_be_borrowed_by_complete_closure(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "standalone-economics-closure.duckdb")
+    plan, _intent, _order, _trade, _economics, postings, reconciliation = (
+        _canonical_reconciliation_bundle()
+    )
+    _append_canonical_reconciliation_bundle(
+        store,
+        postings=postings,
+        reconciliation=reconciliation,
+    )
+    standalone_intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+            leg_sequence=1,
+            token_id="217427",
+        )
+    )
+    store.append_execution_intent(standalone_intent)
+    store.append_authoritative_trade_economics(
+        authoritative_economics(
+            standalone_intent,
+            venue_order_id="order-standalone",
+            venue_trade_id="trade-standalone",
+            source_hash="9" * 64,
+        )
+    )
+
+    with pytest.raises(ConflictingRecordError, match="reconciliation"):
+        store.verified_live_execution_account_fingerprints(NOW + timedelta(seconds=4))
 
 
 def test_verified_reconciliation_cannot_borrow_another_accounts_posting(

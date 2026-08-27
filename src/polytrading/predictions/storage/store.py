@@ -29,7 +29,13 @@ from polytrading.predictions.domain import (
     TradeRecord,
 )
 from polytrading.predictions.economics_models import ScanReport
-from polytrading.predictions.execution.ledger import AuthoritativeTradeEconomics
+from polytrading.predictions.execution.ledger import (
+    AuthoritativeTradeEconomics,
+    LiveLedgerError,
+    _classify_trade_histories,
+    _hash_families_are_pairwise_disjoint,
+    postings_for_confirmed_trades,
+)
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -79,6 +85,124 @@ def _order_event_sort_key(record: VenueOrderEvent) -> tuple[datetime, bool, int,
 
 class ConflictingRecordError(ValueError):
     """Raised when an immutable prediction-market identity is retried with different content."""
+
+
+def _validate_live_reconciliation_closure(
+    reconciliation: LiveReconciliation,
+    *,
+    intents_by_id: dict[UUID, ExecutionIntent],
+    orders: tuple[VenueOrderEvent, ...],
+    trades: tuple[VenueTradeEvent, ...],
+    economics: tuple[AuthoritativeTradeEconomics, ...],
+    postings: tuple[LiveLedgerPosting, ...],
+) -> None:
+    """Rebuild one reconciliation from only the evidence visible at its own cutoff."""
+
+    if not reconciliation.complete:
+        return
+
+    bounded_postings = tuple(
+        posting
+        for posting in postings
+        if posting.account_fingerprint == reconciliation.account_fingerprint
+        and posting.occurred_at <= reconciliation.observed_at
+    )
+    bounded_intents = tuple(
+        intent
+        for intent in intents_by_id.values()
+        if intent.account_fingerprint == reconciliation.account_fingerprint
+        and intent.created_at <= reconciliation.observed_at
+    )
+    bounded_intent_ids = {intent.intent_id for intent in bounded_intents}
+    bounded_orders = tuple(
+        order
+        for order in orders
+        if order.intent_id in bounded_intent_ids and order.received_at <= reconciliation.observed_at
+    )
+    bounded_trades = tuple(
+        trade
+        for trade in trades
+        if trade.intent_id in bounded_intent_ids and trade.received_at <= reconciliation.observed_at
+    )
+    bounded_economics = tuple(
+        record
+        for record in economics
+        if record.account_fingerprint == reconciliation.account_fingerprint
+        and record.occurred_at <= reconciliation.observed_at
+        and record.information_cutoff <= reconciliation.observed_at
+    )
+
+    bounded_posting_ids = {posting.posting_id for posting in bounded_postings}
+    bounded_order_hashes = {order.raw_event_hash for order in bounded_orders}
+    exact_trade_hashes = {record.trade_event_hash for record in bounded_economics}
+    exact_evidence_hashes = {
+        evidence_hash
+        for record in bounded_economics
+        for evidence_hash in (
+            record.economics_fingerprint,
+            record.settlement_hash,
+            record.fee_hash,
+            record.source_hash,
+            *((record.cost_basis_evidence_hash,) if record.cost_basis_evidence_hash else ()),
+        )
+    }
+    exact_balance_hashes = {
+        evidence_hash
+        for record in bounded_economics
+        for evidence_hash in record.balance_evidence_hashes
+    }
+    try:
+        classified_histories = _classify_trade_histories(bounded_trades)
+        classified_trade_hashes = {
+            event_hash
+            for history in classified_histories
+            for event_hash in history.raw_event_hashes
+        }
+        canonical_postings = postings_for_confirmed_trades(
+            bounded_intents,
+            bounded_trades,
+            bounded_economics,
+        )
+    except (LiveLedgerError, TypeError, ValueError) as error:
+        raise ConflictingRecordError("reconciliation canonical evidence does not close") from error
+
+    supplied_postings = tuple(sorted(bounded_postings, key=lambda posting: posting.posting_id))
+    known_raw_hashes = bounded_order_hashes | classified_trade_hashes
+    known_economics_hashes = exact_evidence_hashes | exact_balance_hashes
+    reconciliation_hashes = {
+        *reconciliation.evidence_hashes,
+        *reconciliation.venue_order_hashes,
+        *reconciliation.venue_trade_hashes,
+        *reconciliation.balance_hashes,
+        *reconciliation.allowance_hashes,
+    }
+    if (
+        set(reconciliation.expected_posting_ids) != bounded_posting_ids
+        or supplied_postings != canonical_postings
+        or any(history.confirmed_terminal is None for history in classified_histories)
+        or not set(reconciliation.venue_order_hashes) <= bounded_order_hashes
+        or set(reconciliation.venue_trade_hashes) != classified_trade_hashes
+        or not exact_trade_hashes <= classified_trade_hashes
+        or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
+        or not exact_balance_hashes <= set(reconciliation.balance_hashes)
+        or not _hash_families_are_pairwise_disjoint(
+            reconciliation.venue_order_hashes,
+            reconciliation.venue_trade_hashes,
+            reconciliation.evidence_hashes,
+            reconciliation.balance_hashes,
+            reconciliation.allowance_hashes,
+        )
+        or set(reconciliation.evidence_hashes) & known_raw_hashes
+        or set(reconciliation.venue_order_hashes) & known_economics_hashes
+        or set(reconciliation.venue_trade_hashes) & known_economics_hashes
+        or set(reconciliation.balance_hashes) & (known_raw_hashes | exact_evidence_hashes)
+        or set(reconciliation.allowance_hashes) & (known_raw_hashes | known_economics_hashes)
+        or any(
+            not set(posting.lineage_hashes) <= reconciliation_hashes
+            for posting in supplied_postings
+        )
+    ):
+        raise ConflictingRecordError("reconciliation evidence is not relationally closed")
 
 
 class _ExecutionOperationClaim(PredictionRecord):
@@ -1418,17 +1542,10 @@ class PredictionMarketStore:
                 raise ConflictingRecordError("orphan venue order event has no visible intent")
             orders_by_venue_id.setdefault(order.venue_order_id, []).append(order)
         if any(
-            len(
-                {
-                    intents_by_id[order.intent_id].account_fingerprint
-                    for order in order_history
-                    if order.intent_id is not None
-                }
-            )
-            != 1
+            len({order.intent_id for order in order_history if order.intent_id is not None}) != 1
             for order_history in orders_by_venue_id.values()
         ):
-            raise ConflictingRecordError("venue order identity crosses execution accounts")
+            raise ConflictingRecordError("venue order identity crosses execution intent/account")
         trades_by_venue_id: dict[str, list[VenueTradeEvent]] = {}
         for trade in trades:
             if trade.intent_id is None or trade.intent_id not in intents_by_id:
@@ -1440,17 +1557,10 @@ class PredictionMarketStore:
                 raise ConflictingRecordError("venue trade event references an unavailable order")
             trades_by_venue_id.setdefault(trade.venue_trade_id, []).append(trade)
         if any(
-            len(
-                {
-                    intents_by_id[trade.intent_id].account_fingerprint
-                    for trade in trade_history
-                    if trade.intent_id is not None
-                }
-            )
-            != 1
+            len({trade.intent_id for trade in trade_history if trade.intent_id is not None}) != 1
             for trade_history in trades_by_venue_id.values()
         ):
-            raise ConflictingRecordError("venue trade identity crosses execution accounts")
+            raise ConflictingRecordError("venue trade identity crosses execution intent/account")
         accounts = {record.account_fingerprint for record in plans}
         for intent in intents:
             plan = plans_by_id.get(intent.plan_id)
@@ -1550,6 +1660,14 @@ class PredictionMarketStore:
                 for posting in expected_postings
             ):
                 raise ConflictingRecordError("reconciliation posting account mismatch")
+            _validate_live_reconciliation_closure(
+                reconciliation,
+                intents_by_id=intents_by_id,
+                orders=orders,
+                trades=trades,
+                economics=economics,
+                postings=postings,
+            )
         return tuple(sorted(accounts))
 
     @staticmethod

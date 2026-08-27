@@ -18,7 +18,7 @@ from polytrading.predictions.dashboard_models import (
     DashboardRecord,
     PredictionDashboardSnapshot,
 )
-from polytrading.predictions.domain import Sha256, normalize_utc_timestamp
+from polytrading.predictions.domain import PredictionRecord, Sha256, normalize_utc_timestamp
 
 EventId = Annotated[str, Field(max_length=20, pattern=r"^(0|[1-9][0-9]*)$")]
 _EVENT_ID = re.compile(r"^(0|[1-9][0-9]*)$")
@@ -40,7 +40,7 @@ _DOMAIN_FIELDS: dict[DashboardDomain, tuple[str, ...]] = {
 }
 
 
-class DashboardRevision(DashboardRecord):
+class _DashboardRevisionInput(PredictionRecord):
     schema_version: Literal[1]
     event_id: EventId
     revision_id: Sha256
@@ -62,6 +62,10 @@ class DashboardRevision(DashboardRecord):
         if value != expected:
             raise ValueError("changed_domains must be sorted and unique")
         return value
+
+
+class DashboardRevision(DashboardRecord):
+    _validation_model = _DashboardRevisionInput
 
     @classmethod
     def from_snapshots(
@@ -87,7 +91,7 @@ class DashboardRevision(DashboardRecord):
         )
 
 
-class DashboardReset(DashboardRecord):
+class _DashboardResetInput(PredictionRecord):
     schema_version: Literal[1]
     event_id: EventId
     latest_revision_id: Sha256
@@ -98,6 +102,10 @@ class DashboardReset(DashboardRecord):
     @classmethod
     def _emitted_at_is_utc(cls, value: datetime) -> datetime:
         return normalize_utc_timestamp(value)
+
+
+class DashboardReset(DashboardRecord):
+    _validation_model = _DashboardResetInput
 
 
 DashboardEvent = DashboardRevision | DashboardReset

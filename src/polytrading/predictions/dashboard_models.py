@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
     Field,
     StringConstraints,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -70,6 +71,18 @@ TimelineState = Literal[
     "SIGNED",
     "SUBMITTING",
     "UNKNOWN",
+]
+PublicProofTemplate = Literal[
+    "UNAPPROVED_TEMPLATE",
+    "binary_complement@1",
+    "cross_venue_equivalence@1",
+    "exhaustive_outcome_set@1",
+    "logical_implication@1",
+]
+ScanReasonCode = Literal[
+    "SCAN_INSUFFICIENT_EVIDENCE",
+    "SCAN_REJECTED",
+    "SCAN_SHADOW_CANDIDATE",
 ]
 
 
@@ -277,7 +290,7 @@ class CandidateListing(DashboardRecord):
     relationship_type: RelationshipType
     venues: tuple[PredictionVenue, ...]
     disposition: CandidateDisposition
-    provenance_kind: str
+    provenance_kind: Literal["ai", "deterministic"]
     unresolved_field_count: int
     observed_at: datetime
 
@@ -295,7 +308,7 @@ class ProofListing(DashboardRecord):
     schema_version: Literal[1]
     proof_id: UUID
     candidate_id: UUID
-    template: str
+    template: PublicProofTemplate
     status: ProofStatus
     rejection_reason: ProofRejectionReason | None
     minimum_basket_payout: Decimal | None
@@ -306,7 +319,7 @@ class ProofSummary(DashboardRecord):
     schema_version: Literal[1]
     total: int
     by_status: dict[str, int]
-    by_template: dict[str, int]
+    by_template: dict[PublicProofTemplate, int]
     latest: tuple[ProofListing, ...]
 
 
@@ -314,7 +327,7 @@ class ScanListing(DashboardRecord):
     schema_version: Literal[1]
     candidate_id: UUID
     decision: ScanDecision
-    reason: str
+    reason: ScanReasonCode
     surplus: Decimal | None
     capacity: Decimal | None
     as_of: datetime
@@ -332,7 +345,7 @@ class ShadowListing(DashboardRecord):
     proposal_id: UUID
     candidate_id: UUID
     current_state: ShadowState
-    scenario_id: NonEmptyString | None
+    scenario_id: Literal["SCENARIO_RECORDED"] | None
     quantity: PositiveDecimal
     paper_pnl: FiniteDecimal | None
     observed_at: datetime
@@ -352,7 +365,7 @@ class ShadowSummary(DashboardRecord):
     reconciled_paper_pnl_usd: FiniteDecimal
     unreconciled_count: NonNegativeCount
     latest: Annotated[tuple[ShadowListing, ...], Field(max_length=20)]
-    experiments_by_family: dict[str, NonNegativeCount]
+    experiments_by_family: dict[Literal["EXPERIMENT_FAMILY_RECORDED"], NonNegativeCount]
 
     @field_validator("by_terminal_state", "experiments_by_family")
     @classmethod
@@ -380,7 +393,7 @@ class ShadowSummary(DashboardRecord):
     def _require_unique_newest_first(
         cls, value: tuple[ShadowListing, ...]
     ) -> tuple[ShadowListing, ...]:
-        value = tuple(ShadowListing.model_validate(item.model_dump()) for item in value)
+        value = tuple(_ShadowListingInput.model_validate(item.model_dump()) for item in value)
         proposal_ids = tuple(item.proposal_id for item in value)
         if len(set(proposal_ids)) != len(proposal_ids):
             raise ValueError("latest proposals must be unique")
@@ -491,3 +504,359 @@ class PredictionDashboardSnapshot(_PredictionDashboardContent):
         if self.revision_id != self.deterministic_revision_id():
             raise ValueError("dashboard revision does not match snapshot content")
         return self
+
+
+# Pydantic remains the private validation and serialization engine above.  Published dashboard
+# values below deliberately are not Pydantic objects: explicit BaseModel descriptors can bypass
+# subclass method overrides, so a BaseModel cannot be the root of a sealed publication boundary.
+_DashboardRecordInput = DashboardRecord
+_ExecutionReadinessSummaryInput = ExecutionReadinessSummary
+_MarketAtlasOpportunityInput = MarketAtlasOpportunity
+_ExecutionTimelineEntryInput = ExecutionTimelineEntry
+_LiveLedgerSummaryInput = LiveLedgerSummary
+_EvidenceStatusInput = EvidenceStatus
+_PredictionEvidenceCountsInput = PredictionEvidenceCounts
+_PredictionOperationRecipesInput = PredictionOperationRecipes
+_CandidateListingInput = CandidateListing
+_CandidateSummaryInput = CandidateSummary
+_ProofListingInput = ProofListing
+_ProofSummaryInput = ProofSummary
+_ScanListingInput = ScanListing
+_ScanSummaryInput = ScanSummary
+_ShadowListingInput = ShadowListing
+_ShadowSummaryInput = ShadowSummary
+_PredictionDashboardContentInput = _PredictionDashboardContent
+_PredictionDashboardSnapshotInput = PredictionDashboardSnapshot
+
+
+class FrozenMapping(Mapping[str, Any]):
+    """Tuple-backed immutable mapping with no reachable ``dict`` storage."""
+
+    __slots__ = ("_pairs",)
+
+    def __init__(self, pairs: tuple[tuple[str, Any], ...]) -> None:
+        object.__setattr__(self, "_pairs", pairs)
+
+    def __getitem__(self, key: str) -> Any:
+        for candidate, value in self._pairs:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self._pairs)
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def __repr__(self) -> str:
+        return repr({key: value for key, value in self._pairs})
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Mapping):
+            return dict(self.items()) == dict(other.items())
+        return NotImplemented
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("dashboard mappings are immutable")
+
+
+class _SealedRecordMeta(type):
+    def __new__(
+        mcls,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> _SealedRecordMeta:
+        namespace.setdefault("__slots__", ())
+        return super().__new__(mcls, name, bases, namespace, **kwargs)
+
+
+class DashboardRecord(metaclass=_SealedRecordMeta):
+    """Validated, tuple-backed public value with no Pydantic or mutable backing."""
+
+    __slots__ = ("_items",)
+    _validation_model: ClassVar[type[BaseModel]]
+
+    def __init__(self, **values: Any) -> None:
+        try:
+            object.__getattribute__(self, "_items")
+        except AttributeError:
+            pass
+        else:
+            raise TypeError("dashboard records cannot be reinitialized")
+        validated = self._validation_model(**_thaw(values))
+        object.__setattr__(self, "_items", _sealed_items(validated))
+
+    @classmethod
+    def _from_validated(cls, validated: BaseModel) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_items", _sealed_items(validated))
+        return instance
+
+    @classmethod
+    def model_validate(
+        cls,
+        value: object,
+        *,
+        strict: bool | None = None,
+        context: Any = None,
+        **kwargs: Any,
+    ) -> Self:
+        if isinstance(value, DashboardRecord | BaseModel):
+            value = value.model_dump(mode="python", round_trip=True)
+        validated = cls._validation_model.model_validate(
+            _thaw(value),
+            strict=strict,
+            context=context,
+            **kwargs,
+        )
+        return cls._from_validated(validated)
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        value: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        context: Any = None,
+        **kwargs: Any,
+    ) -> Self:
+        validated = cls._validation_model.model_validate_json(
+            value,
+            strict=strict,
+            context=context,
+            **kwargs,
+        )
+        return cls._from_validated(validated)
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        del _fields_set
+        return cls.model_validate(values, strict=True)
+
+    def _validated_input(self) -> BaseModel:
+        return self._validation_model.model_validate(
+            {name: _thaw(value) for name, value in self._items},
+            strict=True,
+        )
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._validated_input().model_dump(*args, **kwargs)
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+        return self._validated_input().model_dump_json(*args, **kwargs)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        del deep
+        values = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            values.update(dict(update))
+        return type(self).model_validate(values, strict=True)
+
+    def copy(
+        self,
+        *,
+        include: set[str] | Mapping[str, Any] | None = None,
+        exclude: set[str] | Mapping[str, Any] | None = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        values = self.model_dump(mode="python", round_trip=True, include=include, exclude=exclude)
+        if update is not None:
+            values.update(dict(update))
+        return type(self).model_validate(values, strict=True)
+
+    def __getattr__(self, name: str) -> Any:
+        for field_name, value in self._items:
+            if field_name == name:
+                return value
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise ValidationError.from_exception_data(
+            type(self).__name__,
+            [{"type": "frozen_instance", "loc": (name,), "input": value}],
+        )
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{name}={value!r}" for name, value in self._items)
+        return f"{type(self).__name__}({fields})"
+
+    def __eq__(self, other: object) -> bool:
+        return type(self) is type(other) and self._items == other._items
+
+
+class _PublishedLegacyRecord(DashboardRecord):
+    """Base for per-validation-model legacy adapters created by ``_legacy_public_type``."""
+
+
+class ExecutionReadinessSummary(DashboardRecord):
+    _validation_model = _ExecutionReadinessSummaryInput
+
+
+class MarketAtlasOpportunity(DashboardRecord):
+    _validation_model = _MarketAtlasOpportunityInput
+
+
+class ExecutionTimelineEntry(DashboardRecord):
+    _validation_model = _ExecutionTimelineEntryInput
+
+
+class LiveLedgerSummary(DashboardRecord):
+    _validation_model = _LiveLedgerSummaryInput
+
+
+class EvidenceStatus(DashboardRecord):
+    _validation_model = _EvidenceStatusInput
+
+
+class PredictionEvidenceCounts(DashboardRecord):
+    _validation_model = _PredictionEvidenceCountsInput
+
+
+class PredictionOperationRecipes(DashboardRecord):
+    _validation_model = _PredictionOperationRecipesInput
+
+
+class CandidateListing(DashboardRecord):
+    _validation_model = _CandidateListingInput
+
+
+class CandidateSummary(DashboardRecord):
+    _validation_model = _CandidateSummaryInput
+
+
+class ProofListing(DashboardRecord):
+    _validation_model = _ProofListingInput
+
+
+class ProofSummary(DashboardRecord):
+    _validation_model = _ProofSummaryInput
+
+
+class ScanListing(DashboardRecord):
+    _validation_model = _ScanListingInput
+
+
+class ScanSummary(DashboardRecord):
+    _validation_model = _ScanSummaryInput
+
+
+class ShadowListing(DashboardRecord):
+    _validation_model = _ShadowListingInput
+
+
+class ShadowSummary(DashboardRecord):
+    _validation_model = _ShadowSummaryInput
+
+
+class PredictionDashboardSnapshot(DashboardRecord):
+    _validation_model = _PredictionDashboardSnapshotInput
+
+    def cutoff_bound_sections(self) -> tuple[DashboardRecord, ...]:
+        return (
+            self.execution_readiness,
+            *self.opportunities,
+            *self.execution_timeline,
+            self.live_ledger,
+            self.evidence_status,
+        )
+
+    def deterministic_revision_id(self) -> Sha256:
+        canonical = json.dumps(
+            self.model_dump(mode="json", exclude={"revision_id"}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    @classmethod
+    def finalize(cls, **values: Any) -> PredictionDashboardSnapshot:
+        if "revision_id" in values:
+            raise ValueError("finalization computes revision_id")
+        content = _PredictionDashboardContentInput.model_validate(_thaw(values), strict=True)
+        canonical = json.dumps(
+            content.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return cls.model_validate(
+            {
+                **content.model_dump(mode="python", round_trip=True),
+                "revision_id": sha256(canonical).hexdigest(),
+            },
+            strict=True,
+        )
+
+
+_PUBLIC_RECORD_TYPES: dict[type[BaseModel], type[DashboardRecord]] = {
+    _ExecutionReadinessSummaryInput: ExecutionReadinessSummary,
+    _MarketAtlasOpportunityInput: MarketAtlasOpportunity,
+    _ExecutionTimelineEntryInput: ExecutionTimelineEntry,
+    _LiveLedgerSummaryInput: LiveLedgerSummary,
+    _EvidenceStatusInput: EvidenceStatus,
+    _PredictionEvidenceCountsInput: PredictionEvidenceCounts,
+    _PredictionOperationRecipesInput: PredictionOperationRecipes,
+    _CandidateListingInput: CandidateListing,
+    _CandidateSummaryInput: CandidateSummary,
+    _ProofListingInput: ProofListing,
+    _ProofSummaryInput: ProofSummary,
+    _ScanListingInput: ScanListing,
+    _ScanSummaryInput: ScanSummary,
+    _ShadowListingInput: ShadowListing,
+    _ShadowSummaryInput: ShadowSummary,
+    _PredictionDashboardSnapshotInput: PredictionDashboardSnapshot,
+}
+_LEGACY_PUBLIC_TYPES: dict[type[BaseModel], type[DashboardRecord]] = {}
+
+
+def _legacy_public_type(model: type[BaseModel]) -> type[DashboardRecord]:
+    public_type = _LEGACY_PUBLIC_TYPES.get(model)
+    if public_type is None:
+        public_type = _SealedRecordMeta(
+            model.__name__,
+            (_PublishedLegacyRecord,),
+            {
+                "__module__": __name__,
+                "_validation_model": model,
+            },
+        )
+        _LEGACY_PUBLIC_TYPES[model] = public_type
+    return public_type
+
+
+def _sealed_items(validated: BaseModel) -> tuple[tuple[str, Any], ...]:
+    return tuple((name, _seal(getattr(validated, name))) for name in type(validated).model_fields)
+
+
+def _seal(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        public_type = _PUBLIC_RECORD_TYPES.get(type(value))
+        if public_type is None:
+            public_type = _legacy_public_type(type(value))
+        return public_type._from_validated(value)
+    if isinstance(value, Mapping):
+        return FrozenMapping(tuple((key, _seal(item)) for key, item in value.items()))
+    if isinstance(value, list | tuple):
+        return tuple(_seal(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_seal(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, DashboardRecord):
+        return {name: _thaw(item) for name, item in value._items}
+    if isinstance(value, BaseModel):
+        return _thaw(value.model_dump(mode="python", round_trip=True))
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple | frozenset):
+        return tuple(_thaw(item) for item in value)
+    return value

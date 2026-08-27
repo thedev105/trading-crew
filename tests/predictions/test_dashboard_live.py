@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Event, Thread
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from polytrading.predictions.dashboard import PredictionDashboardBuilder
 from polytrading.predictions.dashboard_live import (
@@ -93,6 +93,27 @@ def test_dashboard_revision_is_strict_immutable_metadata_only(
         )
 
 
+def test_revision_and_reset_metadata_have_no_pydantic_backing_or_base_forks(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    buffer = DashboardRevisionBuffer(capacity=1, clock=lambda: NOW)
+    revision = buffer.publish(snapshot)
+    assert revision is not None
+    reset = buffer.event_after("999")
+    assert isinstance(reset, DashboardReset)
+
+    for event in (revision, reset):
+        canonical = event.model_dump_json()
+        assert not isinstance(event, BaseModel)
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.__init__(event, **event.model_dump(mode="python"))
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.model_copy(event, update={"schema_version": 2})
+        with pytest.raises((TypeError, AttributeError, ValueError)):
+            BaseModel.model_construct.__func__(type(event), **event.model_dump(mode="python"))
+        assert event.model_dump_json() == canonical
+
+
 def test_first_publication_marks_all_domains_and_ids_are_monotonic(
     snapshot: PredictionDashboardSnapshot,
 ) -> None:
@@ -174,11 +195,13 @@ def test_buffer_independently_rejects_a_stale_snapshot_revision(
     snapshot: PredictionDashboardSnapshot,
 ) -> None:
     stale = object.__new__(PredictionDashboardSnapshot)
-    object.__setattr__(stale, "__dict__", dict(snapshot.__dict__))
-    object.__setattr__(stale, "__pydantic_fields_set__", snapshot.__pydantic_fields_set__)
-    object.__setattr__(stale, "__pydantic_extra__", snapshot.__pydantic_extra__)
-    object.__setattr__(stale, "__pydantic_private__", snapshot.__pydantic_private__)
-    object.__setattr__(stale, "revision_id", "f" * 64)
+    object.__setattr__(
+        stale,
+        "_items",
+        tuple(
+            (name, "f" * 64 if name == "revision_id" else value) for name, value in snapshot._items
+        ),
+    )
 
     with pytest.raises(ValueError, match="revision"):
         DashboardRevisionBuffer(capacity=2, clock=lambda: NOW).publish(stale)
