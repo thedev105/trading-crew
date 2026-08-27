@@ -1010,3 +1010,274 @@ def test_verified_live_account_discovery_rejects_tampered_index_hash_or_json(
 
     with pytest.raises(ConflictingRecordError):
         store.verified_live_execution_account_fingerprints(economics.information_cutoff)
+
+
+def test_verified_dashboard_bulk_execution_cut_includes_every_record_family(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "dashboard-cut.duckdb")
+    plan, intent, _envelope, order, trade, posting, reconciliation, kill, *_ = execution_records()
+    economics = authoritative_economics(intent)
+    kill = kill.model_copy(
+        update={
+            "scope": plan.account_fingerprint,
+            "source_intent_id": intent.intent_id,
+            "source_order_id": order.venue_order_id,
+        }
+    )
+    for append, record in (
+        (store.append_live_execution_plan, plan),
+        (store.append_execution_intent, intent),
+        (store.append_venue_order_event, order),
+        (store.append_venue_trade_event, trade),
+        (store.append_kill_switch_event, kill),
+        (store.append_authoritative_trade_economics, economics),
+        (store.append_live_ledger_posting, posting),
+        (store.append_live_reconciliation, reconciliation),
+    ):
+        append(record)
+    cutoff = economics.information_cutoff
+
+    assert store.verified_live_execution_plans_as_of(cutoff) == (plan,)
+    assert store.verified_execution_intent_history_as_of(cutoff) == (intent,)
+    assert store.verified_venue_order_events_as_of(cutoff) == (order,)
+    assert store.verified_venue_trade_events_as_of(cutoff) == (trade,)
+    assert store.verified_kill_switch_events_as_of(cutoff) == (kill,)
+    assert store.verified_authoritative_trade_economics_as_of(cutoff) == (economics,)
+    assert store.verified_live_ledger_postings_as_of(cutoff) == (posting,)
+    assert store.verified_live_reconciliations_as_of(cutoff) == (reconciliation,)
+
+
+def test_verified_account_discovery_includes_account_kill_without_plan_but_not_global_kill(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "kill-discovery.duckdb")
+    account = "a" * 64
+    source = execution_records()[7]
+    account_kill = source.model_copy(
+        update={
+            "scope": account,
+            "source_intent_id": None,
+            "source_order_id": None,
+        }
+    )
+    global_kill = source.model_copy(
+        update={
+            "kill_event_id": UUID(int=999),
+            "scope": "GLOBAL",
+            "source_intent_id": None,
+            "source_order_id": None,
+        }
+    )
+    store.append_kill_switch_event(account_kill)
+    store.append_kill_switch_event(global_kill)
+
+    assert store.verified_live_execution_account_fingerprints(NOW) == (account,)
+    assert store.verified_kill_switch_events_as_of(NOW) == tuple(
+        sorted((account_kill, global_kill), key=lambda item: (item.occurred_at, item.kill_event_id))
+    )
+
+
+@pytest.mark.parametrize("kind", ["order", "trade"])
+def test_verified_account_discovery_rejects_intentless_venue_events(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"intentless-{kind}.duckdb")
+    order = execution_records()[3].model_copy(update={"intent_id": None})
+    trade = execution_records()[4].model_copy(update={"intent_id": None})
+    if kind == "order":
+        store.append_venue_order_event(order)
+    else:
+        store.append_venue_trade_event(trade)
+
+    with pytest.raises(ConflictingRecordError, match="intent"):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+@pytest.mark.parametrize("bad_source", ["intent", "order"])
+def test_verified_account_discovery_rejects_unresolved_kill_source_references(
+    bad_source: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"bad-kill-{bad_source}.duckdb")
+    plan, intent, _envelope, order, *_records, kill, _activation, _conformance = execution_records()
+    intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+        )
+    )
+    order = order.model_copy(update={"intent_id": intent.intent_id})
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_venue_order_event(order)
+    updates: dict[str, object] = {
+        "scope": plan.account_fingerprint,
+        "source_intent_id": intent.intent_id,
+        "source_order_id": order.venue_order_id,
+    }
+    if bad_source == "intent":
+        updates["source_intent_id"] = UUID(int=999_991)
+        updates["source_order_id"] = None
+    else:
+        updates["source_order_id"] = "missing-order"
+    store.append_kill_switch_event(kill.model_copy(update=updates))
+
+    with pytest.raises(ConflictingRecordError, match=bad_source):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+def test_verified_trade_requires_its_visible_source_order(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "orphan-trade-order.duckdb")
+    plan, intent, _envelope, _order, trade, *_ = execution_records()
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_venue_trade_event(trade)
+
+    with pytest.raises(ConflictingRecordError, match="order"):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+@pytest.mark.parametrize("family", ["order", "trade"])
+def test_verified_account_discovery_rejects_cross_account_venue_identity_reuse(
+    family: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"cross-account-{family}-identity.duckdb")
+    plan_a = LiveExecutionPlan.model_validate(
+        live_execution_plan_fields(
+            plan_id=UUID(int=81_001),
+            proposal_id=UUID(int=81_002),
+            candidate_id=UUID(int=81_003),
+            account_fingerprint="a" * 64,
+        )
+    )
+    plan_b = LiveExecutionPlan.model_validate(
+        live_execution_plan_fields(
+            plan_id=UUID(int=82_001),
+            proposal_id=UUID(int=82_002),
+            candidate_id=UUID(int=82_003),
+            account_fingerprint="b" * 64,
+        )
+    )
+    intent_a = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan_a.plan_id,
+            account_fingerprint=plan_a.account_fingerprint,
+        )
+    )
+    intent_b = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan_b.plan_id,
+            account_fingerprint=plan_b.account_fingerprint,
+        )
+    )
+    source_order = execution_records()[3]
+    order_a = source_order.model_copy(
+        update={"event_id": UUID(int=83_001), "intent_id": intent_a.intent_id}
+    )
+    order_b = source_order.model_copy(
+        update={
+            "event_id": UUID(int=83_002),
+            "raw_event_hash": "8" * 64,
+            "intent_id": intent_b.intent_id,
+            "venue_order_id": "order-2" if family == "trade" else order_a.venue_order_id,
+        }
+    )
+    for record in (plan_a, plan_b):
+        store.append_live_execution_plan(record)
+    for record in (intent_a, intent_b):
+        store.append_execution_intent(record)
+    for record in (order_a, order_b):
+        store.append_venue_order_event(record)
+    if family == "trade":
+        source_trade = execution_records()[4]
+        store.append_venue_trade_event(
+            source_trade.model_copy(
+                update={
+                    "trade_event_id": UUID(int=84_001),
+                    "intent_id": intent_a.intent_id,
+                    "venue_order_id": order_a.venue_order_id,
+                }
+            )
+        )
+        store.append_venue_trade_event(
+            source_trade.model_copy(
+                update={
+                    "trade_event_id": UUID(int=84_002),
+                    "raw_event_hash": "9" * 64,
+                    "intent_id": intent_b.intent_id,
+                    "venue_order_id": order_b.venue_order_id,
+                }
+            )
+        )
+
+    with pytest.raises(ConflictingRecordError, match="account"):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+def test_verified_reconciliation_cannot_borrow_another_accounts_posting(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "cross-account-reconciliation-posting.duckdb")
+    plan_a, intent_a, economics_a, posting_a, reconciliation_a = _relational_execution_records()
+    plan_b = LiveExecutionPlan.model_validate(
+        live_execution_plan_fields(
+            plan_id=UUID(int=85_001),
+            proposal_id=UUID(int=85_002),
+            candidate_id=UUID(int=85_003),
+            account_fingerprint="b" * 64,
+        )
+    )
+    intent_b = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan_b.plan_id,
+            account_fingerprint=plan_b.account_fingerprint,
+        )
+    )
+    economics_b = authoritative_economics(
+        intent_b,
+        venue_order_id="order-2",
+        venue_trade_id="trade-2",
+    )
+    posting_b = posting_a.model_copy(
+        update={
+            "posting_id": UUID(int=85_004),
+            "account_fingerprint": plan_b.account_fingerprint,
+            "intent_id": intent_b.intent_id,
+            "venue_order_id": economics_b.venue_order_id,
+            "venue_trade_id": economics_b.venue_trade_id,
+        }
+    )
+    reconciliation_a = reconciliation_a.model_copy(
+        update={"expected_posting_ids": (posting_b.posting_id,)}
+    )
+    for append, records in (
+        (store.append_live_execution_plan, (plan_a, plan_b)),
+        (store.append_execution_intent, (intent_a, intent_b)),
+        (store.append_authoritative_trade_economics, (economics_a, economics_b)),
+        (store.append_live_ledger_posting, (posting_a, posting_b)),
+        (store.append_live_reconciliation, (reconciliation_a,)),
+    ):
+        for record in records:
+            append(record)
+
+    with pytest.raises(ConflictingRecordError, match="account"):
+        store.verified_live_execution_account_fingerprints(economics_a.information_cutoff)
+
+
+def test_verified_bulk_queries_fail_before_silently_truncating_complete_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import polytrading.predictions.storage.store as store_module
+    from tests.predictions.candidate_helpers import candidate_relationship
+
+    store = PredictionMarketStore(tmp_path / "bounded-dashboard.duckdb")
+    store.append_candidate_relationship(candidate_relationship(candidate_id=UUID(int=81001)))
+    store.append_candidate_relationship(candidate_relationship(candidate_id=UUID(int=81002)))
+    monkeypatch.setattr(store_module, "_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS", 1)
+
+    with pytest.raises(ConflictingRecordError, match="limit"):
+        store.verified_candidate_relationships_as_of(NOW)

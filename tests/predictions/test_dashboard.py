@@ -210,6 +210,9 @@ def test_dashboard_ai_provenance_candidate_disposition_is_not_forced_to_quaranti
 def test_dashboard_json_endpoint_includes_proof_summary(tmp_path: Path) -> None:
     database = tmp_path / "predictions.duckdb"
     store = PredictionMarketStore(database)
+    store.append_candidate_relationship(
+        candidate_relationship(observed_at=NOW, information_cutoff=NOW)
+    )
     store.append_proof_artifact(proof_artifact(observed_at=NOW, information_cutoff=NOW))
     store.close()
     application = PredictionDashboardApplication(database, clock=lambda: NOW)
@@ -238,6 +241,9 @@ def test_dashboard_json_endpoint_omits_proofs_when_none_seeded(tmp_path: Path) -
 def test_dashboard_json_endpoint_includes_scan_summary(tmp_path: Path) -> None:
     database = tmp_path / "predictions.duckdb"
     store = PredictionMarketStore(database)
+    store.append_candidate_relationship(
+        candidate_relationship(observed_at=NOW, information_cutoff=NOW)
+    )
     store.append_scan_report(
         scan_report(
             decision="REJECTED",
@@ -381,3 +387,57 @@ def test_database_snapshot_factory_rejects_a_naive_cutoff(tmp_path: Path) -> Non
             database,
             now=NOW.replace(tzinfo=None),
         )
+
+
+def test_database_snapshot_factory_remains_read_only_beside_concurrent_observers(
+    tmp_path: Path,
+) -> None:
+    import polytrading.predictions.dashboard as prediction_dashboard
+
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    observer = PredictionMarketStore(database, read_only=True)
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+    try:
+        for _ in range(3):
+            snapshot = prediction_dashboard.build_prediction_dashboard_snapshot(database, now=NOW)
+            response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787")
+            assert snapshot.as_of == NOW
+            assert response.status == HTTPStatus.OK
+            assert all(count == 0 for count in observer.evidence_counts_as_of(NOW).values())
+    finally:
+        observer.close()
+
+
+def test_actual_publisher_factory_polls_beside_read_only_get_and_store_observers(
+    tmp_path: Path,
+) -> None:
+    import polytrading.predictions.dashboard as prediction_dashboard
+    from polytrading.predictions.dashboard_live import (
+        DashboardRevisionBuffer,
+        DashboardRevisionPublisher,
+    )
+
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    observer = PredictionMarketStore(database, read_only=True)
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=lambda: prediction_dashboard.build_prediction_dashboard_snapshot(
+            database, now=NOW
+        ),
+        revision_buffer=DashboardRevisionBuffer(capacity=2, clock=lambda: NOW),
+        interval_seconds=1,
+        clock=lambda: NOW,
+    )
+    try:
+        for _ in range(3):
+            publisher.poll_once()
+            assert (
+                application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1:8787").status
+                == HTTPStatus.OK
+            )
+            assert all(count == 0 for count in observer.evidence_counts_as_of(NOW).values())
+    finally:
+        publisher.close()
+        observer.close()

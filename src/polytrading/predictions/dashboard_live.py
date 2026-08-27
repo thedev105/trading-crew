@@ -15,12 +15,14 @@ from pydantic import Field, field_validator
 
 from polytrading.predictions.dashboard_models import (
     DashboardDomain,
+    DashboardRecord,
     PredictionDashboardSnapshot,
 )
-from polytrading.predictions.domain import PredictionRecord, Sha256, normalize_utc_timestamp
+from polytrading.predictions.domain import Sha256, normalize_utc_timestamp
 
-EventId = Annotated[str, Field(pattern=r"^(0|[1-9][0-9]*)$")]
+EventId = Annotated[str, Field(max_length=20, pattern=r"^(0|[1-9][0-9]*)$")]
 _EVENT_ID = re.compile(r"^(0|[1-9][0-9]*)$")
+_MAX_EVENT_ID_DIGITS = 20
 _PRODUCTION_CAPACITY = 128
 _DOMAIN_FIELDS: dict[DashboardDomain, tuple[str, ...]] = {
     DashboardDomain.OVERVIEW: ("health", "recipes"),
@@ -38,7 +40,7 @@ _DOMAIN_FIELDS: dict[DashboardDomain, tuple[str, ...]] = {
 }
 
 
-class DashboardRevision(PredictionRecord):
+class DashboardRevision(DashboardRecord):
     schema_version: Literal[1]
     event_id: EventId
     revision_id: Sha256
@@ -85,7 +87,7 @@ class DashboardRevision(PredictionRecord):
         )
 
 
-class DashboardReset(PredictionRecord):
+class DashboardReset(DashboardRecord):
     schema_version: Literal[1]
     event_id: EventId
     latest_revision_id: Sha256
@@ -101,14 +103,16 @@ class DashboardReset(PredictionRecord):
 DashboardEvent = DashboardRevision | DashboardReset
 
 
+class DashboardCursorError(ValueError):
+    """A bounded Last-Event-ID is malformed."""
+
+
+class DashboardSnapshotUnavailable(RuntimeError):
+    """A supplied cursor cannot be evaluated before an initial publication."""
+
+
 def deterministic_dashboard_revision(snapshot: PredictionDashboardSnapshot) -> Sha256:
-    canonical = json.dumps(
-        snapshot.model_dump(mode="json", exclude={"revision_id"}),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return sha256(canonical).hexdigest()
+    return snapshot.deterministic_revision_id()
 
 
 def changed_dashboard_domains(
@@ -189,6 +193,8 @@ class DashboardRevisionBuffer:
         *,
         emitted_at: datetime | None = None,
     ) -> DashboardRevision | None:
+        if snapshot.revision_id != deterministic_dashboard_revision(snapshot):
+            raise ValueError("dashboard snapshot revision does not match content")
         fingerprints = _domain_fingerprints(snapshot)
         with self._condition:
             if self._closed:
@@ -224,9 +230,10 @@ class DashboardRevisionBuffer:
             return self._event_after_locked(last_event_id)
 
     def _event_after_locked(self, last_event_id: str | None) -> DashboardEvent | None:
-        if last_event_id is not None and _EVENT_ID.fullmatch(last_event_id) is None:
-            raise ValueError("Last-Event-ID must be a decimal event ID")
+        _validate_event_id(last_event_id)
         if not self._events:
+            if last_event_id is not None:
+                raise DashboardSnapshotUnavailable("SNAPSHOT_UNAVAILABLE")
             return None
         latest = self._events[-1]
         if last_event_id is None:
@@ -261,7 +268,20 @@ class DashboardRevisionBuffer:
             self._condition.notify_all()
 
 
-WaitFunction = Callable[[Event, float], bool]
+def _validate_event_id(last_event_id: str | None) -> None:
+    if last_event_id is None:
+        return
+    try:
+        encoded_length = len(last_event_id.encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError):
+        encoded_length = _MAX_EVENT_ID_DIGITS + 1
+    if (
+        not isinstance(last_event_id, str)
+        or len(last_event_id) > _MAX_EVENT_ID_DIGITS
+        or encoded_length > _MAX_EVENT_ID_DIGITS
+        or _EVENT_ID.fullmatch(last_event_id) is None
+    ):
+        raise DashboardCursorError("Last-Event-ID must be a bounded decimal event ID")
 
 
 class DashboardRevisionPublisher:
@@ -274,15 +294,18 @@ class DashboardRevisionPublisher:
         revision_buffer: DashboardRevisionBuffer,
         interval_seconds: float,
         clock: Callable[[], datetime] | None = None,
-        wait: WaitFunction | None = None,
+        shutdown_timeout_seconds: float = 2.0,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
+        if shutdown_timeout_seconds <= 0:
+            raise ValueError("shutdown_timeout_seconds must be positive")
         self._snapshot_factory = snapshot_factory
         self._buffer = revision_buffer
         self._interval_seconds = interval_seconds
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._wait = wait or (lambda stop, interval: stop.wait(interval))
+        self._wait = lambda stop, interval: stop.wait(interval)
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._stop = Event()
         self._lifecycle_lock = Lock()
         self._thread: Thread | None = None
@@ -296,11 +319,33 @@ class DashboardRevisionPublisher:
 
     @property
     def failure_code(self) -> str | None:
-        return self._failure_code
+        with self._lifecycle_lock:
+            return self._failure_code
 
     def poll_once(self) -> DashboardRevision | None:
-        snapshot = self._snapshot_factory()
-        return self._buffer.publish(snapshot, emitted_at=self._clock())
+        failure_code: str | None = None
+        snapshot: PredictionDashboardSnapshot | None = None
+        emitted_at: datetime | None = None
+        try:
+            snapshot = self._snapshot_factory()
+        except Exception:
+            failure_code = "SNAPSHOT_UNAVAILABLE"
+        if failure_code is None:
+            try:
+                emitted_at = self._clock()
+            except Exception:
+                failure_code = "CLOCK_UNAVAILABLE"
+        if failure_code is None:
+            try:
+                assert snapshot is not None and emitted_at is not None
+                revision = self._buffer.publish(snapshot, emitted_at=emitted_at)
+            except Exception:
+                failure_code = "SNAPSHOT_INVALID"
+        if failure_code is not None:
+            self._set_failure(failure_code)
+            raise RuntimeError(failure_code) from None
+        self._set_failure(None)
+        return revision
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -316,21 +361,52 @@ class DashboardRevisionPublisher:
             self._thread.start()
 
     def _run(self) -> None:
-        try:
-            while not self._stop.is_set():
-                self.poll_once()
+        while not self._stop.is_set():
+            if not self._poll_worker():
+                break
+            try:
                 if self._wait(self._stop, self._interval_seconds):
                     break
+            except Exception:
+                self._set_failure("WAIT_UNAVAILABLE")
+                self._stop.set()
+                self._buffer.close()
+                break
+
+    def _poll_worker(self) -> bool:
+        try:
+            snapshot = self._snapshot_factory()
         except Exception:
-            self._failure_code = "SNAPSHOT_UNAVAILABLE"
+            self._set_failure("SNAPSHOT_UNAVAILABLE")
+            return True
+        try:
+            emitted_at = self._clock()
+        except Exception:
+            self._set_failure("CLOCK_UNAVAILABLE")
             self._stop.set()
             self._buffer.close()
+            return False
+        try:
+            self._buffer.publish(snapshot, emitted_at=emitted_at)
+        except Exception:
+            if self._stop.is_set():
+                return False
+            self._set_failure("SNAPSHOT_INVALID")
+            return True
+        self._set_failure(None)
+        return True
+
+    def _set_failure(self, code: str | None) -> None:
+        with self._lifecycle_lock:
+            self._failure_code = code
 
     def close(self) -> None:
+        self._buffer.close()
         with self._lifecycle_lock:
             self._closed = True
             self._stop.set()
             thread = self._thread
         if thread is not None and thread is not current_thread():
-            thread.join()
-        self._buffer.close()
+            thread.join(self._shutdown_timeout_seconds)
+            if thread.is_alive():
+                self._set_failure("SHUTDOWN_TIMEOUT")

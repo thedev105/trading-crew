@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 from pydantic import ValidationError
@@ -35,28 +35,32 @@ def snapshot(tmp_path: Path) -> PredictionDashboardSnapshot:
 
 
 def _revision(snapshot: PredictionDashboardSnapshot, seed: int) -> PredictionDashboardSnapshot:
-    return snapshot.model_copy(update={"revision_id": f"{seed:064x}"})
+    values = snapshot.model_dump(mode="python", exclude={"revision_id"})
+    values["recipes"] = snapshot.recipes.model_copy(
+        update={"recipes": (*snapshot.recipes.recipes, f"observer-status-{seed}")}
+    )
+    return PredictionDashboardSnapshot.finalize(**values)
 
 
 def test_deterministic_revision_is_canonical_and_omits_revision_id(
     snapshot: PredictionDashboardSnapshot,
 ) -> None:
     assert deterministic_dashboard_revision(snapshot) == snapshot.revision_id
-    changed_id_only = snapshot.model_copy(update={"revision_id": "f" * 64})
-    assert deterministic_dashboard_revision(changed_id_only) == snapshot.revision_id
+    with pytest.raises(ValidationError, match="revision"):
+        snapshot.model_copy(update={"revision_id": "f" * 64})
 
 
 def test_changed_domains_are_stable_sorted_and_match_additive_legacy_mapping(
     snapshot: PredictionDashboardSnapshot,
 ) -> None:
-    changed = snapshot.model_copy(
-        update={
+    changed = PredictionDashboardSnapshot.finalize(
+        **{
+            **snapshot.model_dump(mode="python", exclude={"revision_id"}),
             "recipes": snapshot.recipes.model_copy(
                 update={"recipes": (*snapshot.recipes.recipes, "observer-status")}
             ),
             "live_ledger": snapshot.live_ledger.model_copy(update={"posting_count": 1}),
             "evidence_counts": snapshot.evidence_counts.model_copy(update={"counts": {"x": 1}}),
-            "revision_id": "a" * 64,
         }
     )
     assert changed_dashboard_domains(snapshot, changed) == (
@@ -166,6 +170,20 @@ def test_buffer_retains_only_metadata_and_defensively_copies_caller_collections(
     assert forbidden.isdisjoint(dumped)
 
 
+def test_buffer_independently_rejects_a_stale_snapshot_revision(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    stale = object.__new__(PredictionDashboardSnapshot)
+    object.__setattr__(stale, "__dict__", dict(snapshot.__dict__))
+    object.__setattr__(stale, "__pydantic_fields_set__", snapshot.__pydantic_fields_set__)
+    object.__setattr__(stale, "__pydantic_extra__", snapshot.__pydantic_extra__)
+    object.__setattr__(stale, "__pydantic_private__", snapshot.__pydantic_private__)
+    object.__setattr__(stale, "revision_id", "f" * 64)
+
+    with pytest.raises(ValueError, match="revision"):
+        DashboardRevisionBuffer(capacity=2, clock=lambda: NOW).publish(stale)
+
+
 def test_capacity_and_cursor_inputs_fail_closed(snapshot: PredictionDashboardSnapshot) -> None:
     with pytest.raises(ValueError, match="capacity"):
         DashboardRevisionBuffer(capacity=0)
@@ -223,13 +241,128 @@ def test_publisher_shutdown_interrupts_injected_wait_and_joins_thread(
         revision_buffer=DashboardRevisionBuffer(capacity=2, clock=lambda: NOW),
         interval_seconds=60,
         clock=lambda: NOW,
-        wait=controlled_wait,
     )
+    publisher._wait = controlled_wait
     publisher.start()
     assert entered_wait.wait(1)
     publisher.close()
     assert calls == 1
     assert publisher.running is False
+
+
+def test_publisher_recovers_after_one_snapshot_factory_failure(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    published = Event()
+    calls = 0
+    buffer = DashboardRevisionBuffer(capacity=2, clock=lambda: NOW)
+
+    def snapshot_factory() -> PredictionDashboardSnapshot:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("private-key authorization signed-body account ip")
+        published.set()
+        return snapshot
+
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=snapshot_factory,
+        revision_buffer=buffer,
+        interval_seconds=0.01,
+        clock=lambda: NOW,
+    )
+    publisher.start()
+    try:
+        assert published.wait(1)
+        assert buffer.wait_for_event(None, timeout=1) is not None
+        assert publisher.running is True
+        assert publisher.failure_code is None
+    finally:
+        publisher.close()
+
+
+def test_publisher_close_is_bounded_for_blocked_factory_then_joins_after_release(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    entered = Event()
+    release = Event()
+    close_returned = Event()
+
+    def blocked_factory() -> PredictionDashboardSnapshot:
+        entered.set()
+        release.wait()
+        return snapshot
+
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=blocked_factory,
+        revision_buffer=DashboardRevisionBuffer(capacity=2, clock=lambda: NOW),
+        interval_seconds=60,
+        clock=lambda: NOW,
+        shutdown_timeout_seconds=0.05,
+    )
+    publisher.start()
+    assert entered.wait(1)
+    closer = Thread(target=lambda: (publisher.close(), close_returned.set()), daemon=True)
+    closer.start()
+    returned_within_bound = close_returned.wait(0.25)
+    release.set()
+    assert close_returned.wait(1)
+    publisher.close()
+    closer.join(1)
+
+    assert returned_within_bound
+    assert publisher.failure_code == "SHUTDOWN_TIMEOUT"
+    assert publisher.running is False
+
+
+def test_publisher_close_before_start_and_repeated_close_are_deterministic(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    buffer = DashboardRevisionBuffer(capacity=2, clock=lambda: NOW)
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=lambda: snapshot,
+        revision_buffer=buffer,
+        interval_seconds=1,
+        clock=lambda: NOW,
+    )
+
+    publisher.close()
+    publisher.close()
+    assert buffer.closed
+    assert publisher.running is False
+    with pytest.raises(RuntimeError, match="closed"):
+        publisher.start()
+
+
+@pytest.mark.parametrize(
+    ("seam", "expected"),
+    [("clock", "CLOCK_UNAVAILABLE"), ("wait", "WAIT_UNAVAILABLE")],
+)
+def test_publisher_hostile_seams_map_to_fixed_failure_state(
+    seam: str,
+    expected: str,
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=lambda: snapshot,
+        revision_buffer=DashboardRevisionBuffer(capacity=2, clock=lambda: NOW),
+        interval_seconds=0.01,
+        clock=(lambda: (_ for _ in ()).throw(RuntimeError("raw clock canary")))
+        if seam == "clock"
+        else (lambda: NOW),
+    )
+    if seam == "wait":
+        publisher._wait = lambda _stop, _interval: (_ for _ in ()).throw(
+            RuntimeError("raw wait canary")
+        )
+    publisher.start()
+    for _ in range(100):
+        if publisher.failure_code is not None:
+            break
+        Event().wait(0.01)
+    publisher.close()
+
+    assert publisher.failure_code == expected
 
 
 def test_reset_is_strict_and_contains_no_snapshot_values() -> None:

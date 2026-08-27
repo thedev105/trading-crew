@@ -55,6 +55,7 @@ _MIGRATION_NAME = re.compile(r"(?P<version>[0-9]{3})_[a-z0-9_]+\.sql")
 _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _FAMILY_SENTINEL_TABLE = "prediction_raw_envelopes"
 _MAX_VERIFIED_LIVE_ACCOUNT_RECORDS = 10_000
+_ACCOUNT_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 
 
 def _utc_from_epoch_us(value: int | None) -> datetime | None:
@@ -1041,6 +1042,229 @@ class PredictionMarketStore:
                 records.append(record)
         return tuple(sorted(records, key=sort_key, reverse=reverse))
 
+    def verified_live_execution_plans_as_of(self, as_of: datetime) -> tuple[LiveExecutionPlan, ...]:
+        return self._verified_records(
+            table="live_execution_plans",
+            model=LiveExecutionPlan,
+            candidate_where=(
+                "(observed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.observed_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(information_cutoff <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.information_cutoff')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(as_of, as_of, as_of, as_of),
+            index_columns=(
+                "CAST(plan_id AS VARCHAR)",
+                "CAST(proposal_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(observed_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=lambda record: (
+                str(record.plan_id),
+                str(record.proposal_id),
+                record.account_fingerprint,
+                _epoch_us(record.observed_at),
+                _epoch_us(record.information_cutoff),
+            ),
+            matches=lambda record: (
+                record.observed_at <= as_of and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (record.observed_at, record.plan_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_execution_intent_history_as_of(
+        self, as_of: datetime
+    ) -> tuple[ExecutionIntent, ...]:
+        return self._verified_records(
+            table="execution_intents",
+            model=ExecutionIntent,
+            candidate_where=(
+                "created_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.created_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(intent_id AS VARCHAR)",
+                "CAST(plan_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(created_at)",
+                "epoch_us(deadline)",
+            ),
+            indexed_values=lambda record: (
+                str(record.intent_id),
+                str(record.plan_id),
+                record.account_fingerprint,
+                _epoch_us(record.created_at),
+                _epoch_us(record.deadline),
+            ),
+            matches=lambda record: record.created_at <= as_of,
+            sort_key=lambda record: (record.created_at, record.intent_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_venue_order_events_as_of(self, as_of: datetime) -> tuple[VenueOrderEvent, ...]:
+        return self._verified_records(
+            table="venue_order_events",
+            model=VenueOrderEvent,
+            candidate_where=(
+                "received_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.received_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(event_id AS VARCHAR)",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(received_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.event_id),
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.received_at),
+            ),
+            matches=lambda record: record.received_at <= as_of,
+            sort_key=_order_event_sort_key,
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_venue_trade_events_as_of(self, as_of: datetime) -> tuple[VenueTradeEvent, ...]:
+        return self._verified_records(
+            table="venue_trade_events",
+            model=VenueTradeEvent,
+            candidate_where=(
+                "received_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.received_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(trade_event_id AS VARCHAR)",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(received_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.trade_event_id),
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.received_at),
+            ),
+            matches=lambda record: record.received_at <= as_of,
+            sort_key=lambda record: (record.received_at, record.trade_event_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_kill_switch_events_as_of(self, as_of: datetime) -> tuple[KillSwitchEvent, ...]:
+        return self._verified_records(
+            table="execution_kill_events",
+            model=KillSwitchEvent,
+            candidate_where=(
+                "occurred_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.occurred_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(kill_event_id AS VARCHAR)",
+                "scope",
+                "epoch_us(occurred_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.kill_event_id),
+                record.scope,
+                _epoch_us(record.occurred_at),
+            ),
+            matches=lambda record: record.occurred_at <= as_of,
+            sort_key=lambda record: (record.occurred_at, record.kill_event_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_authoritative_trade_economics_as_of(
+        self, as_of: datetime
+    ) -> tuple[AuthoritativeTradeEconomics, ...]:
+        return self._verified_records(
+            table="authoritative_trade_economics",
+            model=AuthoritativeTradeEconomics,
+            candidate_where=(
+                "(occurred_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.occurred_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(information_cutoff <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.information_cutoff')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(as_of, as_of, as_of, as_of),
+            index_columns=(
+                "economics_fingerprint",
+                "account_fingerprint",
+                "CAST(intent_id AS VARCHAR)",
+                "venue_order_id",
+                "venue_trade_id",
+                "trade_state",
+                "settlement_state",
+                "epoch_us(occurred_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=self._authoritative_economics_indexed_values,
+            matches=lambda record: (
+                record.occurred_at <= as_of and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (
+                record.occurred_at,
+                record.venue_trade_id,
+                record.economics_fingerprint,
+            ),
+            decode=_authoritative_trade_economics_from_json,
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_live_ledger_postings_as_of(self, as_of: datetime) -> tuple[LiveLedgerPosting, ...]:
+        return self._verified_records(
+            table="live_ledger_postings",
+            model=LiveLedgerPosting,
+            candidate_where=(
+                "occurred_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.occurred_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(posting_id AS VARCHAR)",
+                "account_fingerprint",
+                "CAST(intent_id AS VARCHAR)",
+                "epoch_us(occurred_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.posting_id),
+                record.account_fingerprint,
+                None if record.intent_id is None else str(record.intent_id),
+                _epoch_us(record.occurred_at),
+            ),
+            matches=lambda record: record.occurred_at <= as_of,
+            sort_key=lambda record: (record.occurred_at, record.posting_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
+    def verified_live_reconciliations_as_of(
+        self, as_of: datetime
+    ) -> tuple[LiveReconciliation, ...]:
+        return self._verified_records(
+            table="live_reconciliations",
+            model=LiveReconciliation,
+            candidate_where=(
+                "observed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.observed_at')) AS TIMESTAMPTZ) <= ?"
+            ),
+            candidate_parameters=(as_of, as_of),
+            index_columns=(
+                "CAST(reconciliation_id AS VARCHAR)",
+                "account_fingerprint",
+                "epoch_us(observed_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.reconciliation_id),
+                record.account_fingerprint,
+                _epoch_us(record.observed_at),
+            ),
+            matches=lambda record: record.observed_at <= as_of,
+            sort_key=lambda record: (record.observed_at, record.reconciliation_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
     def verified_live_execution_account_fingerprints(
         self,
         as_of: datetime,
@@ -1182,9 +1406,51 @@ class PredictionMarketStore:
             sort_key=lambda record: (record.observed_at, record.reconciliation_id),
             maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
         )
+        orders = self.verified_venue_order_events_as_of(as_of)
+        trades = self.verified_venue_trade_events_as_of(as_of)
+        kills = self.verified_kill_switch_events_as_of(as_of)
 
         plans_by_id = {record.plan_id: record for record in plans}
         intents_by_id = {record.intent_id: record for record in intents}
+        orders_by_venue_id: dict[str, list[VenueOrderEvent]] = {}
+        for order in orders:
+            if order.intent_id is None or order.intent_id not in intents_by_id:
+                raise ConflictingRecordError("orphan venue order event has no visible intent")
+            orders_by_venue_id.setdefault(order.venue_order_id, []).append(order)
+        if any(
+            len(
+                {
+                    intents_by_id[order.intent_id].account_fingerprint
+                    for order in order_history
+                    if order.intent_id is not None
+                }
+            )
+            != 1
+            for order_history in orders_by_venue_id.values()
+        ):
+            raise ConflictingRecordError("venue order identity crosses execution accounts")
+        trades_by_venue_id: dict[str, list[VenueTradeEvent]] = {}
+        for trade in trades:
+            if trade.intent_id is None or trade.intent_id not in intents_by_id:
+                raise ConflictingRecordError("orphan venue trade event has no visible intent")
+            if trade.venue_order_id is not None and not any(
+                order.intent_id == trade.intent_id
+                for order in orders_by_venue_id.get(trade.venue_order_id, ())
+            ):
+                raise ConflictingRecordError("venue trade event references an unavailable order")
+            trades_by_venue_id.setdefault(trade.venue_trade_id, []).append(trade)
+        if any(
+            len(
+                {
+                    intents_by_id[trade.intent_id].account_fingerprint
+                    for trade in trade_history
+                    if trade.intent_id is not None
+                }
+            )
+            != 1
+            for trade_history in trades_by_venue_id.values()
+        ):
+            raise ConflictingRecordError("venue trade identity crosses execution accounts")
         accounts = {record.account_fingerprint for record in plans}
         for intent in intents:
             plan = plans_by_id.get(intent.plan_id)
@@ -1206,12 +1472,84 @@ class PredictionMarketStore:
                 raise ConflictingRecordError("orphan live ledger posting has no visible intent")
             if intent.account_fingerprint != posting.account_fingerprint:
                 raise ConflictingRecordError("live ledger posting and intent account mismatch")
+            if posting.venue_order_id is not None and not (
+                any(
+                    order.intent_id == posting.intent_id
+                    for order in orders_by_venue_id.get(posting.venue_order_id, ())
+                )
+                or any(
+                    record.intent_id == posting.intent_id
+                    and record.venue_order_id == posting.venue_order_id
+                    for record in economics
+                )
+            ):
+                raise ConflictingRecordError("live ledger posting references unavailable order")
+            if posting.venue_trade_id is not None and not (
+                any(
+                    trade.intent_id == posting.intent_id
+                    and trade.venue_trade_id == posting.venue_trade_id
+                    for trade in trades
+                )
+                or any(
+                    record.intent_id == posting.intent_id
+                    and record.venue_trade_id == posting.venue_trade_id
+                    for record in economics
+                )
+            ):
+                raise ConflictingRecordError("live ledger posting references unavailable trade")
             accounts.add(posting.account_fingerprint)
+        for kill in kills:
+            source_intent = (
+                None if kill.source_intent_id is None else intents_by_id.get(kill.source_intent_id)
+            )
+            if kill.source_intent_id is not None and source_intent is None:
+                raise ConflictingRecordError("kill event references an unavailable intent")
+            source_orders = (
+                ()
+                if kill.source_order_id is None
+                else tuple(orders_by_venue_id.get(kill.source_order_id, ()))
+            )
+            if kill.source_order_id is not None and (
+                not source_orders
+                or (
+                    source_intent is not None
+                    and not any(
+                        order.intent_id == source_intent.intent_id for order in source_orders
+                    )
+                )
+            ):
+                raise ConflictingRecordError("kill event references an unavailable order")
+            if _ACCOUNT_FINGERPRINT.fullmatch(kill.scope) is not None:
+                if source_intent is not None and source_intent.account_fingerprint != kill.scope:
+                    raise ConflictingRecordError("kill event and source intent account mismatch")
+                if (
+                    source_intent is None
+                    and source_orders
+                    and any(
+                        intents_by_id[order.intent_id].account_fingerprint != kill.scope
+                        for order in source_orders
+                        if order.intent_id is not None
+                    )
+                ):
+                    raise ConflictingRecordError("kill event and source order account mismatch")
+                accounts.add(kill.scope)
+        postings_by_id = {posting.posting_id: posting for posting in postings}
         for reconciliation in reconciliations:
             if reconciliation.account_fingerprint not in accounts:
                 raise ConflictingRecordError(
                     "orphan live reconciliation has no visible execution account"
                 )
+            expected_postings = tuple(
+                postings_by_id.get(posting_id) for posting_id in reconciliation.expected_posting_ids
+            )
+            if any(posting is None for posting in expected_postings):
+                raise ConflictingRecordError("reconciliation references unavailable postings")
+            if any(
+                posting is not None
+                and posting.account_fingerprint != reconciliation.account_fingerprint
+                for posting in expected_postings
+            ):
+                raise ConflictingRecordError("reconciliation posting account mismatch")
         return tuple(sorted(accounts))
 
     @staticmethod
@@ -1836,6 +2174,7 @@ class PredictionMarketStore:
             ),
             matches=lambda record: record.observed_at <= as_of,
             sort_key=lambda record: (record.observed_at, record.conformance_result_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
         )
 
     # -- cutoff-safe reads ----------------------------------------------
@@ -1853,6 +2192,27 @@ class PredictionMarketStore:
             [venue.value, as_of],
         ).fetchone()
         return None if row is None else VenueManifest.model_validate_json(row[0])
+
+    def verified_latest_venue_manifest_as_of(
+        self, venue: PredictionVenue, as_of: datetime
+    ) -> VenueManifest | None:
+        records = self._verified_records(
+            table="venue_manifests",
+            model=VenueManifest,
+            candidate_where=(
+                "(venue = ? OR TRY(json_extract_string(record_json, '$.venue')) = ?) AND "
+                "(reviewed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.reviewed_at')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(venue.value, venue.value, as_of, as_of),
+            index_columns=("venue", "epoch_us(reviewed_at)"),
+            indexed_values=lambda record: (record.venue.value, _epoch_us(record.reviewed_at)),
+            matches=lambda record: record.venue is venue and record.reviewed_at <= as_of,
+            sort_key=lambda record: record.reviewed_at,
+            reverse=True,
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+        return records[0] if records else None
 
     def markets_as_of(self, venue: PredictionVenue, as_of: datetime) -> tuple[MarketRecord, ...]:
         # A correlated subquery evaluated once per candidate row does not scale to a
@@ -2167,6 +2527,40 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(CandidateRelationship.model_validate_json(row[0]) for row in rows)
 
+    def verified_candidate_relationships_as_of(
+        self, as_of: datetime
+    ) -> tuple[CandidateRelationship, ...]:
+        return self._verified_records(
+            table="candidate_relationships",
+            model=CandidateRelationship,
+            candidate_where=(
+                "(observed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.observed_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(information_cutoff <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.information_cutoff')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(as_of, as_of, as_of, as_of),
+            index_columns=(
+                "CAST(candidate_id AS VARCHAR)",
+                "relationship_type",
+                "trial_family_id",
+                "epoch_us(observed_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=lambda record: (
+                str(record.candidate_id),
+                record.relationship_type.value,
+                record.trial_family_id,
+                _epoch_us(record.observed_at),
+                _epoch_us(record.information_cutoff),
+            ),
+            matches=lambda record: (
+                record.observed_at <= as_of and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (record.observed_at, record.candidate_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
     def candidate_relationship_by_id(
         self, candidate_id: UUID, as_of: datetime
     ) -> CandidateRelationship | None:
@@ -2269,6 +2663,40 @@ class PredictionMarketStore:
         ).fetchall()
         return tuple(ProofArtifact.model_validate_json(row[0]) for row in rows)
 
+    def verified_proof_artifacts_as_of(self, as_of: datetime) -> tuple[ProofArtifact, ...]:
+        return self._verified_records(
+            table="proof_artifacts",
+            model=ProofArtifact,
+            candidate_where=(
+                "(observed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.observed_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(information_cutoff <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.information_cutoff')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(as_of, as_of, as_of, as_of),
+            index_columns=(
+                "CAST(proof_id AS VARCHAR)",
+                "CAST(candidate_id AS VARCHAR)",
+                "template",
+                "status",
+                "epoch_us(observed_at)",
+                "epoch_us(information_cutoff)",
+            ),
+            indexed_values=lambda record: (
+                str(record.proof_id),
+                str(record.candidate_id),
+                record.template,
+                record.status,
+                _epoch_us(record.observed_at),
+                _epoch_us(record.information_cutoff),
+            ),
+            matches=lambda record: (
+                record.observed_at <= as_of and record.information_cutoff <= as_of
+            ),
+            sort_key=lambda record: (record.observed_at, record.proof_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+
     def scan_reports_as_of(self, as_of: datetime) -> tuple[ScanReport, ...]:
         rows = self._connection.execute(
             """
@@ -2281,18 +2709,33 @@ class PredictionMarketStore:
         return tuple(ScanReport.model_validate_json(row[0]) for row in rows)
 
     def verified_scan_reports_as_of(self, as_of: datetime) -> tuple[ScanReport, ...]:
-        rows = self._connection.execute(
-            """
-            SELECT record_json, record_hash FROM scan_reports
-            WHERE observed_at <= ?
-            ORDER BY observed_at, report_id
-            """,
-            [as_of],
-        ).fetchall()
-        return tuple(
-            record
-            for row in rows
-            if (record := _verified_record(row, ScanReport, "scan report")) is not None
+        return self._verified_records(
+            table="scan_reports",
+            model=ScanReport,
+            candidate_where=(
+                "(observed_at <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.observed_at')) AS TIMESTAMPTZ) <= ?) AND "
+                "(as_of <= ? OR TRY_CAST(TRY(json_extract_string(record_json, "
+                "'$.as_of')) AS TIMESTAMPTZ) <= ?)"
+            ),
+            candidate_parameters=(as_of, as_of, as_of, as_of),
+            index_columns=(
+                "CAST(report_id AS VARCHAR)",
+                "CAST(candidate_id AS VARCHAR)",
+                "decision",
+                "epoch_us(as_of)",
+                "epoch_us(observed_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.report_id),
+                str(record.candidate_id),
+                record.decision,
+                _epoch_us(record.as_of),
+                _epoch_us(record.observed_at),
+            ),
+            matches=lambda record: record.observed_at <= as_of and record.as_of <= as_of,
+            sort_key=lambda record: (record.observed_at, record.report_id),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
         )
 
     def scan_report_by_id(self, report_id: UUID, as_of: datetime) -> ScanReport | None:

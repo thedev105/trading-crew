@@ -17,20 +17,24 @@ import duckdb
 
 from polytrading.lifecycle import cleanup_error_cause, owned_resource_cleanup
 from polytrading.predictions.dashboard import (
-    PredictionDashboardBuilder,
     build_prediction_dashboard_snapshot,
     render_prediction_dashboard_json,
 )
 from polytrading.predictions.dashboard_live import (
+    DashboardCursorError,
     DashboardReset,
     DashboardRevision,
     DashboardRevisionBuffer,
     DashboardRevisionPublisher,
+    DashboardSnapshotUnavailable,
 )
 from polytrading.predictions.storage.store import PredictionMarketStore
 
 _LOGGER = logging.getLogger(__name__)
 _HOST = re.compile(r"(?P<name>localhost|127\.0\.0\.1)(?::(?P<port>[0-9]+))?")
+_MAX_HOST_BYTES = 255
+_MAX_PORT_DIGITS = 5
+_MAX_TARGET_BYTES = 2048
 _STATIC_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
@@ -84,7 +88,14 @@ class PredictionDashboardApplication:
         if not _valid_host(host):
             return _error_response(HTTPStatus.BAD_REQUEST, "INVALID_HOST")
 
-        parsed = urlsplit(target)
+        if not _bounded_utf8(target, _MAX_TARGET_BYTES):
+            return _error_response(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST_TARGET")
+        try:
+            parsed = urlsplit(target)
+        except (TypeError, ValueError):
+            return _error_response(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST_TARGET")
+        if parsed.scheme or parsed.netloc:
+            return _error_response(HTTPStatus.BAD_REQUEST, "INVALID_REQUEST_TARGET")
         if parsed.path == "/api/v1/predictions-events":
             if method != "GET":
                 return _error_response(
@@ -125,9 +136,14 @@ class PredictionDashboardApplication:
     def _events_response(self, last_event_id: str | None, *, timeout: float) -> WebResponse:
         try:
             event = self._revision_buffer.wait_for_event(last_event_id, timeout=timeout)
-        except ValueError:
+            body = b": keepalive\n\n" if event is None else _sse_event_frame(event)
+        except DashboardCursorError:
             return _error_response(HTTPStatus.BAD_REQUEST, "INVALID_EVENT_CURSOR")
-        body = b": keepalive\n\n" if event is None else _sse_event_frame(event)
+        except DashboardSnapshotUnavailable:
+            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, "SNAPSHOT_UNAVAILABLE")
+        except Exception:
+            _LOGGER.error("prediction_dashboard_failure failure=EVENT_STREAM_UNAVAILABLE")
+            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, "EVENT_STREAM_UNAVAILABLE")
         return WebResponse(
             HTTPStatus.OK,
             "text/event-stream; charset=utf-8",
@@ -141,19 +157,13 @@ class PredictionDashboardApplication:
 
     def _dashboard_response(self) -> WebResponse:
         try:
-            with owned_resource_cleanup() as cleanup:
-                as_of = self._clock()
-                if as_of.tzinfo is None:
-                    raise ValueError("dashboard clock must be timezone-aware")
-                store = PredictionMarketStore(self._database_path, read_only=True)
-                cleanup.add(store.close)
-                snapshot = PredictionDashboardBuilder(store, self._database_path).build(as_of)
-                return WebResponse(
-                    HTTPStatus.OK,
-                    "application/json; charset=utf-8",
-                    render_prediction_dashboard_json(snapshot),
-                    dict(_SECURITY_HEADERS),
-                )
+            snapshot = build_prediction_dashboard_snapshot(self._database_path, now=self._clock())
+            return WebResponse(
+                HTTPStatus.OK,
+                "application/json; charset=utf-8",
+                render_prediction_dashboard_json(snapshot),
+                dict(_SECURITY_HEADERS),
+            )
         except Exception as error:
             status, code = _classify_dashboard_failure(error)
             _LOGGER.error("predictions dashboard snapshot failure: %s", code)
@@ -163,13 +173,15 @@ class PredictionDashboardApplication:
 def validate_prediction_dashboard_database(path: Path) -> None:
     if not path.is_file():
         raise ValueError("predictions dashboard requires an existing database file")
+    failure_code: str | None = None
     try:
         with owned_resource_cleanup() as cleanup:
             store = PredictionMarketStore(path, read_only=True)
             cleanup.add(store.close)
     except Exception as error:
-        _status, code = _classify_dashboard_failure(error)
-        raise PredictionDashboardLifecycleError(code) from cleanup_error_cause(error)
+        _status, failure_code = _classify_dashboard_failure(error)
+    if failure_code is not None:
+        raise PredictionDashboardLifecycleError(failure_code) from None
 
 
 def serve_prediction_dashboard(
@@ -193,20 +205,22 @@ def serve_prediction_dashboard(
         interval_seconds=1,
         clock=server_clock,
     )
+    failed = False
     try:
         with owned_resource_cleanup() as cleanup:
-            publisher.start()
             cleanup.add(publisher.close)
+            publisher.poll_once()
+            publisher.start()
             server = ThreadingHTTPServer(("127.0.0.1", port), _handler_for(application))
             server.daemon_threads = True
             cleanup.add(server.server_close)
             print(f"polytrading predictions dashboard: http://127.0.0.1:{server.server_port}")
             with suppress(KeyboardInterrupt):
                 server.serve_forever()
-    except Exception as error:
-        raise PredictionDashboardLifecycleError("DASHBOARD_SERVER_ERROR") from cleanup_error_cause(
-            error
-        )
+    except Exception:
+        failed = True
+    if failed:
+        raise PredictionDashboardLifecycleError("DASHBOARD_SERVER_ERROR") from None
 
 
 def _handler_for(
@@ -251,6 +265,12 @@ def _handler_for(
                 self.headers.get("Host", ""),
                 last_event_id=last_event_id,
             )
+            _LOGGER.info(
+                "prediction_dashboard_request method=%s route=%s status=%d",
+                method,
+                _route_code(self.path),
+                response.status.value,
+            )
             self.send_response(response.status.value)
             self.send_header("Content-Type", response.content_type)
             is_event_stream = response.content_type == "text/event-stream; charset=utf-8"
@@ -287,7 +307,7 @@ def _handler_for(
                 cursor = _event_id_from_frame(followup.body) or cursor
 
         def log_message(self, format: str, *args: object) -> None:
-            _LOGGER.info("predictions dashboard request: " + format, *args)
+            del format, args
 
     return PredictionDashboardRequestHandler
 
@@ -333,11 +353,34 @@ def _write_sse_frame(stream: object, frame: bytes) -> bool:
 
 
 def _valid_host(host: str) -> bool:
+    if not _bounded_utf8(host, _MAX_HOST_BYTES):
+        return False
     match = _HOST.fullmatch(host)
     if match is None:
         return False
     port = match.group("port")
-    return port is None or 1 <= int(port) <= 65_535
+    return port is None or (len(port) <= _MAX_PORT_DIGITS and 1 <= int(port) <= 65_535)
+
+
+def _bounded_utf8(value: object, maximum_bytes: int) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= maximum_bytes
+    except UnicodeEncodeError:
+        return False
+
+
+def _route_code(target: str) -> str:
+    if target.startswith("/api/v1/predictions-dashboard"):
+        return "DASHBOARD"
+    if target.startswith("/api/v1/predictions-events"):
+        return "EVENTS"
+    if target.startswith("/assets/") or target == "/":
+        return "STATIC"
+    if target.startswith("/healthz"):
+        return "HEALTH"
+    return "UNKNOWN"
 
 
 def _is_database_busy(error: BaseException) -> bool:

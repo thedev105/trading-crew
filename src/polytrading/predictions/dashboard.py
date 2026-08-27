@@ -4,7 +4,6 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
-from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -47,6 +46,7 @@ from polytrading.predictions.health import PredictionHealthAuditor
 from polytrading.predictions.manifest import evaluate_execution_gate
 from polytrading.predictions.polymarket_execution import (
     POLYMARKET_PROTOCOL_VERSION,
+    load_protocol_snapshot,
     verify_protocol_sources,
 )
 from polytrading.predictions.proofs_models import ProofArtifact
@@ -85,17 +85,7 @@ class PredictionDashboardBuilder:
     def build(self, as_of: datetime) -> PredictionDashboardSnapshot:
         cutoff = normalize_utc_timestamp(as_of)
         with self._store.transaction():
-            snapshot = self._build_at_cutoff(cutoff)
-        canonical = json.dumps(
-            snapshot.model_dump(mode="json", exclude={"revision_id"}),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return PredictionDashboardSnapshot.model_validate(
-            {**snapshot.model_dump(mode="python"), "revision_id": sha256(canonical).hexdigest()},
-            strict=True,
-        )
+            return self._build_at_cutoff(cutoff)
 
     def _build_at_cutoff(self, as_of: datetime) -> PredictionDashboardSnapshot:
         health = PredictionHealthAuditor(self._store).audit(as_of)
@@ -111,9 +101,8 @@ class PredictionDashboardBuilder:
             live_ledger,
             evidence_status,
         ) = self._live_execution_views(as_of)
-        return PredictionDashboardSnapshot(
+        return PredictionDashboardSnapshot.finalize(
             schema_version=1,
-            revision_id="0" * 64,
             as_of=as_of,
             health=health,
             markets=shown_markets,
@@ -146,14 +135,32 @@ class PredictionDashboardBuilder:
         if len(accounts) > _MAX_SAFETY_RECORDS:
             raise ValueError("dashboard account limit exceeded")
 
-        protocol = verify_protocol_sources()
+        protocol_snapshot = load_protocol_snapshot()
+        protocol = verify_protocol_sources(protocol_snapshot)
+        expected_fixture_hashes = tuple(
+            sorted(item.sha256 for item in protocol_snapshot.fixture_hashes)
+        )
+        expected_source_hashes = tuple(
+            sorted(item.normalized_content_sha256 for item in protocol_snapshot.sources)
+        )
         conformance = self._store.verified_protocol_conformance_results(as_of)
         if len(conformance) > _MAX_SAFETY_RECORDS:
             raise ValueError("dashboard conformance record limit exceeded")
         latest_conformance = conformance[-1] if conformance else None
-        conformance_result = "NOT_RUN" if latest_conformance is None else latest_conformance.result
+        conformance_bound = (
+            latest_conformance is not None
+            and latest_conformance.result == "CONFORMANT"
+            and latest_conformance.fixture_hashes == expected_fixture_hashes
+            and latest_conformance.source_hashes == expected_source_hashes
+            and protocol.state == "CURRENT"
+        )
+        conformance_result = "CONFORMANT" if conformance_bound else "PROTOCOL_REVIEW_REQUIRED"
 
-        manifest = self._store.latest_venue_manifest_as_of(PredictionVenue.POLYMARKET, as_of)
+        manifest = self._store.verified_latest_venue_manifest_as_of(
+            PredictionVenue.POLYMARKET, as_of
+        )
+        if manifest is not None and manifest.implementation_state.value != "LIVE_DISABLED":
+            raise ValueError("database manifest contradicts shipped LIVE_DISABLED posture")
         manifest_gate = evaluate_execution_gate(manifest, venue=PredictionVenue.POLYMARKET)
         capability = UnavailableProductionCapabilityVerifier().verify(
             capability_bundle=b"", now=as_of
@@ -164,7 +171,12 @@ class PredictionDashboardBuilder:
         timeline: list[ExecutionTimelineEntry] = []
         posting_count = 0
         reconciliations = []
-        latest_kill = None
+        all_kill_events = self._store.verified_kill_switch_events_as_of(as_of)
+        latest_kill = max(
+            all_kill_events,
+            key=lambda event: (event.occurred_at, event.kill_event_id),
+            default=None,
+        )
         for account in accounts:
             plans = self._store.verified_live_execution_plans_for_account(account, as_of)
             intents = self._store.verified_execution_intent_history_for_account(account, as_of)
@@ -201,12 +213,6 @@ class PredictionDashboardBuilder:
             kill_state = derive_kill_state(kill_events, production=True)
             if not kill_state.engaged:
                 raise ValueError("production execution must remain killed")
-            if kill_state.latest_event is not None and (
-                latest_kill is None
-                or (kill_state.latest_event.occurred_at, kill_state.latest_event.kill_event_id)
-                > (latest_kill.occurred_at, latest_kill.kill_event_id)
-            ):
-                latest_kill = kill_state.latest_event
 
             for plan in plans:
                 timeline.append(
@@ -271,7 +277,7 @@ class PredictionDashboardBuilder:
                     event.kill_event_id,
                     event.occurred_at,
                     "ENGAGED",
-                    event.trigger,
+                    "KILL_EVENT_RECORDED",
                     False,
                     event,
                 )
@@ -284,12 +290,28 @@ class PredictionDashboardBuilder:
                     reconciliation.reconciliation_id,
                     reconciliation.observed_at,
                     "COMPLETE" if reconciliation.complete else "INCOMPLETE",
-                    reconciliation.next_action,
+                    None if reconciliation.complete else "RECONCILIATION_ACTION_REQUIRED",
                     reconciliation.complete,
                     reconciliation,
                 )
                 for reconciliation in account_reconciliations
             )
+
+        account_scopes = set(accounts)
+        timeline.extend(
+            _timeline_entry(
+                as_of,
+                "kill",
+                event.kill_event_id,
+                event.occurred_at,
+                "ENGAGED",
+                "KILL_EVENT_RECORDED",
+                False,
+                event,
+            )
+            for event in all_kill_events
+            if event.scope not in account_scopes
+        )
 
         if len(timeline) > _MAX_SAFETY_RECORDS:
             raise ValueError("dashboard execution timeline limit exceeded")
@@ -303,10 +325,10 @@ class PredictionDashboardBuilder:
         if conformance_result != "CONFORMANT":
             unmet_gates.add("PROTOCOL_CONFORMANCE_REQUIRED")
         unmet = tuple(sorted(unmet_gates))
-        source_hashes = set(() if manifest is None else manifest.source_hashes)
-        if latest_conformance is not None:
-            source_hashes.update(latest_conformance.fixture_hashes)
-            source_hashes.update(latest_conformance.source_hashes)
+        source_hashes = set(expected_fixture_hashes)
+        source_hashes.update(expected_source_hashes)
+        if manifest is not None:
+            source_hashes.update(manifest.source_hashes)
 
         complete_count = sum(record.complete for record in reconciliations)
         readiness = ExecutionReadinessSummary(
@@ -319,7 +341,7 @@ class PredictionDashboardBuilder:
                 None if latest_conformance is None else latest_conformance.observed_at
             ),
             kill_engaged=True,
-            kill_trigger=None if latest_kill is None else latest_kill.trigger,
+            kill_trigger=None if latest_kill is None else "KILL_EVENT_RECORDED",
             production_capability_available=False,
             live_action_available=False,
             unmet_gates=unmet,
@@ -357,17 +379,32 @@ class PredictionDashboardBuilder:
         )
 
     def _market_atlas_opportunities(self, as_of: datetime) -> tuple[MarketAtlasOpportunity, ...]:
-        candidates = self._store.candidate_relationships_as_of(as_of)
-        proofs = self._store.proof_artifacts_as_of(as_of)
-        reports = self._store.scan_reports_as_of(as_of)
+        candidates = self._store.verified_candidate_relationships_as_of(as_of)
+        proofs = self._store.verified_proof_artifacts_as_of(as_of)
+        reports = self._store.verified_scan_reports_as_of(as_of)
         if max(len(candidates), len(proofs), len(reports)) > _MAX_SAFETY_RECORDS:
             raise ValueError("dashboard opportunity evidence limit exceeded")
+        candidates_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        if len(candidates_by_id) != len(candidates):
+            raise ValueError("duplicate candidate identity in opportunity evidence")
+        if any(proof.candidate_id not in candidates_by_id for proof in proofs):
+            raise ValueError("proof references an unavailable candidate")
+        if any(report.candidate_id not in candidates_by_id for report in reports):
+            raise ValueError("scan report references an unavailable candidate")
+        proofs_by_id = {proof.proof_id: proof for proof in proofs}
         latest_proof = {proof.candidate_id: proof for proof in proofs}
         latest_report = {report.candidate_id: report for report in reports}
         opportunities = []
         for candidate in candidates:
-            proof = latest_proof.get(candidate.candidate_id)
             report = latest_report.get(candidate.candidate_id)
+            if report is None:
+                proof = latest_proof.get(candidate.candidate_id)
+            elif report.proof_id is None:
+                proof = None
+            else:
+                proof = proofs_by_id.get(report.proof_id)
+                if proof is None or proof.candidate_id != report.candidate_id:
+                    raise ValueError("scan report references an unavailable proof")
             economics = None if report is None else report.economics
             evidence_records = tuple(
                 record for record in (candidate, proof, report) if record is not None
@@ -412,7 +449,7 @@ class PredictionDashboardBuilder:
         return tuple(books)
 
     def _candidate_summary(self, as_of: datetime) -> CandidateSummary:
-        candidates = self._store.candidate_relationships_as_of(as_of)
+        candidates = self._store.verified_candidate_relationships_as_of(as_of)
         by_relationship_type: dict[str, int] = {}
         by_disposition: dict[str, int] = {}
         by_provenance_kind: dict[str, int] = {}
@@ -436,7 +473,7 @@ class PredictionDashboardBuilder:
         )
 
     def _proof_summary(self, as_of: datetime) -> ProofSummary:
-        proofs = self._store.proof_artifacts_as_of(as_of)
+        proofs = self._store.verified_proof_artifacts_as_of(as_of)
         by_status: dict[str, int] = {}
         by_template: dict[str, int] = {}
         for proof in proofs:
@@ -457,7 +494,7 @@ class PredictionDashboardBuilder:
         )
 
     def _scan_summary(self, as_of: datetime) -> ScanSummary:
-        reports = self._store.scan_reports_as_of(as_of)
+        reports = self._store.verified_scan_reports_as_of(as_of)
         by_decision: dict[str, int] = {}
         for report in reports:
             _increment(by_decision, report.decision)
@@ -628,7 +665,7 @@ def _timeline_entry(
             "schema_version": 1,
             "as_of": as_of,
             "kind": kind,
-            "record_id": str(record_id),
+            "record_id": record_id,
             "occurred_at": occurred_at,
             "state": state,
             "reason_code": reason_code,
@@ -789,7 +826,7 @@ def build_prediction_dashboard_snapshot(
     database_path: Path, *, now: datetime
 ) -> PredictionDashboardSnapshot:
     cutoff = normalize_utc_timestamp(now)
-    store = PredictionMarketStore(database_path)
+    store = PredictionMarketStore(database_path, read_only=True)
     try:
         return PredictionDashboardBuilder(store, database_path).build(cutoff)
     finally:

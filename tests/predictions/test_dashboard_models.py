@@ -14,8 +14,14 @@ from polytrading.predictions.dashboard import (
     PredictionDashboardBuilder,
     render_prediction_dashboard_json,
 )
-from polytrading.predictions.dashboard_models import ShadowListing, ShadowSummary
+from polytrading.predictions.dashboard_models import (
+    PredictionDashboardSnapshot,
+    PredictionEvidenceCounts,
+    ShadowListing,
+    ShadowSummary,
+)
 from polytrading.predictions.domain import PredictionFeeRate, PredictionVenue
+from polytrading.predictions.execution.models import canonical_execution_hash
 from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.shadow_ledger import (
@@ -1248,7 +1254,7 @@ def test_snapshot_includes_health_for_all_venues(tmp_path: Path) -> None:
     store.append_venue_manifest(
         venue_manifest(
             venue=PredictionVenue.POLYMARKET,
-            implementation_state=AdapterImplementationState.READ_ONLY,
+            implementation_state=AdapterImplementationState.LIVE_DISABLED,
         )
     )
     snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
@@ -1372,6 +1378,14 @@ def test_snapshot_proofs_summary_is_empty_when_no_proofs_exist(tmp_path: Path) -
 
 def test_snapshot_proofs_summary_counts_match_seeded_proofs(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    for candidate_id in (UUID(int=101), UUID(int=102)):
+        store.append_candidate_relationship(
+            candidate_relationship(
+                candidate_id=candidate_id,
+                observed_at=NOW,
+                information_cutoff=NOW,
+            )
+        )
     store.append_proof_artifact(
         proof_artifact(
             proof_id=UUID(int=1),
@@ -1435,12 +1449,20 @@ def test_snapshot_omits_a_proof_observed_after_its_own_cutoff(tmp_path: Path) ->
 def test_snapshot_proofs_latest_is_newest_first_and_capped_at_twenty(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     for offset in range(25):
+        observed_at = NOW - timedelta(minutes=25 - offset)
+        store.append_candidate_relationship(
+            candidate_relationship(
+                candidate_id=UUID(int=200 + offset),
+                observed_at=observed_at,
+                information_cutoff=observed_at,
+            )
+        )
         store.append_proof_artifact(
             proof_artifact(
                 proof_id=UUID(int=offset + 1),
                 candidate_id=UUID(int=200 + offset),
-                observed_at=NOW - timedelta(minutes=25 - offset),
-                information_cutoff=NOW - timedelta(minutes=25 - offset),
+                observed_at=observed_at,
+                information_cutoff=observed_at,
             )
         )
     snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
@@ -1462,6 +1484,9 @@ def test_snapshot_scans_summary_is_empty_when_no_scans_exist(tmp_path: Path) -> 
 
 def test_snapshot_scans_summary_counts_match_seeded_scans(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_candidate_relationship(
+        candidate_relationship(candidate_id=UUID(int=301), observed_at=NOW)
+    )
     store.append_scan_report(
         scan_report(
             candidate_id=UUID(int=301),
@@ -1507,6 +1532,14 @@ def test_snapshot_omits_a_scan_observed_after_its_own_cutoff(tmp_path: Path) -> 
 def test_snapshot_scans_latest_is_newest_first_and_capped_at_twenty(tmp_path: Path) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     for offset in range(25):
+        observed_at = NOW - timedelta(minutes=25 - offset)
+        store.append_candidate_relationship(
+            candidate_relationship(
+                candidate_id=UUID(int=400 + offset),
+                observed_at=observed_at,
+                information_cutoff=observed_at,
+            )
+        )
         store.append_scan_report(
             scan_report(
                 candidate_id=UUID(int=400 + offset),
@@ -1514,8 +1547,8 @@ def test_snapshot_scans_latest_is_newest_first_and_capped_at_twenty(tmp_path: Pa
                 reason="economics unfavorable",
                 economics=None,
                 proof_id=None,
-                as_of=NOW - timedelta(minutes=25 - offset),
-                observed_at=NOW - timedelta(minutes=25 - offset),
+                as_of=observed_at,
+                observed_at=observed_at,
             )
         )
     snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
@@ -1534,6 +1567,7 @@ def _append_live_dashboard_execution_bundle(store: PredictionMarketStore) -> str
         LiveExecutionPlan,
         ProtocolConformanceResult,
     )
+    from polytrading.predictions.polymarket_execution import load_protocol_snapshot
     from tests.predictions.execution_helpers import (
         execution_intent_fields,
         live_execution_plan_fields,
@@ -1572,12 +1606,15 @@ def _append_live_dashboard_execution_bundle(store: PredictionMarketStore) -> str
             occurred_at=NOW - timedelta(seconds=1),
         )
     )
+    protocol = load_protocol_snapshot()
     store.append_protocol_conformance_result(
         ProtocolConformanceResult(
             schema_version=1,
             conformance_result_id=UUID(int=902),
-            fixture_hashes=("1" * 64,),
-            source_hashes=("2" * 64,),
+            fixture_hashes=tuple(sorted(item.sha256 for item in protocol.fixture_hashes)),
+            source_hashes=tuple(
+                sorted(item.normalized_content_sha256 for item in protocol.sources)
+            ),
             implementation_revision="task-12",
             executed_checks=("fixture_trust",),
             result="CONFORMANT",
@@ -1586,8 +1623,8 @@ def _append_live_dashboard_execution_bundle(store: PredictionMarketStore) -> str
     )
     store.append_venue_manifest(
         venue_manifest(
-            implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
-            jurisdiction_review_status="ELIGIBILITY_REVIEWED",
+            implementation_state=AdapterImplementationState.LIVE_DISABLED,
+            jurisdiction_review_status="UNREVIEWED",
             reviewed_at=NOW - timedelta(seconds=3),
         )
     )
@@ -1626,6 +1663,24 @@ def test_market_atlas_five_view_models_are_strict_immutable_and_one_cutoff(
     )
     assert isinstance(snapshot.opportunities, tuple)
     assert isinstance(snapshot.execution_timeline, tuple)
+    timeline_entry = dashboard_models.ExecutionTimelineEntry.model_validate(
+        {
+            "schema_version": 1,
+            "as_of": NOW,
+            "kind": "plan",
+            "record_id": UUID(int=1),
+            "occurred_at": NOW,
+            "state": "PLANNED",
+            "reason_code": None,
+            "reconciled": False,
+            "evidence_hashes": ("0" * 64,),
+        },
+        strict=True,
+    )
+    with pytest.raises(ValidationError):
+        timeline_entry.model_copy(update={"record_id": "not-a-uuid"})
+    with pytest.raises(ValidationError):
+        timeline_entry.model_copy(update={"state": "raw-adapter-state"})
 
     readiness = snapshot.execution_readiness
     with pytest.raises(ValidationError):
@@ -1661,6 +1716,91 @@ def test_market_atlas_snapshot_revision_omits_revision_id_from_canonical_hash(
     assert len(snapshot.revision_id) == 64
 
 
+def test_public_dashboard_models_validate_copy_and_construct_escape_hatches(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    candidate = candidate_relationship(observed_at=NOW, information_cutoff=NOW)
+    proof = proof_artifact(
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        observed_at=NOW,
+        as_of=NOW,
+    )
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+    _append_live_dashboard_execution_bundle(store)
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    public_models = (
+        snapshot,
+        snapshot.evidence_counts,
+        snapshot.recipes,
+        snapshot.candidates,
+        snapshot.proofs,
+        snapshot.scans,
+        snapshot.shadow,
+        snapshot.execution_readiness,
+        snapshot.live_ledger,
+        snapshot.evidence_status,
+        *snapshot.candidates.latest,
+        *snapshot.proofs.latest,
+        *snapshot.scans.latest,
+        *snapshot.opportunities,
+        *snapshot.execution_timeline,
+        shadow_listing(),
+    )
+
+    for model in public_models:
+        with pytest.raises(ValidationError):
+            model.model_copy(update={"schema_version": 2})
+        with pytest.raises(ValidationError):
+            type(model).model_construct(**{**model.model_dump(mode="python"), "schema_version": 2})
+
+
+def test_public_dashboard_mappings_are_detached_deeply_immutable_and_json_compatible() -> None:
+    caller_counts = {"verified": 1}
+    counts = PredictionEvidenceCounts.model_validate(
+        {"schema_version": 1, "counts": caller_counts}, strict=True
+    )
+    caller_counts["verified"] = 99
+
+    assert counts.counts == {"verified": 1}
+    assert json.loads(counts.model_dump_json()) == {
+        "schema_version": 1,
+        "counts": {"verified": 1},
+    }
+    with pytest.raises(TypeError):
+        counts.counts["verified"] = 2
+
+    copied_source = {"verified": 3}
+    copied = counts.model_copy(update={"counts": copied_source})
+    copied_source["verified"] = 88
+    assert copied.counts == {"verified": 3}
+    with pytest.raises(TypeError):
+        copied.counts["new"] = 1
+
+
+def test_finalized_snapshot_rejects_stale_caller_supplied_revision(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    stale = {**snapshot.model_dump(mode="python"), "revision_id": "f" * 64}
+
+    with pytest.raises(ValidationError, match="revision"):
+        PredictionDashboardSnapshot.model_validate(stale, strict=True)
+    with pytest.raises(ValidationError, match="revision"):
+        PredictionDashboardSnapshot.model_validate(stale, strict=True, context=object())
+    with pytest.raises(ValidationError, match="revision"):
+        PredictionDashboardSnapshot.model_construct(**stale)
+    with pytest.raises(ValidationError, match="revision"):
+        snapshot.model_copy(update={"revision_id": "f" * 64})
+
+
 def test_market_atlas_snapshot_never_infers_live_readiness_from_persisted_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1676,6 +1816,191 @@ def test_market_atlas_snapshot_never_infers_live_readiness_from_persisted_eviden
     assert snapshot.execution_readiness.production_capability_available is False
     assert snapshot.execution_readiness.live_action_available is False
     assert "CAPABILITY_VERIFIER_NOT_CONFIGURED" in snapshot.execution_readiness.unmet_gates
+
+
+def test_market_atlas_rejects_database_manifest_that_contradicts_shipped_live_disabled(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_venue_manifest(
+        venue_manifest(
+            implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
+            jurisdiction_review_status="ELIGIBILITY_REVIEWED",
+            reviewed_at=NOW,
+        )
+    )
+
+    with pytest.raises(ValueError, match="manifest"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("record_hash", "0" * 64),
+        ("venue", PredictionVenue.KALSHI.value),
+        ("reviewed_at", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_market_atlas_strictly_revalidates_database_manifest_indexes_and_hash(
+    column: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_venue_manifest(
+        venue_manifest(
+            implementation_state=AdapterImplementationState.LIVE_DISABLED,
+            reviewed_at=NOW,
+        )
+    )
+    store._connection.execute(f"UPDATE venue_manifests SET {column} = ?", [value])
+
+    with pytest.raises(ValueError):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_market_atlas_conformance_is_fixed_and_bound_to_current_protocol_hashes(
+    tmp_path: Path,
+) -> None:
+    from polytrading.predictions.execution.models import ProtocolConformanceResult
+
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    raw_canary = "CONFORMANT authorization=Bearer-private-account-ip"
+    store.append_protocol_conformance_result(
+        ProtocolConformanceResult(
+            schema_version=1,
+            conformance_result_id=UUID(int=990),
+            fixture_hashes=("1" * 64,),
+            source_hashes=("2" * 64,),
+            implementation_revision="stale",
+            executed_checks=("caller-controlled",),
+            result=raw_canary,
+            observed_at=NOW,
+        )
+    )
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    rendered = render_prediction_dashboard_json(snapshot).decode()
+    assert snapshot.execution_readiness.conformance_result == "PROTOCOL_REVIEW_REQUIRED"
+    assert snapshot.evidence_status.conformance_result == "PROTOCOL_REVIEW_REQUIRED"
+    assert raw_canary not in rendered
+
+
+def test_market_atlas_opportunity_binds_report_to_its_exact_proof_not_latest_proof(
+    tmp_path: Path,
+) -> None:
+    candidate = candidate_relationship(observed_at=NOW - timedelta(minutes=3))
+    proof_a = proof_artifact(
+        proof_id=UUID(int=8101),
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW - timedelta(minutes=2),
+    )
+    proof_b = proof_artifact(
+        proof_id=UUID(int=8102),
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW,
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof_a.proof_id,
+        observed_at=NOW - timedelta(minutes=1),
+        as_of=NOW - timedelta(minutes=1),
+    )
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof_a)
+    store.append_proof_artifact(proof_b)
+    store.append_scan_report(report)
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+    assert snapshot.opportunities[0].proof_id == proof_a.proof_id
+    expected = {
+        canonical_execution_hash(candidate),
+        canonical_execution_hash(proof_a),
+        canonical_execution_hash(report),
+    }
+    assert set(snapshot.opportunities[0].evidence_hashes) == expected
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("candidate_relationships", "relationship_type", "tampered"),
+        ("proof_artifacts", "candidate_id", UUID(int=999_801)),
+        ("scan_reports", "observed_at", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_market_atlas_strictly_revalidates_opportunity_hashes_indexes_and_cutoffs(
+    table: str,
+    column: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    candidate = candidate_relationship(observed_at=NOW, information_cutoff=NOW)
+    proof = proof_artifact(
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW,
+        information_cutoff=NOW,
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        observed_at=NOW,
+        as_of=NOW,
+    )
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+    store._connection.execute(f"UPDATE {table} SET {column} = ?", [value])
+
+    with pytest.raises(ValueError):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+
+def test_market_atlas_projects_only_stable_codes_from_kill_and_reconciliation_text(
+    tmp_path: Path,
+) -> None:
+    from polytrading.predictions.execution.models import KillSwitchEvent, LiveReconciliation
+
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    account = _append_live_dashboard_execution_bundle(store)
+    canary = "private-key authorization signed-body account geographic-ip raw-target"
+    store.append_kill_switch_event(
+        KillSwitchEvent(
+            schema_version=1,
+            kill_event_id=UUID(int=990_101),
+            trigger=canary,
+            scope="GLOBAL",
+            source_intent_id=None,
+            source_order_id=None,
+            prior_state=True,
+            occurred_at=NOW,
+        )
+    )
+    store.append_live_reconciliation(
+        LiveReconciliation(
+            schema_version=1,
+            reconciliation_id=UUID(int=990_102),
+            account_fingerprint=account,
+            observed_at=NOW,
+            complete=False,
+            differences=(canary,),
+            evidence_hashes=("f" * 64,),
+            next_action=canary,
+        )
+    )
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    rendered = render_prediction_dashboard_json(snapshot).decode()
+
+    assert canary not in rendered
+    assert snapshot.execution_readiness.kill_trigger == "KILL_EVENT_RECORDED"
+    reason_codes = {entry.reason_code for entry in snapshot.execution_timeline}
+    assert "KILL_EVENT_RECORDED" in reason_codes
+    assert "RECONCILIATION_ACTION_REQUIRED" in reason_codes
 
 
 def test_market_atlas_builder_uses_exactly_one_transaction_for_every_visible_query(

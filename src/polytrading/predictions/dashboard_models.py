@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Literal
+from hashlib import sha256
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from polytrading.predictions.candidates_models import CandidateDisposition, RelationshipType
 from polytrading.predictions.domain import (
@@ -25,6 +34,94 @@ NonNegativeCount = Annotated[int, Field(ge=0)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+ActivationGateCode = Literal[
+    "AUTOMATED_USE_RESTRICTED",
+    "CAPABILITY_VERIFIER_NOT_CONFIGURED",
+    "COLLECTION_NOT_PERMITTED",
+    "EXECUTION_KILL_ENGAGED",
+    "JURISDICTION_BLOCKED",
+    "JURISDICTION_UNREVIEWED",
+    "LIVE_NOT_ELIGIBLE",
+    "MANIFEST_NOT_FOUND",
+    "PROTOCOL_CONFORMANCE_REQUIRED",
+    "PROTOCOL_REVIEW_REQUIRED",
+]
+TimelineState = Literal[
+    "ACK_DELAYED",
+    "ACK_LIVE_UNEXPECTED",
+    "ACK_MATCHED",
+    "CANCEL_PENDING",
+    "CANCELLED",
+    "COMPLETE",
+    "CONFIRMED",
+    "ENGAGED",
+    "FAILED",
+    "FILLED",
+    "INCOMPLETE",
+    "INTENT_RECORDED",
+    "MATCHED",
+    "MATCHED_NOT_BROADCASTED",
+    "MINED",
+    "PARTIALLY_FILLED",
+    "PLANNED",
+    "RECONCILED",
+    "REJECTED",
+    "RETRYING",
+    "SIGNED",
+    "SUBMITTING",
+    "UNKNOWN",
+]
+
+
+class FrozenDict(dict[str, Any]):
+    """A detached JSON-object-compatible mapping with no mutation surface."""
+
+    @staticmethod
+    def _immutable(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("dashboard mappings are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        for name in type(value).model_fields:
+            object.__setattr__(value, name, _deep_freeze(getattr(value, name)))
+        return value
+    if isinstance(value, Mapping):
+        return FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+class DashboardRecord(PredictionRecord):
+    """Dashboard publication boundary with validated copies and immutable children."""
+
+    @model_validator(mode="after")
+    def _freeze_publication_tree(self) -> Self:
+        return _deep_freeze(self)
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        del _fields_set
+        return cls.model_validate(values, strict=True)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        del deep
+        values = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            values.update(dict(update))
+        return type(self).model_validate(values, strict=True)
 
 
 class DashboardDomain(StrEnum):
@@ -35,18 +132,18 @@ class DashboardDomain(StrEnum):
     EVIDENCE = "evidence"
 
 
-class ExecutionReadinessSummary(PredictionRecord):
+class ExecutionReadinessSummary(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
     implementation_state: Literal["LIVE_DISABLED"]
     protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
-    conformance_result: NonEmptyString
+    conformance_result: Literal["CONFORMANT", "PROTOCOL_REVIEW_REQUIRED"]
     conformance_observed_at: datetime | None
     kill_engaged: Literal[True]
-    kill_trigger: NonEmptyString | None
+    kill_trigger: Literal["KILL_EVENT_RECORDED"] | None
     production_capability_available: Literal[False]
     live_action_available: Literal[False]
-    unmet_gates: tuple[NonEmptyString, ...]
+    unmet_gates: tuple[ActivationGateCode, ...]
 
     @field_validator("conformance_observed_at")
     @classmethod
@@ -67,7 +164,7 @@ class ExecutionReadinessSummary(PredictionRecord):
         return value
 
 
-class MarketAtlasOpportunity(PredictionRecord):
+class MarketAtlasOpportunity(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
     candidate_id: UUID
@@ -87,14 +184,14 @@ class MarketAtlasOpportunity(PredictionRecord):
         return value
 
 
-class ExecutionTimelineEntry(PredictionRecord):
+class ExecutionTimelineEntry(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
     kind: Literal["plan", "intent", "order", "trade", "kill", "reconciliation"]
-    record_id: NonEmptyString
+    record_id: UUID
     occurred_at: datetime
-    state: NonEmptyString
-    reason_code: NonEmptyString | None
+    state: TimelineState
+    reason_code: Literal["KILL_EVENT_RECORDED", "RECONCILIATION_ACTION_REQUIRED"] | None
     reconciled: bool
     evidence_hashes: tuple[Sha256, ...]
 
@@ -113,7 +210,7 @@ class ExecutionTimelineEntry(PredictionRecord):
         return value
 
 
-class LiveLedgerSummary(PredictionRecord):
+class LiveLedgerSummary(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
     posting_count: NonNegativeCount
@@ -135,17 +232,17 @@ class LiveLedgerSummary(PredictionRecord):
         return self
 
 
-class EvidenceStatus(PredictionRecord):
+class EvidenceStatus(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
-    protocol_version: NonEmptyString
+    protocol_version: Literal["polymarket-clob-2026-08-25-v1"]
     protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
-    manifest_state: NonEmptyString
-    conformance_result: NonEmptyString
+    manifest_state: Literal["MISSING", "LIVE_DISABLED"]
+    conformance_result: Literal["CONFORMANT", "PROTOCOL_REVIEW_REQUIRED"]
     conformance_observed_at: datetime | None
     account_count: NonNegativeCount
     source_hashes: tuple[Sha256, ...]
-    unmet_activation_gates: tuple[NonEmptyString, ...]
+    unmet_activation_gates: tuple[ActivationGateCode, ...]
 
     @field_validator("conformance_observed_at")
     @classmethod
@@ -164,17 +261,17 @@ class EvidenceStatus(PredictionRecord):
         return value
 
 
-class PredictionEvidenceCounts(PredictionRecord):
+class PredictionEvidenceCounts(DashboardRecord):
     schema_version: Literal[1]
     counts: dict[str, int]
 
 
-class PredictionOperationRecipes(PredictionRecord):
+class PredictionOperationRecipes(DashboardRecord):
     schema_version: Literal[1]
     recipes: tuple[str, ...]
 
 
-class CandidateListing(PredictionRecord):
+class CandidateListing(DashboardRecord):
     schema_version: Literal[1]
     candidate_id: UUID
     relationship_type: RelationshipType
@@ -185,7 +282,7 @@ class CandidateListing(PredictionRecord):
     observed_at: datetime
 
 
-class CandidateSummary(PredictionRecord):
+class CandidateSummary(DashboardRecord):
     schema_version: Literal[1]
     total: int
     by_relationship_type: dict[str, int]
@@ -194,7 +291,7 @@ class CandidateSummary(PredictionRecord):
     latest: tuple[CandidateListing, ...]
 
 
-class ProofListing(PredictionRecord):
+class ProofListing(DashboardRecord):
     schema_version: Literal[1]
     proof_id: UUID
     candidate_id: UUID
@@ -205,7 +302,7 @@ class ProofListing(PredictionRecord):
     observed_at: datetime
 
 
-class ProofSummary(PredictionRecord):
+class ProofSummary(DashboardRecord):
     schema_version: Literal[1]
     total: int
     by_status: dict[str, int]
@@ -213,7 +310,7 @@ class ProofSummary(PredictionRecord):
     latest: tuple[ProofListing, ...]
 
 
-class ScanListing(PredictionRecord):
+class ScanListing(DashboardRecord):
     schema_version: Literal[1]
     candidate_id: UUID
     decision: ScanDecision
@@ -223,14 +320,14 @@ class ScanListing(PredictionRecord):
     as_of: datetime
 
 
-class ScanSummary(PredictionRecord):
+class ScanSummary(DashboardRecord):
     schema_version: Literal[1]
     total: int
     by_decision: dict[str, int]
     latest: tuple[ScanListing, ...]
 
 
-class ShadowListing(PredictionRecord):
+class ShadowListing(DashboardRecord):
     schema_version: Literal[1]
     proposal_id: UUID
     candidate_id: UUID
@@ -247,7 +344,7 @@ class ShadowListing(PredictionRecord):
         return self
 
 
-class ShadowSummary(PredictionRecord):
+class ShadowSummary(DashboardRecord):
     schema_version: Literal[1]
     proposals_total: NonNegativeCount
     by_terminal_state: dict[str, NonNegativeCount]
@@ -322,9 +419,8 @@ class ShadowSummary(PredictionRecord):
         return self
 
 
-class PredictionDashboardSnapshot(PredictionRecord):
+class _PredictionDashboardContent(DashboardRecord):
     schema_version: Literal[1]
-    revision_id: Sha256
     as_of: datetime
     health: PredictionHealthReport
     markets: tuple[MarketRecord, ...]
@@ -351,9 +447,47 @@ class PredictionDashboardSnapshot(PredictionRecord):
         )
 
     @model_validator(mode="after")
-    def _one_coherent_cutoff(self) -> PredictionDashboardSnapshot:
+    def _one_coherent_cutoff(self) -> _PredictionDashboardContent:
         if any(section.as_of != self.as_of for section in self.cutoff_bound_sections()):
             raise ValueError("dashboard sections must share one as_of cutoff")
         if any(item.occurred_at > self.as_of for item in self.execution_timeline):
             raise ValueError("execution timeline cannot exceed the dashboard cutoff")
+        return self
+
+
+class PredictionDashboardSnapshot(_PredictionDashboardContent):
+    revision_id: Sha256
+
+    def deterministic_revision_id(self) -> Sha256:
+        canonical = json.dumps(
+            self.model_dump(mode="json", exclude={"revision_id"}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    @classmethod
+    def finalize(cls, **values: Any) -> PredictionDashboardSnapshot:
+        if "revision_id" in values:
+            raise ValueError("finalization computes revision_id")
+        content = _PredictionDashboardContent.model_validate(values, strict=True)
+        canonical = json.dumps(
+            content.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return cls.model_validate(
+            {
+                **content.model_dump(mode="python", round_trip=True),
+                "revision_id": sha256(canonical).hexdigest(),
+            },
+            strict=True,
+        )
+
+    @model_validator(mode="after")
+    def _revision_matches_content(self) -> PredictionDashboardSnapshot:
+        if self.revision_id != self.deterministic_revision_id():
+            raise ValueError("dashboard revision does not match snapshot content")
         return self
