@@ -28,6 +28,7 @@ from polytrading.predictions.dashboard_live import (
     DashboardRevisionPublisher,
     DashboardSnapshotUnavailable,
 )
+from polytrading.predictions.dashboard_models import PredictionDashboardSnapshot
 from polytrading.predictions.storage.store import PredictionMarketStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ _HOST = re.compile(r"(?P<name>localhost|127\.0\.0\.1)(?::(?P<port>[0-9]+))?")
 _MAX_HOST_BYTES = 255
 _MAX_PORT_DIGITS = 5
 _MAX_TARGET_BYTES = 2048
+_SSE_RETRY_MILLISECONDS = 3000
 _STATIC_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
@@ -76,10 +78,15 @@ class PredictionDashboardApplication:
         clock: Callable[[], datetime],
         *,
         revision_buffer: DashboardRevisionBuffer | None = None,
+        snapshot_provider: Callable[[], PredictionDashboardSnapshot] | None = None,
     ) -> None:
         self._database_path = database_path
         self._clock = clock
         self._revision_buffer = revision_buffer or DashboardRevisionBuffer(clock=clock)
+        self._snapshot_provider = snapshot_provider or self._build_snapshot
+
+    def _build_snapshot(self) -> PredictionDashboardSnapshot:
+        return build_prediction_dashboard_snapshot(self._database_path, now=self._clock())
 
     def respond(
         self,
@@ -162,13 +169,15 @@ class PredictionDashboardApplication:
 
     def _dashboard_response(self) -> WebResponse:
         try:
-            snapshot = build_prediction_dashboard_snapshot(self._database_path, now=self._clock())
+            snapshot = self._snapshot_provider()
             return WebResponse(
                 HTTPStatus.OK,
                 "application/json; charset=utf-8",
                 render_prediction_dashboard_json(snapshot),
                 dict(_SECURITY_HEADERS),
             )
+        except DashboardSnapshotUnavailable:
+            return _error_response(HTTPStatus.SERVICE_UNAVAILABLE, "SNAPSHOT_UNAVAILABLE")
         except Exception as error:
             status, code = _classify_dashboard_failure(error)
             _LOGGER.error("predictions dashboard snapshot failure: %s", code)
@@ -197,11 +206,6 @@ def serve_prediction_dashboard(
 ) -> None:
     server_clock = clock or _utc_now
     revision_buffer = DashboardRevisionBuffer(clock=server_clock)
-    application = PredictionDashboardApplication(
-        database_path,
-        clock=server_clock,
-        revision_buffer=revision_buffer,
-    )
     publisher = DashboardRevisionPublisher(
         snapshot_factory=lambda: build_prediction_dashboard_snapshot(
             database_path, now=server_clock()
@@ -209,6 +213,12 @@ def serve_prediction_dashboard(
         revision_buffer=revision_buffer,
         interval_seconds=1,
         clock=server_clock,
+    )
+    application = PredictionDashboardApplication(
+        database_path,
+        clock=server_clock,
+        revision_buffer=revision_buffer,
+        snapshot_provider=publisher.latest_snapshot,
     )
     failed = False
     try:
@@ -335,17 +345,20 @@ def _sse_event_frame(event: DashboardRevision | DashboardReset) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     )
-    return f"id: {event.event_id}\nevent: {event_name}\ndata: {data}\n\n".encode()
+    return (
+        f"retry: {_SSE_RETRY_MILLISECONDS}\n"
+        f"id: {event.event_id}\nevent: {event_name}\ndata: {data}\n\n"
+    ).encode()
 
 
 def _event_id_from_frame(frame: bytes) -> str | None:
-    first_line, _separator, _rest = frame.partition(b"\n")
-    if not first_line.startswith(b"id: "):
-        return None
-    try:
-        return first_line.removeprefix(b"id: ").decode("ascii")
-    except UnicodeDecodeError:
-        return None
+    for line in frame.splitlines():
+        if line.startswith(b"id: "):
+            try:
+                return line.removeprefix(b"id: ").decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return None
 
 
 def _write_sse_frame(stream: object, frame: bytes) -> bool:

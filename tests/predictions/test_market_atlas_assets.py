@@ -203,6 +203,11 @@ def test_market_atlas_has_exactly_five_primary_views() -> None:
         "evidence",
     ]
     assert all(attrs.get("type") == "button" for attrs in view_buttons)
+    tablists = [
+        attrs for tag, attrs in parser.tags if tag == "div" and attrs.get("role") == "tablist"
+    ]
+    assert len(tablists) == 1
+    assert "aria-orientation" not in tablists[0]
 
 
 def test_market_atlas_shell_has_semantic_landmarks_and_persistent_safety_rail() -> None:
@@ -461,6 +466,17 @@ def test_store_atomically_detaches_freezes_and_coalesces_valid_replacements(
         assert.equal(Object.isFrozen(accepted.execution_readiness), true);
         assert.equal(Object.isFrozen(accepted.opportunities), true);
         assert.equal(Object.isFrozen(accepted.opportunities[0]), true);
+        const assertNullPrototypeGraph = (value) => {{
+          if (Array.isArray(value)) {{
+            assert.equal(Object.isFrozen(value), true);
+            value.forEach(assertNullPrototypeGraph);
+          }} else if (value !== null && typeof value === "object") {{
+            assert.equal(Object.getPrototypeOf(value), null);
+            assert.equal(Object.isFrozen(value), true);
+            Object.values(value).forEach(assertNullPrototypeGraph);
+          }}
+        }};
+        assertNullPrototypeGraph(accepted);
         assert.equal(Object.isFrozen(input), false);
         input.live_ledger.realized_pnl_usd = "999999";
         assert.equal(accepted.live_ledger.realized_pnl_usd, "7.75");
@@ -485,6 +501,108 @@ def test_store_atomically_detaches_freezes_and_coalesces_valid_replacements(
         assert.equal(state.displaySnapshot.opportunities[0].conservative_surplus_usd, null);
         assert.equal(state.displaySnapshot.opportunities[0].capacity_usd, null);
         assert.equal(state.financialsHidden, true);
+        """
+    )
+
+
+def test_store_rejects_inherited_schema_and_prototype_meta_keys(tmp_path: Path) -> None:
+    uri = module_uri(tmp_path, "store.js")
+    snapshot = json.dumps(valid_snapshot())
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ createSnapshotStore, INCONSISTENT }} from {json.dumps(uri)};
+
+        const baseline = {snapshot};
+        const store = createSnapshotStore({{ scheduleNotification: (callback) => callback() }});
+        const accepted = store.replaceSnapshot(baseline);
+
+        const inheritedSchema = JSON.parse(JSON.stringify(baseline));
+        delete inheritedSchema.live_ledger.schema_version;
+        Object.prototype.schema_version = 1;
+        try {{
+          assert.throws(() => store.replaceSnapshot(inheritedSchema), /INVALID_SNAPSHOT/);
+        }} finally {{
+          delete Object.prototype.schema_version;
+        }}
+        assert.equal(store.getState().snapshot, accepted);
+
+        for (const key of ["__proto__", "constructor", "prototype"]) {{
+          const hostile = JSON.parse(JSON.stringify(baseline));
+          hostile.shadow.latest = [{{ current_state: "reconciled" }}];
+          Object.defineProperty(hostile.shadow.latest[0], key, {{
+            value: {{ paper_pnl: "HOSTILE-CANARY" }},
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          }});
+          assert.throws(() => store.replaceSnapshot(hostile), /INVALID_SNAPSHOT/);
+          assert.equal(store.getState().snapshot, accepted);
+          assert.equal(store.getState().connectionState, INCONSISTENT);
+        }}
+        """
+    )
+
+
+def test_store_prepares_clock_and_scheduler_before_one_snapshot_commit(tmp_path: Path) -> None:
+    uri = module_uri(tmp_path, "store.js")
+    snapshot = json.dumps(valid_snapshot())
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ createSnapshotStore, INCONSISTENT }} from {json.dumps(uri)};
+
+        const baseline = {snapshot};
+        for (const seam of ["clock", "scheduler"]) {{
+          let hostile = false;
+          const store = createSnapshotStore({{
+            now: () => {{
+              if (hostile && seam === "clock") throw new Error("CLOCK-CANARY");
+              return Date.parse("2026-08-16T12:00:05Z");
+            }},
+            scheduleNotification: (callback) => {{
+              if (hostile && seam === "scheduler") throw new Error("SCHEDULER-CANARY");
+              callback();
+            }},
+          }});
+          const first = store.replaceSnapshot(baseline);
+          const replacement = JSON.parse(JSON.stringify(baseline));
+          replacement.revision_id = "e".repeat(64);
+          hostile = true;
+          assert.throws(() => store.replaceSnapshot(replacement));
+          assert.equal(store.getState().snapshot, first, `${{seam}} replaced last-good identity`);
+          assert.equal(store.getState().connectionState, INCONSISTENT);
+        }}
+        """
+    )
+
+
+def test_store_recursively_redacts_aggregate_and_row_level_pnl(tmp_path: Path) -> None:
+    uri = module_uri(tmp_path, "store.js")
+    snapshot = valid_snapshot()
+    snapshot["shadow"]["latest"] = [  # type: ignore[index]
+        {
+            "current_state": "reconciled",
+            "paper_pnl": "PAPER-PNL-CANARY",
+            "live_pnl_usd": "LIVE-PNL-CANARY",
+            "nested": {"paper_pnl_usd": "NESTED-PNL-CANARY"},
+        }
+    ]
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ createSnapshotStore, INCONSISTENT }} from {json.dumps(uri)};
+
+        const store = createSnapshotStore({{ scheduleNotification: (callback) => callback() }});
+        store.replaceSnapshot({json.dumps(snapshot)});
+        store.setConnectionState(INCONSISTENT, "REVISION_MISMATCH");
+        const state = store.getState();
+        const renderedSurface = JSON.stringify(state.displaySnapshot);
+        assert.equal(state.displaySnapshot.live_ledger.pnl_publishable, false);
+        assert.doesNotMatch(renderedSurface, /PAPER-PNL-CANARY|LIVE-PNL-CANARY|NESTED-PNL-CANARY/);
+        assert.equal(state.displaySnapshot.shadow.latest[0].paper_pnl, null);
+        assert.equal(state.displaySnapshot.shadow.latest[0].live_pnl_usd, null);
+        assert.equal(state.displaySnapshot.shadow.latest[0].nested.paper_pnl_usd, null);
         """
     )
 
@@ -643,7 +761,7 @@ def test_stream_coalesces_full_get_refreshes_and_fails_closed_on_revision_mismat
     )
 
 
-def test_stream_reconnect_polling_staleness_and_abort_are_bounded(
+def test_stream_native_reconnect_polling_staleness_and_abort_are_bounded(
     tmp_path: Path,
 ) -> None:
     uri = module_bundle_uri(tmp_path, "stream.js", "api.js", "store.js")
@@ -713,10 +831,10 @@ def test_stream_reconnect_polling_staleness_and_abort_are_bounded(
         assert.equal(store.getState().connectionState, CONNECTED);
 
         firstSource.emit("error");
-        assert.equal(firstSource.closed, true);
+        assert.equal(firstSource.closed, false);
         assert.equal(store.getState().connectionState, DEGRADED);
         const scheduledDelays = [...timers.values()].map((item) => item.delay);
-        assert.equal(scheduledDelays.includes(1000), true);
+        assert.equal(scheduledDelays.includes(1000), false);
         assert.equal(scheduledDelays.includes(5000), true);
 
         mode = "failure";
@@ -725,16 +843,21 @@ def test_stream_reconnect_polling_staleness_and_abort_are_bounded(
         timers.delete(poll[0]);
         await poll[1].callback();
         await stream.whenIdle();
-        assert.equal(store.getState().connectionState, DISCONNECTED);
+        assert.equal(store.getState().connectionState, DEGRADED);
+        assert.equal([...timers.values()].some((item) => item.delay === 5000), true);
 
-        const reconnect = [...timers.entries()].find(([_id, item]) => item.delay === 1000);
-        assert.ok(reconnect);
-        timers.delete(reconnect[0]);
-        reconnect[1].callback();
-        assert.equal(FakeEventSource.instances.length, 2);
-        FakeEventSource.instances[1].emit("error");
-        assert.equal([...timers.values()].some((item) => item.delay === 2000), true);
-        assert.equal([...timers.values()].every((item) => item.delay <= 16000), true);
+        mode = "success";
+        firstSource.emit("open");
+        assert.equal(FakeEventSource.instances.length, 1);
+        assert.equal(firstSource.closed, false);
+        assert.equal(store.getState().connectionState, DEGRADED);
+        await stream.requestRefresh();
+        assert.equal(store.getState().connectionState, CONNECTED);
+
+        mode = "failure";
+        await stream.requestRefresh();
+        assert.equal(store.getState().connectionState, DEGRADED);
+        assert.equal([...timers.values()].some((item) => item.delay === 5000), true);
 
         mode = "pending";
         const pending = stream.requestRefresh();
@@ -744,6 +867,9 @@ def test_stream_reconnect_polling_staleness_and_abort_are_bounded(
         assert.equal(FakeEventSource.instances.every((source) => source.closed), true);
         assert.equal(timers.size, 0);
         assert.ok(cleared.length > 0);
+        const stoppedState = store.getState().connectionState;
+        firstSource.emit("error");
+        assert.equal(store.getState().connectionState, stoppedState);
         void pending;
 
         const staleStore = createSnapshotStore({{
@@ -765,6 +891,171 @@ def test_stream_reconnect_polling_staleness_and_abort_are_bounded(
         FakeEventSource.instances.at(-1).emit("open");
         assert.equal(staleStore.getState().connectionState, STALE);
         staleController.abort();
+        """
+    )
+
+
+def test_snapshot_polling_reschedules_in_finally_after_refresh_failure(
+    tmp_path: Path,
+) -> None:
+    uri = module_bundle_uri(tmp_path, "stream.js", "api.js", "store.js")
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ startBoundedSnapshotPolling }} from {json.dumps(uri)};
+
+        let timerId = 0;
+        const timers = new Map();
+        const setTimeoutFn = (callback, delay) => {{
+          timerId += 1;
+          timers.set(timerId, {{ callback, delay }});
+          return timerId;
+        }};
+        let pollAttempts = 0;
+        const polling = startBoundedSnapshotPolling({{
+          refresh: async () => {{ pollAttempts += 1; throw new Error("POLL-CANARY"); }},
+          setTimeoutFn,
+          clearTimeoutFn: (id) => timers.delete(id),
+          intervalMs: 7000,
+        }});
+        const firstPoll = [...timers.entries()].find(([_id, item]) => item.delay === 7000);
+        assert.ok(firstPoll);
+        timers.delete(firstPoll[0]);
+        await firstPoll[1].callback();
+        assert.equal(pollAttempts, 1);
+        assert.equal([...timers.values()].some((item) => item.delay === 7000), true);
+        polling.stop();
+        """
+    )
+
+
+def test_stream_deadline_starts_sse_independently_and_retains_polling(
+    tmp_path: Path,
+) -> None:
+    uri = module_bundle_uri(tmp_path, "stream.js", "api.js", "store.js")
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{
+          DEGRADED,
+          createSnapshotStore,
+        }} from {json.dumps((tmp_path / "store.mjs").as_uri())};
+        import {{ startRevisionStream }} from {json.dumps(uri)};
+
+        let timerId = 0;
+        const timers = new Map();
+        const setTimeoutFn = (callback, delay) => {{
+          timerId += 1;
+          timers.set(timerId, {{ callback, delay }});
+          return timerId;
+        }};
+        const clearTimeoutFn = (id) => timers.delete(id);
+
+        class FakeEventSource {{
+          static instances = [];
+          constructor(url) {{
+            this.url = url;
+            this.closed = false;
+            this.listeners = new Map();
+            FakeEventSource.instances.push(this);
+          }}
+          addEventListener(name, listener) {{ this.listeners.set(name, listener); }}
+          emit(name, data = undefined) {{ this.listeners.get(name)?.({{ data }}); }}
+          close() {{ this.closed = true; }}
+        }}
+
+        let requestSignal;
+        const store = createSnapshotStore({{ scheduleNotification: (callback) => callback() }});
+        const controller = new AbortController();
+        const stream = startRevisionStream({{
+          store,
+          signal: controller.signal,
+          fetchSnapshot: ({{ signal }}) => {{
+            requestSignal = signal;
+            return new Promise(() => undefined);
+          }},
+          EventSourceConstructor: FakeEventSource,
+          setTimeoutFn,
+          clearTimeoutFn,
+          random: () => 0.5,
+          requestTimeoutMs: 250,
+          pollIntervalMs: 5000,
+        }});
+
+        assert.equal(FakeEventSource.instances.length, 1);
+        assert.equal(FakeEventSource.instances[0].url, "/api/v1/predictions-events");
+        FakeEventSource.instances[0].emit("open");
+        const deadline = [...timers.entries()].find(([_id, item]) => item.delay === 250);
+        assert.ok(deadline);
+        timers.delete(deadline[0]);
+        deadline[1].callback();
+        await stream.ready;
+        assert.equal(requestSignal.aborted, true);
+        assert.equal(store.getState().snapshot, null);
+        assert.equal(store.getState().connectionState, DEGRADED);
+        assert.equal([...timers.values()].some((item) => item.delay === 5000), true);
+        controller.abort();
+        """
+    )
+
+
+def test_stream_manually_retries_only_event_source_construction_failures(
+    tmp_path: Path,
+) -> None:
+    uri = module_bundle_uri(tmp_path, "stream.js", "api.js", "store.js")
+    snapshot = json.dumps(valid_snapshot())
+    run_node_module_test(
+        f"""
+        import assert from "node:assert/strict";
+        import {{ createSnapshotStore }} from {json.dumps((tmp_path / "store.mjs").as_uri())};
+        import {{ startRevisionStream }} from {json.dumps(uri)};
+
+        let constructionAttempts = 0;
+        const sources = [];
+        class ConstructionFlakyEventSource {{
+          constructor(url) {{
+            constructionAttempts += 1;
+            if (constructionAttempts === 1) throw new Error("CONSTRUCTION-CANARY");
+            this.url = url;
+            this.closed = false;
+            this.listeners = new Map();
+            sources.push(this);
+          }}
+          addEventListener(name, listener) {{ this.listeners.set(name, listener); }}
+          emit(name, data = undefined) {{ this.listeners.get(name)?.({{ data }}); }}
+          close() {{ this.closed = true; }}
+        }}
+        let timerId = 0;
+        const timers = new Map();
+        const setTimeoutFn = (callback, delay) => {{
+          timerId += 1;
+          timers.set(timerId, {{ callback, delay }});
+          return timerId;
+        }};
+        const controller = new AbortController();
+        const stream = startRevisionStream({{
+          store: createSnapshotStore({{ scheduleNotification: (callback) => callback() }}),
+          signal: controller.signal,
+          fetchSnapshot: () => Promise.resolve(structuredClone({snapshot})),
+          EventSourceConstructor: ConstructionFlakyEventSource,
+          setTimeoutFn,
+          clearTimeoutFn: (id) => timers.delete(id),
+          random: () => 0.5,
+          reconnectBaseMs: 1000,
+          reconnectCeilingMs: 16000,
+        }});
+        await stream.ready;
+        assert.equal(sources.length, 0);
+        const retry = [...timers.entries()].find(([_id, item]) => item.delay === 1000);
+        assert.ok(retry);
+        timers.delete(retry[0]);
+        retry[1].callback();
+        assert.equal(sources.length, 1);
+        sources[0].emit("error");
+        assert.equal(sources[0].closed, false);
+        assert.equal(constructionAttempts, 2);
+        assert.equal([...timers.values()].some((item) => item.delay === 2000), false);
+        controller.abort();
         """
     )
 
@@ -824,7 +1115,7 @@ def test_charts_create_accessible_bounded_svg_nodes_and_explicit_fallbacks(
         assert.equal(redacted.tagName, "p");
         assert.match(redacted.textContent, /unavailable/i);
 
-        const sparkline = sparklineSvg([-1e300, 0, 1e300], {{
+        const sparkline = sparklineSvg([-Number.MAX_VALUE, 0, Number.MAX_VALUE], {{
           documentRef,
           title: "Observed evidence cadence",
           description: "Three bounded observations.",
@@ -945,6 +1236,22 @@ def test_all_five_views_render_complete_observer_evidence_without_action_afforda
         assert.match(overviewText, /5s ago/);
         const postureValue = nodes(overview).find((node) => node.textContent === "LIVE_DISABLED");
         assert.match(postureValue.className, /metric-card__value--token/);
+
+        const zeroCheckpointSnapshot = structuredClone(snapshot);
+        zeroCheckpointSnapshot.live_ledger.reconciliation_count = 0;
+        zeroCheckpointSnapshot.live_ledger.complete_reconciliation_count = 0;
+        zeroCheckpointSnapshot.live_ledger.incomplete_reconciliation_count = 0;
+        const zeroCheckpointOverview = makeRoot();
+        renderOverview(zeroCheckpointOverview, zeroCheckpointSnapshot, context);
+        assert.match(textTree(zeroCheckpointOverview), /Reconciliation\s+UNAVAILABLE/);
+        assert.match(textTree(zeroCheckpointOverview), /NO CHECKPOINT/);
+
+        const incompleteSnapshot = structuredClone(snapshot);
+        incompleteSnapshot.live_ledger.complete_reconciliation_count = 0;
+        incompleteSnapshot.live_ledger.incomplete_reconciliation_count = 1;
+        const incompleteOverview = makeRoot();
+        renderOverview(incompleteOverview, incompleteSnapshot, context);
+        assert.match(textTree(incompleteOverview), /Reconciliation\s+INCOMPLETE/);
 
         const markets = makeRoot();
         renderMarkets(markets, snapshot, context);

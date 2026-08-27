@@ -14,6 +14,7 @@ from polytrading.predictions.dashboard_live import (
     DashboardRevision,
     DashboardRevisionBuffer,
     DashboardRevisionPublisher,
+    DashboardSnapshotUnavailable,
     changed_dashboard_domains,
     deterministic_dashboard_revision,
 )
@@ -240,6 +241,38 @@ def test_publisher_poll_once_suppresses_duplicates_and_uses_injected_clock(
     assert publisher.poll_once() is None
     last = publisher.poll_once()
     assert last is not None and last.emitted_at == NOW + timedelta(seconds=3)
+    publisher.close()
+
+
+def test_publisher_owns_the_exact_latest_snapshot_without_widening_the_metadata_buffer(
+    snapshot: PredictionDashboardSnapshot,
+) -> None:
+    first = _revision(snapshot, 1)
+    second = _revision(snapshot, 2)
+    snapshots = iter((first, first, second))
+    buffer = DashboardRevisionBuffer(capacity=4, clock=lambda: NOW)
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=lambda: next(snapshots),
+        revision_buffer=buffer,
+        interval_seconds=1,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(DashboardSnapshotUnavailable, match="SNAPSHOT_UNAVAILABLE"):
+        publisher.latest_snapshot()
+
+    first_event = publisher.poll_once()
+    assert first_event is not None
+    assert publisher.latest_snapshot() is first
+    assert publisher.poll_once() is None
+    assert publisher.latest_snapshot() is first
+    second_event = publisher.poll_once()
+    assert second_event is not None
+    assert publisher.latest_snapshot() is second
+    assert second_event.revision_id == second.revision_id
+    assert not any(
+        isinstance(value, PredictionDashboardSnapshot) for value in vars(buffer).values()
+    )
     publisher.close()
 
 

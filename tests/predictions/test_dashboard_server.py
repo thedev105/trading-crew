@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from io import BytesIO
 from pathlib import Path
@@ -9,7 +9,10 @@ import pytest
 import polytrading.predictions.dashboard_live as prediction_dashboard_live
 import polytrading.predictions.dashboard_server as prediction_dashboard_server
 from polytrading.predictions.dashboard import PredictionDashboardBuilder
-from polytrading.predictions.dashboard_live import DashboardRevisionBuffer
+from polytrading.predictions.dashboard_live import (
+    DashboardRevisionBuffer,
+    DashboardRevisionPublisher,
+)
 from polytrading.predictions.dashboard_models import PredictionDashboardSnapshot
 from polytrading.predictions.dashboard_server import (
     PredictionDashboardApplication,
@@ -82,15 +85,70 @@ def test_existing_dashboard_equally_rejects_a_fresh_predictions_database(tmp_pat
         validate_dashboard_database(predictions_db)
 
 
-def test_dashboard_response_rejects_a_naive_clock(tmp_path: Path) -> None:
+def test_dashboard_response_is_unavailable_before_first_publisher_snapshot(tmp_path: Path) -> None:
     database = tmp_path / "predictions.duckdb"
     PredictionMarketStore(database).close()
-    application = PredictionDashboardApplication(database, clock=lambda: datetime(2026, 8, 16, 12))
+    buffer = DashboardRevisionBuffer(capacity=2, clock=lambda: NOW)
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=lambda: (_ for _ in ()).throw(AssertionError("factory must not run")),
+        revision_buffer=buffer,
+        interval_seconds=1,
+        clock=lambda: NOW,
+    )
+    application = PredictionDashboardApplication(
+        database,
+        clock=lambda: (_ for _ in ()).throw(AssertionError("GET must not rebuild")),
+        revision_buffer=buffer,
+        snapshot_provider=publisher.latest_snapshot,
+    )
 
     response = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1")
 
-    assert response.status.value == 503
-    assert b"DATABASE_UNAVAILABLE" in response.body
+    assert response.status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert json.loads(response.body) == {"error": {"code": "SNAPSHOT_UNAVAILABLE"}}
+    publisher.close()
+
+
+def test_published_event_and_advancing_clock_gets_share_one_exact_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    build_times = iter((NOW, NOW + timedelta(seconds=1), NOW + timedelta(seconds=2)))
+    build_calls: list[datetime] = []
+
+    def build_once() -> PredictionDashboardSnapshot:
+        cutoff = next(build_times)
+        build_calls.append(cutoff)
+        return prediction_dashboard_server.build_prediction_dashboard_snapshot(database, now=cutoff)
+
+    buffer = DashboardRevisionBuffer(capacity=2, clock=lambda: NOW)
+    publisher = DashboardRevisionPublisher(
+        snapshot_factory=build_once,
+        revision_buffer=buffer,
+        interval_seconds=1,
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    application = PredictionDashboardApplication(
+        database,
+        clock=lambda: (_ for _ in ()).throw(AssertionError("GET must not rebuild")),
+        revision_buffer=buffer,
+        snapshot_provider=publisher.latest_snapshot,
+    )
+
+    event = publisher.poll_once()
+    assert event is not None
+    event_response = application.respond("GET", "/api/v1/predictions-events", "127.0.0.1")
+    first = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1")
+    second = application.respond("GET", "/api/v1/predictions-dashboard", "127.0.0.1")
+
+    event_document = json.loads(event_response.body.split(b"data: ", 1)[1])
+    first_document = json.loads(first.body)
+    assert first.status == second.status == HTTPStatus.OK
+    assert first.body == second.body
+    assert event_document["revision_id"] == first_document["revision_id"] == event.revision_id
+    assert build_calls == [NOW]
+    publisher.close()
 
 
 def test_serve_prediction_dashboard_stops_cleanly_on_keyboard_interrupt(
@@ -152,7 +210,10 @@ def test_serve_prediction_dashboard_sanitizes_a_server_failure(
 def test_head_has_get_parity_and_no_body(tmp_path: Path, path: str) -> None:
     database = tmp_path / "predictions.duckdb"
     PredictionMarketStore(database).close()
-    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+    snapshot = prediction_dashboard_server.build_prediction_dashboard_snapshot(database, now=NOW)
+    application = PredictionDashboardApplication(
+        database, clock=lambda: NOW, snapshot_provider=lambda: snapshot
+    )
 
     get_response = application.respond("GET", path, "127.0.0.1")
     head_response = application.respond("HEAD", path, "127.0.0.1")
@@ -221,10 +282,11 @@ def test_sse_emits_exact_compact_revision_metadata_only(tmp_path: Path) -> None:
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["X-Accel-Buffering"] == "no"
     lines = response.body.decode("utf-8").splitlines()
-    assert lines[0] == "id: 1"
-    assert lines[1] == "event: revision"
-    assert lines[2].startswith("data: {")
-    document = json.loads(lines[2].removeprefix("data: "))
+    assert lines[0] == "retry: 3000"
+    assert lines[1] == "id: 1"
+    assert lines[2] == "event: revision"
+    assert lines[3].startswith("data: {")
+    document = json.loads(lines[3].removeprefix("data: "))
     assert set(document) == {
         "schema_version",
         "revision_id",
@@ -262,7 +324,7 @@ def test_sse_resume_reset_keepalive_and_coalescing(tmp_path: Path) -> None:
     )
 
     reset = application.respond("GET", "/api/v1/predictions-events", "127.0.0.1", last_event_id="1")
-    assert reset.body.startswith(b"id: 3\nevent: reset\ndata: ")
+    assert reset.body.startswith(b"retry: 3000\nid: 3\nevent: reset\ndata: ")
     reset_data = json.loads(reset.body.split(b"data: ", 1)[1])
     assert set(reset_data) == {
         "schema_version",
@@ -451,19 +513,38 @@ def test_server_publishes_synchronously_before_starting_or_listening(
     database = tmp_path / "predictions.duckdb"
     PredictionMarketStore(database).close()
     calls: list[str] = []
+    publisher_instance = None
 
     class StubPublisher:
         def __init__(self, **_kwargs: object) -> None:
-            pass
+            nonlocal publisher_instance
+            publisher_instance = self
 
         def poll_once(self) -> None:
             calls.append("poll")
+
+        def latest_snapshot(self) -> PredictionDashboardSnapshot:
+            raise AssertionError("server should not request during construction")
 
         def start(self) -> None:
             calls.append("start")
 
         def close(self) -> None:
             calls.append("publisher-close")
+
+    class StubApplication:
+        def __init__(
+            self,
+            _database_path: Path,
+            _clock: object = None,
+            *,
+            clock: object = None,
+            revision_buffer: object,
+            snapshot_provider: object,
+        ) -> None:
+            del self, _clock, clock, revision_buffer
+            assert publisher_instance is not None
+            assert snapshot_provider == publisher_instance.latest_snapshot
 
     class StubServer:
         server_port = 8787
@@ -478,6 +559,9 @@ def test_server_publishes_synchronously_before_starting_or_listening(
             calls.append("server-close")
 
     monkeypatch.setattr(prediction_dashboard_server, "DashboardRevisionPublisher", StubPublisher)
+    monkeypatch.setattr(
+        prediction_dashboard_server, "PredictionDashboardApplication", StubApplication
+    )
     monkeypatch.setattr(prediction_dashboard_server, "ThreadingHTTPServer", StubServer)
 
     serve_prediction_dashboard(database, 8787, clock=lambda: NOW)

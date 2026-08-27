@@ -316,9 +316,11 @@ class DashboardRevisionPublisher:
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._stop = Event()
         self._lifecycle_lock = Lock()
+        self._publication_lock = Lock()
         self._thread: Thread | None = None
         self._closed = False
         self._failure_code: str | None = None
+        self._latest_snapshot: PredictionDashboardSnapshot | None = None
 
     @property
     def running(self) -> bool:
@@ -329,6 +331,23 @@ class DashboardRevisionPublisher:
     def failure_code(self) -> str | None:
         with self._lifecycle_lock:
             return self._failure_code
+
+    def latest_snapshot(self) -> PredictionDashboardSnapshot:
+        with self._publication_lock:
+            if self._latest_snapshot is None:
+                raise DashboardSnapshotUnavailable("SNAPSHOT_UNAVAILABLE")
+            return self._latest_snapshot
+
+    def _publish_snapshot(
+        self,
+        snapshot: PredictionDashboardSnapshot,
+        *,
+        emitted_at: datetime,
+    ) -> DashboardRevision | None:
+        with self._publication_lock:
+            revision = self._buffer.publish(snapshot, emitted_at=emitted_at)
+            self._latest_snapshot = snapshot
+            return revision
 
     def poll_once(self) -> DashboardRevision | None:
         failure_code: str | None = None
@@ -346,7 +365,7 @@ class DashboardRevisionPublisher:
         if failure_code is None:
             try:
                 assert snapshot is not None and emitted_at is not None
-                revision = self._buffer.publish(snapshot, emitted_at=emitted_at)
+                revision = self._publish_snapshot(snapshot, emitted_at=emitted_at)
             except Exception:
                 failure_code = "SNAPSHOT_INVALID"
         if failure_code is not None:
@@ -395,7 +414,7 @@ class DashboardRevisionPublisher:
             self._buffer.close()
             return False
         try:
-            self._buffer.publish(snapshot, emitted_at=emitted_at)
+            self._publish_snapshot(snapshot, emitted_at=emitted_at)
         except Exception:
             if self._stop.is_set():
                 return False

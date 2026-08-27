@@ -56,7 +56,14 @@ function boundedCoordinate(value, minimum, maximum, start, extent) {
   if (maximum === minimum) {
     return start + extent / 2;
   }
-  const ratio = Math.min(1, Math.max(0, (value - minimum) / (maximum - minimum)));
+  const scale = Math.max(1, Math.abs(minimum), Math.abs(maximum));
+  const scaledMinimum = minimum / scale;
+  const scaledMaximum = maximum / scale;
+  const scaledValue = value / scale;
+  const ratio = Math.min(
+    1,
+    Math.max(0, (scaledValue - scaledMinimum) / (scaledMaximum - scaledMinimum)),
+  );
   return start + ratio * extent;
 }
 

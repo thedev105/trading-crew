@@ -192,7 +192,14 @@ export function renderOverview(root, snapshot, context = {}) {
   const dom = domFor(context);
   const now = context.now ?? Date.now;
   const unknownCount = snapshot.execution_timeline.filter((entry) => entry.state === "UNKNOWN").length;
+  const reconciliations = snapshot.live_ledger.reconciliation_count;
   const incomplete = snapshot.live_ledger.incomplete_reconciliation_count;
+  const reconciliationState = reconciliations === 0
+    ? "UNAVAILABLE"
+    : incomplete === 0 ? "COMPLETE" : "INCOMPLETE";
+  const reconciliationDetail = reconciliations === 0
+    ? "NO CHECKPOINT · no authoritative reconciliation observed"
+    : `${snapshot.live_ledger.complete_reconciliation_count} complete · ${incomplete} incomplete`;
   const metrics = element(dom, "section", "metric-grid", null);
   metrics.setAttribute("aria-label", "Operating posture metrics");
   metrics.append(
@@ -219,9 +226,9 @@ export function renderOverview(root, snapshot, context = {}) {
     metricCard(
       dom,
       "Reconciliation",
-      incomplete === 0 ? "COMPLETE" : "INCOMPLETE",
-      `${snapshot.live_ledger.complete_reconciliation_count} complete · ${incomplete} incomplete`,
-      incomplete === 0 ? "healthy" : "fault",
+      reconciliationState,
+      reconciliationDetail,
+      reconciliations === 0 ? "warning" : incomplete === 0 ? "healthy" : "fault",
     ),
   );
 
