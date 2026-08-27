@@ -26,6 +26,7 @@ from polytrading.predictions.execution.ledger import (
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     LiveReconciliation,
+    VenueOrderEvent,
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
@@ -53,6 +54,7 @@ FEE_HASH = "3" * 64
 SOURCE_HASH = "4" * 64
 BALANCE_HASH = "5" * 64
 COST_BASIS_HASH = "6" * 64
+ORDER_HASH = "7" * 64
 
 
 class ScriptedSequence(Sequence[object]):
@@ -142,6 +144,34 @@ def trade_event(
         received_at=received_at,
         sequence_number=sequence_number,
         protocol_version=source_intent.protocol_version,
+        lineage_hashes=(raw_event_hash,),
+    )
+
+
+def order_event(
+    source_intent: ExecutionIntent,
+    *,
+    event_id: UUID | None = None,
+    venue_order_id: str = ORDER_ID,
+    raw_event_hash: str = ORDER_HASH,
+    received_at: datetime = NOW + timedelta(milliseconds=500),
+    protocol_version: str | None = None,
+) -> VenueOrderEvent:
+    return VenueOrderEvent(
+        schema_version=1,
+        event_id=event_id or UUID("42b33848-ff46-4c45-b9ab-0c74510687e0"),
+        venue="polymarket",
+        raw_event_hash=raw_event_hash,
+        source_channel="recovery_read",
+        venue_order_id=venue_order_id,
+        intent_id=source_intent.intent_id,
+        original_venue_state=VenueOrderState.RECONCILED.value,
+        normalized_state=VenueOrderState.RECONCILED,
+        terminal=True,
+        venue_timestamp=received_at,
+        received_at=received_at,
+        sequence_number=None,
+        protocol_version=protocol_version or source_intent.protocol_version,
         lineage_hashes=(raw_event_hash,),
     )
 
@@ -458,13 +488,22 @@ def test_total_snapshot_pnl_iterates_every_caller_collection_exactly_once() -> N
     source_intent = intent()
     exact = exact_economics(source_intent, realized_pnl=Decimal("1.25"))
     event = trade_event(source_intent)
+    order = order_event(source_intent)
     postings = postings_for_confirmed_trades((source_intent,), (event,), (exact,))
     snapshot = snapshot_for(source_intent, exact)
-    closed = reconcile_live_account(postings, snapshot, (source_intent,), (event,), (exact,))
+    closed = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+        (order,),
+    )
     posting_values = ScriptedSequence((postings, ()))
     intent_values = ScriptedSequence(((source_intent,), ()))
     trade_values = ScriptedSequence(((event,), ()))
     economics_values = ScriptedSequence(((exact,), ()))
+    order_values = ScriptedSequence(((order,), ()))
 
     assert reconciled_live_pnl(
         posting_values,  # type: ignore[arg-type]
@@ -473,11 +512,18 @@ def test_total_snapshot_pnl_iterates_every_caller_collection_exactly_once() -> N
         intent_values,  # type: ignore[arg-type]
         trade_values,  # type: ignore[arg-type]
         economics_values,  # type: ignore[arg-type]
+        order_values,  # type: ignore[arg-type]
     ) == Decimal("1.25")
     assert tuple(
         values.iterations
-        for values in (posting_values, intent_values, trade_values, economics_values)
-    ) == (1, 1, 1, 1)
+        for values in (
+            posting_values,
+            intent_values,
+            trade_values,
+            economics_values,
+            order_values,
+        )
+    ) == (1, 1, 1, 1, 1)
 
 
 def test_total_snapshot_revalidates_an_alias_mutated_after_it_is_yielded() -> None:
@@ -554,6 +600,256 @@ def test_reconciliation_hash_families_separate_raw_events_and_account_reads() ->
     assert BALANCE_HASH in result.balance_hashes
     assert snapshot.opening_allowance_source_hash in result.allowance_hashes
     assert not set(result.venue_trade_hashes) & set(result.evidence_hashes)
+
+
+def test_canonical_reconciliation_binds_exact_order_history_into_identity() -> None:
+    source_intent, exact, postings = exact_postings()
+    snapshot = snapshot_for(source_intent, exact)
+    event = trade_event(source_intent)
+    first_order = order_event(source_intent)
+    second_order = order_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+        venue_order_id="venue-order-2",
+        raw_event_hash=evidence_hash(80),
+        received_at=NOW + timedelta(milliseconds=750),
+    )
+
+    forward = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+        (second_order, first_order, first_order),
+    )
+    reverse = reconcile_live_account(
+        tuple(reversed(postings)),
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+        (first_order, second_order),
+    )
+    orderless = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (event,),
+        (exact,),
+    )
+
+    assert forward == reverse
+    assert forward.complete
+    assert forward.venue_order_hashes == tuple(sorted((ORDER_HASH, evidence_hash(80))))
+    assert forward.reconciliation_id != orderless.reconciliation_id
+    assert orderless.venue_order_hashes == ()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "malformed",
+        "orphan",
+        "cross_account",
+        "future",
+        "before_intent",
+        "protocol_mismatch",
+        "conflicting_event_id",
+        "raw_hash_reuse",
+        "venue_order_crosses_intent",
+    ],
+)
+def test_canonical_reconciliation_rejects_invalid_order_history(
+    defect: str,
+) -> None:
+    source_intent, exact, postings = exact_postings()
+    snapshot = snapshot_for(source_intent, exact)
+    supplied_intents = (source_intent,)
+    first = order_event(source_intent)
+    supplied_orders: object = (first,)
+    expected_hashes = (ORDER_HASH,)
+    if defect == "malformed":
+        supplied_orders = (object(),)
+        expected_hashes = ()
+    elif defect == "orphan":
+        supplied_orders = (first.model_copy(update={"intent_id": None}),)
+    elif defect == "cross_account":
+        other_intent = intent(
+            account_fingerprint="b" * 64,
+            leg_sequence=1,
+            token_id="217427",
+        )
+        supplied_intents = (source_intent, other_intent)
+        supplied_orders = (order_event(other_intent),)
+    elif defect == "future":
+        supplied_orders = (
+            order_event(
+                source_intent, received_at=snapshot.observed_at + timedelta(microseconds=1)
+            ),
+        )
+    elif defect == "before_intent":
+        supplied_orders = (
+            order_event(
+                source_intent,
+                received_at=source_intent.created_at - timedelta(microseconds=1),
+            ),
+        )
+    elif defect == "protocol_mismatch":
+        supplied_orders = (order_event(source_intent, protocol_version="other-protocol"),)
+    elif defect == "conflicting_event_id":
+        supplied_orders = (
+            first,
+            order_event(
+                source_intent,
+                event_id=first.event_id,
+                raw_event_hash=evidence_hash(81),
+                received_at=NOW + timedelta(milliseconds=750),
+            ),
+        )
+        expected_hashes = tuple(sorted((ORDER_HASH, evidence_hash(81))))
+    elif defect == "raw_hash_reuse":
+        supplied_orders = (
+            first,
+            order_event(
+                source_intent,
+                event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+                venue_order_id="venue-order-2",
+                raw_event_hash=ORDER_HASH,
+                received_at=NOW + timedelta(milliseconds=750),
+            ),
+        )
+    elif defect == "venue_order_crosses_intent":
+        other_intent = intent(leg_sequence=1, token_id="217427")
+        supplied_intents = (source_intent, other_intent)
+        supplied_orders = (
+            first,
+            order_event(
+                other_intent,
+                event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+                raw_event_hash=evidence_hash(81),
+                received_at=NOW + timedelta(milliseconds=750),
+            ),
+        )
+        expected_hashes = tuple(sorted((ORDER_HASH, evidence_hash(81))))
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        supplied_intents,
+        (trade_event(source_intent),),
+        (exact,),
+        supplied_orders,  # type: ignore[arg-type]
+    )
+
+    assert not result.complete
+    assert result.differences == ("ORDER_HISTORY_INVALID",)
+    assert result.next_action == "HALT_AND_RECONCILE"
+    assert result.venue_order_hashes == expected_hashes
+
+
+def test_reconciliation_snapshots_order_history_before_caller_mutation() -> None:
+    source_intent, exact, postings = exact_postings()
+    snapshot = snapshot_for(source_intent, exact)
+    mutable_order = order_event(source_intent)
+
+    class MutatingOrderSequence(Sequence[object]):
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int) -> object:
+            del index
+            raise IndexError
+
+        def __iter__(self) -> Iterator[object]:
+            yield mutable_order
+            object.__setattr__(mutable_order, "raw_event_hash", "not-a-hash")
+
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+        MutatingOrderSequence(),
+    )
+
+    assert not result.complete
+    assert result.differences == ("ORDER_HISTORY_INVALID",)
+    assert result.venue_order_hashes == ()
+
+
+def test_pnl_reconstruction_requires_exact_order_history() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    trade = trade_event(source_intent)
+    order = order_event(source_intent)
+    reconciliation = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (order,),
+    )
+    extra = order_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+        venue_order_id="venue-order-2",
+        raw_event_hash=evidence_hash(81),
+        received_at=NOW + timedelta(milliseconds=750),
+    )
+    mismatched = order.model_copy(
+        update={
+            "raw_event_hash": evidence_hash(82),
+            "lineage_hashes": (evidence_hash(82),),
+        }
+    )
+
+    assert reconciled_live_pnl(
+        postings,
+        reconciliation,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (order,),
+    ) == Decimal("1.25")
+    assert (
+        reconciled_live_pnl(
+            postings,
+            reconciliation,
+            snapshot,
+            (source_intent,),
+            (trade,),
+            (exact,),
+        )
+        is None
+    )
+    assert (
+        reconciled_live_pnl(
+            postings,
+            reconciliation,
+            snapshot,
+            (source_intent,),
+            (trade,),
+            (exact,),
+            (order, extra),
+        )
+        is None
+    )
+    assert (
+        reconciled_live_pnl(
+            postings,
+            reconciliation,
+            snapshot,
+            (source_intent,),
+            (trade,),
+            (exact,),
+            (mismatched,),
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

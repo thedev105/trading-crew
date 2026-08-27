@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from polytrading.predictions.dashboard import PredictionDashboardBuilder
 from polytrading.predictions.execution.coordinator import (
     CoordinatorCode,
     ExecutionCoordinator,
@@ -2364,6 +2365,7 @@ def _persist_honest_task11_checkpoint(
         (source_intent,),
         trade_events,
         (exact,),
+        (order_event,),
     )
     assert reconciliation.complete
     store.append_live_execution_plan(plan)
@@ -2405,6 +2407,43 @@ def test_reopened_startup_accepts_honest_task11_checkpoint(tmp_path: Path) -> No
     assert report.code is CoordinatorCode.RECOVERY_COMPLETE
     assert report.blocked_intent_ids == ()
     reopened.close()
+
+
+def test_canonical_task11_checkpoint_is_observable_by_dashboard(tmp_path: Path) -> None:
+    path = tmp_path / "canonical-task11-dashboard.duckdb"
+    store = PredictionMarketStore(path)
+    _persist_honest_task11_checkpoint(store)
+
+    snapshot = PredictionDashboardBuilder(store, path).build(NOW + timedelta(seconds=1))
+
+    assert snapshot.live_ledger.reconciliation_count == 1
+    assert snapshot.live_ledger.complete_reconciliation_count == 1
+    store.close()
+
+
+@pytest.mark.parametrize("family", ["venue_order_hashes", "allowance_hashes"])
+def test_startup_rejects_task11_checkpoint_with_missing_required_hash_family(
+    store: PredictionMarketStore,
+    family: str,
+) -> None:
+    plan, _, _, _, reconciliation = _persist_honest_task11_checkpoint(store)
+    corrupt = reconciliation.model_copy(update={family: ()})
+    payload, record_hash = _stored_record(corrupt)
+    store._connection.execute(
+        "UPDATE live_reconciliations SET record_json = ?, record_hash = ? "
+        "WHERE reconciliation_id = ?",
+        [payload, record_hash, reconciliation.reconciliation_id],
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids != ()
 
 
 @pytest.mark.parametrize(
@@ -3121,6 +3160,9 @@ def test_fully_cumulative_later_complete_checkpoint_closes_the_economics_tail(
 ) -> None:
     plan, first_intent, first_exact, _, _ = _persist_honest_task11_checkpoint(store)
     second_intent, second_order, second_trade, second_exact = _task11_tail_records(plan)
+    first_order = store.verified_venue_order_events_for_intent(
+        first_intent.intent_id, second_exact.information_cutoff
+    )[0]
     first_trade = store.verified_venue_trade_events_for_intent(
         first_intent.intent_id, second_exact.information_cutoff
     )[0]
@@ -3196,7 +3238,14 @@ def test_fully_cumulative_later_complete_checkpoint_closes_the_economics_tail(
         recent_trades_source_hash=f"{315:064x}",
         settlements_source_hash=f"{316:064x}",
     )
-    reconciliation = reconcile_live_account(postings, snapshot, intents, trades, economics)
+    reconciliation = reconcile_live_account(
+        postings,
+        snapshot,
+        intents,
+        trades,
+        economics,
+        (first_order, second_order),
+    )
     assert reconciliation.complete
     store.append_execution_intent(second_intent)
     store.append_venue_order_event(second_order)

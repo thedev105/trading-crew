@@ -2206,11 +2206,12 @@ class ExecutionCoordinator:
                         or any(
                             history.confirmed_terminal is None for history in classified_histories
                         )
-                        or not set(reconciliation.venue_order_hashes) <= bounded_order_hashes
+                        or set(reconciliation.venue_order_hashes) != bounded_order_hashes
                         or set(reconciliation.venue_trade_hashes) != classified_trade_hashes
                         or not exact_trade_hashes <= classified_trade_hashes
                         or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
                         or not exact_balance_hashes <= set(reconciliation.balance_hashes)
+                        or not reconciliation.allowance_hashes
                         or not _hash_families_are_pairwise_disjoint(
                             reconciliation.venue_order_hashes,
                             reconciliation.venue_trade_hashes,

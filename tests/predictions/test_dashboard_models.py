@@ -1383,6 +1383,7 @@ def test_snapshot_candidates_latest_is_newest_first_and_capped_at_twenty(tmp_pat
             candidate_relationship(
                 candidate_id=UUID(int=offset + 1),
                 observed_at=NOW - timedelta(minutes=25 - offset),
+                information_cutoff=NOW - timedelta(minutes=25 - offset),
             )
         )
     snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
@@ -2261,6 +2262,98 @@ def test_market_atlas_rejects_temporally_inverted_candidate_proof_report_chain(
 
     with pytest.raises(ValueError, match="temporal"):
         PredictionDashboardBuilder(store, tmp_path / "inverted-opportunity.duckdb").build(NOW)
+
+
+@pytest.mark.parametrize(
+    "inversion",
+    ["candidate", "proof", "proof_report", "proofless_report", "masked_report"],
+)
+def test_market_atlas_rejects_every_intrinsic_cutoff_observation_inversion(
+    inversion: str,
+    tmp_path: Path,
+) -> None:
+    candidate_observed = NOW - timedelta(minutes=10)
+    proof_observed = NOW - timedelta(minutes=8)
+    report_observed = NOW - timedelta(minutes=6)
+    candidate = candidate_relationship(
+        candidate_id=UUID(int=82_301),
+        observed_at=candidate_observed,
+        information_cutoff=(
+            candidate_observed + timedelta(minutes=1)
+            if inversion == "candidate"
+            else candidate_observed
+        ),
+    )
+    proof = proof_artifact(
+        proof_id=UUID(int=82_401),
+        candidate_id=candidate.candidate_id,
+        observed_at=proof_observed,
+        information_cutoff=(
+            proof_observed + timedelta(minutes=1) if inversion == "proof" else proof_observed
+        ),
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=None if inversion == "proofless_report" else proof.proof_id,
+        reason=f"intrinsic {inversion}",
+        observed_at=report_observed,
+        as_of=(
+            report_observed + timedelta(minutes=1)
+            if inversion in {"proof_report", "proofless_report", "masked_report"}
+            else report_observed
+        ),
+    )
+    database = tmp_path / f"intrinsic-{inversion}.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate)
+    if inversion != "proofless_report":
+        store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+    if inversion == "masked_report":
+        store.append_scan_report(
+            scan_report(
+                candidate_id=candidate.candidate_id,
+                proof_id=proof.proof_id,
+                reason="newer valid report",
+                observed_at=NOW - timedelta(minutes=2),
+                as_of=NOW - timedelta(minutes=2),
+            )
+        )
+
+    with pytest.raises(ValueError, match="temporal"):
+        PredictionDashboardBuilder(store, database).build(NOW)
+
+
+def test_market_atlas_accepts_intrinsic_cutoff_observation_equality(tmp_path: Path) -> None:
+    candidate_time = NOW - timedelta(minutes=10)
+    proof_time = NOW - timedelta(minutes=8)
+    report_time = NOW - timedelta(minutes=6)
+    candidate = candidate_relationship(
+        candidate_id=UUID(int=82_302),
+        observed_at=candidate_time,
+        information_cutoff=candidate_time,
+    )
+    proof = proof_artifact(
+        proof_id=UUID(int=82_402),
+        candidate_id=candidate.candidate_id,
+        observed_at=proof_time,
+        information_cutoff=proof_time,
+    )
+    report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        observed_at=report_time,
+        as_of=report_time,
+    )
+    database = tmp_path / "intrinsic-equality.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(report)
+
+    snapshot = PredictionDashboardBuilder(store, database).build(NOW)
+
+    assert len(snapshot.opportunities) == 1
 
 
 def _append_execution_timeline_facts(

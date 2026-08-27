@@ -26,6 +26,7 @@ from polytrading.predictions.execution.ledger import (
     _bounded_decimal,
     _classify_trade_histories,
     _decimal_resource_components,
+    _dedupe_records,
     _exact_add,
     _exact_difference,
     _ExactArithmeticError,
@@ -40,6 +41,7 @@ from polytrading.predictions.execution.models import (
     ExecutionIntent,
     LiveLedgerPosting,
     LiveReconciliation,
+    VenueOrderEvent,
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
@@ -430,6 +432,55 @@ def _snapshot_postings(
     return result
 
 
+def _snapshot_order_history(
+    order_history: Sequence[VenueOrderEvent],
+    intents: tuple[ExecutionIntent, ...],
+    snapshot: VenueAccountSnapshot,
+) -> tuple[tuple[Sha256, ...], bool]:
+    try:
+        values = _snapshot_sequence(order_history, VenueOrderEvent, "ORDER_EVENT_INVALID")
+    except LiveLedgerError:
+        return (), False
+    hashes = tuple(sorted({event.raw_event_hash for event in values}))
+    try:
+        events = _dedupe_records(
+            values,
+            identity=lambda event: event.event_id,
+            conflict_code="ORDER_EVENT_CONFLICT",
+        )
+    except LiveLedgerError:
+        return hashes, False
+
+    intents_by_id = {intent.intent_id: intent for intent in intents}
+    event_ids_by_hash: dict[Sha256, UUID] = {}
+    intent_ids_by_order: dict[str, UUID | None] = {}
+    valid = True
+    for event in events:
+        if (
+            event.raw_event_hash in event_ids_by_hash
+            and event_ids_by_hash[event.raw_event_hash] != event.event_id
+        ):
+            valid = False
+        else:
+            event_ids_by_hash[event.raw_event_hash] = event.event_id
+        if (
+            event.venue_order_id in intent_ids_by_order
+            and intent_ids_by_order[event.venue_order_id] != event.intent_id
+        ):
+            valid = False
+        else:
+            intent_ids_by_order[event.venue_order_id] = event.intent_id
+
+        intent = None if event.intent_id is None else intents_by_id.get(event.intent_id)
+        if intent is None or (
+            intent.account_fingerprint != snapshot.account_fingerprint
+            or event.protocol_version != intent.protocol_version
+            or not intent.created_at <= event.received_at <= snapshot.observed_at
+        ):
+            valid = False
+    return hashes, valid
+
+
 def _snapshot_evidence(snapshot: VenueAccountSnapshot) -> dict[str, tuple[Sha256, ...]]:
     evidence_hashes = {
         snapshot.snapshot_fingerprint,
@@ -536,12 +587,13 @@ def _result(
     snapshot: VenueAccountSnapshot,
     postings: tuple[LiveLedgerPosting, ...],
     differences: set[str],
+    order_event_hashes: tuple[Sha256, ...] = (),
     trade_event_hashes: tuple[Sha256, ...] = (),
 ) -> LiveReconciliation:
     evidence = _snapshot_evidence(snapshot)
     differences = set(differences)
     if not _hash_families_are_pairwise_disjoint(
-        (),
+        order_event_hashes,
         trade_event_hashes,
         evidence["evidence"],
         evidence["balances"],
@@ -558,7 +610,7 @@ def _result(
         "differences": tuple(sorted(differences)),
         "evidence_hashes": evidence["evidence"],
         "next_action": None if not differences else "HALT_AND_RECONCILE",
-        "venue_order_hashes": (),
+        "venue_order_hashes": tuple(sorted(set(order_event_hashes))),
         "venue_trade_hashes": tuple(sorted(set(trade_event_hashes))),
         "balance_hashes": evidence["balances"],
         "allowance_hashes": evidence["allowances"],
@@ -581,6 +633,7 @@ def reconcile_live_account(
     intents: Sequence[ExecutionIntent],
     trades: Sequence[VenueTradeEvent],
     economics: Sequence[AuthoritativeTradeEconomics],
+    order_history: Sequence[VenueOrderEvent] = (),
 ) -> LiveReconciliation:
     """Close posting effects against independent two-cut authoritative evidence."""
     observed = _snapshot_input(snapshot)
@@ -595,6 +648,12 @@ def reconcile_live_account(
         )
     except LiveLedgerError:
         return _result(observed, (), {"POSTINGS_INVALID"})
+    order_event_hashes, order_history_valid = _snapshot_order_history(
+        order_history,
+        intent_values,
+        observed,
+    )
+    order_differences = set() if order_history_valid else {"ORDER_HISTORY_INVALID"}
     try:
         trade_histories = _classify_trade_histories(trade_values)
         trade_event_hashes = tuple(
@@ -616,7 +675,13 @@ def reconcile_live_account(
             if str(exc) == "TRADE_EVENT_CONFLICT"
             else "POSTINGS_INVALID"
         )
-        return _result(observed, (), {difference}, trade_event_hashes)
+        return _result(
+            observed,
+            (),
+            {difference, *order_differences},
+            order_event_hashes=order_event_hashes,
+            trade_event_hashes=trade_event_hashes,
+        )
     try:
         rows = _snapshot_postings(
             posting_values,
@@ -638,9 +703,17 @@ def reconcile_live_account(
             )
         except LiveLedgerError:
             canonical_rows = ()
-        return _result(observed, canonical_rows, {difference}, trade_event_hashes)
-    differences: set[str] = set()
-    snapshot_evidence = set(_snapshot_evidence(observed)["all"]) | set(trade_event_hashes)
+        return _result(
+            observed,
+            canonical_rows,
+            {difference, *order_differences},
+            order_event_hashes=order_event_hashes,
+            trade_event_hashes=trade_event_hashes,
+        )
+    differences: set[str] = set(order_differences)
+    snapshot_evidence = (
+        set(_snapshot_evidence(observed)["all"]) | set(order_event_hashes) | set(trade_event_hashes)
+    )
     task1_trades_by_trade = {
         history.venue_trade_id: history.confirmed_terminal
         for history in trade_histories
@@ -812,7 +885,13 @@ def reconcile_live_account(
         differences.add(f"TRADE_UNEXPLAINED:{trade_id}")
     for trade_id in sorted(set(settlements) - expected_trade_ids):
         differences.add(f"SETTLEMENT_UNEXPLAINED:{trade_id}")
-    return _result(observed, rows, differences, trade_event_hashes)
+    return _result(
+        observed,
+        rows,
+        differences,
+        order_event_hashes=order_event_hashes,
+        trade_event_hashes=trade_event_hashes,
+    )
 
 
 def reconciled_live_pnl(
@@ -822,6 +901,7 @@ def reconciled_live_pnl(
     intents: Sequence[ExecutionIntent],
     trades: Sequence[VenueTradeEvent],
     economics: Sequence[AuthoritativeTradeEconomics],
+    order_history: Sequence[VenueOrderEvent] = (),
 ) -> Decimal | None:
     """Reconstruct all evidence before publishing explicitly posted realized P&L."""
     if type(reconciliation) is not LiveReconciliation:
@@ -838,6 +918,11 @@ def reconciled_live_pnl(
             AuthoritativeTradeEconomics,
             "ECONOMICS_EVIDENCE_INVALID",
         )
+        order_values = _snapshot_sequence(
+            order_history,
+            VenueOrderEvent,
+            "ORDER_EVENT_INVALID",
+        )
         rows = _snapshot_postings(
             posting_values,
             intent_values,
@@ -850,6 +935,7 @@ def reconciled_live_pnl(
             intent_values,
             trade_values,
             economics_values,
+            order_values,
         )
     except (TypeError, ValueError, LiveLedgerError):
         return None

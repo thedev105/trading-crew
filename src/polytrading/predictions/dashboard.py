@@ -387,6 +387,12 @@ class PredictionDashboardBuilder:
         reports = self._store.verified_scan_reports_as_of(as_of)
         if max(len(candidates), len(proofs), len(reports)) > _MAX_SAFETY_RECORDS:
             raise ValueError("dashboard opportunity evidence limit exceeded")
+        if any(candidate.information_cutoff > candidate.observed_at for candidate in candidates):
+            raise ValueError("candidate intrinsic temporal order is invalid")
+        if any(proof.information_cutoff > proof.observed_at for proof in proofs):
+            raise ValueError("proof intrinsic temporal order is invalid")
+        if any(report.as_of > report.observed_at for report in reports):
+            raise ValueError("scan report intrinsic temporal order is invalid")
         candidates_by_id = {candidate.candidate_id: candidate for candidate in candidates}
         if len(candidates_by_id) != len(candidates):
             raise ValueError("duplicate candidate identity in opportunity evidence")
