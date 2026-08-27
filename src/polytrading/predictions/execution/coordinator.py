@@ -2265,14 +2265,7 @@ class ExecutionCoordinator:
             if intent.intent_id in forced_reasons:
                 blocked.append(intent.intent_id)
                 continue
-            try:
-                history = self._store.verified_venue_order_events_for_intent(
-                    intent.intent_id,
-                    now,
-                )
-            except ConflictingRecordError:
-                blocked.append(intent.intent_id)
-                continue
+            history = order_histories[intent.intent_id]
             latest = history[-1] if history else None
             if latest is None or latest.normalized_state not in unresolved_states:
                 continue

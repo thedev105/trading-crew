@@ -2639,6 +2639,276 @@ def _run_task11_recovery_path(
     return executor.recover_account(ACCOUNT_FINGERPRINT)
 
 
+class _BoundedHistoryRead:
+    def __init__(self, *views: object) -> None:
+        self._views = views
+        self.calls = 0
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        if self.calls >= len(self._views):
+            raise AssertionError("UNBOUNDED_HISTORY_READ")
+        view = self._views[self.calls]
+        self.calls += 1
+        if isinstance(view, BaseException):
+            raise view
+        return view
+
+
+def _install_bounded_history_reads(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    order_views: tuple[object, ...],
+    trade_views: tuple[object, ...],
+) -> tuple[_BoundedHistoryRead, _BoundedHistoryRead]:
+    order_read = _BoundedHistoryRead(*order_views)
+    trade_read = _BoundedHistoryRead(*trade_views)
+    monkeypatch.setattr(store, "verified_venue_order_events_for_intent", order_read)
+    monkeypatch.setattr(store, "verified_venue_trade_events_for_intent", trade_read)
+    return order_read, trade_read
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+def test_followup_immutable_history_never_observes_a_late_order_fault(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    order_history = store.verified_venue_order_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    trade_history = store.verified_venue_trade_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    order_read, trade_read = _install_bounded_history_reads(
+        store,
+        monkeypatch,
+        order_views=(order_history, RuntimeError("hostile late store fault")),
+        trade_views=(trade_history,),
+    )
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+    report: RecoveryReport | None = None
+    unexpected_fault: BaseException | None = None
+    try:
+        report = (
+            executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+            if recovery_path == "startup"
+            else executor.recover_account(ACCOUNT_FINGERPRINT)
+        )
+    except BaseException as error:
+        unexpected_fault = error
+    kill_triggers = tuple(
+        event.trigger
+        for event in store.verified_kill_switch_events(
+            ACCOUNT_FINGERPRINT,
+            NOW + timedelta(seconds=1),
+        )
+    )
+
+    assert (
+        order_read.calls,
+        trade_read.calls,
+        unexpected_fault,
+        None if report is None else report.code,
+        None if report is None else report.blocked_intent_ids,
+        None if report is None else report.kill_reason,
+        kill_triggers,
+        executor.new_intents_blocked,
+    ) == (
+        1,
+        1,
+        None,
+        CoordinatorCode.RECOVERY_COMPLETE,
+        (),
+        None,
+        (),
+        False,
+    )
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+def test_followup_immutable_history_never_observes_a_changed_second_view(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    order_history = store.verified_venue_order_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    trade_history = store.verified_venue_trade_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    changed_history = (
+        VenueOrderEvent.model_validate(
+            order_history[-1]
+            .model_copy(
+                update={
+                    "normalized_state": VenueOrderState.UNKNOWN,
+                    "original_venue_state": VenueOrderState.UNKNOWN.value,
+                    "terminal": False,
+                }
+            )
+            .model_dump(mode="python"),
+            strict=True,
+        ),
+    )
+    order_read, trade_read = _install_bounded_history_reads(
+        store,
+        monkeypatch,
+        order_views=(order_history, changed_history),
+        trade_views=(trade_history,),
+    )
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = (
+        executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+        if recovery_path == "startup"
+        else executor.recover_account(ACCOUNT_FINGERPRINT)
+    )
+
+    assert order_read.calls == trade_read.calls == 1
+    assert report.code is CoordinatorCode.RECOVERY_COMPLETE
+    assert report.blocked_intent_ids == ()
+    assert (
+        store.verified_kill_switch_events(
+            ACCOUNT_FINGERPRINT,
+            NOW + timedelta(seconds=1),
+        )
+        == ()
+    )
+    assert not executor.new_intents_blocked
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+@pytest.mark.parametrize("faulted_history", ["order", "trade"])
+def test_followup_immutable_history_initial_fault_is_stable_and_durable(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
+    faulted_history: str,
+) -> None:
+    plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    order_history = store.verified_venue_order_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    trade_history = store.verified_venue_trade_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    fault = RuntimeError("hostile initial store fault")
+    order_read, trade_read = _install_bounded_history_reads(
+        store,
+        monkeypatch,
+        order_views=(fault,) if faulted_history == "order" else (order_history,),
+        trade_views=(fault,) if faulted_history == "trade" else (trade_history,),
+    )
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = (
+        executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+        if recovery_path == "startup"
+        else executor.recover_account(ACCOUNT_FINGERPRINT)
+    )
+    kill_triggers = tuple(
+        event.trigger
+        for event in store.verified_kill_switch_events(
+            ACCOUNT_FINGERPRINT,
+            NOW + timedelta(seconds=1),
+        )
+    )
+
+    assert order_read.calls == (1 if faulted_history == "order" else 0)
+    assert trade_read.calls == 1
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (source_intent.intent_id,)
+    assert report.kill_reason == CoordinatorCode.RECOVERY_BLOCKED.value
+    assert kill_triggers == (CoordinatorCode.RECOVERY_BLOCKED.value,)
+    assert executor.new_intents_blocked
+
+
+@pytest.mark.parametrize("recovery_path", ["startup", "account"])
+@pytest.mark.parametrize("expected_outcome", ["complete", "blocked"])
+def test_followup_immutable_history_honest_reads_are_exactly_once(
+    store: PredictionMarketStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
+    expected_outcome: str,
+) -> None:
+    if expected_outcome == "complete":
+        plan, source_intent, *_ = _persist_honest_task11_checkpoint(store)
+    else:
+        plan = execution_plan()
+        source_intent = execution_intent(plan)
+        store.append_live_execution_plan(plan)
+        store.append_execution_intent(source_intent)
+        store.append_venue_order_event(
+            lifecycle_event(
+                source_intent,
+                VenueOrderState.UNKNOWN,
+                received_at=NOW + timedelta(milliseconds=100),
+            ).model_copy(update={"intent_id": source_intent.intent_id})
+        )
+    order_history = store.verified_venue_order_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    trade_history = store.verified_venue_trade_events_for_intent(
+        source_intent.intent_id,
+        NOW + timedelta(milliseconds=500),
+    )
+    order_read, trade_read = _install_bounded_history_reads(
+        store,
+        monkeypatch,
+        order_views=(order_history, order_history),
+        trade_views=(trade_history,),
+    )
+    executor = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    )
+
+    report = (
+        executor.recover_on_startup(ACCOUNT_FINGERPRINT)
+        if recovery_path == "startup"
+        else executor.recover_account(ACCOUNT_FINGERPRINT)
+    )
+
+    assert order_read.calls == trade_read.calls == 1
+    assert report.code is (
+        CoordinatorCode.RECOVERY_COMPLETE
+        if expected_outcome == "complete"
+        else CoordinatorCode.RECOVERY_BLOCKED
+    )
+    assert report.blocked_intent_ids == (
+        () if expected_outcome == "complete" else (source_intent.intent_id,)
+    )
+
+
 @pytest.mark.parametrize("recovery_path", ["startup", "account"])
 @pytest.mark.parametrize("checkpoint", ["none", "earlier"])
 @pytest.mark.parametrize("conflict", ["trade_identity", "raw_hash"])
