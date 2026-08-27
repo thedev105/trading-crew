@@ -30,6 +30,7 @@ from polytrading.predictions.execution.models import (
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
+    canonical_live_reconciliation_id,
 )
 from polytrading.predictions.execution.reconciliation import (
     AssetAmountObservation,
@@ -53,7 +54,7 @@ from polytrading.predictions.polymarket_execution.routes import (
     expected_route_result_flags,
 )
 from polytrading.predictions.polymarket_execution.user_stream import UserStreamHealth
-from polytrading.predictions.storage.store import PredictionMarketStore
+from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
 from tests.predictions.test_execution_authority import HASHES
 from tests.predictions.test_execution_coordinator import (
     ACCOUNT_FINGERPRINT,
@@ -68,6 +69,16 @@ from tests.predictions.test_execution_coordinator import (
     preflight_evidence,
     submit_result,
 )
+
+
+def _append_live_reconciliation(
+    store: PredictionMarketStore,
+    record: LiveReconciliation,
+) -> bool:
+    return store.append_live_reconciliation(
+        record.model_copy(update={"reconciliation_id": canonical_live_reconciliation_id(record)})
+    )
+
 
 SIGNER_ADDRESS = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
 TAIL_ORDER_HASH = f"{401:064x}"
@@ -1736,7 +1747,8 @@ def test_startup_keeps_sequence_monotonicity_independent_across_trade_ids(
 def test_startup_blocks_account_with_incomplete_reconciliation_even_without_intents(
     store: PredictionMarketStore,
 ) -> None:
-    store.append_live_reconciliation(
+    _append_live_reconciliation(
+        store,
         LiveReconciliation(
             schema_version=1,
             reconciliation_id=uuid4(),
@@ -1746,7 +1758,7 @@ def test_startup_blocks_account_with_incomplete_reconciliation_even_without_inte
             differences=("balance_mismatch",),
             evidence_hashes=(HASHES[9],),
             next_action="manual_review",
-        )
+        ),
     )
     plan = execution_plan()
     reader = RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=()))
@@ -1843,7 +1855,8 @@ def test_startup_blocks_unreconciled_or_out_of_cutoff_live_ledger_posting(
             )
         )
     if coverage != "none":
-        store.append_live_reconciliation(
+        _append_live_reconciliation(
+            store,
             LiveReconciliation(
                 schema_version=1,
                 reconciliation_id=uuid4(),
@@ -1854,7 +1867,7 @@ def test_startup_blocks_unreconciled_or_out_of_cutoff_live_ledger_posting(
                 evidence_hashes=(HASHES[10],),
                 next_action=None,
                 expected_posting_ids=(posting_id,) if coverage in {"newer", "missing"} else (),
-            )
+            ),
         )
     plan = execution_plan()
     restart = recovering_coordinator(
@@ -1947,7 +1960,8 @@ def _append_complete_reconciliation(
     fee_hashes: tuple[str, ...] = (HASHES[13],),
     balance_hashes: tuple[str, ...] = (HASHES[9],),
 ) -> None:
-    store.append_live_reconciliation(
+    _append_live_reconciliation(
+        store,
         LiveReconciliation(
             schema_version=1,
             reconciliation_id=uuid4(),
@@ -1961,7 +1975,7 @@ def _append_complete_reconciliation(
             venue_trade_hashes=tuple(sorted(trade_hashes)),
             balance_hashes=tuple(sorted(balance_hashes)),
             expected_posting_ids=posting_ids,
-        )
+        ),
     )
 
 
@@ -2109,7 +2123,7 @@ def test_valid_complete_reconciliations_close_each_bounded_snapshot(
             + timedelta(milliseconds=300 if checkpoint_shape == "cumulative" else 200),
         }
     )
-    store.append_live_reconciliation(second)
+    _append_live_reconciliation(store, second)
 
     report = recovering_coordinator(
         store,
@@ -2376,7 +2390,7 @@ def _persist_honest_task11_checkpoint(
     store.append_authoritative_trade_economics(exact)
     for posting in postings:
         store.append_live_ledger_posting(posting)
-    store.append_live_reconciliation(reconciliation)
+    _append_live_reconciliation(store, reconciliation)
     return plan, source_intent, exact, postings, reconciliation
 
 
@@ -2419,6 +2433,79 @@ def test_canonical_task11_checkpoint_is_observable_by_dashboard(tmp_path: Path) 
     assert snapshot.live_ledger.reconciliation_count == 1
     assert snapshot.live_ledger.complete_reconciliation_count == 1
     store.close()
+
+
+def test_injected_reconciliation_id_alias_blocks_restart_and_dashboard(tmp_path: Path) -> None:
+    path = tmp_path / "forged-reconciliation-id.duckdb"
+    store = PredictionMarketStore(path)
+    plan, _intent, _exact, _postings, reconciliation = _persist_honest_task11_checkpoint(store)
+    forged = reconciliation.model_copy(update={"reconciliation_id": UUID(int=999_998)})
+    payload, record_hash = _stored_record(forged)
+    store._connection.execute(
+        "INSERT INTO live_reconciliations "
+        "(reconciliation_id, account_fingerprint, observed_at, record_json, record_hash) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            forged.reconciliation_id,
+            forged.account_fingerprint,
+            forged.observed_at,
+            payload,
+            record_hash,
+        ],
+    )
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids != ()
+    with pytest.raises(ConflictingRecordError, match="reconciliation"):
+        PredictionDashboardBuilder(store, path).build(NOW + timedelta(seconds=1))
+
+
+def test_post_terminal_order_history_blocks_restart_and_dashboard(tmp_path: Path) -> None:
+    path = tmp_path / "post-terminal-order-history.duckdb"
+    store = PredictionMarketStore(path)
+    plan, source_intent, _exact, _postings, reconciliation = _persist_honest_task11_checkpoint(
+        store
+    )
+    post_terminal = lifecycle_event(
+        source_intent,
+        VenueOrderState.ACK_MATCHED,
+        received_at=NOW + timedelta(milliseconds=100),
+    ).model_copy(
+        update={
+            "event_id": UUID(int=999_997),
+            "intent_id": source_intent.intent_id,
+            "raw_event_hash": f"{499:064x}",
+        }
+    )
+    store.append_venue_order_event(post_terminal)
+    terminal_hash = reconciliation.venue_order_hashes[0]
+    store._connection.execute(
+        "DELETE FROM live_reconciliations WHERE reconciliation_id = ?",
+        [reconciliation.reconciliation_id],
+    )
+    contradictory = reconciliation.model_copy(
+        update={"venue_order_hashes": tuple(sorted((terminal_hash, post_terminal.raw_event_hash)))}
+    )
+    _append_live_reconciliation(store, contradictory)
+
+    report = recovering_coordinator(
+        store,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        FakeSigner(),
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+
+    assert report.code is CoordinatorCode.RECOVERY_BLOCKED
+    assert report.blocked_intent_ids == (source_intent.intent_id,)
+    with pytest.raises(ConflictingRecordError, match="order history"):
+        PredictionDashboardBuilder(store, path).build(NOW + timedelta(seconds=1))
 
 
 @pytest.mark.parametrize("family", ["venue_order_hashes", "allowance_hashes"])
@@ -2614,7 +2701,8 @@ def test_latest_complete_checkpoint_must_close_every_economics_tail(
         for posting in cumulative:
             store.append_live_ledger_posting(posting)
     if tail_shape == "later_incomplete":
-        store.append_live_reconciliation(
+        _append_live_reconciliation(
+            store,
             first_reconciliation.model_copy(
                 update={
                     "reconciliation_id": uuid4(),
@@ -2623,7 +2711,7 @@ def test_latest_complete_checkpoint_must_close_every_economics_tail(
                     "differences": ("tail_unclosed",),
                     "next_action": "HALT_AND_RECONCILE",
                 }
-            )
+            ),
         )
 
     report = recovering_coordinator(
@@ -3090,7 +3178,8 @@ def test_confirmed_raw_checkpoint_closure_rejects_a_later_incomplete_checkpoint(
     store.append_execution_intent(second_intent)
     store.append_venue_order_event(second_order)
     store.append_venue_trade_event(second_trade)
-    store.append_live_reconciliation(
+    _append_live_reconciliation(
+        store,
         first_reconciliation.model_copy(
             update={
                 "reconciliation_id": uuid4(),
@@ -3099,7 +3188,7 @@ def test_confirmed_raw_checkpoint_closure_rejects_a_later_incomplete_checkpoint(
                 "differences": ("tail_unclosed",),
                 "next_action": "HALT_AND_RECONCILE",
             }
-        )
+        ),
     )
 
     report = _run_task11_recovery_path(store, plan, recovery_path)
@@ -3253,7 +3342,7 @@ def test_fully_cumulative_later_complete_checkpoint_closes_the_economics_tail(
     store.append_authoritative_trade_economics(second_exact)
     for posting in postings:
         store.append_live_ledger_posting(posting)
-    store.append_live_reconciliation(reconciliation)
+    _append_live_reconciliation(store, reconciliation)
 
     report = recovering_coordinator(
         store,
@@ -3423,7 +3512,8 @@ def test_startup_blocks_covered_posting_with_orphan_relationships(
             occurred_at=NOW + timedelta(milliseconds=100),
         )
     )
-    store.append_live_reconciliation(
+    _append_live_reconciliation(
+        store,
         LiveReconciliation(
             schema_version=1,
             reconciliation_id=uuid4(),
@@ -3437,7 +3527,7 @@ def test_startup_blocks_covered_posting_with_orphan_relationships(
             venue_trade_hashes=(HASHES[11],),
             balance_hashes=(HASHES[9],),
             expected_posting_ids=(posting_id,),
-        )
+        ),
     )
 
     report = recovering_coordinator(

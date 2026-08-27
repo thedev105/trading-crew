@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Self
-from uuid import UUID, uuid5
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -24,9 +24,9 @@ from polytrading.predictions.execution.ledger import (
     AuthoritativeTradeEconomics,
     LiveLedgerError,
     _bounded_decimal,
+    _classify_order_histories,
     _classify_trade_histories,
     _decimal_resource_components,
-    _dedupe_records,
     _exact_add,
     _exact_difference,
     _ExactArithmeticError,
@@ -46,9 +46,9 @@ from polytrading.predictions.execution.models import (
     VenueTradeEvent,
     VenueTradeState,
     canonical_execution_hash,
+    canonical_live_reconciliation_id,
 )
 
-_RECONCILIATION_NAMESPACE = UUID("cc34beb0-472f-4d4f-ab9d-038e8336323f")
 _PUBLIC_TEXT = Annotated[
     str,
     StringConstraints(min_length=1, max_length=256, pattern=r"^[\x20-\x7e]+$"),
@@ -438,47 +438,24 @@ def _snapshot_order_history(
     snapshot: VenueAccountSnapshot,
 ) -> tuple[tuple[Sha256, ...], bool]:
     try:
-        values = _snapshot_sequence(order_history, VenueOrderEvent, "ORDER_EVENT_INVALID")
+        histories = _classify_order_histories(order_history, snapshot.observed_at)
     except LiveLedgerError:
         return (), False
-    hashes = tuple(sorted({event.raw_event_hash for event in values}))
-    try:
-        events = _dedupe_records(
-            values,
-            identity=lambda event: event.event_id,
-            conflict_code="ORDER_EVENT_CONFLICT",
-        )
-    except LiveLedgerError:
-        return hashes, False
-
     intents_by_id = {intent.intent_id: intent for intent in intents}
-    event_ids_by_hash: dict[Sha256, UUID] = {}
-    intent_ids_by_order: dict[str, UUID | None] = {}
-    valid = True
-    for event in events:
-        if (
-            event.raw_event_hash in event_ids_by_hash
-            and event_ids_by_hash[event.raw_event_hash] != event.event_id
-        ):
-            valid = False
-        else:
-            event_ids_by_hash[event.raw_event_hash] = event.event_id
-        if (
-            event.venue_order_id in intent_ids_by_order
-            and intent_ids_by_order[event.venue_order_id] != event.intent_id
-        ):
-            valid = False
-        else:
-            intent_ids_by_order[event.venue_order_id] = event.intent_id
-
-        intent = None if event.intent_id is None else intents_by_id.get(event.intent_id)
+    for history in histories:
+        intent = None if history.intent_id is None else intents_by_id.get(history.intent_id)
         if intent is None or (
             intent.account_fingerprint != snapshot.account_fingerprint
-            or event.protocol_version != intent.protocol_version
-            or not intent.created_at <= event.received_at <= snapshot.observed_at
+            or history.protocol_version != intent.protocol_version
+            or any(intent.created_at > event.received_at for event in history.ordered_events)
         ):
-            valid = False
-    return hashes, valid
+            return (), False
+    return (
+        tuple(
+            sorted(event_hash for history in histories for event_hash in history.raw_event_hashes)
+        ),
+        True,
+    )
 
 
 def _snapshot_evidence(snapshot: VenueAccountSnapshot) -> dict[str, tuple[Sha256, ...]]:
@@ -617,14 +594,8 @@ def _result(
         "expected_posting_ids": expected_ids,
         "lineage_hashes": (snapshot.snapshot_fingerprint,),
     }
-    fields["reconciliation_id"] = _reconciliation_id(fields)
+    fields["reconciliation_id"] = canonical_live_reconciliation_id(fields)
     return LiveReconciliation(**fields)
-
-
-def _reconciliation_id(fields: Mapping[str, object]) -> UUID:
-    payload = dict(fields)
-    payload.pop("reconciliation_id", None)
-    return uuid5(_RECONCILIATION_NAMESPACE, canonical_execution_hash(payload))
 
 
 def reconcile_live_account(
@@ -951,7 +922,7 @@ def reconciled_live_pnl(
         or not closed.complete
         or closed.differences
         or closed.next_action is not None
-        or closed.reconciliation_id != _reconciliation_id(closed.model_dump(mode="python"))
+        or closed.reconciliation_id != canonical_live_reconciliation_id(closed)
         or closed.expected_posting_ids != tuple(sorted(row.posting_id for row in rows))
         or any(row.account_fingerprint != closed.account_fingerprint for row in rows)
         or any(not set(row.lineage_hashes) <= closed_hashes for row in rows)

@@ -20,6 +20,7 @@ import pytest
 from pydantic import ValidationError
 
 from polytrading.predictions.execution.ledger import (
+    MAX_LIVE_EVIDENCE_ITEMS,
     AuthoritativeTradeEconomics,
     postings_for_confirmed_trades,
 )
@@ -154,9 +155,14 @@ def order_event(
     event_id: UUID | None = None,
     venue_order_id: str = ORDER_ID,
     raw_event_hash: str = ORDER_HASH,
+    state: VenueOrderState = VenueOrderState.RECONCILED,
+    venue_timestamp: datetime | None = None,
     received_at: datetime = NOW + timedelta(milliseconds=500),
+    sequence_number: int | None = None,
     protocol_version: str | None = None,
 ) -> VenueOrderEvent:
+    if venue_timestamp is None:
+        venue_timestamp = received_at
     return VenueOrderEvent(
         schema_version=1,
         event_id=event_id or UUID("42b33848-ff46-4c45-b9ab-0c74510687e0"),
@@ -165,12 +171,18 @@ def order_event(
         source_channel="recovery_read",
         venue_order_id=venue_order_id,
         intent_id=source_intent.intent_id,
-        original_venue_state=VenueOrderState.RECONCILED.value,
-        normalized_state=VenueOrderState.RECONCILED,
-        terminal=True,
-        venue_timestamp=received_at,
+        original_venue_state=state.value,
+        normalized_state=state,
+        terminal=state
+        in {
+            VenueOrderState.FILLED,
+            VenueOrderState.CANCELLED,
+            VenueOrderState.REJECTED,
+            VenueOrderState.RECONCILED,
+        },
+        venue_timestamp=venue_timestamp,
         received_at=received_at,
-        sequence_number=None,
+        sequence_number=sequence_number,
         protocol_version=protocol_version or source_intent.protocol_version,
         lineage_hashes=(raw_event_hash,),
     )
@@ -526,6 +538,24 @@ def test_total_snapshot_pnl_iterates_every_caller_collection_exactly_once() -> N
     ) == (1, 1, 1, 1, 1)
 
 
+def test_order_history_cap_applies_before_exact_replay_deduplication() -> None:
+    source_intent, exact, postings = exact_postings()
+    event = order_event(source_intent)
+
+    result = reconcile_live_account(
+        postings,
+        snapshot_for(source_intent, exact),
+        (source_intent,),
+        (trade_event(source_intent),),
+        (exact,),
+        (event,) * (MAX_LIVE_EVIDENCE_ITEMS + 1),
+    )
+
+    assert not result.complete
+    assert result.differences == ("ORDER_HISTORY_INVALID",)
+    assert result.venue_order_hashes == ()
+
+
 def test_total_snapshot_revalidates_an_alias_mutated_after_it_is_yielded() -> None:
     source_intent = intent()
     exact = exact_economics(source_intent)
@@ -668,7 +698,7 @@ def test_canonical_reconciliation_rejects_invalid_order_history(
     supplied_intents = (source_intent,)
     first = order_event(source_intent)
     supplied_orders: object = (first,)
-    expected_hashes = (ORDER_HASH,)
+    expected_hashes = ()
     if defect == "malformed":
         supplied_orders = (object(),)
         expected_hashes = ()
@@ -707,7 +737,6 @@ def test_canonical_reconciliation_rejects_invalid_order_history(
                 received_at=NOW + timedelta(milliseconds=750),
             ),
         )
-        expected_hashes = tuple(sorted((ORDER_HASH, evidence_hash(81))))
     elif defect == "raw_hash_reuse":
         supplied_orders = (
             first,
@@ -731,7 +760,6 @@ def test_canonical_reconciliation_rejects_invalid_order_history(
                 received_at=NOW + timedelta(milliseconds=750),
             ),
         )
-        expected_hashes = tuple(sorted((ORDER_HASH, evidence_hash(81))))
 
     result = reconcile_live_account(
         postings,
@@ -746,6 +774,146 @@ def test_canonical_reconciliation_rejects_invalid_order_history(
     assert result.differences == ("ORDER_HISTORY_INVALID",)
     assert result.next_action == "HALT_AND_RECONCILE"
     assert result.venue_order_hashes == expected_hashes
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "terminal_then_nonterminal",
+        "illegal_transition",
+        "sequence_regression",
+        "sequence_tie",
+        "sequence_mix",
+        "ambiguous_same_receipt",
+        "future_venue_time",
+    ],
+)
+def test_order_lifecycle_contradictions_block_reconciliation_and_pnl(defect: str) -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    first = order_event(
+        source_intent,
+        state=VenueOrderState.ACK_MATCHED,
+        sequence_number=1,
+    )
+    second = order_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+        raw_event_hash=evidence_hash(81),
+        state=VenueOrderState.FILLED,
+        received_at=NOW + timedelta(milliseconds=750),
+        sequence_number=2,
+    )
+    if defect == "terminal_then_nonterminal":
+        first = order_event(source_intent)
+        second = second.model_copy(
+            update={
+                "normalized_state": VenueOrderState.ACK_MATCHED,
+                "original_venue_state": VenueOrderState.ACK_MATCHED.value,
+                "terminal": False,
+                "sequence_number": None,
+            }
+        )
+    elif defect == "illegal_transition":
+        second = second.model_copy(
+            update={
+                "normalized_state": VenueOrderState.SUBMITTING,
+                "original_venue_state": VenueOrderState.SUBMITTING.value,
+                "terminal": False,
+            }
+        )
+    elif defect == "sequence_regression":
+        first = first.model_copy(update={"sequence_number": 2})
+        second = second.model_copy(update={"sequence_number": 1})
+    elif defect == "sequence_tie":
+        second = second.model_copy(update={"sequence_number": 1})
+    elif defect == "sequence_mix":
+        second = second.model_copy(update={"sequence_number": None})
+    elif defect == "ambiguous_same_receipt":
+        first = first.model_copy(update={"sequence_number": None})
+        second = second.model_copy(
+            update={"received_at": first.received_at, "venue_timestamp": first.received_at}
+        )
+    elif defect == "future_venue_time":
+        second = second.model_copy(
+            update={"venue_timestamp": snapshot.observed_at + timedelta(microseconds=1)}
+        )
+
+    trade = trade_event(source_intent)
+    result = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (second, first),
+    )
+
+    assert not result.complete
+    assert result.differences == ("ORDER_HISTORY_INVALID",)
+    assert result.venue_order_hashes == ()
+    assert (
+        reconciled_live_pnl(
+            postings,
+            result,
+            snapshot,
+            (source_intent,),
+            (trade,),
+            (exact,),
+            (first, second),
+        )
+        is None
+    )
+
+
+def test_order_lifecycle_classification_is_permutation_invariant_and_replay_idempotent() -> None:
+    source_intent, exact, postings = exact_postings(realized_pnl=Decimal("1.25"))
+    snapshot = snapshot_for(source_intent, exact)
+    trade = trade_event(source_intent)
+    first = order_event(
+        source_intent,
+        state=VenueOrderState.ACK_MATCHED,
+        sequence_number=1,
+    )
+    second = order_event(
+        source_intent,
+        event_id=UUID("42b33848-ff46-4c45-b9ab-0c74510687e1"),
+        raw_event_hash=evidence_hash(81),
+        state=VenueOrderState.FILLED,
+        received_at=first.received_at,
+        venue_timestamp=first.venue_timestamp,
+        sequence_number=2,
+    )
+
+    forward = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (first, second, first),
+    )
+    reverse = reconcile_live_account(
+        postings,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (second, first),
+    )
+
+    assert forward == reverse
+    assert forward.complete
+    assert forward.venue_order_hashes == tuple(sorted((ORDER_HASH, evidence_hash(81))))
+    assert reconciled_live_pnl(
+        postings,
+        forward,
+        snapshot,
+        (source_intent,),
+        (trade,),
+        (exact,),
+        (second, first, first),
+    ) == Decimal("1.25")
 
 
 def test_reconciliation_snapshots_order_history_before_caller_mutation() -> None:

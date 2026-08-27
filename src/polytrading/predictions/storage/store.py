@@ -32,6 +32,7 @@ from polytrading.predictions.economics_models import ScanReport
 from polytrading.predictions.execution.ledger import (
     AuthoritativeTradeEconomics,
     LiveLedgerError,
+    _classify_order_histories,
     _classify_trade_histories,
     _hash_families_are_pairwise_disjoint,
     postings_for_confirmed_trades,
@@ -50,6 +51,7 @@ from polytrading.predictions.execution.models import (
     VenueTradeEvent,
     VenueTradeState,
     canonical_execution_hash,
+    canonical_live_reconciliation_id,
 )
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import VenueManifest
@@ -98,6 +100,12 @@ def _validate_live_reconciliation_closure(
 ) -> None:
     """Rebuild one reconciliation from only the evidence visible at its own cutoff."""
 
+    try:
+        canonical_id = canonical_live_reconciliation_id(reconciliation)
+    except (TypeError, ValueError) as error:
+        raise ConflictingRecordError("reconciliation identity is invalid") from error
+    if reconciliation.reconciliation_id != canonical_id:
+        raise ConflictingRecordError("reconciliation identity is not canonical")
     if not reconciliation.complete:
         return
 
@@ -133,7 +141,6 @@ def _validate_live_reconciliation_closure(
     )
 
     bounded_posting_ids = {posting.posting_id for posting in bounded_postings}
-    bounded_order_hashes = {order.raw_event_hash for order in bounded_orders}
     exact_trade_hashes = {record.trade_event_hash for record in bounded_economics}
     exact_evidence_hashes = {
         evidence_hash
@@ -152,6 +159,15 @@ def _validate_live_reconciliation_closure(
         for evidence_hash in record.balance_evidence_hashes
     }
     try:
+        classified_order_histories = _classify_order_histories(
+            bounded_orders,
+            reconciliation.observed_at,
+        )
+        classified_order_hashes = {
+            event_hash
+            for history in classified_order_histories
+            for event_hash in history.raw_event_hashes
+        }
         classified_histories = _classify_trade_histories(bounded_trades)
         classified_trade_hashes = {
             event_hash
@@ -167,7 +183,7 @@ def _validate_live_reconciliation_closure(
         raise ConflictingRecordError("reconciliation canonical evidence does not close") from error
 
     supplied_postings = tuple(sorted(bounded_postings, key=lambda posting: posting.posting_id))
-    known_raw_hashes = bounded_order_hashes | classified_trade_hashes
+    known_raw_hashes = classified_order_hashes | classified_trade_hashes
     known_economics_hashes = exact_evidence_hashes | exact_balance_hashes
     reconciliation_hashes = {
         *reconciliation.evidence_hashes,
@@ -180,7 +196,7 @@ def _validate_live_reconciliation_closure(
         set(reconciliation.expected_posting_ids) != bounded_posting_ids
         or supplied_postings != canonical_postings
         or any(history.confirmed_terminal is None for history in classified_histories)
-        or set(reconciliation.venue_order_hashes) != bounded_order_hashes
+        or set(reconciliation.venue_order_hashes) != classified_order_hashes
         or set(reconciliation.venue_trade_hashes) != classified_trade_hashes
         or not exact_trade_hashes <= classified_trade_hashes
         or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)
@@ -694,6 +710,12 @@ class PredictionMarketStore:
             "reconciliation_id",
             record.reconciliation_id,
         )
+        try:
+            canonical_id = canonical_live_reconciliation_id(record)
+        except (TypeError, ValueError) as error:
+            raise ConflictingRecordError("live reconciliation identity is invalid") from error
+        if record.reconciliation_id != canonical_id:
+            raise ConflictingRecordError("live reconciliation identity is not canonical")
         return self._append_hashed_record(
             table="live_reconciliations",
             identity_column="reconciliation_id",
@@ -1537,6 +1559,21 @@ class PredictionMarketStore:
 
         plans_by_id = {record.plan_id: record for record in plans}
         intents_by_id = {record.intent_id: record for record in intents}
+        try:
+            classified_order_histories = _classify_order_histories(orders, as_of)
+        except LiveLedgerError as error:
+            raise ConflictingRecordError("venue order history is contradictory") from error
+        if any(
+            history.intent_id is None
+            or history.intent_id not in intents_by_id
+            or history.protocol_version != intents_by_id[history.intent_id].protocol_version
+            or any(
+                intents_by_id[history.intent_id].created_at > event.received_at
+                for event in history.ordered_events
+            )
+            for history in classified_order_histories
+        ):
+            raise ConflictingRecordError("venue order history is not bound to its intent")
         orders_by_venue_id: dict[str, list[VenueOrderEvent]] = {}
         for order in orders:
             if order.intent_id is None or order.intent_id not in intents_by_id:

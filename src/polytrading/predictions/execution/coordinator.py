@@ -26,8 +26,10 @@ from polytrading.predictions.execution.kill_switch import KillState
 from polytrading.predictions.execution.ledger import (
     LiveLedgerError,
     _ClassifiedTradeHistory,
+    _classify_order_histories,
     _classify_trade_histories,
     _hash_families_are_pairwise_disjoint,
+    _legal_order_transition,
     postings_for_confirmed_trades,
 )
 from polytrading.predictions.execution.models import (
@@ -41,6 +43,7 @@ from polytrading.predictions.execution.models import (
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
+    canonical_live_reconciliation_id,
 )
 from polytrading.predictions.polymarket_execution.heartbeat import HeartbeatState
 from polytrading.predictions.polymarket_execution.rest import RestResult
@@ -929,77 +932,6 @@ class ExecutionCoordinator:
         )
 
     @staticmethod
-    def _legal_order_transition(
-        previous: VenueOrderState,
-        current: VenueOrderState,
-    ) -> bool:
-        legal: dict[VenueOrderState, frozenset[VenueOrderState]] = {
-            VenueOrderState.ACK_MATCHED: frozenset(
-                {
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.CANCEL_PENDING,
-                    VenueOrderState.CANCELLED,
-                    VenueOrderState.REJECTED,
-                    VenueOrderState.UNKNOWN,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-            VenueOrderState.ACK_DELAYED: frozenset(
-                {
-                    VenueOrderState.ACK_MATCHED,
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.REJECTED,
-                    VenueOrderState.UNKNOWN,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-            VenueOrderState.ACK_LIVE_UNEXPECTED: frozenset(
-                {
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.CANCEL_PENDING,
-                    VenueOrderState.CANCELLED,
-                    VenueOrderState.REJECTED,
-                    VenueOrderState.UNKNOWN,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-            VenueOrderState.PARTIALLY_FILLED: frozenset(
-                {
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.CANCEL_PENDING,
-                    VenueOrderState.CANCELLED,
-                    VenueOrderState.UNKNOWN,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-            VenueOrderState.CANCEL_PENDING: frozenset(
-                {
-                    VenueOrderState.CANCELLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.UNKNOWN,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-            VenueOrderState.UNKNOWN: frozenset(
-                {
-                    VenueOrderState.ACK_MATCHED,
-                    VenueOrderState.PARTIALLY_FILLED,
-                    VenueOrderState.FILLED,
-                    VenueOrderState.CANCEL_PENDING,
-                    VenueOrderState.CANCELLED,
-                    VenueOrderState.REJECTED,
-                    VenueOrderState.RECONCILED,
-                }
-            ),
-        }
-        return current in legal.get(previous, frozenset())
-
-    @staticmethod
     def _known_venue_order_ids(events: tuple[VenueOrderEvent, ...]) -> tuple[str, ...]:
         return tuple(
             sorted(
@@ -1089,7 +1021,7 @@ class ExecutionCoordinator:
                 and event.venue_timestamp is not None
                 and event.venue_timestamp <= previous.venue_timestamp
             )
-            or not self._legal_order_transition(
+            or not _legal_order_transition(
                 previous.normalized_state,
                 event.normalized_state,
             )
@@ -1968,19 +1900,34 @@ class ExecutionCoordinator:
             intent.intent_id: [] for intent in intents
         }
         if not account_history_invalid:
+            account_order_events = tuple(
+                event for history in order_histories.values() for event in history
+            )
             account_trade_events = tuple(
                 event for history in trade_histories.values() for event in history
             )
             try:
+                classified_order_histories = _classify_order_histories(account_order_events, now)
                 classified_histories = _classify_trade_histories(account_trade_events)
             except Exception:
                 account_history_invalid = True
             else:
                 known_intent_ids = set(classified_by_intent)
+                intents_by_id = {intent.intent_id: intent for intent in intents}
                 if any(
                     event.intent_id != intent_id
-                    for intent_id, history in trade_histories.items()
+                    for histories in (order_histories, trade_histories)
+                    for intent_id, history in histories.items()
                     for event in history
+                ) or any(
+                    history.intent_id is None
+                    or history.intent_id not in known_intent_ids
+                    or history.protocol_version != intents_by_id[history.intent_id].protocol_version
+                    or any(
+                        intents_by_id[history.intent_id].created_at > event.received_at
+                        for event in history.ordered_events
+                    )
+                    for history in classified_order_histories
                 ):
                     account_history_invalid = True
                 for history in classified_histories:
@@ -2056,6 +2003,18 @@ class ExecutionCoordinator:
                 postings = ()
                 economics = ()
                 account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
+            try:
+                reconciliation_identity_invalid = any(
+                    reconciliation.reconciliation_id
+                    != canonical_live_reconciliation_id(reconciliation)
+                    for reconciliation in reconciliations
+                )
+            except (TypeError, ValueError):
+                reconciliation_identity_invalid = True
+            if reconciliation_identity_invalid:
+                account_block_reason = CoordinatorCode.RECOVERY_BLOCKED.value
+                for intent in intents:
+                    forced_reasons.setdefault(intent.intent_id, account_block_reason)
             if any(not reconciliation.complete for reconciliation in reconciliations):
                 account_block_reason = "RECONCILIATION_INCOMPLETE"
                 for intent in intents:
@@ -2147,7 +2106,6 @@ class ExecutionCoordinator:
                         and exact.information_cutoff <= reconciliation.observed_at
                     )
                     bounded_posting_ids = {posting.posting_id for posting in bounded_postings}
-                    bounded_order_hashes = {event.raw_event_hash for event in bounded_order_events}
                     bounded_trade_hashes = {event.raw_event_hash for event in bounded_trade_events}
                     exact_trade_hashes = {exact.trade_event_hash for exact in bounded_economics}
                     exact_evidence_hashes = {
@@ -2171,6 +2129,15 @@ class ExecutionCoordinator:
                         for evidence_hash in exact.balance_evidence_hashes
                     }
                     try:
+                        classified_order_histories = _classify_order_histories(
+                            bounded_order_events,
+                            reconciliation.observed_at,
+                        )
+                        classified_order_hashes = {
+                            event_hash
+                            for history in classified_order_histories
+                            for event_hash in history.raw_event_hashes
+                        }
                         classified_histories = _classify_trade_histories(bounded_trade_events)
                         classified_trade_hashes = {
                             event_hash
@@ -2183,6 +2150,7 @@ class ExecutionCoordinator:
                             bounded_economics,
                         )
                     except LiveLedgerError:
+                        classified_order_hashes = set()
                         classified_histories = ()
                         classified_trade_hashes = set()
                         canonical_postings = ()
@@ -2190,7 +2158,7 @@ class ExecutionCoordinator:
                     supplied_postings = tuple(
                         sorted(bounded_postings, key=lambda posting: posting.posting_id)
                     )
-                    known_raw_hashes = bounded_order_hashes | bounded_trade_hashes
+                    known_raw_hashes = classified_order_hashes | bounded_trade_hashes
                     known_economics_hashes = exact_evidence_hashes | exact_balance_hashes
                     reconciliation_hashes = {
                         *reconciliation.evidence_hashes,
@@ -2201,12 +2169,14 @@ class ExecutionCoordinator:
                     }
                     if (
                         reconciliation.account_fingerprint != account_fingerprint
+                        or reconciliation.reconciliation_id
+                        != canonical_live_reconciliation_id(reconciliation)
                         or set(reconciliation.expected_posting_ids) != bounded_posting_ids
                         or supplied_postings != canonical_postings
                         or any(
                             history.confirmed_terminal is None for history in classified_histories
                         )
-                        or set(reconciliation.venue_order_hashes) != bounded_order_hashes
+                        or set(reconciliation.venue_order_hashes) != classified_order_hashes
                         or set(reconciliation.venue_trade_hashes) != classified_trade_hashes
                         or not exact_trade_hashes <= classified_trade_hashes
                         or not exact_evidence_hashes <= set(reconciliation.evidence_hashes)

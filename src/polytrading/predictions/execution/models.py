@@ -24,6 +24,7 @@ PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 _INTENT_NAMESPACE = UUID("b59d5b2a-94e6-4a5e-b184-327132349d5e")
+_RECONCILIATION_NAMESPACE = UUID("cc34beb0-472f-4d4f-ab9d-038e8336323f")
 _PUBLIC_ORDER_ADDRESS_FIELDS = frozenset({"maker", "signer"})
 _PUBLIC_ORDER_BYTES32_FIELDS = frozenset({"builder", "metadata"})
 _PUBLIC_ORDER_STRING_INTEGER_FIELDS = frozenset(
@@ -499,6 +500,25 @@ class LiveReconciliation(_ExecutionRecord):
         if not self.complete and self.next_action is None:
             raise ValueError("incomplete reconciliation requires a next action")
         return self
+
+
+def canonical_live_reconciliation_id(
+    value: LiveReconciliation | Mapping[str, object],
+) -> UUID:
+    """Derive one durable identity from every reconciliation field except its ID."""
+
+    if isinstance(value, LiveReconciliation):
+        payload = value.model_dump(mode="python")
+    elif isinstance(value, Mapping):
+        payload = dict(value)
+    else:
+        raise TypeError("live reconciliation identity input is invalid")
+    expected = set(LiveReconciliation.model_fields)
+    supplied = frozenset(payload)
+    if supplied not in {frozenset(expected), frozenset(expected - {"reconciliation_id"})}:
+        raise ValueError("live reconciliation identity fields are incomplete")
+    payload.pop("reconciliation_id", None)
+    return uuid5(_RECONCILIATION_NAMESPACE, canonical_execution_hash(payload))
 
 
 class ProtocolConformanceResult(_ExecutionRecord):

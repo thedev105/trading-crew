@@ -302,3 +302,32 @@ def test_complete_reconciliation_rejects_unexplained_differences() -> None:
             evidence_hashes=(),
             next_action=None,
         )
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_live_reconciliation_identity_is_derived_from_every_other_field(complete: bool) -> None:
+    from polytrading.predictions.execution.models import canonical_live_reconciliation_id
+
+    record = LiveReconciliation(
+        schema_version=1,
+        reconciliation_id=UUID(int=0),
+        account_fingerprint="a" * 64,
+        observed_at=datetime(2026, 8, 25, 16, tzinfo=UTC),
+        complete=complete,
+        differences=() if complete else ("ORDER_HISTORY_INVALID",),
+        evidence_hashes=("1" * 64,),
+        next_action=None if complete else "HALT_AND_RECONCILE",
+        venue_order_hashes=("2" * 64,),
+        venue_trade_hashes=("3" * 64,),
+        balance_hashes=("4" * 64,),
+        allowance_hashes=("5" * 64,),
+        expected_posting_ids=(UUID(int=1),),
+        lineage_hashes=("6" * 64,),
+    )
+    canonical = record.model_copy(
+        update={"reconciliation_id": canonical_live_reconciliation_id(record)}
+    )
+    changed = canonical.model_copy(update={"evidence_hashes": ("7" * 64,)})
+
+    assert canonical_live_reconciliation_id(canonical) == canonical.reconciliation_id
+    assert canonical_live_reconciliation_id(changed) != canonical.reconciliation_id

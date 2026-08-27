@@ -7,6 +7,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Annotated, Literal, Self
 from uuid import UUID, uuid5
 
@@ -19,10 +20,12 @@ from pydantic import (
     model_validator,
 )
 
-from polytrading.predictions.domain import Sha256
+from polytrading.predictions.domain import Sha256, normalize_utc_timestamp
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     LiveLedgerPosting,
+    VenueOrderEvent,
+    VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
     canonical_execution_hash,
@@ -81,6 +84,99 @@ class _ClassifiedTradeHistory:
     failed_terminal: VenueTradeEvent | None
     latest_unresolved_state: VenueTradeState | None
     unresolved_ambiguous: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassifiedOrderHistory:
+    """One bounded order history in evidence-derived chronological order."""
+
+    venue_order_id: str
+    ordered_events: tuple[VenueOrderEvent, ...]
+    raw_event_hashes: tuple[Sha256, ...]
+    intent_id: UUID | None
+    protocol_version: str
+    terminal_event: VenueOrderEvent | None
+
+
+_LEGAL_ORDER_TRANSITIONS: Mapping[VenueOrderState, frozenset[VenueOrderState]] = MappingProxyType(
+    {
+        VenueOrderState.ACK_MATCHED: frozenset(
+            {
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.CANCEL_PENDING,
+                VenueOrderState.CANCELLED,
+                VenueOrderState.REJECTED,
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+        VenueOrderState.ACK_DELAYED: frozenset(
+            {
+                VenueOrderState.ACK_MATCHED,
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.REJECTED,
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+        VenueOrderState.ACK_LIVE_UNEXPECTED: frozenset(
+            {
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.CANCEL_PENDING,
+                VenueOrderState.CANCELLED,
+                VenueOrderState.REJECTED,
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+        VenueOrderState.PARTIALLY_FILLED: frozenset(
+            {
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.CANCEL_PENDING,
+                VenueOrderState.CANCELLED,
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+        VenueOrderState.CANCEL_PENDING: frozenset(
+            {
+                VenueOrderState.CANCEL_PENDING,
+                VenueOrderState.CANCELLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+        VenueOrderState.UNKNOWN: frozenset(
+            {
+                VenueOrderState.ACK_MATCHED,
+                VenueOrderState.PARTIALLY_FILLED,
+                VenueOrderState.FILLED,
+                VenueOrderState.CANCEL_PENDING,
+                VenueOrderState.CANCELLED,
+                VenueOrderState.REJECTED,
+                VenueOrderState.RECONCILED,
+            }
+        ),
+    }
+)
+_TERMINAL_ORDER_STATES = frozenset(
+    {
+        VenueOrderState.FILLED,
+        VenueOrderState.CANCELLED,
+        VenueOrderState.REJECTED,
+        VenueOrderState.RECONCILED,
+    }
+)
+
+
+def _legal_order_transition(previous: VenueOrderState, current: VenueOrderState) -> bool:
+    return current in _LEGAL_ORDER_TRANSITIONS.get(previous, frozenset())
 
 
 class AuthoritativeTradeEconomics(BaseModel):
@@ -456,6 +552,103 @@ def _snapshot_trade_events(
         identity=lambda item: item.trade_event_id,
         conflict_code="TRADE_EVENT_CONFLICT",
     )
+
+
+def _classify_order_histories(
+    orders: Sequence[VenueOrderEvent],
+    cutoff: datetime,
+) -> tuple[_ClassifiedOrderHistory, ...]:
+    """Validate bounded order histories without caller-order or venue-time inference."""
+
+    try:
+        normalized_cutoff = normalize_utc_timestamp(cutoff)
+    except (AttributeError, TypeError, ValueError):
+        raise LiveLedgerError("ORDER_EVENT_INVALID") from None
+    order_values = _dedupe_records(
+        _snapshot_sequence(orders, VenueOrderEvent, "ORDER_EVENT_INVALID"),
+        identity=lambda event: event.event_id,
+        conflict_code="ORDER_EVENT_CONFLICT",
+    )
+    event_by_raw_hash: dict[Sha256, UUID] = {}
+    grouped: dict[str, list[VenueOrderEvent]] = defaultdict(list)
+    for event in order_values:
+        existing_event_id = event_by_raw_hash.setdefault(event.raw_event_hash, event.event_id)
+        if existing_event_id != event.event_id:
+            raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+        if event.received_at > normalized_cutoff or (
+            event.venue_timestamp is not None and event.venue_timestamp > normalized_cutoff
+        ):
+            raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+        grouped[event.venue_order_id].append(event)
+
+    classified: list[_ClassifiedOrderHistory] = []
+    for venue_order_id in sorted(grouped):
+        history = grouped[venue_order_id]
+        intent_ids = {event.intent_id for event in history}
+        protocol_versions = {event.protocol_version for event in history}
+        if len(intent_ids) != 1 or len(protocol_versions) != 1:
+            raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+
+        sequence_presence = {event.sequence_number is None for event in history}
+        if len(sequence_presence) != 1:
+            raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+        sequences_supplied = False in sequence_presence
+        receipt_groups: dict[datetime, list[VenueOrderEvent]] = defaultdict(list)
+        for event in history:
+            receipt_groups[event.received_at].append(event)
+
+        ordered: list[VenueOrderEvent] = []
+        prior_sequence: int | None = None
+        for received_at in sorted(receipt_groups):
+            group = receipt_groups[received_at]
+            if not sequences_supplied:
+                if len(group) != 1:
+                    raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+                evidence_order = group
+            else:
+                sequences = tuple(event.sequence_number for event in group)
+                if any(sequence is None for sequence in sequences) or len(set(sequences)) != len(
+                    sequences
+                ):
+                    raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+                evidence_order = sorted(group, key=lambda event: event.sequence_number)  # type: ignore[arg-type]
+            for event in evidence_order:
+                if (
+                    sequences_supplied
+                    and prior_sequence is not None
+                    and event.sequence_number is not None
+                    and event.sequence_number <= prior_sequence
+                ):
+                    raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+                if event.sequence_number is not None:
+                    prior_sequence = event.sequence_number
+                ordered.append(event)
+
+        terminal_event: VenueOrderEvent | None = None
+        previous: VenueOrderEvent | None = None
+        for event in ordered:
+            if terminal_event is not None:
+                raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+            if previous is not None and not _legal_order_transition(
+                previous.normalized_state,
+                event.normalized_state,
+            ):
+                raise LiveLedgerError("ORDER_EVENT_CONFLICT") from None
+            if event.normalized_state in _TERMINAL_ORDER_STATES:
+                terminal_event = event
+            previous = event
+
+        classified.append(
+            _ClassifiedOrderHistory(
+                venue_order_id=venue_order_id,
+                ordered_events=tuple(ordered),
+                raw_event_hashes=tuple(sorted(event.raw_event_hash for event in ordered)),
+                intent_id=next(iter(intent_ids)),
+                protocol_version=next(iter(protocol_versions)),
+                terminal_event=terminal_event,
+            )
+        )
+    return tuple(classified)
 
 
 def _classify_trade_histories(

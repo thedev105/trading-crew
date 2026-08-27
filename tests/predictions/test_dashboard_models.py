@@ -2453,7 +2453,11 @@ def test_market_atlas_strictly_revalidates_opportunity_hashes_indexes_and_cutoff
 def test_market_atlas_projects_only_stable_codes_from_kill_and_reconciliation_text(
     tmp_path: Path,
 ) -> None:
-    from polytrading.predictions.execution.models import KillSwitchEvent, LiveReconciliation
+    from polytrading.predictions.execution.models import (
+        KillSwitchEvent,
+        LiveReconciliation,
+        canonical_live_reconciliation_id,
+    )
 
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
     account = _append_live_dashboard_execution_bundle(store)
@@ -2470,16 +2474,19 @@ def test_market_atlas_projects_only_stable_codes_from_kill_and_reconciliation_te
             occurred_at=NOW,
         )
     )
+    reconciliation = LiveReconciliation(
+        schema_version=1,
+        reconciliation_id=UUID(int=990_102),
+        account_fingerprint=account,
+        observed_at=NOW,
+        complete=False,
+        differences=(canary,),
+        evidence_hashes=("f" * 64,),
+        next_action=canary,
+    )
     store.append_live_reconciliation(
-        LiveReconciliation(
-            schema_version=1,
-            reconciliation_id=UUID(int=990_102),
-            account_fingerprint=account,
-            observed_at=NOW,
-            complete=False,
-            differences=(canary,),
-            evidence_hashes=("f" * 64,),
-            next_action=canary,
+        reconciliation.model_copy(
+            update={"reconciliation_id": canonical_live_reconciliation_id(reconciliation)}
         )
     )
 
