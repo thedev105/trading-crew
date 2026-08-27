@@ -62,6 +62,7 @@ from tests.predictions.test_execution_coordinator import (
     FakeAuthority,
     FakePreflight,
     FakeSigner,
+    coordinator,
     engage_durable_kill,
     execution_intent,
     execution_plan,
@@ -353,6 +354,115 @@ def recovering_coordinator(
         clock=lambda: NOW + timedelta(milliseconds=500),
         test_only_kill_state=KillState(engaged=False, latest_event=None),
     )
+
+
+def _empty_synthetic_submit_snapshot() -> VenueAccountSnapshot:
+    hashes = tuple(f"{value:064x}" for value in range(870_001, 870_012))
+    return VenueAccountSnapshot(
+        schema_version=1,
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        cutoff_at=NOW - timedelta(seconds=1),
+        observed_at=NOW + timedelta(milliseconds=100),
+        opening_cash_balances=(),
+        current_cash_balances=(),
+        opening_token_positions=(),
+        current_token_positions=(),
+        opening_allowances=(),
+        current_allowances=(),
+        opening_cumulative_fees=(),
+        current_cumulative_fees=(),
+        open_orders=(),
+        recent_trades=(),
+        settlements=(),
+        opening_cash_source_hash=hashes[0],
+        current_cash_source_hash=hashes[1],
+        opening_position_source_hash=hashes[2],
+        current_position_source_hash=hashes[3],
+        opening_allowance_source_hash=hashes[4],
+        current_allowance_source_hash=hashes[5],
+        opening_fee_source_hash=hashes[6],
+        current_fee_source_hash=hashes[7],
+        open_orders_source_hash=hashes[8],
+        recent_trades_source_hash=hashes[9],
+        settlements_source_hash=hashes[10],
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_state", "expected_recovery_code"),
+    [
+        (
+            RestCode.ORDER_OUTCOME_UNKNOWN,
+            VenueOrderState.UNKNOWN,
+            CoordinatorCode.RECOVERY_BLOCKED,
+        ),
+        (
+            RestCode.AUTH_REQUEST_BUILD_FAILED,
+            VenueOrderState.REJECTED,
+            CoordinatorCode.RECOVERY_COMPLETE,
+        ),
+    ],
+)
+def test_real_synthetic_submit_history_survives_reconciliation_restart_and_dashboard(
+    tmp_path: Path,
+    code: RestCode,
+    expected_state: VenueOrderState,
+    expected_recovery_code: CoordinatorCode,
+) -> None:
+    path = tmp_path / f"synthetic-{code.value}.duckdb"
+    initial = PredictionMarketStore(path)
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    result = coordinator(
+        initial,
+        FakePreflight(preflight_evidence(plan)),
+        FakeSigner(submit_result(code)),
+    ).submit_intent(intent)
+    events = initial.verified_venue_order_events_for_intent(
+        intent.intent_id,
+        NOW + timedelta(seconds=1),
+    )
+    reconciliation = reconcile_live_account(
+        (),
+        _empty_synthetic_submit_snapshot(),
+        (intent,),
+        (),
+        (),
+        events,
+    )
+
+    assert result.state is expected_state
+    assert reconciliation.complete
+    assert reconciliation.differences == ()
+    assert reconciliation.venue_order_hashes == tuple(
+        sorted(event.raw_event_hash for event in events)
+    )
+    assert reconciliation.reconciliation_id == canonical_live_reconciliation_id(reconciliation)
+    assert initial.append_live_reconciliation(reconciliation)
+    initial.close()
+
+    reopened = PredictionMarketStore(path)
+    restart_signer = FakeSigner()
+    report = recovering_coordinator(
+        reopened,
+        RecordingAccountReader(orders=OrdersReadPayload(kind="ORDERS_READ", items=())),
+        restart_signer,
+        plan,
+    ).recover_on_startup(ACCOUNT_FINGERPRINT)
+    snapshot = PredictionDashboardBuilder(reopened, path).build(NOW + timedelta(seconds=1))
+
+    assert report.code is expected_recovery_code
+    assert report.submit_attempts == 0
+    assert restart_signer.submit_calls == 0
+    assert reopened.verified_live_execution_account_fingerprints(NOW + timedelta(seconds=1)) == (
+        ACCOUNT_FINGERPRINT,
+    )
+    assert snapshot.execution_readiness.implementation_state == "LIVE_DISABLED"
+    assert snapshot.execution_readiness.live_action_available is False
+    assert snapshot.execution_readiness.kill_engaged is True
+    assert snapshot.live_ledger.reconciliation_count == 1
+    assert snapshot.live_ledger.complete_reconciliation_count == 1
+    reopened.close()
 
 
 def test_recovery_snapshots_each_read_before_later_callback_alias_mutation(

@@ -26,6 +26,7 @@ from polytrading.predictions.execution.models import (
     VenueOrderState,
     VenueTradeEvent,
     VenueTradeState,
+    canonical_execution_hash,
     canonical_live_reconciliation_id,
 )
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
@@ -1295,6 +1296,24 @@ def _with_canonical_reconciliation_id(record: LiveReconciliation) -> LiveReconci
     return record.model_copy(update={"reconciliation_id": canonical_live_reconciliation_id(record)})
 
 
+def _inject_live_reconciliation_below_append(
+    store: PredictionMarketStore,
+    record: LiveReconciliation,
+) -> None:
+    store._connection.execute(
+        "INSERT INTO live_reconciliations "
+        "(reconciliation_id, account_fingerprint, observed_at, record_json, record_hash) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            record.reconciliation_id,
+            record.account_fingerprint,
+            record.observed_at,
+            record.model_dump_json(),
+            canonical_execution_hash(record),
+        ],
+    )
+
+
 def _canonical_reconciliation_bundle() -> tuple[
     LiveExecutionPlan,
     ExecutionIntent,
@@ -1484,6 +1503,38 @@ def test_append_live_reconciliation_rejects_id_only_alias(tmp_path: Path) -> Non
     changed_evidence = reconciliation.model_copy(update={"evidence_hashes": ("f" * 64,)})
     with pytest.raises(ConflictingRecordError, match="reconciliation"):
         store.append_live_reconciliation(changed_evidence)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+@pytest.mark.parametrize("query", ["as_of", "for_account"])
+def test_generic_verified_reconciliation_reads_fail_whole_on_id_only_alias(
+    tmp_path: Path,
+    complete: bool,
+    query: str,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"reconciliation-{query}-{complete}.duckdb")
+    *_evidence, reconciliation = _canonical_reconciliation_bundle()
+    if not complete:
+        reconciliation = _with_canonical_reconciliation_id(
+            reconciliation.model_copy(
+                update={
+                    "complete": False,
+                    "differences": ("ORDER_HISTORY_INVALID",),
+                    "next_action": "HALT_AND_RECONCILE",
+                }
+            )
+        )
+    alias = reconciliation.model_copy(update={"reconciliation_id": UUID(int=86_111)})
+    _inject_live_reconciliation_below_append(store, alias)
+
+    with pytest.raises(ConflictingRecordError, match=r"reconciliation.*identity"):
+        if query == "as_of":
+            store.verified_live_reconciliations_as_of(NOW + timedelta(seconds=4))
+        else:
+            store.verified_live_reconciliations_for_account(
+                reconciliation.account_fingerprint,
+                NOW + timedelta(seconds=4),
+            )
 
 
 def test_verified_reconciliation_rejects_post_terminal_order_history(tmp_path: Path) -> None:

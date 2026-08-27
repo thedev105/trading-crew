@@ -100,6 +100,12 @@ class _ClassifiedOrderHistory:
 
 _LEGAL_ORDER_TRANSITIONS: Mapping[VenueOrderState, frozenset[VenueOrderState]] = MappingProxyType(
     {
+        VenueOrderState.SUBMITTING: frozenset(
+            {
+                VenueOrderState.UNKNOWN,
+                VenueOrderState.REJECTED,
+            }
+        ),
         VenueOrderState.ACK_MATCHED: frozenset(
             {
                 VenueOrderState.PARTIALLY_FILLED,

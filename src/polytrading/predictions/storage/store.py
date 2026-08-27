@@ -89,6 +89,15 @@ class ConflictingRecordError(ValueError):
     """Raised when an immutable prediction-market identity is retried with different content."""
 
 
+def _require_canonical_live_reconciliation(record: LiveReconciliation) -> None:
+    try:
+        canonical_id = canonical_live_reconciliation_id(record)
+    except (TypeError, ValueError) as error:
+        raise ConflictingRecordError("live reconciliation identity is invalid") from error
+    if record.reconciliation_id != canonical_id:
+        raise ConflictingRecordError("live reconciliation identity is not canonical")
+
+
 def _validate_live_reconciliation_closure(
     reconciliation: LiveReconciliation,
     *,
@@ -100,12 +109,7 @@ def _validate_live_reconciliation_closure(
 ) -> None:
     """Rebuild one reconciliation from only the evidence visible at its own cutoff."""
 
-    try:
-        canonical_id = canonical_live_reconciliation_id(reconciliation)
-    except (TypeError, ValueError) as error:
-        raise ConflictingRecordError("reconciliation identity is invalid") from error
-    if reconciliation.reconciliation_id != canonical_id:
-        raise ConflictingRecordError("reconciliation identity is not canonical")
+    _require_canonical_live_reconciliation(reconciliation)
     if not reconciliation.complete:
         return
 
@@ -710,12 +714,7 @@ class PredictionMarketStore:
             "reconciliation_id",
             record.reconciliation_id,
         )
-        try:
-            canonical_id = canonical_live_reconciliation_id(record)
-        except (TypeError, ValueError) as error:
-            raise ConflictingRecordError("live reconciliation identity is invalid") from error
-        if record.reconciliation_id != canonical_id:
-            raise ConflictingRecordError("live reconciliation identity is not canonical")
+        _require_canonical_live_reconciliation(record)
         return self._append_hashed_record(
             table="live_reconciliations",
             identity_column="reconciliation_id",
@@ -1389,7 +1388,7 @@ class PredictionMarketStore:
     def verified_live_reconciliations_as_of(
         self, as_of: datetime
     ) -> tuple[LiveReconciliation, ...]:
-        return self._verified_records(
+        records = self._verified_records(
             table="live_reconciliations",
             model=LiveReconciliation,
             candidate_where=(
@@ -1411,6 +1410,9 @@ class PredictionMarketStore:
             sort_key=lambda record: (record.observed_at, record.reconciliation_id),
             maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
         )
+        for record in records:
+            _require_canonical_live_reconciliation(record)
+        return records
 
     def verified_live_execution_account_fingerprints(
         self,
@@ -2229,7 +2231,7 @@ class PredictionMarketStore:
     def verified_live_reconciliations_for_account(
         self, account_fingerprint: str, as_of: datetime
     ) -> tuple[LiveReconciliation, ...]:
-        return self._verified_records(
+        records = self._verified_records(
             table="live_reconciliations",
             model=LiveReconciliation,
             candidate_where=(
@@ -2253,6 +2255,9 @@ class PredictionMarketStore:
             ),
             sort_key=lambda record: (record.observed_at, record.reconciliation_id),
         )
+        for record in records:
+            _require_canonical_live_reconciliation(record)
+        return records
 
     def verified_kill_switch_events(
         self, scope: str, as_of: datetime

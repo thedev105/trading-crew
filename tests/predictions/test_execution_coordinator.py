@@ -24,6 +24,7 @@ from polytrading.predictions.execution.coordinator import (
     SubmissionResult,
 )
 from polytrading.predictions.execution.kill_switch import KillState
+from polytrading.predictions.execution.ledger import LiveLedgerError, _classify_order_histories
 from polytrading.predictions.execution.models import (
     ActivationEvidence,
     ExecutionIntent,
@@ -1211,6 +1212,76 @@ def test_submit_maps_only_the_closed_task8_acknowledgements(
     assert result.state is expected_state
     assert signer.submit_calls == 1
     assert bool(store.verified_kill_switch_events(ACCOUNT_FINGERPRINT, NOW)) is expected_kill
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_states"),
+    [
+        (
+            RestCode.ORDER_OUTCOME_UNKNOWN,
+            (VenueOrderState.SUBMITTING, VenueOrderState.UNKNOWN),
+        ),
+        (
+            RestCode.AUTH_REQUEST_BUILD_FAILED,
+            (VenueOrderState.SUBMITTING, VenueOrderState.REJECTED),
+        ),
+    ],
+)
+def test_real_synthetic_submit_histories_pass_shared_classifier(
+    store: PredictionMarketStore,
+    code: RestCode,
+    expected_states: tuple[VenueOrderState, VenueOrderState],
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    result = coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        FakeSigner(submit_result(code)),
+    ).submit_intent(intent)
+    events = store.verified_venue_order_events_for_intent(
+        intent.intent_id,
+        NOW + timedelta(seconds=1),
+    )
+
+    assert result.state is expected_states[-1]
+    assert tuple(event.normalized_state for event in events) == expected_states
+    assert {event.venue_order_id for event in events} == {f"intent:{intent.intent_id}"}
+    histories = _classify_order_histories(events, NOW + timedelta(seconds=1))
+    assert len(histories) == 1
+    assert histories[0].ordered_events == events
+    assert histories[0].raw_event_hashes == tuple(sorted(event.raw_event_hash for event in events))
+
+
+def test_rejected_synthetic_submit_history_remains_terminal_absorbing(
+    store: PredictionMarketStore,
+) -> None:
+    plan = execution_plan()
+    intent = execution_intent(plan)
+    coordinator(
+        store,
+        FakePreflight(preflight_evidence(plan)),
+        FakeSigner(submit_result(RestCode.AUTH_REQUEST_BUILD_FAILED)),
+    ).submit_intent(intent)
+    events = store.verified_venue_order_events_for_intent(
+        intent.intent_id,
+        NOW + timedelta(seconds=1),
+    )
+    post_rejection = lifecycle_event(
+        intent,
+        VenueOrderState.UNKNOWN,
+        venue_order_id=f"intent:{intent.intent_id}",
+        received_at=NOW + timedelta(seconds=1),
+    ).model_copy(
+        update={
+            "event_id": UUID(int=86_112),
+            "intent_id": intent.intent_id,
+            "raw_event_hash": "e" * 64,
+        }
+    )
+
+    with pytest.raises(LiveLedgerError, match="ORDER_EVENT_CONFLICT"):
+        _classify_order_histories((*events, post_rejection), NOW + timedelta(seconds=2))
 
 
 @pytest.mark.parametrize(
