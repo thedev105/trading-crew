@@ -855,3 +855,158 @@ def test_execution_intent_history_detects_indexed_identity_corruption(
 
     with pytest.raises(ConflictingRecordError, match="indexed columns"):
         store.verified_execution_intent_history_for_plan(plan.plan_id, NOW)
+
+
+def _relational_execution_records() -> tuple[
+    LiveExecutionPlan,
+    ExecutionIntent,
+    AuthoritativeTradeEconomics,
+    LiveLedgerPosting,
+    LiveReconciliation,
+]:
+    plan = LiveExecutionPlan.model_validate(live_execution_plan_fields(observed_at=NOW))
+    intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+            created_at=NOW,
+        )
+    )
+    economics = authoritative_economics(intent)
+    posting = execution_records()[5].model_copy(
+        update={
+            "account_fingerprint": plan.account_fingerprint,
+            "intent_id": intent.intent_id,
+            "venue_order_id": economics.venue_order_id,
+            "venue_trade_id": economics.venue_trade_id,
+            "occurred_at": NOW,
+        }
+    )
+    reconciliation = execution_records()[6].model_copy(
+        update={"account_fingerprint": plan.account_fingerprint, "observed_at": NOW}
+    )
+    return plan, intent, economics, posting, reconciliation
+
+
+def test_verified_live_account_discovery_revalidates_every_account_bearing_family(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, intent, economics, posting, reconciliation = _relational_execution_records()
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_authoritative_trade_economics(economics)
+    store.append_live_ledger_posting(posting)
+    store.append_live_reconciliation(reconciliation)
+
+    assert store.verified_live_execution_account_fingerprints(economics.information_cutoff) == (
+        plan.account_fingerprint,
+    )
+
+
+def test_verified_live_account_discovery_excludes_a_complete_future_bundle(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    plan, _intent, _economics, posting, reconciliation = _relational_execution_records()
+    future = NOW + timedelta(minutes=1)
+    future_plan = plan.model_copy(
+        update={
+            "observed_at": future,
+            "information_cutoff": future,
+            "book_deadline": future + timedelta(seconds=5),
+            "proof_deadline": future + timedelta(seconds=5),
+            "economics_deadline": future + timedelta(seconds=5),
+            "account_deadline": future + timedelta(seconds=5),
+            "geoblock_deadline": future + timedelta(seconds=5),
+        }
+    )
+    future_intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=future_plan.plan_id,
+            account_fingerprint=future_plan.account_fingerprint,
+            created_at=future,
+            deadline=future + timedelta(seconds=5),
+        )
+    )
+    future_economics = authoritative_economics(
+        future_intent,
+        occurred_at=future + timedelta(seconds=1),
+        information_cutoff=future + timedelta(seconds=2),
+    )
+    store.append_live_execution_plan(future_plan)
+    store.append_execution_intent(future_intent)
+    store.append_authoritative_trade_economics(future_economics)
+    store.append_live_ledger_posting(
+        posting.model_copy(update={"intent_id": future_intent.intent_id, "occurred_at": future})
+    )
+    store.append_live_reconciliation(reconciliation.model_copy(update={"observed_at": future}))
+
+    assert store.verified_live_execution_account_fingerprints(NOW) == ()
+
+
+@pytest.mark.parametrize("orphan_kind", ["intent", "economics", "posting", "reconciliation"])
+def test_verified_live_account_discovery_rejects_orphan_relational_evidence(
+    orphan_kind: str,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"orphan-{orphan_kind}.duckdb")
+    _plan, intent, economics, posting, reconciliation = _relational_execution_records()
+    append = {
+        "intent": lambda: store.append_execution_intent(intent),
+        "economics": lambda: store.append_authoritative_trade_economics(economics),
+        "posting": lambda: store.append_live_ledger_posting(posting),
+        "reconciliation": lambda: store.append_live_reconciliation(reconciliation),
+    }
+    append[orphan_kind]()
+
+    with pytest.raises(ConflictingRecordError, match="orphan"):
+        store.verified_live_execution_account_fingerprints(economics.information_cutoff)
+
+
+def test_verified_live_account_discovery_rejects_cross_account_relations(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "cross-account.duckdb")
+    plan, _intent, *_ = _relational_execution_records()
+    mismatched = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint="9" * 64,
+            created_at=NOW,
+        )
+    )
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(mismatched)
+
+    with pytest.raises(ConflictingRecordError, match="account"):
+        store.verified_live_execution_account_fingerprints(NOW)
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("live_execution_plans", "account_fingerprint", "9" * 64),
+        ("execution_intents", "record_hash", "0" * 64),
+        ("authoritative_trade_economics", "intent_id", UUID(int=999)),
+        ("live_ledger_postings", "occurred_at", NOW - timedelta(seconds=1)),
+        ("live_reconciliations", "record_json", "{}"),
+    ],
+)
+def test_verified_live_account_discovery_rejects_tampered_index_hash_or_json(
+    table: str,
+    column: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / f"tampered-{table}.duckdb")
+    plan, intent, economics, posting, reconciliation = _relational_execution_records()
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_authoritative_trade_economics(economics)
+    store.append_live_ledger_posting(posting)
+    store.append_live_reconciliation(reconciliation)
+    store._connection.execute(f"UPDATE {table} SET {column} = ?", [value])
+
+    with pytest.raises(ConflictingRecordError):
+        store.verified_live_execution_account_fingerprints(economics.information_cutoff)

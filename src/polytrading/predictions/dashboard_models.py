@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from polytrading.predictions.domain import (
     PredictionBookSnapshot,
     PredictionRecord,
     PredictionVenue,
+    Sha256,
 )
 from polytrading.predictions.economics_models import ScanDecision
 from polytrading.predictions.health import PredictionHealthReport
@@ -23,6 +25,143 @@ NonNegativeCount = Annotated[int, Field(ge=0)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+
+
+class DashboardDomain(StrEnum):
+    OVERVIEW = "overview"
+    MARKETS = "markets"
+    EXECUTION = "execution"
+    LEDGER = "ledger"
+    EVIDENCE = "evidence"
+
+
+class ExecutionReadinessSummary(PredictionRecord):
+    schema_version: Literal[1]
+    as_of: datetime
+    implementation_state: Literal["LIVE_DISABLED"]
+    protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
+    conformance_result: NonEmptyString
+    conformance_observed_at: datetime | None
+    kill_engaged: Literal[True]
+    kill_trigger: NonEmptyString | None
+    production_capability_available: Literal[False]
+    live_action_available: Literal[False]
+    unmet_gates: tuple[NonEmptyString, ...]
+
+    @field_validator("conformance_observed_at")
+    @classmethod
+    def _conformance_timestamp_is_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("unmet_gates")
+    @classmethod
+    def _unmet_gates_are_sorted_unique(
+        cls, value: tuple[NonEmptyString, ...]
+    ) -> tuple[NonEmptyString, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("unmet_gates must be sorted and unique")
+        return value
+
+
+class MarketAtlasOpportunity(PredictionRecord):
+    schema_version: Literal[1]
+    as_of: datetime
+    candidate_id: UUID
+    proof_id: UUID | None
+    relationship_type: RelationshipType
+    decision: ScanDecision | None
+    conservative_surplus_usd: FiniteDecimal | None
+    capacity_usd: FiniteDecimal | None
+    reconciled: bool
+    evidence_hashes: tuple[Sha256, ...]
+
+    @field_validator("evidence_hashes")
+    @classmethod
+    def _opportunity_hashes_sorted_unique(cls, value: tuple[Sha256, ...]) -> tuple[Sha256, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("evidence_hashes must be sorted and unique")
+        return value
+
+
+class ExecutionTimelineEntry(PredictionRecord):
+    schema_version: Literal[1]
+    as_of: datetime
+    kind: Literal["plan", "intent", "order", "trade", "kill", "reconciliation"]
+    record_id: NonEmptyString
+    occurred_at: datetime
+    state: NonEmptyString
+    reason_code: NonEmptyString | None
+    reconciled: bool
+    evidence_hashes: tuple[Sha256, ...]
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _occurred_at_is_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("evidence_hashes")
+    @classmethod
+    def _timeline_hashes_sorted_unique(cls, value: tuple[Sha256, ...]) -> tuple[Sha256, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("evidence_hashes must be sorted and unique")
+        return value
+
+
+class LiveLedgerSummary(PredictionRecord):
+    schema_version: Literal[1]
+    as_of: datetime
+    posting_count: NonNegativeCount
+    reconciliation_count: NonNegativeCount
+    complete_reconciliation_count: NonNegativeCount
+    incomplete_reconciliation_count: NonNegativeCount
+    pnl_publishable: bool
+    realized_pnl_usd: FiniteDecimal | None
+
+    @model_validator(mode="after")
+    def _ledger_totals_are_coherent(self) -> LiveLedgerSummary:
+        if (
+            self.complete_reconciliation_count + self.incomplete_reconciliation_count
+            != self.reconciliation_count
+        ):
+            raise ValueError("reconciliation counts must sum to reconciliation_count")
+        if self.pnl_publishable != (self.realized_pnl_usd is not None):
+            raise ValueError("realized P&L is present exactly when publishable")
+        return self
+
+
+class EvidenceStatus(PredictionRecord):
+    schema_version: Literal[1]
+    as_of: datetime
+    protocol_version: NonEmptyString
+    protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
+    manifest_state: NonEmptyString
+    conformance_result: NonEmptyString
+    conformance_observed_at: datetime | None
+    account_count: NonNegativeCount
+    source_hashes: tuple[Sha256, ...]
+    unmet_activation_gates: tuple[NonEmptyString, ...]
+
+    @field_validator("conformance_observed_at")
+    @classmethod
+    def _evidence_timestamp_is_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("source_hashes", "unmet_activation_gates")
+    @classmethod
+    def _evidence_tuples_sorted_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("evidence tuples must be sorted and unique")
+        return value
 
 
 class PredictionEvidenceCounts(PredictionRecord):
@@ -185,6 +324,7 @@ class ShadowSummary(PredictionRecord):
 
 class PredictionDashboardSnapshot(PredictionRecord):
     schema_version: Literal[1]
+    revision_id: Sha256
     as_of: datetime
     health: PredictionHealthReport
     markets: tuple[MarketRecord, ...]
@@ -195,3 +335,25 @@ class PredictionDashboardSnapshot(PredictionRecord):
     proofs: ProofSummary
     scans: ScanSummary
     shadow: ShadowSummary
+    execution_readiness: ExecutionReadinessSummary
+    opportunities: Annotated[tuple[MarketAtlasOpportunity, ...], Field(max_length=200)]
+    execution_timeline: Annotated[tuple[ExecutionTimelineEntry, ...], Field(max_length=500)]
+    live_ledger: LiveLedgerSummary
+    evidence_status: EvidenceStatus
+
+    def cutoff_bound_sections(self) -> tuple[PredictionRecord, ...]:
+        return (
+            self.execution_readiness,
+            *self.opportunities,
+            *self.execution_timeline,
+            self.live_ledger,
+            self.evidence_status,
+        )
+
+    @model_validator(mode="after")
+    def _one_coherent_cutoff(self) -> PredictionDashboardSnapshot:
+        if any(section.as_of != self.as_of for section in self.cutoff_bound_sections()):
+            raise ValueError("dashboard sections must share one as_of cutoff")
+        if any(item.occurred_at > self.as_of for item in self.execution_timeline):
+            raise ValueError("execution timeline cannot exceed the dashboard cutoff")
+        return self

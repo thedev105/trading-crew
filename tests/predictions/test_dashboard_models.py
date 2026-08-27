@@ -1525,3 +1525,253 @@ def test_snapshot_scans_latest_is_newest_first_and_capped_at_twenty(tmp_path: Pa
     as_ofs = [listing.as_of for listing in snapshot.scans.latest]
     assert as_ofs == sorted(as_ofs, reverse=True)
     assert snapshot.scans.latest[0].candidate_id == UUID(int=424)
+
+
+def _append_live_dashboard_execution_bundle(store: PredictionMarketStore) -> str:
+    from polytrading.predictions.execution.models import (
+        ExecutionIntent,
+        KillSwitchEvent,
+        LiveExecutionPlan,
+        ProtocolConformanceResult,
+    )
+    from tests.predictions.execution_helpers import (
+        execution_intent_fields,
+        live_execution_plan_fields,
+    )
+
+    plan = LiveExecutionPlan.model_validate(
+        live_execution_plan_fields(
+            information_cutoff=NOW - timedelta(minutes=3),
+            observed_at=NOW - timedelta(minutes=2),
+            book_deadline=NOW + timedelta(minutes=5),
+            proof_deadline=NOW + timedelta(minutes=5),
+            economics_deadline=NOW + timedelta(minutes=5),
+            account_deadline=NOW + timedelta(minutes=5),
+            geoblock_deadline=NOW + timedelta(minutes=5),
+        )
+    )
+    intent = ExecutionIntent.model_validate(
+        execution_intent_fields(
+            plan_id=plan.plan_id,
+            account_fingerprint=plan.account_fingerprint,
+            created_at=NOW - timedelta(minutes=1),
+            deadline=NOW + timedelta(minutes=4),
+        )
+    )
+    store.append_live_execution_plan(plan)
+    store.append_execution_intent(intent)
+    store.append_kill_switch_event(
+        KillSwitchEvent(
+            schema_version=1,
+            kill_event_id=UUID(int=901),
+            trigger="RECOVERY_REQUIRED",
+            scope=plan.account_fingerprint,
+            source_intent_id=intent.intent_id,
+            source_order_id=None,
+            prior_state=True,
+            occurred_at=NOW - timedelta(seconds=1),
+        )
+    )
+    store.append_protocol_conformance_result(
+        ProtocolConformanceResult(
+            schema_version=1,
+            conformance_result_id=UUID(int=902),
+            fixture_hashes=("1" * 64,),
+            source_hashes=("2" * 64,),
+            implementation_revision="task-12",
+            executed_checks=("fixture_trust",),
+            result="CONFORMANT",
+            observed_at=NOW - timedelta(seconds=2),
+        )
+    )
+    store.append_venue_manifest(
+        venue_manifest(
+            implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
+            jurisdiction_review_status="ELIGIBILITY_REVIEWED",
+            reviewed_at=NOW - timedelta(seconds=3),
+        )
+    )
+    return plan.account_fingerprint
+
+
+def test_market_atlas_five_view_models_are_strict_immutable_and_one_cutoff(
+    tmp_path: Path,
+) -> None:
+    import polytrading.predictions.dashboard_models as dashboard_models
+
+    expected_models = (
+        "DashboardDomain",
+        "ExecutionReadinessSummary",
+        "MarketAtlasOpportunity",
+        "ExecutionTimelineEntry",
+        "LiveLedgerSummary",
+        "EvidenceStatus",
+    )
+    assert all(hasattr(dashboard_models, name) for name in expected_models)
+
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    sections = snapshot.cutoff_bound_sections()
+    assert all(section.as_of == snapshot.as_of == NOW for section in sections)
+    assert all(
+        type(value).__name__
+        in {
+            "ExecutionReadinessSummary",
+            "MarketAtlasOpportunity",
+            "ExecutionTimelineEntry",
+            "LiveLedgerSummary",
+            "EvidenceStatus",
+        }
+        for value in sections
+    )
+    assert isinstance(snapshot.opportunities, tuple)
+    assert isinstance(snapshot.execution_timeline, tuple)
+
+    readiness = snapshot.execution_readiness
+    with pytest.raises(ValidationError):
+        readiness.live_action_available = True
+    with pytest.raises(ValidationError):
+        type(readiness).model_validate(
+            {**readiness.model_dump(mode="python"), "unmet_gates": ["MUTABLE"]},
+            strict=True,
+        )
+    with pytest.raises(ValidationError):
+        type(readiness).model_validate(
+            {
+                **readiness.model_dump(mode="python"),
+                "as_of": NOW.replace(tzinfo=None),
+            },
+            strict=True,
+        )
+
+
+def test_market_atlas_snapshot_revision_omits_revision_id_from_canonical_hash(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+    canonical = json.dumps(
+        snapshot.model_dump(mode="json", exclude={"revision_id"}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    assert snapshot.revision_id == sha256(canonical).hexdigest()
+    assert len(snapshot.revision_id) == 64
+
+
+def test_market_atlas_snapshot_never_infers_live_readiness_from_persisted_evidence(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    _append_live_dashboard_execution_bundle(store)
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+    assert snapshot.execution_readiness.implementation_state == "LIVE_DISABLED"
+    assert snapshot.execution_readiness.protocol_state == "CURRENT"
+    assert snapshot.execution_readiness.conformance_result == "CONFORMANT"
+    assert snapshot.execution_readiness.kill_engaged is True
+    assert snapshot.execution_readiness.production_capability_available is False
+    assert snapshot.execution_readiness.live_action_available is False
+    assert "CAPABILITY_VERIFIER_NOT_CONFIGURED" in snapshot.execution_readiness.unmet_gates
+
+
+def test_market_atlas_builder_uses_exactly_one_transaction_for_every_visible_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    original_transaction = store.transaction
+    original_accounts = store.verified_live_execution_account_fingerprints
+    active = False
+    transaction_count = 0
+
+    @contextmanager
+    def observed_transaction() -> Iterator[PredictionMarketStore]:
+        nonlocal active, transaction_count
+        transaction_count += 1
+        with original_transaction():
+            active = True
+            try:
+                yield store
+            finally:
+                active = False
+
+    def observed_accounts(as_of: datetime) -> tuple[str, ...]:
+        assert active
+        assert as_of == NOW
+        return original_accounts(as_of)
+
+    monkeypatch.setattr(store, "transaction", observed_transaction)
+    monkeypatch.setattr(store, "verified_live_execution_account_fingerprints", observed_accounts)
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+    assert snapshot.as_of == NOW
+    assert transaction_count == 1
+
+
+def test_market_atlas_snapshot_is_sanitized_and_never_exposes_account_fingerprints(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    account_fingerprint = _append_live_dashboard_execution_bundle(store)
+
+    document = json.loads(
+        render_prediction_dashboard_json(
+            PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+        )
+    )
+    assert {
+        "execution_readiness",
+        "opportunities",
+        "execution_timeline",
+        "live_ledger",
+        "evidence_status",
+    } <= set(document)
+    forbidden_fields = {
+        "private_key",
+        "api_key",
+        "api_secret",
+        "passphrase",
+        "auth_headers",
+        "canonical_order_json",
+        "raw_frame",
+        "raw_payload",
+        "ipc_payload",
+        "geographic_ip",
+        "account_fingerprint",
+        "public_signature",
+    }
+
+    def all_keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return set(value) | {key for item in value.values() for key in all_keys(item)}
+        if isinstance(value, list):
+            return {key for item in value for key in all_keys(item)}
+        return set()
+
+    assert not (forbidden_fields & all_keys(document))
+    assert account_fingerprint not in json.dumps(document, sort_keys=True)
+
+
+def test_market_atlas_snapshot_fails_instead_of_truncating_safety_relevant_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    accounts = tuple(f"{index:064x}" for index in range(10_001))
+    monkeypatch.setattr(
+        store,
+        "verified_live_execution_account_fingerprints",
+        lambda _as_of: accounts,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="dashboard account limit"):
+        PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)

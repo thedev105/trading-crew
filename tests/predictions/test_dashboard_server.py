@@ -1,9 +1,14 @@
+import json
 from datetime import UTC, datetime
+from http import HTTPStatus
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 
 import polytrading.predictions.dashboard_server as prediction_dashboard_server
+from polytrading.predictions.dashboard import PredictionDashboardBuilder
+from polytrading.predictions.dashboard_live import DashboardRevisionBuffer
 from polytrading.predictions.dashboard_server import (
     PredictionDashboardApplication,
     PredictionDashboardLifecycleError,
@@ -14,6 +19,17 @@ from polytrading.predictions.storage.store import PredictionMarketStore
 from polytrading.storage.store import DuckDBStore
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
+
+
+def _seeded_revision_buffer(database: Path, *, capacity: int = 3) -> DashboardRevisionBuffer:
+    store = PredictionMarketStore(database)
+    try:
+        snapshot = PredictionDashboardBuilder(store, database).build(NOW)
+    finally:
+        store.close()
+    buffer = DashboardRevisionBuffer(capacity=capacity, clock=lambda: NOW)
+    buffer.publish(snapshot)
+    return buffer
 
 
 def test_validate_requires_an_existing_database_file(tmp_path: Path) -> None:
@@ -107,3 +123,161 @@ def test_serve_prediction_dashboard_sanitizes_a_server_failure(
         serve_prediction_dashboard(database, 8787, clock=lambda: NOW)
     assert caught.value.__cause__ is secret
     assert str(secret) not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/predictions-dashboard", "/", "/assets/app.css", "/assets/app.js"],
+)
+def test_head_has_get_parity_and_no_body(tmp_path: Path, path: str) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    get_response = application.respond("GET", path, "127.0.0.1")
+    head_response = application.respond("HEAD", path, "127.0.0.1")
+
+    assert head_response.status == get_response.status == HTTPStatus.OK
+    assert head_response.content_type == get_response.content_type
+    assert head_response.headers == {
+        **get_response.headers,
+        "Content-Length": str(len(get_response.body)),
+    }
+    assert head_response.body == b""
+
+
+def test_sse_emits_exact_compact_revision_metadata_only(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    buffer = _seeded_revision_buffer(database)
+    application = PredictionDashboardApplication(
+        database, clock=lambda: NOW, revision_buffer=buffer
+    )
+
+    response = application.respond(
+        "GET", "/api/v1/predictions-events", "127.0.0.1", last_event_id=None
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert response.content_type == "text/event-stream; charset=utf-8"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Accel-Buffering"] == "no"
+    lines = response.body.decode("utf-8").splitlines()
+    assert lines[0] == "id: 1"
+    assert lines[1] == "event: revision"
+    assert lines[2].startswith("data: {")
+    document = json.loads(lines[2].removeprefix("data: "))
+    assert set(document) == {
+        "schema_version",
+        "revision_id",
+        "as_of",
+        "emitted_at",
+        "changed_domains",
+    }
+    forbidden = {
+        "event_id",
+        "posting_count",
+        "markets",
+        "account_fingerprint",
+        "canonical_order_json",
+        "raw_payload",
+        "command",
+    }
+    assert forbidden.isdisjoint(document)
+    assert response.body.endswith(b"\n\n")
+
+
+def test_sse_resume_reset_keepalive_and_coalescing(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    buffer = _seeded_revision_buffer(database, capacity=2)
+    store = PredictionMarketStore(database)
+    try:
+        base = PredictionDashboardBuilder(store, database).build(NOW)
+    finally:
+        store.close()
+    second = buffer.publish(base.model_copy(update={"revision_id": "2" * 64}))
+    latest = buffer.publish(base.model_copy(update={"revision_id": "3" * 64}))
+    assert second is not None and latest is not None
+    application = PredictionDashboardApplication(
+        database, clock=lambda: NOW, revision_buffer=buffer
+    )
+
+    reset = application.respond("GET", "/api/v1/predictions-events", "127.0.0.1", last_event_id="1")
+    assert reset.body.startswith(b"id: 3\nevent: reset\ndata: ")
+    reset_data = json.loads(reset.body.split(b"data: ", 1)[1])
+    assert set(reset_data) == {
+        "schema_version",
+        "latest_revision_id",
+        "emitted_at",
+        "reason",
+    }
+
+    keepalive = application.respond(
+        "GET", "/api/v1/predictions-events", "127.0.0.1", last_event_id="3"
+    )
+    assert keepalive.body == b": keepalive\n\n"
+
+
+@pytest.mark.parametrize(
+    "method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT", "HEAD"]
+)
+def test_events_route_is_get_only(tmp_path: Path, method: str) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+    response = application.respond(method, "/api/v1/predictions-events", "127.0.0.1")
+    assert response.status == HTTPStatus.METHOD_NOT_ALLOWED
+    assert response.headers["Allow"] == "GET"
+
+
+@pytest.mark.parametrize(
+    "method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"]
+)
+@pytest.mark.parametrize("path", ["/api/v1/predictions-dashboard", "/", "/assets/app.js"])
+def test_snapshot_and_static_routes_have_no_mutating_or_bidirectional_method(
+    tmp_path: Path, method: str, path: str
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+    response = application.respond(method, path, "127.0.0.1")
+    assert response.status == HTTPStatus.METHOD_NOT_ALLOWED
+    assert response.headers["Allow"] == "GET, HEAD"
+
+
+def test_events_reject_query_non_loopback_and_invalid_cursor(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(
+        database,
+        clock=lambda: NOW,
+        revision_buffer=_seeded_revision_buffer(database),
+    )
+    assert (
+        application.respond("GET", "/api/v1/predictions-events?x=1", "127.0.0.1").status
+        == HTTPStatus.BAD_REQUEST
+    )
+    assert (
+        application.respond("GET", "/api/v1/predictions-events", "example.com").status
+        == HTTPStatus.BAD_REQUEST
+    )
+    response = application.respond(
+        "GET", "/api/v1/predictions-events", "127.0.0.1", last_event_id="hostile"
+    )
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert b"INVALID_EVENT_CURSOR" in response.body
+
+
+def test_broken_sse_pipe_is_a_clean_disconnect() -> None:
+    class BrokenPipe:
+        def write(self, _body: bytes) -> int:
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise AssertionError("flush cannot follow a broken write")
+
+    assert prediction_dashboard_server._write_sse_frame(BrokenPipe(), b"frame") is False
+    healthy = BytesIO()
+    assert prediction_dashboard_server._write_sse_frame(healthy, b"frame") is True
+    assert healthy.getvalue() == b"frame"

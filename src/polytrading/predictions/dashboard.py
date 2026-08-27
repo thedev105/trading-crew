@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
+from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,11 @@ from polytrading.predictions.candidates_models import CandidateRelationship
 from polytrading.predictions.dashboard_models import (
     CandidateListing,
     CandidateSummary,
+    EvidenceStatus,
+    ExecutionReadinessSummary,
+    ExecutionTimelineEntry,
+    LiveLedgerSummary,
+    MarketAtlasOpportunity,
     PredictionDashboardSnapshot,
     PredictionEvidenceCounts,
     PredictionOperationRecipes,
@@ -30,10 +36,19 @@ from polytrading.predictions.domain import (
     PredictionBookSnapshot,
     PredictionFeeRate,
     PredictionVenue,
+    normalize_utc_timestamp,
 )
 from polytrading.predictions.economics_models import ScanReport
+from polytrading.predictions.execution.authority import UnavailableProductionCapabilityVerifier
+from polytrading.predictions.execution.kill_switch import derive_kill_state
+from polytrading.predictions.execution.models import canonical_execution_hash
 from polytrading.predictions.experiments import ShadowExperiment
 from polytrading.predictions.health import PredictionHealthAuditor
+from polytrading.predictions.manifest import evaluate_execution_gate
+from polytrading.predictions.polymarket_execution import (
+    POLYMARKET_PROTOCOL_VERSION,
+    verify_protocol_sources,
+)
 from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.shadow_ledger import (
     LedgerPosting,
@@ -57,6 +72,9 @@ _MAX_CANDIDATES_SHOWN = 20
 _MAX_PROOFS_SHOWN = 20
 _MAX_SCANS_SHOWN = 20
 _MAX_SHADOW_SHOWN = 20
+_MAX_OPPORTUNITIES_SHOWN = 200
+_MAX_EXECUTION_TIMELINE_SHOWN = 500
+_MAX_SAFETY_RECORDS = 10_000
 
 
 class PredictionDashboardBuilder:
@@ -65,14 +83,37 @@ class PredictionDashboardBuilder:
         self._database_path = database_path
 
     def build(self, as_of: datetime) -> PredictionDashboardSnapshot:
+        cutoff = normalize_utc_timestamp(as_of)
+        with self._store.transaction():
+            snapshot = self._build_at_cutoff(cutoff)
+        canonical = json.dumps(
+            snapshot.model_dump(mode="json", exclude={"revision_id"}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return PredictionDashboardSnapshot.model_validate(
+            {**snapshot.model_dump(mode="python"), "revision_id": sha256(canonical).hexdigest()},
+            strict=True,
+        )
+
+    def _build_at_cutoff(self, as_of: datetime) -> PredictionDashboardSnapshot:
         health = PredictionHealthAuditor(self._store).audit(as_of)
         markets: list[MarketRecord] = []
         for venue in PredictionVenue:
             markets.extend(self._store.markets_as_of(venue, as_of))
         markets.sort(key=lambda market: market.retrieved_at, reverse=True)
         shown_markets = tuple(markets[:_MAX_MARKETS_SHOWN])
+        (
+            execution_readiness,
+            opportunities,
+            execution_timeline,
+            live_ledger,
+            evidence_status,
+        ) = self._live_execution_views(as_of)
         return PredictionDashboardSnapshot(
             schema_version=1,
+            revision_id="0" * 64,
             as_of=as_of,
             health=health,
             markets=shown_markets,
@@ -85,7 +126,273 @@ class PredictionDashboardBuilder:
             proofs=self._proof_summary(as_of),
             scans=self._scan_summary(as_of),
             shadow=self._shadow_summary(as_of),
+            execution_readiness=execution_readiness,
+            opportunities=opportunities,
+            execution_timeline=execution_timeline,
+            live_ledger=live_ledger,
+            evidence_status=evidence_status,
         )
+
+    def _live_execution_views(
+        self, as_of: datetime
+    ) -> tuple[
+        ExecutionReadinessSummary,
+        tuple[MarketAtlasOpportunity, ...],
+        tuple[ExecutionTimelineEntry, ...],
+        LiveLedgerSummary,
+        EvidenceStatus,
+    ]:
+        accounts = self._store.verified_live_execution_account_fingerprints(as_of)
+        if len(accounts) > _MAX_SAFETY_RECORDS:
+            raise ValueError("dashboard account limit exceeded")
+
+        protocol = verify_protocol_sources()
+        conformance = self._store.verified_protocol_conformance_results(as_of)
+        if len(conformance) > _MAX_SAFETY_RECORDS:
+            raise ValueError("dashboard conformance record limit exceeded")
+        latest_conformance = conformance[-1] if conformance else None
+        conformance_result = "NOT_RUN" if latest_conformance is None else latest_conformance.result
+
+        manifest = self._store.latest_venue_manifest_as_of(PredictionVenue.POLYMARKET, as_of)
+        manifest_gate = evaluate_execution_gate(manifest, venue=PredictionVenue.POLYMARKET)
+        capability = UnavailableProductionCapabilityVerifier().verify(
+            capability_bundle=b"", now=as_of
+        )
+        if capability.allowed or capability.reason != "CAPABILITY_VERIFIER_NOT_CONFIGURED":
+            raise ValueError("production capability posture is not fail closed")
+
+        timeline: list[ExecutionTimelineEntry] = []
+        posting_count = 0
+        reconciliations = []
+        latest_kill = None
+        for account in accounts:
+            plans = self._store.verified_live_execution_plans_for_account(account, as_of)
+            intents = self._store.verified_execution_intent_history_for_account(account, as_of)
+            postings = self._store.verified_live_ledger_postings_for_account(account, as_of)
+            account_reconciliations = self._store.verified_live_reconciliations_for_account(
+                account, as_of
+            )
+            kill_events = self._store.verified_kill_switch_events(account, as_of)
+            _require_bounded_safety_records(
+                plans=plans,
+                intents=intents,
+                postings=postings,
+                reconciliations=account_reconciliations,
+                kill_events=kill_events,
+            )
+            plan_ids = {plan.plan_id for plan in plans}
+            intent_ids = {intent.intent_id for intent in intents}
+            posting_ids = {posting.posting_id for posting in postings}
+            if any(intent.plan_id not in plan_ids for intent in intents):
+                raise ValueError("execution intent references an unavailable plan")
+            if any(
+                posting.intent_id is not None and posting.intent_id not in intent_ids
+                for posting in postings
+            ):
+                raise ValueError("live posting references an unavailable intent")
+            if any(
+                not set(reconciliation.expected_posting_ids).issubset(posting_ids)
+                for reconciliation in account_reconciliations
+            ):
+                raise ValueError("reconciliation references unavailable postings")
+
+            posting_count += len(postings)
+            reconciliations.extend(account_reconciliations)
+            kill_state = derive_kill_state(kill_events, production=True)
+            if not kill_state.engaged:
+                raise ValueError("production execution must remain killed")
+            if kill_state.latest_event is not None and (
+                latest_kill is None
+                or (kill_state.latest_event.occurred_at, kill_state.latest_event.kill_event_id)
+                > (latest_kill.occurred_at, latest_kill.kill_event_id)
+            ):
+                latest_kill = kill_state.latest_event
+
+            for plan in plans:
+                timeline.append(
+                    _timeline_entry(
+                        as_of,
+                        "plan",
+                        plan.plan_id,
+                        plan.observed_at,
+                        "PLANNED",
+                        None,
+                        False,
+                        plan,
+                    )
+                )
+            for intent in intents:
+                timeline.append(
+                    _timeline_entry(
+                        as_of,
+                        "intent",
+                        intent.intent_id,
+                        intent.created_at,
+                        "INTENT_RECORDED",
+                        None,
+                        False,
+                        intent,
+                    )
+                )
+                orders = self._store.verified_venue_order_events_for_intent(intent.intent_id, as_of)
+                trades = self._store.verified_venue_trade_events_for_intent(intent.intent_id, as_of)
+                if len(orders) + len(trades) > _MAX_SAFETY_RECORDS:
+                    raise ValueError("dashboard venue event limit exceeded")
+                timeline.extend(
+                    _timeline_entry(
+                        as_of,
+                        "order",
+                        event.event_id,
+                        event.received_at,
+                        event.normalized_state.value,
+                        None,
+                        event.normalized_state.value == "RECONCILED",
+                        event,
+                    )
+                    for event in orders
+                )
+                timeline.extend(
+                    _timeline_entry(
+                        as_of,
+                        "trade",
+                        event.trade_event_id,
+                        event.received_at,
+                        event.normalized_state.value,
+                        None,
+                        event.normalized_state.value == "CONFIRMED",
+                        event,
+                    )
+                    for event in trades
+                )
+            timeline.extend(
+                _timeline_entry(
+                    as_of,
+                    "kill",
+                    event.kill_event_id,
+                    event.occurred_at,
+                    "ENGAGED",
+                    event.trigger,
+                    False,
+                    event,
+                )
+                for event in kill_events
+            )
+            timeline.extend(
+                _timeline_entry(
+                    as_of,
+                    "reconciliation",
+                    reconciliation.reconciliation_id,
+                    reconciliation.observed_at,
+                    "COMPLETE" if reconciliation.complete else "INCOMPLETE",
+                    reconciliation.next_action,
+                    reconciliation.complete,
+                    reconciliation,
+                )
+                for reconciliation in account_reconciliations
+            )
+
+        if len(timeline) > _MAX_SAFETY_RECORDS:
+            raise ValueError("dashboard execution timeline limit exceeded")
+        timeline.sort(key=lambda item: (item.occurred_at, item.record_id), reverse=True)
+
+        unmet_gates = {"CAPABILITY_VERIFIER_NOT_CONFIGURED", "EXECUTION_KILL_ENGAGED"}
+        if not manifest_gate.allowed and manifest_gate.reason is not None:
+            unmet_gates.add(manifest_gate.reason)
+        if protocol.state != "CURRENT":
+            unmet_gates.add("PROTOCOL_REVIEW_REQUIRED")
+        if conformance_result != "CONFORMANT":
+            unmet_gates.add("PROTOCOL_CONFORMANCE_REQUIRED")
+        unmet = tuple(sorted(unmet_gates))
+        source_hashes = set(() if manifest is None else manifest.source_hashes)
+        if latest_conformance is not None:
+            source_hashes.update(latest_conformance.fixture_hashes)
+            source_hashes.update(latest_conformance.source_hashes)
+
+        complete_count = sum(record.complete for record in reconciliations)
+        readiness = ExecutionReadinessSummary(
+            schema_version=1,
+            as_of=as_of,
+            implementation_state="LIVE_DISABLED",
+            protocol_state=protocol.state,
+            conformance_result=conformance_result,
+            conformance_observed_at=(
+                None if latest_conformance is None else latest_conformance.observed_at
+            ),
+            kill_engaged=True,
+            kill_trigger=None if latest_kill is None else latest_kill.trigger,
+            production_capability_available=False,
+            live_action_available=False,
+            unmet_gates=unmet,
+        )
+        ledger = LiveLedgerSummary(
+            schema_version=1,
+            as_of=as_of,
+            posting_count=posting_count,
+            reconciliation_count=len(reconciliations),
+            complete_reconciliation_count=complete_count,
+            incomplete_reconciliation_count=len(reconciliations) - complete_count,
+            pnl_publishable=False,
+            realized_pnl_usd=None,
+        )
+        evidence = EvidenceStatus(
+            schema_version=1,
+            as_of=as_of,
+            protocol_version=POLYMARKET_PROTOCOL_VERSION,
+            protocol_state=protocol.state,
+            manifest_state=("MISSING" if manifest is None else manifest.implementation_state.value),
+            conformance_result=conformance_result,
+            conformance_observed_at=(
+                None if latest_conformance is None else latest_conformance.observed_at
+            ),
+            account_count=len(accounts),
+            source_hashes=tuple(sorted(source_hashes)),
+            unmet_activation_gates=unmet,
+        )
+        return (
+            readiness,
+            self._market_atlas_opportunities(as_of),
+            tuple(timeline[:_MAX_EXECUTION_TIMELINE_SHOWN]),
+            ledger,
+            evidence,
+        )
+
+    def _market_atlas_opportunities(self, as_of: datetime) -> tuple[MarketAtlasOpportunity, ...]:
+        candidates = self._store.candidate_relationships_as_of(as_of)
+        proofs = self._store.proof_artifacts_as_of(as_of)
+        reports = self._store.scan_reports_as_of(as_of)
+        if max(len(candidates), len(proofs), len(reports)) > _MAX_SAFETY_RECORDS:
+            raise ValueError("dashboard opportunity evidence limit exceeded")
+        latest_proof = {proof.candidate_id: proof for proof in proofs}
+        latest_report = {report.candidate_id: report for report in reports}
+        opportunities = []
+        for candidate in candidates:
+            proof = latest_proof.get(candidate.candidate_id)
+            report = latest_report.get(candidate.candidate_id)
+            economics = None if report is None else report.economics
+            evidence_records = tuple(
+                record for record in (candidate, proof, report) if record is not None
+            )
+            opportunities.append(
+                MarketAtlasOpportunity(
+                    schema_version=1,
+                    as_of=as_of,
+                    candidate_id=candidate.candidate_id,
+                    proof_id=None if proof is None else proof.proof_id,
+                    relationship_type=candidate.relationship_type,
+                    decision=None if report is None else report.decision,
+                    conservative_surplus_usd=(
+                        None if economics is None else economics.conservative_surplus_usd
+                    ),
+                    capacity_usd=(
+                        None if economics is None else economics.capacity_usd_at_current_depth
+                    ),
+                    reconciled=False,
+                    evidence_hashes=tuple(
+                        sorted(canonical_execution_hash(record) for record in evidence_records)
+                    ),
+                )
+            )
+        return tuple(reversed(opportunities[-_MAX_OPPORTUNITIES_SHOWN:]))
 
     def _latest_books(
         self, markets: tuple[MarketRecord, ...], as_of: datetime
@@ -300,6 +607,38 @@ def _scenario_from_execution_events(events: tuple[ShadowEvent, ...]) -> str | No
     return next(iter(scenario_ids))
 
 
+def _require_bounded_safety_records(**families: tuple[object, ...]) -> None:
+    for name, records in families.items():
+        if len(records) > _MAX_SAFETY_RECORDS:
+            raise ValueError(f"dashboard {name} limit exceeded")
+
+
+def _timeline_entry(
+    as_of: datetime,
+    kind: str,
+    record_id: object,
+    occurred_at: datetime,
+    state: str,
+    reason_code: str | None,
+    reconciled: bool,
+    record: BaseModel,
+) -> ExecutionTimelineEntry:
+    return ExecutionTimelineEntry.model_validate(
+        {
+            "schema_version": 1,
+            "as_of": as_of,
+            "kind": kind,
+            "record_id": str(record_id),
+            "occurred_at": occurred_at,
+            "state": state,
+            "reason_code": reason_code,
+            "reconciled": reconciled,
+            "evidence_hashes": (canonical_execution_hash(record),),
+        },
+        strict=True,
+    )
+
+
 def _validated_shadow_pnl(
     *,
     plan: ShadowPlan,
@@ -444,6 +783,17 @@ def render_prediction_dashboard_json(snapshot: PredictionDashboardSnapshot) -> b
     return json.dumps(
         _json_value(snapshot), ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode()
+
+
+def build_prediction_dashboard_snapshot(
+    database_path: Path, *, now: datetime
+) -> PredictionDashboardSnapshot:
+    cutoff = normalize_utc_timestamp(now)
+    store = PredictionMarketStore(database_path)
+    try:
+        return PredictionDashboardBuilder(store, database_path).build(cutoff)
+    finally:
+        store.close()
 
 
 def _json_value(value: Any) -> Any:

@@ -349,3 +349,35 @@ def test_dashboard_served_shadow_assets_never_use_forbidden_words(tmp_path: Path
 
     for forbidden in _FORBIDDEN_WORDS:
         assert forbidden.encode() not in served
+
+
+def test_database_snapshot_factory_captures_one_normalized_cutoff(tmp_path: Path) -> None:
+    from datetime import timedelta, timezone
+
+    import polytrading.predictions.dashboard as prediction_dashboard
+
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    assert hasattr(prediction_dashboard, "build_prediction_dashboard_snapshot")
+
+    eastern = NOW.astimezone(timezone(-timedelta(hours=4)))
+    snapshot = prediction_dashboard.build_prediction_dashboard_snapshot(database, now=eastern)
+
+    assert snapshot.as_of == NOW
+    assert all(section.as_of == NOW for section in snapshot.cutoff_bound_sections())
+    assert len(snapshot.revision_id) == 64
+
+
+def test_database_snapshot_factory_rejects_a_naive_cutoff(tmp_path: Path) -> None:
+    import pytest
+
+    import polytrading.predictions.dashboard as prediction_dashboard
+
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        prediction_dashboard.build_prediction_dashboard_snapshot(
+            database,
+            now=NOW.replace(tzinfo=None),
+        )
