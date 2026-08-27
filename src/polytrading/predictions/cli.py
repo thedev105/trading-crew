@@ -305,7 +305,9 @@ def add_predictions_subcommands(
         parser_class=_ExecutionArgumentParser,
     )
     polymarket_conformance = conformance_commands.add_parser(
-        "polymarket", help="verify the frozen Polymarket protocol offline"
+        "polymarket",
+        help="verify the frozen Polymarket protocol offline",
+        allow_abbrev=False,
     )
     polymarket_conformance.add_argument("--db", required=True, type=Path)
     polymarket_conformance.add_argument("--fixtures", type=Path)

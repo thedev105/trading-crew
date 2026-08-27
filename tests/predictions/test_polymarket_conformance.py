@@ -45,6 +45,15 @@ def _copy_fixtures(tmp_path: Path) -> Path:
     return target
 
 
+def _copy_fixtures_with_duplicate_content(tmp_path: Path) -> Path:
+    target = _copy_fixtures(tmp_path)
+    shutil.copyfile(
+        target / "order_vectors_v1.json",
+        target / "event_vectors_v1.json",
+    )
+    return target
+
+
 def _run_cli(
     database: Path,
     *,
@@ -111,6 +120,23 @@ def test_valid_copied_fixture_override_is_conformant(
 
     assert result.result == "CONFORMANT"
     assert result.failure_fingerprints == ()
+
+
+def test_duplicate_allowlisted_fixture_content_is_a_strict_review_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(conformance, "_utc_now", lambda: FIXED_NOW)
+
+    result = run_conformance(
+        _copy_fixtures_with_duplicate_content(tmp_path),
+        "duplicate-content",
+    )
+
+    assert result.result == "PROTOCOL_REVIEW_REQUIRED"
+    assert result.failure_fingerprints
+    assert result.fixture_hashes == tuple(sorted(set(result.fixture_hashes)))
+    assert len(result.fixture_hashes) == 3
+    _assert_sensitive_absent(result.model_dump_json())
 
 
 @pytest.mark.parametrize(
@@ -369,6 +395,35 @@ def test_cli_changed_fixture_persists_review_result_and_exits_two(
     assert captured.err == ""
     assert payload["result"] == "PROTOCOL_REVIEW_REQUIRED"
     _assert_sensitive_absent(captured.out, "raw-secret-invalid")
+
+    store = PredictionMarketStore(database, read_only=True)
+    try:
+        stored = store.verified_protocol_conformance_results(FIXED_NOW + timedelta(seconds=1))
+    finally:
+        store.close()
+    assert len(stored) == 1
+    assert stored[0].result == "PROTOCOL_REVIEW_REQUIRED"
+
+
+def test_cli_duplicate_allowlisted_fixture_content_persists_review_result_and_exits_two(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(conformance, "_utc_now", lambda: FIXED_NOW)
+    fixture_root = _copy_fixtures_with_duplicate_content(tmp_path)
+    database = tmp_path / "duplicate-content.duckdb"
+
+    exit_code = _run_cli(database, fixtures=fixture_root)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 2
+    assert captured.err == ""
+    assert payload["result"] == "PROTOCOL_REVIEW_REQUIRED"
+    assert payload["fixture_hashes"] == sorted(set(payload["fixture_hashes"]))
+    assert len(payload["fixture_hashes"]) == 3
+    _assert_sensitive_absent(captured.out)
 
     store = PredictionMarketStore(database, read_only=True)
     try:

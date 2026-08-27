@@ -149,6 +149,33 @@ def test_execution_conformance_requires_database_and_explicit_format() -> None:
         assert exit_info.value.code == 64
 
 
+@pytest.mark.parametrize(
+    "abbreviated_argv",
+    [
+        ["--d", "x.duckdb", "--format", "json"],
+        ["--db", "x.duckdb", "--fo", "json"],
+        ["--db", "x.duckdb", "--for", "json"],
+        ["--db", "x.duckdb", "--forma", "json"],
+        ["--db", "x.duckdb", "--fix", "fixtures", "--format", "json"],
+    ],
+)
+def test_execution_conformance_rejects_abbreviated_long_options_with_exit_64(
+    abbreviated_argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(
+            [
+                "predictions",
+                "execution",
+                "conformance",
+                "polymarket",
+                *abbreviated_argv,
+            ]
+        )
+
+    assert exit_info.value.code == 64
+
+
 def test_predictions_venues_status_reports_missing_manifests(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

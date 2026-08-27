@@ -627,7 +627,7 @@ def run_conformance(
     else:
         captured, complete = _capture_fixture_root(root, failures)
 
-    fixture_hashes = tuple(sorted(member.digest for member in captured.values()))
+    fixture_hashes = tuple(sorted({member.digest for member in captured.values()}))
     source_hashes: tuple[str, ...] = ()
     if complete:
         try:
