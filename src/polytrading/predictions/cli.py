@@ -288,7 +288,9 @@ def add_predictions_subcommands(
     shadow_replay.add_argument("--format", choices=("text", "json"), default="text")
 
     execution = predictions_commands.add_parser(
-        "execution", help="offline execution protocol verification"
+        "execution",
+        help="offline execution protocol verification",
+        allow_abbrev=False,
     )
     execution.error = _execution_parser_error  # type: ignore[method-assign]
     execution_commands = execution.add_subparsers(
@@ -297,7 +299,9 @@ def add_predictions_subcommands(
         parser_class=_ExecutionArgumentParser,
     )
     conformance = execution_commands.add_parser(
-        "conformance", help="verify frozen protocol conformance offline"
+        "conformance",
+        help="verify frozen protocol conformance offline",
+        allow_abbrev=False,
     )
     conformance_commands = conformance.add_subparsers(
         dest="predictions_execution_conformance_command",

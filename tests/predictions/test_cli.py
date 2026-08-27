@@ -150,16 +150,64 @@ def test_execution_conformance_requires_database_and_explicit_format() -> None:
 
 
 @pytest.mark.parametrize(
+    "parent_argv",
+    [
+        ["predictions", "execution"],
+        ["predictions", "execution", "conformance"],
+    ],
+    ids=("execution", "conformance"),
+)
+@pytest.mark.parametrize("abbreviated_help", ["--h", "--he", "--hel"])
+def test_execution_parent_parsers_reject_abbreviated_help_with_exit_64(
+    parent_argv: list[str], abbreviated_help: str
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([*parent_argv, abbreviated_help])
+
+    assert exit_info.value.code == 64
+
+
+@pytest.mark.parametrize(
+    "parent_argv",
+    [
+        ["predictions", "execution"],
+        ["predictions", "execution", "conformance"],
+    ],
+    ids=("execution", "conformance"),
+)
+def test_execution_parent_parsers_accept_literal_help(
+    parent_argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([*parent_argv, "--help"])
+
+    captured = capsys.readouterr()
+    assert exit_info.value.code == 0
+    assert captured.err == ""
+    assert captured.out.startswith("usage:")
+
+
+@pytest.mark.parametrize(
     "abbreviated_argv",
     [
         ["--d", "x.duckdb", "--format", "json"],
+        ["--db", "x.duckdb", "--f", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fi", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fix", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fixt", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fixtu", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fixtur", "fixtures", "--format", "json"],
+        ["--db", "x.duckdb", "--fixture", "fixtures", "--format", "json"],
         ["--db", "x.duckdb", "--fo", "json"],
         ["--db", "x.duckdb", "--for", "json"],
+        ["--db", "x.duckdb", "--form", "json"],
         ["--db", "x.duckdb", "--forma", "json"],
-        ["--db", "x.duckdb", "--fix", "fixtures", "--format", "json"],
+        ["--h"],
+        ["--he"],
+        ["--hel"],
     ],
 )
-def test_execution_conformance_rejects_abbreviated_long_options_with_exit_64(
+def test_execution_conformance_leaf_rejects_every_proper_option_prefix_with_exit_64(
     abbreviated_argv: list[str],
 ) -> None:
     with pytest.raises(SystemExit) as exit_info:
@@ -174,6 +222,15 @@ def test_execution_conformance_rejects_abbreviated_long_options_with_exit_64(
         )
 
     assert exit_info.value.code == 64
+
+
+def test_non_execution_parser_keeps_existing_long_option_abbreviation() -> None:
+    parsed = build_parser().parse_args(
+        ["predictions", "venues", "status", "--db", "x.duckdb", "--fo", "json"]
+    )
+
+    assert parsed.predictions_command == "venues"
+    assert parsed.format == "json"
 
 
 def test_predictions_venues_status_reports_missing_manifests(
