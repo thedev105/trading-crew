@@ -1371,9 +1371,12 @@ def _append_canonical_reconciliation_bundle(
         "missing_posting",
         "extra_posting",
         "future_posting",
+        "missing_order_hash",
+        "unsupported_order_hash",
         "missing_trade_hash",
         "unsupported_trade_hash",
         "missing_economics_hash",
+        "missing_allowance_hash",
         "overlapping_families",
         "noncanonical_posting",
         "lineage_outside_families",
@@ -1399,6 +1402,10 @@ def test_verified_reconciliation_requires_own_cut_canonical_typed_closure(
         reconciliation = reconciliation.model_copy(
             update={"observed_at": economics.occurred_at - timedelta(microseconds=1)}
         )
+    elif defect == "missing_order_hash":
+        reconciliation = reconciliation.model_copy(update={"venue_order_hashes": ()})
+    elif defect == "unsupported_order_hash":
+        reconciliation = reconciliation.model_copy(update={"venue_order_hashes": ("f" * 64,)})
     elif defect == "missing_trade_hash":
         reconciliation = reconciliation.model_copy(update={"venue_trade_hashes": ()})
     elif defect == "unsupported_trade_hash":
@@ -1407,6 +1414,8 @@ def test_verified_reconciliation_requires_own_cut_canonical_typed_closure(
         reconciliation = reconciliation.model_copy(
             update={"evidence_hashes": reconciliation.evidence_hashes[1:]}
         )
+    elif defect == "missing_allowance_hash":
+        reconciliation = reconciliation.model_copy(update={"allowance_hashes": ()})
     elif defect == "overlapping_families":
         reconciliation = reconciliation.model_copy(
             update={"allowance_hashes": (reconciliation.balance_hashes[0],)}

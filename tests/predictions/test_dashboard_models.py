@@ -1238,13 +1238,42 @@ def test_snapshot_recipes_include_shadow_run_and_replay_examples(tmp_path: Path)
     recipes = PredictionDashboardBuilder(store, database).build(NOW).recipes.recipes
 
     assert (
-        f"polytrading predictions shadow run --db {database} "
+        "polytrading predictions shadow run --db $PREDICTIONS_DATABASE "
         "--trial-family <trial-family> --format json"
     ) in recipes
     assert (
-        f"polytrading predictions shadow replay --db {database} "
+        "polytrading predictions shadow replay --db $PREDICTIONS_DATABASE "
         "--proposal-id <proposal-id> --format json"
     ) in recipes
+
+
+def test_snapshot_recipes_never_publish_or_expand_the_database_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    canary = "authorization=Bearer-private-key_signed-body_account_geographic-ip"
+    database = tmp_path / f"{canary}.duckdb"
+    monkeypatch.setenv("PREDICTIONS_DATABASE", canary)
+    store = PredictionMarketStore(database)
+
+    snapshot = PredictionDashboardBuilder(store, database).build(NOW)
+    recipes = snapshot.recipes.recipes
+    model_json = snapshot.model_dump_json()
+    rendered_json = render_prediction_dashboard_json(snapshot).decode()
+
+    assert recipes
+    assert all("--db $PREDICTIONS_DATABASE" in recipe for recipe in recipes)
+    for public_value in ("\n".join(recipes), model_json, rendered_json):
+        assert str(database) not in public_value
+        assert canary not in public_value
+        for fragment in (
+            "authorization=Bearer",
+            "private-key",
+            "signed-body",
+            "_account_",
+            "geographic-ip",
+        ):
+            assert fragment not in public_value
 
 
 def test_snapshot_includes_health_for_all_venues(tmp_path: Path) -> None:
@@ -2096,6 +2125,104 @@ def test_market_atlas_opportunity_binds_report_to_its_exact_proof_not_latest_pro
         canonical_execution_hash(report),
     }
     assert set(snapshot.opportunities[0].evidence_hashes) == expected
+
+
+@pytest.mark.parametrize(
+    "masked_defect",
+    ["missing_proof", "wrong_candidate", "proof_after_report"],
+)
+def test_market_atlas_validates_every_report_before_latest_projection(
+    masked_defect: str,
+    tmp_path: Path,
+) -> None:
+    candidate = candidate_relationship(
+        candidate_id=UUID(int=82_001),
+        observed_at=NOW - timedelta(minutes=10),
+        information_cutoff=NOW - timedelta(minutes=10),
+    )
+    proof = proof_artifact(
+        proof_id=UUID(int=82_101),
+        candidate_id=candidate.candidate_id,
+        observed_at=NOW - timedelta(minutes=8),
+        information_cutoff=NOW - timedelta(minutes=8),
+    )
+    masked_proof_id = proof.proof_id
+    other_candidate = None
+    other_proof = None
+    if masked_defect == "missing_proof":
+        masked_proof_id = UUID(int=999_999)
+    elif masked_defect == "wrong_candidate":
+        other_candidate = candidate_relationship(
+            candidate_id=UUID(int=82_002),
+            observed_at=NOW - timedelta(minutes=10),
+            information_cutoff=NOW - timedelta(minutes=10),
+        )
+        other_proof = proof_artifact(
+            proof_id=UUID(int=82_102),
+            candidate_id=other_candidate.candidate_id,
+            observed_at=NOW - timedelta(minutes=8),
+            information_cutoff=NOW - timedelta(minutes=8),
+        )
+        masked_proof_id = other_proof.proof_id
+    masked_report_time = NOW - timedelta(minutes=9 if masked_defect == "proof_after_report" else 6)
+    masked_report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=masked_proof_id,
+        reason=f"masked {masked_defect}",
+        as_of=masked_report_time,
+        observed_at=masked_report_time,
+    )
+    latest_report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=proof.proof_id,
+        reason="newest valid report",
+        as_of=NOW - timedelta(minutes=2),
+        observed_at=NOW - timedelta(minutes=2),
+    )
+    database = tmp_path / f"masked-{masked_defect}.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate)
+    if other_candidate is not None and other_proof is not None:
+        store.append_candidate_relationship(other_candidate)
+        store.append_proof_artifact(other_proof)
+    store.append_proof_artifact(proof)
+    store.append_scan_report(masked_report)
+    store.append_scan_report(latest_report)
+
+    with pytest.raises(ValueError, match=r"scan report|temporal"):
+        PredictionDashboardBuilder(store, database).build(NOW)
+
+
+def test_market_atlas_validates_candidate_order_for_every_proofless_report(
+    tmp_path: Path,
+) -> None:
+    candidate = candidate_relationship(
+        candidate_id=UUID(int=82_201),
+        observed_at=NOW - timedelta(minutes=5),
+        information_cutoff=NOW - timedelta(minutes=5),
+    )
+    masked_report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=None,
+        reason="candidate did not exist yet",
+        as_of=NOW - timedelta(minutes=6),
+        observed_at=NOW - timedelta(minutes=6),
+    )
+    latest_report = scan_report(
+        candidate_id=candidate.candidate_id,
+        proof_id=None,
+        reason="newest valid report",
+        as_of=NOW - timedelta(minutes=2),
+        observed_at=NOW - timedelta(minutes=2),
+    )
+    database = tmp_path / "masked-proofless-candidate-time.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_candidate_relationship(candidate)
+    store.append_scan_report(masked_report)
+    store.append_scan_report(latest_report)
+
+    with pytest.raises(ValueError, match="temporal"):
+        PredictionDashboardBuilder(store, database).build(NOW)
 
 
 @pytest.mark.parametrize(

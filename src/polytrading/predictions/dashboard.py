@@ -77,6 +77,7 @@ _MAX_SHADOW_SHOWN = 20
 _MAX_OPPORTUNITIES_SHOWN = 200
 _MAX_EXECUTION_TIMELINE_SHOWN = 500
 _MAX_SAFETY_RECORDS = 10_000
+_PREDICTIONS_DATABASE_PLACEHOLDER = "$PREDICTIONS_DATABASE"
 
 
 class PredictionDashboardBuilder:
@@ -400,6 +401,24 @@ class PredictionDashboardBuilder:
         if any(report.candidate_id not in candidates_by_id for report in reports):
             raise ValueError("scan report references an unavailable candidate")
         proofs_by_id = {proof.proof_id: proof for proof in proofs}
+        report_proofs: dict[UUID, ProofArtifact | None] = {}
+        for report in reports:
+            candidate = candidates_by_id[report.candidate_id]
+            if (
+                candidate.information_cutoff > report.as_of
+                or candidate.observed_at > report.observed_at
+            ):
+                raise ValueError("candidate and scan report temporal order is invalid")
+            proof = None if report.proof_id is None else proofs_by_id.get(report.proof_id)
+            if report.proof_id is not None and (
+                proof is None or proof.candidate_id != report.candidate_id
+            ):
+                raise ValueError("scan report references an unavailable proof")
+            if proof is not None and (
+                proof.information_cutoff > report.as_of or proof.observed_at > report.observed_at
+            ):
+                raise ValueError("proof and scan report temporal order is invalid")
+            report_proofs[report.report_id] = proof
         latest_proof = {proof.candidate_id: proof for proof in proofs}
         latest_report = {report.candidate_id: report for report in reports}
         opportunities = []
@@ -407,17 +426,8 @@ class PredictionDashboardBuilder:
             report = latest_report.get(candidate.candidate_id)
             if report is None:
                 proof = latest_proof.get(candidate.candidate_id)
-            elif report.proof_id is None:
-                proof = None
             else:
-                proof = proofs_by_id.get(report.proof_id)
-                if proof is None or proof.candidate_id != report.candidate_id:
-                    raise ValueError("scan report references an unavailable proof")
-                if (
-                    proof.information_cutoff > report.as_of
-                    or proof.observed_at > report.observed_at
-                ):
-                    raise ValueError("proof and scan report temporal order is invalid")
+                proof = report_proofs[report.report_id]
             economics = None if report is None else report.economics
             evidence_records = tuple(
                 record for record in (candidate, proof, report) if record is not None
@@ -618,7 +628,7 @@ class PredictionDashboardBuilder:
         )
 
     def _recipes(self) -> tuple[str, ...]:
-        db = self._database_path
+        db = _PREDICTIONS_DATABASE_PLACEHOLDER
         return (
             f"polytrading predictions venues status --db {db} --format json",
             f"polytrading predictions collect polymarket --db {db}",
