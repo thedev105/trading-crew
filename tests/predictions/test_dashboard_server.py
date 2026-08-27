@@ -21,6 +21,13 @@ from polytrading.predictions.storage.store import PredictionMarketStore
 from polytrading.storage.store import DuckDBStore
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
+MARKET_ATLAS_MODULE_PATHS = (
+    "/assets/api.js",
+    "/assets/stream.js",
+    "/assets/store.js",
+    "/assets/charts.js",
+    "/assets/views.js",
+)
 
 
 def _seeded_revision_buffer(database: Path, *, capacity: int = 3) -> DashboardRevisionBuffer:
@@ -157,6 +164,44 @@ def test_head_has_get_parity_and_no_body(tmp_path: Path, path: str) -> None:
         "Content-Length": str(len(get_response.body)),
     }
     assert head_response.body == b""
+
+
+@pytest.mark.parametrize("path", MARKET_ATLAS_MODULE_PATHS)
+def test_market_atlas_module_assets_are_fixed_no_store_javascript(
+    tmp_path: Path, path: str
+) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    response = application.respond("GET", path, "127.0.0.1")
+    head = application.respond("HEAD", path, "127.0.0.1")
+
+    assert response.status == HTTPStatus.OK
+    assert response.content_type == "text/javascript; charset=utf-8"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "default-src 'self'" in response.headers["Content-Security-Policy"]
+    assert response.body
+    assert head.status == HTTPStatus.OK
+    assert head.content_type == response.content_type
+    assert head.headers["Content-Length"] == str(len(response.body))
+    assert head.body == b""
+
+
+def test_static_asset_allowlist_does_not_become_a_wildcard(tmp_path: Path) -> None:
+    database = tmp_path / "predictions.duckdb"
+    PredictionMarketStore(database).close()
+    application = PredictionDashboardApplication(database, clock=lambda: NOW)
+
+    assert (
+        application.respond("GET", "/assets/not-allowlisted.js", "127.0.0.1").status
+        == HTTPStatus.NOT_FOUND
+    )
+    for path in MARKET_ATLAS_MODULE_PATHS:
+        for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"):
+            response = application.respond(method, path, "127.0.0.1")
+            assert response.status == HTTPStatus.METHOD_NOT_ALLOWED
+            assert response.headers["Allow"] == "GET, HEAD"
 
 
 def test_sse_emits_exact_compact_revision_metadata_only(tmp_path: Path) -> None:

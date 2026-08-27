@@ -395,6 +395,11 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
             "polytrading/predictions/web_assets/index.html",
             "polytrading/predictions/web_assets/app.css",
             "polytrading/predictions/web_assets/app.js",
+            "polytrading/predictions/web_assets/api.js",
+            "polytrading/predictions/web_assets/stream.js",
+            "polytrading/predictions/web_assets/store.js",
+            "polytrading/predictions/web_assets/charts.js",
+            "polytrading/predictions/web_assets/views.js",
         }
         dossiers = tuple(
             ContractCompatibilityDossier.model_validate_json(archive.read(member))

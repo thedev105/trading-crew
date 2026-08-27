@@ -39,6 +39,11 @@ _STATIC_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/api.js": ("api.js", "text/javascript; charset=utf-8"),
+    "/assets/stream.js": ("stream.js", "text/javascript; charset=utf-8"),
+    "/assets/store.js": ("store.js", "text/javascript; charset=utf-8"),
+    "/assets/charts.js": ("charts.js", "text/javascript; charset=utf-8"),
+    "/assets/views.js": ("views.js", "text/javascript; charset=utf-8"),
 }
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (

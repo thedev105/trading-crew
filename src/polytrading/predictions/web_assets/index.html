@@ -1,146 +1,146 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<title>polytrading predictions dashboard</title>
-<link rel="stylesheet" href="/assets/app.css" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#071018" />
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230d1824'/%3E%3Cpath d='M8 22V10h4l4 6 4-6h4v12h-4v-6l-4 6-4-6v6z' fill='%2348d7ef'/%3E%3C/svg%3E" />
+  <title>Market Atlas · predictions dashboard</title>
+  <link rel="stylesheet" href="/assets/app.css" />
 </head>
-<body>
-<main>
-  <h1>Prediction-market evidence (research only)</h1>
-  <p class="warning">
-    Research only. Shadow results are simulations against recorded public evidence. This page
-    has no collection or execution controls.
+<body data-connection="disconnected">
+  <a class="skip-link" href="#main">Skip to market intelligence</a>
+
+  <div class="atlas-shell">
+    <header class="topbar" aria-label="Market Atlas header">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">MA</span>
+        <div>
+          <p class="eyebrow">POLYTRADING · OBSERVER SURFACE</p>
+          <p class="brand-name">Market Atlas</p>
+        </div>
+      </div>
+      <div class="topbar-status" aria-label="Execution posture">
+        <span class="status-chip" data-tone="warning">LIVE_DISABLED</span>
+        <span class="status-chip status-chip--quiet">READ ONLY</span>
+      </div>
+    </header>
+
+    <nav id="primary-navigation" class="primary-nav" aria-label="Primary views">
+      <p class="nav-kicker">Intelligence desk</p>
+      <div class="tab-list" role="tablist" aria-orientation="vertical">
+        <button id="tab-overview" type="button" role="tab" data-view="overview"
+                aria-controls="view-root" aria-selected="true" tabindex="0">Overview</button>
+        <button id="tab-markets" type="button" role="tab" data-view="markets"
+                aria-controls="view-root" aria-selected="false" tabindex="-1">Markets</button>
+        <button id="tab-execution" type="button" role="tab" data-view="execution"
+                aria-controls="view-root" aria-selected="false" tabindex="-1">Execution</button>
+        <button id="tab-ledger" type="button" role="tab" data-view="ledger"
+                aria-controls="view-root" aria-selected="false" tabindex="-1">Ledger</button>
+        <button id="tab-evidence" type="button" role="tab" data-view="evidence"
+                aria-controls="view-root" aria-selected="false" tabindex="-1">Evidence</button>
+      </div>
+      <div class="nav-footnote">
+        <span class="signal-dot" aria-hidden="true"></span>
+        Same-origin observation
+      </div>
+    </nav>
+
+    <main id="main" class="main-canvas" tabindex="-1">
+      <div class="view-heading">
+        <div>
+          <p class="eyebrow">LIVE RESEARCH CONSOLE</p>
+          <h1 id="view-title">Overview</h1>
+        </div>
+        <p id="view-context" class="view-context">Operating posture and evidence freshness</p>
+      </div>
+      <section id="view-root" class="view-root" role="tabpanel"
+               aria-labelledby="tab-overview" aria-busy="true">
+        <div class="loading-panel" role="status">
+          <span class="loading-pulse" aria-hidden="true"></span>
+          <div>
+            <p class="loading-title">Establishing verified snapshot</p>
+            <p class="muted">The observer is waiting for one immutable database cutoff.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside id="safety-rail" class="safety-rail" aria-labelledby="safety-title">
+      <div class="rail-heading">
+        <p class="eyebrow">SAFETY ENVELOPE</p>
+        <h2 id="safety-title">Observer posture</h2>
+      </div>
+
+      <div class="posture-card">
+        <span class="posture-icon" aria-hidden="true">R/O</span>
+        <div>
+          <strong>READ ONLY</strong>
+          <p>No execution authority is present.</p>
+        </div>
+      </div>
+
+      <dl class="rail-metrics">
+        <div>
+          <dt>Implementation</dt>
+          <dd id="implementation-state" data-tone="warning">LIVE_DISABLED</dd>
+        </div>
+        <div>
+          <dt>Kill state</dt>
+          <dd id="kill-state" data-tone="fault">ENGAGED · enforced</dd>
+        </div>
+        <div>
+          <dt>Connection</dt>
+          <dd id="connection-state" data-tone="muted">STARTING</dd>
+        </div>
+        <div>
+          <dt>Snapshot cutoff</dt>
+          <dd id="snapshot-cutoff">Awaiting snapshot</dd>
+        </div>
+        <div>
+          <dt>Last refresh</dt>
+          <dd id="last-refresh">Not yet</dd>
+        </div>
+      </dl>
+
+      <div class="rail-rule" aria-hidden="true"></div>
+      <p class="rail-note">
+        Stream messages announce revisions only. Every displayed fact comes from a complete
+        same-origin snapshot.
+      </p>
+    </aside>
+  </div>
+
+  <div id="connection-overlay" class="connection-overlay" role="status" hidden>
+    <div class="connection-overlay__card">
+      <p class="eyebrow">OBSERVER CHANNEL</p>
+      <p id="connection-overlay-title" class="overlay-title">Connection unavailable</p>
+      <p id="connection-overlay-detail" class="muted">Retaining the last verified snapshot.</p>
+    </div>
+  </div>
+
+  <p id="update-summary" class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+    Market Atlas is loading.
   </p>
-  <p id="as-of">Loading&hellip;</p>
+  <noscript>
+    <p class="noscript-note">Market Atlas needs JavaScript to render its read-only snapshot.</p>
+  </noscript>
 
-  <section>
-    <h2>Venue health</h2>
-    <table id="venues">
-      <thead>
-        <tr>
-          <th>Venue</th>
-          <th>Status</th>
-          <th>Collection allowed</th>
-          <th>Markets</th>
-          <th>Latest book age (s)</th>
-          <th>Reasons</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
+  <!-- Legacy observer-contract anchors remain hidden for downstream static compatibility. -->
+  <div id="legacy-dashboard-contracts" hidden aria-hidden="true">
+    <p id="as-of"></p>
+    <p id="candidates-summary"></p><div id="candidates"></div>
+    <p id="candidates-empty">No candidate relationships observed as of this snapshot.</p>
+    <p id="proofs-summary"></p><div id="proofs"></div>
+    <p id="proofs-empty">No proof artifacts observed as of this snapshot.</p>
+    <p id="scans-summary"></p><div id="scans"></div>
+    <p id="scans-empty">No scan reports observed as of this snapshot.</p>
+    <p id="shadow-summary" aria-live="polite"></p><div id="shadow-proposals"></div>
+    <p id="shadow-empty" aria-live="polite">No shadow proposals observed as of this snapshot.</p>
+    <p id="stale-notice"></p>
+  </div>
 
-  <section>
-    <h2>Markets</h2>
-    <table id="markets">
-      <thead>
-        <tr>
-          <th>Venue</th>
-          <th>Market</th>
-          <th>Question</th>
-          <th>Active</th>
-          <th>Closed</th>
-          <th>Retrieved at</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <section>
-    <h2>Candidate relationships (nominations for review, not trading signals)</h2>
-    <p id="candidates-summary"></p>
-    <table id="candidates">
-      <thead>
-        <tr>
-          <th>Candidate</th>
-          <th>Relationship type</th>
-          <th>Venues</th>
-          <th>Disposition</th>
-          <th>Provenance</th>
-          <th>Unresolved fields</th>
-          <th>Observed at</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <p id="candidates-empty" hidden>No candidate relationships observed as of this snapshot.</p>
-  </section>
-
-  <section>
-    <h2>Proof artifacts (deterministic payoff proofs, not trading signals)</h2>
-    <p id="proofs-summary"></p>
-    <table id="proofs">
-      <thead>
-        <tr>
-          <th>Proof</th>
-          <th>Candidate</th>
-          <th>Template</th>
-          <th>Status</th>
-          <th>Rejection reason</th>
-          <th>Minimum basket payout</th>
-          <th>Observed at</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <p id="proofs-empty" hidden>No proof artifacts observed as of this snapshot.</p>
-  </section>
-
-  <section>
-    <h2>Scan reports (research decisions, not trading signals)</h2>
-    <p id="scans-summary"></p>
-    <table id="scans">
-      <thead>
-        <tr>
-          <th>Candidate</th>
-          <th>Decision</th>
-          <th>Reason</th>
-          <th>Surplus (USD)</th>
-          <th>Capacity (USD)</th>
-          <th>As of</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <p id="scans-empty" hidden>No scan reports observed as of this snapshot.</p>
-  </section>
-
-  <section aria-labelledby="shadow-heading">
-    <h2 id="shadow-heading">Shadow proposals and paper results (simulation only)</h2>
-    <p id="shadow-summary" aria-live="polite"></p>
-    <table id="shadow-proposals">
-      <thead>
-        <tr>
-          <th>Proposal</th>
-          <th>Candidate</th>
-          <th>Current state</th>
-          <th>Scenario</th>
-          <th>Quantity</th>
-          <th>Paper P&amp;L (USD)</th>
-          <th>Observed at</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <p id="shadow-empty" role="status" aria-live="polite" hidden>
-      No shadow proposals observed as of this snapshot.
-    </p>
-  </section>
-
-  <section>
-    <h2>Evidence counts</h2>
-    <pre id="evidence-counts"></pre>
-  </section>
-
-  <section>
-    <h2>Recipes (copy only, never executed)</h2>
-    <ul id="recipes"></ul>
-  </section>
-
-  <p id="stale-notice" hidden>Showing the last successful snapshot; refresh failed.</p>
-</main>
-<script src="/assets/app.js"></script>
+  <script type="module" src="/assets/app.js"></script>
 </body>
 </html>
