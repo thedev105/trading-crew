@@ -26,6 +26,7 @@ from tests.domain.factories import (
     book_snapshot,
     instrument_spec,
 )
+from tests.funding_evidence_seed import bulk_append_funding_evidence
 from tests.trial.funding_helpers import trial_funding_cycle
 
 DYDX_FUNDING_HASH = "1" * 64
@@ -43,6 +44,8 @@ def seed_complete_database(path: Path, *, link_trial_funding: bool = True) -> No
     training_start = item.study_end - timedelta(days=90)
     evaluation_start = item.study_end - timedelta(days=60)
     book_evidence = []
+    funding_observations = []
+    funding_cycles = []
     with store.transaction():
         store.append_instrument(
             instrument_spec(
@@ -135,26 +138,47 @@ def seed_complete_database(path: Path, *, link_trial_funding: bool = True) -> No
                 observed_at=observed_at,
                 source_hash=LIGHTER_FUNDING_HASH,
             )
-            store.append_funding(dydx_funding)
-            store.append_funding(lighter_funding)
+            funding_observations.extend((dydx_funding, lighter_funding))
             if link_trial_funding:
-                append_trial_funding_cycle(
-                    store,
-                    cycle_id=UUID(int=100_000 + hour),
-                    dydx=dydx_funding,
-                    lighter=lighter_funding,
+                funding_cycles.append(
+                    trial_funding_cycle_for_observations(
+                        cycle_id=UUID(int=100_000 + hour),
+                        dydx=dydx_funding,
+                        lighter=lighter_funding,
+                    )
                 )
         for hour in range(1, 60 * 24 + 1):
             boundary = evaluation_start + timedelta(hours=hour)
             book_evidence.append(book_pair_records(10_000 + hour, boundary - timedelta(minutes=1)))
         book_evidence.append(book_pair_records(20_001, KNOWN_AS_OF - timedelta(seconds=10)))
         book_evidence.append(book_pair_records(20_002, KNOWN_AS_OF - timedelta(seconds=5)))
+        bulk_append_funding_evidence(
+            store,
+            funding_observations,
+            funding_cycles,
+            path.parent,
+        )
         bulk_append_book_evidence(store, book_evidence, path.parent)
     store.close()
 
 
 def append_trial_funding_cycle(
     store: DuckDBStore,
+    *,
+    cycle_id: UUID,
+    dydx: FundingObservation,
+    lighter: FundingObservation,
+) -> LighterDydxFundingCycle:
+    cycle = trial_funding_cycle_for_observations(
+        cycle_id=cycle_id,
+        dydx=dydx,
+        lighter=lighter,
+    )
+    store.append_lighter_dydx_funding_cycle(cycle)
+    return cycle
+
+
+def trial_funding_cycle_for_observations(
     *,
     cycle_id: UUID,
     dydx: FundingObservation,
@@ -180,7 +204,6 @@ def append_trial_funding_cycle(
         request_completed_at=dydx.effective_at + timedelta(minutes=2),
         items=tuple(items),
     )
-    store.append_lighter_dydx_funding_cycle(cycle)
     return cycle
 
 

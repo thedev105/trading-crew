@@ -10,7 +10,11 @@ import polytrading.trial as trial_api
 from polytrading.domain.models import Asset, FundingObservation, Venue
 from polytrading.storage.store import DuckDBStore
 from polytrading.trial.funding import record_late_lighter_dydx_cycle
-from polytrading.trial.funding_models import TrialFundingCycleStatus, TrialFundingOutcome
+from polytrading.trial.funding_models import (
+    LighterDydxFundingCycle,
+    TrialFundingCycleStatus,
+    TrialFundingOutcome,
+)
 from polytrading.trial.health import (
     LighterDydxTrialHealthAuditor,
     ProjectedAssetEvidence,
@@ -18,6 +22,7 @@ from polytrading.trial.health import (
 )
 from polytrading.trial.health_models import TrialCollectionStatus, TrialEvidenceStatus
 from tests.book_evidence_seed import bulk_append_book_evidence
+from tests.funding_evidence_seed import bulk_append_funding_evidence
 from tests.trial.funding_helpers import trial_funding_cycle
 from tests.trial.test_book_evidence import (
     DYDX_HASH,
@@ -109,22 +114,31 @@ def test_final_168_miss_shifts_projection_until_it_rolls_out() -> None:
     ) == latest + timedelta(hours=168)
 
 
-def append_complete_funding_boundary(store: DuckDBStore, boundary: datetime, identity: int) -> None:
+def complete_funding_boundary_records(
+    boundary: datetime, identity: int
+) -> tuple[tuple[FundingObservation, ...], LighterDydxFundingCycle]:
     cycle = trial_funding_cycle(cycle_id=UUID(int=identity), cycle_end=boundary)
-    for item in cycle.items:
-        store.append_funding(
-            FundingObservation(
-                schema_version=1,
-                venue=item.venue,
-                symbol=item.symbol,
-                asset=item.asset,
-                rate=Decimal("0.0001"),
-                interval_hours=Decimal("1"),
-                effective_at=boundary,
-                observed_at=boundary + timedelta(seconds=12),
-                source_hash=FUNDING_HASH,
-            )
+    observations = tuple(
+        FundingObservation(
+            schema_version=1,
+            venue=item.venue,
+            symbol=item.symbol,
+            asset=item.asset,
+            rate=Decimal("0.0001"),
+            interval_hours=Decimal("1"),
+            effective_at=boundary,
+            observed_at=boundary + timedelta(seconds=12),
+            source_hash=FUNDING_HASH,
         )
+        for item in cycle.items
+    )
+    return observations, cycle
+
+
+def append_complete_funding_boundary(store: DuckDBStore, boundary: datetime, identity: int) -> None:
+    observations, cycle = complete_funding_boundary_records(boundary, identity)
+    for observation in observations:
+        store.append_funding(observation)
     store.append_lighter_dydx_funding_cycle(cycle)
 
 
@@ -177,10 +191,14 @@ def seed_complete_trial_hours(
     store = DuckDBStore(tmp_path / "trial.duckdb")
     first = AS_OF_HOUR - timedelta(hours=hours - 1)
     book_evidence = []
+    funding_observations = []
+    funding_cycles = []
     with store.transaction():
         for index in range(hours):
             boundary = first + timedelta(hours=index)
-            append_complete_funding_boundary(store, boundary, index + 1)
+            observations, cycle = complete_funding_boundary_records(boundary, index + 1)
+            funding_observations.extend(observations)
+            funding_cycles.append(cycle)
             for offset, asset in enumerate(Asset, start=1):
                 if asset is Asset.BTC and boundary in missing_book_hours:
                     continue
@@ -190,6 +208,12 @@ def seed_complete_trial_hours(
                     continue
                 cycle, snapshots = book_pair_records(identity, boundary, asset=asset)
                 book_evidence.append((cycle, snapshots))
+        bulk_append_funding_evidence(
+            store,
+            funding_observations,
+            funding_cycles,
+            tmp_path,
+        )
         if bulk_book_evidence:
             bulk_append_book_evidence(store, book_evidence, tmp_path)
     return store
