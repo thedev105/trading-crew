@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import TextIO
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import TypeAdapter, ValidationError
@@ -47,6 +48,7 @@ from polytrading.predictions.economics_models import (
     ScanReport,
     deterministic_scan_report_id,
 )
+from polytrading.predictions.execution.models import ProtocolConformanceResult
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.health import PredictionHealthAuditor, VenueEvidenceStatus
 from polytrading.predictions.health_report import (
@@ -57,6 +59,11 @@ from polytrading.predictions.kalshi import KalshiAdapter
 from polytrading.predictions.limitless import LimitlessAdapter
 from polytrading.predictions.manifest import evaluate_collection_gate
 from polytrading.predictions.polymarket import PolymarketAdapter
+from polytrading.predictions.polymarket_execution.conformance import run_conformance
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PROTOCOL_VERSION,
+    bundled_fixture_path,
+)
 from polytrading.predictions.proofs import compile_proof
 from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.registry import PredictionRegistry
@@ -104,6 +111,7 @@ _DEFAULT_CANDIDATES_TRIAL_FAMILY_ID = "increment-2-structural"
 # this mirrors scout_bridge.py's `_RETRIEVAL_CODE_REVISION` fixed module constant rather
 # than inventing a new pattern.
 _CANDIDATES_CODE_REVISION = "unversioned"
+_POLYMARKET_CONFORMANCE_IMPLEMENTATION_REVISION = "task-12"
 _CROSS_VENUE_ABSTENTION_LINE = (
     "cross-venue nomination: abstained (SCOUT_GATE_UNMET: no adjudicated gold evaluation)"
 )
@@ -153,6 +161,29 @@ class PredictionScanError(RuntimeError):
 
 class PredictionShadowError(RuntimeError):
     """A shadow run/replay failure, sanitized for CLI output."""
+
+
+class _ExecutionArgumentParser(argparse.ArgumentParser):
+    """Keep execution-branch usage failures on the documented local-error exit."""
+
+    def parse_known_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        parsed, remaining = super().parse_known_args(args, namespace)
+        if remaining:
+            self.error("EXECUTION_ARGUMENT_INVALID")
+        return parsed, remaining
+
+    def error(self, message: str) -> None:
+        del message
+        raise SystemExit(64) from None
+
+
+def _execution_parser_error(message: str) -> None:
+    del message
+    raise SystemExit(64) from None
 
 
 def _utc_now() -> datetime:
@@ -256,6 +287,32 @@ def add_predictions_subcommands(
     shadow_replay.add_argument("--scenario", choices=tuple(_SHADOW_SCENARIOS))
     shadow_replay.add_argument("--format", choices=("text", "json"), default="text")
 
+    execution = predictions_commands.add_parser(
+        "execution", help="offline execution protocol verification"
+    )
+    execution.error = _execution_parser_error  # type: ignore[method-assign]
+    execution_commands = execution.add_subparsers(
+        dest="predictions_execution_command",
+        required=True,
+        parser_class=_ExecutionArgumentParser,
+    )
+    conformance = execution_commands.add_parser(
+        "conformance", help="verify frozen protocol conformance offline"
+    )
+    conformance_commands = conformance.add_subparsers(
+        dest="predictions_execution_conformance_command",
+        required=True,
+        parser_class=_ExecutionArgumentParser,
+    )
+    polymarket_conformance = conformance_commands.add_parser(
+        "polymarket", help="verify the frozen Polymarket protocol offline"
+    )
+    polymarket_conformance.add_argument("--db", required=True, type=Path)
+    polymarket_conformance.add_argument("--fixtures", type=Path)
+    polymarket_conformance.add_argument(
+        "--format", dest="output_format", choices=("text", "json"), required=True
+    )
+
     dashboard = predictions_commands.add_parser(
         "dashboard", help="serve the loopback-only prediction-market evidence console"
     )
@@ -282,11 +339,81 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
         if arguments.predictions_shadow_command == "run":
             return _run_shadow_run(arguments)
         return _run_shadow_replay(arguments)
+    if arguments.predictions_command == "execution":
+        return _run_polymarket_conformance(arguments)
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
         return 0
     return _run_health(arguments)
+
+
+def _render_polymarket_conformance(
+    result: ProtocolConformanceResult,
+    output_format: str,
+    *,
+    stream: TextIO,
+) -> None:
+    payload = result.model_dump(mode="json")
+    payload["network_used"] = False
+    payload["protocol_version"] = POLYMARKET_PROTOCOL_VERSION
+    if output_format == "json":
+        print(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+            file=stream,
+        )
+        return
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, list):
+            rendered = ",".join(str(item) for item in value)
+        elif isinstance(value, bool):
+            rendered = str(value).lower()
+        else:
+            rendered = str(value)
+        print(f"{key}={rendered}", file=stream)
+
+
+def _run_polymarket_conformance(
+    arguments: argparse.Namespace,
+    *,
+    stream: TextIO | None = None,
+    error_stream: TextIO | None = None,
+) -> int:
+    output = sys.stdout if stream is None else stream
+    errors = sys.stderr if error_stream is None else error_stream
+    fixture_root = arguments.fixtures or bundled_fixture_path()
+    database = arguments.db
+    try:
+        if (
+            not isinstance(fixture_root, Path)
+            or fixture_root.is_symlink()
+            or not fixture_root.is_dir()
+            or not isinstance(database, Path)
+            or database.is_symlink()
+            or database.is_dir()
+            or not database.parent.is_dir()
+        ):
+            raise ValueError("LOCAL_INVOCATION_INVALID")
+        result = run_conformance(
+            fixture_root,
+            _POLYMARKET_CONFORMANCE_IMPLEMENTATION_REVISION,
+        )
+        with database_writer_lease(
+            database,
+            timeout_seconds=_WRITER_LEASE_TIMEOUT_SECONDS,
+        ):
+            store = PredictionMarketStore(database)
+            try:
+                with store.transaction() as transaction:
+                    transaction.append_protocol_conformance_result(result)
+            finally:
+                store.close()
+    except Exception:
+        print("polytrading: conformance local invocation failed", file=errors)
+        return 64
+    _render_polymarket_conformance(result, arguments.output_format, stream=output)
+    return 0 if result.result == "CONFORMANT" else 2
 
 
 def _run_venues_status(arguments: argparse.Namespace) -> int:

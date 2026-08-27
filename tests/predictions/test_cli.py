@@ -82,6 +82,73 @@ def test_predictions_command_does_not_collide_with_existing_top_level_names() ->
     assert "predictions" not in existing
 
 
+def test_execution_conformance_polymarket_is_the_only_accepted_execution_branch() -> None:
+    parsed = build_parser().parse_args(
+        [
+            "predictions",
+            "execution",
+            "conformance",
+            "polymarket",
+            "--db",
+            "var/predictions.duckdb",
+            "--fixtures",
+            "fixtures/polymarket",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert parsed.command == "predictions"
+    assert parsed.predictions_command == "execution"
+    assert parsed.predictions_execution_command == "conformance"
+    assert parsed.predictions_execution_conformance_command == "polymarket"
+    assert parsed.db == Path("var/predictions.duckdb")
+    assert parsed.fixtures == Path("fixtures/polymarket")
+    assert parsed.output_format == "json"
+
+
+@pytest.mark.parametrize(
+    "forbidden_argv",
+    [
+        ["order"],
+        ["cancel"],
+        ["heartbeat"],
+        ["activate"],
+        ["clear-kill"],
+        ["conformance", "limitless"],
+        ["conformance", "polymarket", "--db", "x.duckdb", "--format", "yaml"],
+        [
+            "conformance",
+            "polymarket",
+            "--db",
+            "x.duckdb",
+            "--format",
+            "json",
+            "--private-key",
+            "forbidden",
+        ],
+    ],
+)
+def test_execution_parser_rejects_sibling_and_live_capability_surfaces_with_exit_64(
+    forbidden_argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["predictions", "execution", *forbidden_argv])
+
+    assert exit_info.value.code == 64
+
+
+def test_execution_conformance_requires_database_and_explicit_format() -> None:
+    for argv in (
+        ["predictions", "execution", "conformance", "polymarket", "--format", "json"],
+        ["predictions", "execution", "conformance", "polymarket", "--db", "x.duckdb"],
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(argv)
+
+        assert exit_info.value.code == 64
+
+
 def test_predictions_venues_status_reports_missing_manifests(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
