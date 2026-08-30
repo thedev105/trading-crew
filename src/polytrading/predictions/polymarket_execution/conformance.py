@@ -36,27 +36,51 @@ from polytrading.predictions.polymarket_execution.order import (
     sign_order,
 )
 from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
     POLYMARKET_PROTOCOL_VERSION,
     PolymarketProtocolSnapshot,
+    ProtocolSnapshotError,
+    bind_account_signature,
     load_protocol_snapshot,
+    require_account_signature_model,
     verify_protocol_sources,
 )
 from polytrading.predictions.polymarket_execution.routes import (
+    CREDENTIAL_ROUTE_SPECS,
     ROUTE_SET_HASH,
     ROUTE_SET_VERSION,
     ROUTE_SPECS,
     RouteKey,
+    execution_route_keys,
 )
 from polytrading.predictions.polymarket_execution.user_stream import parse_user_event
 
-_FIXTURE_NAMES = frozenset(
-    {
-        "event_vectors_v1.json",
-        "order_vectors_v1.json",
-        "protocol_v1.json",
-        "sources_v1.json",
-    }
-)
+_FIXTURE_NAMES_BY_VERSION: dict[str, frozenset[str]] = {
+    POLYMARKET_PROTOCOL_VERSION: frozenset(
+        {
+            "event_vectors_v1.json",
+            "order_vectors_v1.json",
+            "protocol_v1.json",
+            "sources_v1.json",
+        }
+    ),
+    POLYMARKET_PILOT_PROTOCOL_VERSION: frozenset(
+        {
+            "credential_vectors_v2.json",
+            "event_vectors_v2.json",
+            "order_vectors_v2.json",
+            "protocol_v2.json",
+            "sources_v2.json",
+        }
+    ),
+}
+# The fixture directory is a closed world: it holds exactly the frozen files of every reviewed
+# checkpoint, and one run captures only the checkpoint it was asked to verify.
+_FIXTURE_NAMES = frozenset().union(*_FIXTURE_NAMES_BY_VERSION.values())
+_VECTOR_SUFFIX = {
+    POLYMARKET_PROTOCOL_VERSION: "v1",
+    POLYMARKET_PILOT_PROTOCOL_VERSION: "v2",
+}
 _MAX_FIXTURE_BYTES = 1_048_576
 _MAX_FAILURES = 32
 _RESULT_NAMESPACE = UUID("9ce0811c-7292-5ad9-a703-a64744c9ee25")
@@ -64,14 +88,41 @@ _ROUTE_SET_HASH = "3429c248a6caec950da2ed46643bb8810ff028740f967888c6b77de1fb127
 _ROUTE_SET_VERSION = "polymarket-mutations-v1"
 _VECTOR_ADDRESS = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
 _VECTOR_TIMESTAMP = "1787673600"
-_ORDER_SIGNATURE_HASH = "fe995ca2b8462511db012086b861761641eeac2b0ffb4456806564d1e96c4707"
+_ORDER_SIGNATURE_HASHES = {
+    POLYMARKET_PROTOCOL_VERSION: (
+        "fe995ca2b8462511db012086b861761641eeac2b0ffb4456806564d1e96c4707"
+    ),
+    POLYMARKET_PILOT_PROTOCOL_VERSION: (
+        "8013260bfd82ceae87e4a4b2bb93b5154d244ce923a40a3002feb9b7d7281bd2"
+    ),
+}
 _L1_SIGNATURE_HASH = "f4872e0ad43bc211048d24f1d9feadfb2c46c4679d132d2756151c034cbaec96"
 _L2_SIGNATURE_HASH = "beb8d495e4c17f7f26d746b6aff6668bb809f5ddfa744ee9a3b36c6ae0241793"
+# One pinned intent identity per reviewed checkpoint: only ``protocol_version`` differs between
+# them, so the signed EIP-712 order and its signature stay byte-identical across both.
+_INTENT_IDENTITIES = {
+    POLYMARKET_PROTOCOL_VERSION: (
+        UUID("30039691-5392-5511-9d27-40ec90530584"),
+        "ead5be0906f78d056f447fdc1ff6bd7c3ce5c897ad9c6696c412c3ce835d8090",
+    ),
+    POLYMARKET_PILOT_PROTOCOL_VERSION: (
+        UUID("dc8a1db2-4097-5167-864b-f9b16c73f847"),
+        "113f1cc24dae72706a1d485e0dc80008714887eaf02c1afc15a45da34d687362",
+    ),
+}
 _ORDER_EXPECTATIONS = {
-    "domain_fingerprint": "1feee49d347d5eb4a787b7c3ec99e591830fe6712fc635bdf3c82db17ebf3cc0",
-    "exact_body_hash": "2201756cba2fdcd84f704de2a5c63fc70676ec14a705cedc1bd852f8098b4ef7",
-    "order_fingerprint": "0d35a463727531d7bbe786c32ca2d7ef0724d5bb08446a185a47a880bb0da5c1",
-    "exchange_fingerprint": "85c145f2427d2871411c94a3d91d4b9768f95b4a3057a6830d67ecac8dc7c56e",
+    POLYMARKET_PROTOCOL_VERSION: {
+        "domain_fingerprint": "1feee49d347d5eb4a787b7c3ec99e591830fe6712fc635bdf3c82db17ebf3cc0",
+        "exact_body_hash": "2201756cba2fdcd84f704de2a5c63fc70676ec14a705cedc1bd852f8098b4ef7",
+        "order_fingerprint": "0d35a463727531d7bbe786c32ca2d7ef0724d5bb08446a185a47a880bb0da5c1",
+        "exchange_fingerprint": "85c145f2427d2871411c94a3d91d4b9768f95b4a3057a6830d67ecac8dc7c56e",
+    },
+    POLYMARKET_PILOT_PROTOCOL_VERSION: {
+        "domain_fingerprint": "1feee49d347d5eb4a787b7c3ec99e591830fe6712fc635bdf3c82db17ebf3cc0",
+        "exact_body_hash": "05403b8bdb92ba8c96df00011b482ac86ff74c779f5bea0b55625ee44f18b01a",
+        "order_fingerprint": "8c58544f5c1ed8509aefa25dcedc2d85668c4f616adf9f436fd07ed99b57ffc9",
+        "exchange_fingerprint": "85c145f2427d2871411c94a3d91d4b9768f95b4a3057a6830d67ecac8dc7c56e",
+    },
 }
 
 
@@ -316,9 +367,10 @@ def _check_order_wire_vector(
         return False
 
     private_material = (1).to_bytes(32, "big")
+    intent_id, intent_fingerprint = _INTENT_IDENTITIES[snapshot.version]
     intent = ExecutionIntent(
         schema_version=1,
-        intent_id=UUID("30039691-5392-5511-9d27-40ec90530584"),
+        intent_id=intent_id,
         plan_id=UUID("0d7c250b-0a21-55f3-a897-8bc98c59f904"),
         leg_sequence=0,
         venue=PredictionVenue.POLYMARKET,
@@ -336,15 +388,19 @@ def _check_order_wire_vector(
         capability_fingerprint="b" * 64,
         created_at=datetime(2026, 8, 25, 16, tzinfo=UTC),
         deadline=datetime(2026, 8, 25, 16, 0, 5, tzinfo=UTC),
-        protocol_version=POLYMARKET_PROTOCOL_VERSION,
-        intent_fingerprint=("ead5be0906f78d056f447fdc1ff6bd7c3ce5c897ad9c6696c412c3ce835d8090"),
+        protocol_version=snapshot.version,
+        intent_fingerprint=intent_fingerprint,
     )
     envelope = sign_order(intent, private_material, snapshot)
     if recover_order_signer(envelope, snapshot) != _VECTOR_ADDRESS:
         return False
-    if sha256(envelope.public_signature.encode("ascii")).hexdigest() != _ORDER_SIGNATURE_HASH:
+    expected_signature = _ORDER_SIGNATURE_HASHES[snapshot.version]
+    if sha256(envelope.public_signature.encode("ascii")).hexdigest() != expected_signature:
         return False
-    return all(getattr(envelope, key) == value for key, value in _ORDER_EXPECTATIONS.items())
+    return all(
+        getattr(envelope, key) == value
+        for key, value in _ORDER_EXPECTATIONS[snapshot.version].items()
+    )
 
 
 def _check_l1_auth_vector(snapshot: PolymarketProtocolSnapshot, *_unused: object) -> bool:
@@ -510,6 +566,7 @@ def _check_event_vectors(
     order_event = parse_user_event(
         _materialized_order_frame(order_vector),
         receipt_time=receipt_time,
+        snapshot=snapshot,
     )
     if (
         order_event.normalized_state.value != "ACK_LIVE_UNEXPECTED"
@@ -532,6 +589,7 @@ def _check_event_vectors(
         event = parse_user_event(
             _materialized_trade_frame(trade_vector, wire_state),
             receipt_time=receipt_time,
+            snapshot=snapshot,
         )
         if (
             event.normalized_state.value != wire_state
@@ -548,8 +606,9 @@ def _validate_vector_documents(
     snapshot: PolymarketProtocolSnapshot,
     captured: Mapping[str, _CapturedMember],
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    order_vectors = _strict_json(captured["order_vectors_v1.json"].contents)
-    event_vectors = _strict_json(captured["event_vectors_v1.json"].contents)
+    suffix = _VECTOR_SUFFIX[snapshot.version]
+    order_vectors = _strict_json(captured[f"order_vectors_{suffix}.json"].contents)
+    event_vectors = _strict_json(captured[f"event_vectors_{suffix}.json"].contents)
     if not isinstance(order_vectors, dict) or not isinstance(event_vectors, dict):
         raise ValueError("VECTOR_SCHEMA_INVALID")
     if set(order_vectors) != {
@@ -566,6 +625,89 @@ def _validate_vector_documents(
         if document.get("protocol_version") != snapshot.version:
             raise ValueError("PROTOCOL_VERSION_MISMATCH")
     return order_vectors, event_vectors
+
+
+def _check_account_signature_model(snapshot: PolymarketProtocolSnapshot, *_unused: object) -> bool:
+    """The pilot checkpoint must name its wallet paths and refuse an undocumented one."""
+    model = require_account_signature_model(snapshot)
+    if model.default_signature_type is not None:
+        return False
+    if set(model.allowed_signature_types) != {0, 1, 2}:
+        return False
+    if not model.unsupported_wallets:
+        return False
+    try:
+        bind_account_signature(
+            snapshot,
+            signer_address=_VECTOR_ADDRESS,
+            funder_address=_VECTOR_ADDRESS,
+            signature_type=3,
+            negative_risk=False,
+            credential_route_hash=_L1_SIGNATURE_HASH,
+        )
+    except ProtocolSnapshotError as error:
+        return error.code == "ACCOUNT_SIGNATURE_MODEL_UNSUPPORTED"
+    return False
+
+
+def _check_credential_vectors(
+    snapshot: PolymarketProtocolSnapshot,
+    credential_vectors: Mapping[str, object],
+) -> bool:
+    """Credential provisioning stays L1-only, outside execution, and never returns secrets."""
+    if RouteKey.CREATE_OR_DERIVE_CREDENTIALS in execution_route_keys():
+        return False
+    routes = credential_vectors.get("routes")
+    if not isinstance(routes, list) or len(routes) != len(CREDENTIAL_ROUTE_SPECS):
+        return False
+    for route in routes:
+        if not isinstance(route, dict):
+            return False
+        spec = CREDENTIAL_ROUTE_SPECS.get(route.get("operation"))
+        if spec is None:
+            return False
+        if (route["host"], route["method"], route["path"], route["auth_level"]) != (
+            spec.host,
+            spec.method,
+            spec.path_template,
+            spec.auth_level,
+        ):
+            return False
+    vector = credential_vectors.get("l1_signature_vector")
+    if not isinstance(vector, dict):
+        return False
+    contract = snapshot.authentication.clob_auth
+    if (
+        vector.get("nonce") != contract.default_nonce
+        or vector.get("message") != contract.message
+        or vector.get("chain_id") != contract.domain.chain_id
+    ):
+        return False
+    signature = sign_clob_auth((1).to_bytes(32, "big"), vector["timestamp"], snapshot)
+    if sha256(signature.encode("ascii")).hexdigest() != vector.get("signature_sha256"):
+        return False
+    handling = credential_vectors.get("response_handling")
+    if not isinstance(handling, dict):
+        return False
+    if handling.get("secret_destination") != "operating_system_keychain":
+        return False
+    returned = handling.get("returned_to_caller")
+    secrets = handling.get("secret_fields")
+    if not isinstance(returned, list) or not isinstance(secrets, list):
+        return False
+    return not set(returned) & set(secrets)
+
+
+def _validate_credential_vectors(
+    snapshot: PolymarketProtocolSnapshot,
+    captured: Mapping[str, _CapturedMember],
+) -> Mapping[str, object]:
+    document = _strict_json(captured["credential_vectors_v2.json"].contents)
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise ValueError("VECTOR_SCHEMA_INVALID")
+    if document.get("protocol_version") != snapshot.version:
+        raise ValueError("PROTOCOL_VERSION_MISMATCH")
+    return document
 
 
 def _result(
@@ -607,8 +749,13 @@ def _result(
 def run_conformance(
     fixture_root: Path,
     implementation_revision: str,
+    *,
+    version: str = POLYMARKET_PROTOCOL_VERSION,
 ) -> ProtocolConformanceResult:
-    """Validate one local frozen fixture root without constructing transport."""
+    """Validate one explicitly selected checkpoint in a local fixture root, without transport."""
+    if version not in _FIXTURE_NAMES_BY_VERSION:
+        raise ValueError("PROTOCOL_VERSION_UNKNOWN") from None
+    expected_names = _FIXTURE_NAMES_BY_VERSION[version]
     if (
         type(implementation_revision) is not str
         or not implementation_revision
@@ -627,7 +774,9 @@ def run_conformance(
     else:
         captured, complete = _capture_fixture_root(root, failures)
 
-    fixture_hashes = tuple(sorted({member.digest for member in captured.values()}))
+    fixture_hashes = tuple(
+        sorted({member.digest for name, member in captured.items() if name in expected_names})
+    )
     source_hashes: tuple[str, ...] = ()
     if complete:
         try:
@@ -635,12 +784,12 @@ def run_conformance(
                 stable_root = Path(temporary)
                 for name, member in captured.items():
                     (stable_root / name).write_bytes(member.contents)
-                readiness = verify_protocol_sources(root=stable_root)
+                readiness = verify_protocol_sources(root=stable_root, version=version)
                 if readiness.state != "CURRENT" or readiness.changed_paths:
                     _record_failure(failures, "TRUST_ROOT_MISMATCH", "fixture-trust")
                 else:
-                    snapshot = load_protocol_snapshot(stable_root)
-                    if snapshot.version != POLYMARKET_PROTOCOL_VERSION:
+                    snapshot = load_protocol_snapshot(stable_root, version=version)
+                    if snapshot.version != version:
                         _record_failure(failures, "PROTOCOL_VERSION_MISMATCH", "protocol")
                     else:
                         source_hashes = tuple(
@@ -663,6 +812,20 @@ def run_conformance(
                             ("route_catalog", _check_route_catalog, (snapshot, order_vectors)),
                             ("event_vectors", _check_event_vectors, (snapshot, event_vectors)),
                         )
+                        if version == POLYMARKET_PILOT_PROTOCOL_VERSION:
+                            credential_vectors = _validate_credential_vectors(snapshot, captured)
+                            check_operations += (
+                                (
+                                    "account_signature_model",
+                                    _check_account_signature_model,
+                                    (snapshot, order_vectors),
+                                ),
+                                (
+                                    "credential_vectors",
+                                    _check_credential_vectors,
+                                    (snapshot, credential_vectors),
+                                ),
+                            )
                         for check_name, operation, arguments in check_operations:
                             checks.add(check_name)
                             try:

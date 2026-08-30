@@ -64,6 +64,7 @@ from polytrading.predictions.polymarket_execution.routes import (
     SubmitOrderRequest,
     TradeReadPayload,
     TradesReadPayload,
+    execution_route_keys,
 )
 from tests.predictions.execution_helpers import execution_intent_fields
 
@@ -159,8 +160,12 @@ def test_route_set_is_the_exact_frozen_execution_allowlist() -> None:
         RouteKey.READ_BALANCE_ALLOWANCE,
         RouteKey.HEARTBEAT,
         RouteKey.GEOBLOCK,
+        RouteKey.CREATE_OR_DERIVE_CREDENTIALS,
     )
-    assert frozenset(ROUTE_SPECS) == frozenset(RouteKey)
+    # Credential provisioning is a route the pilot may call under its own one-time grant; it is
+    # deliberately not part of the execution allowlist any capability can authorize.
+    assert frozenset(ROUTE_SPECS) == execution_route_keys()
+    assert RouteKey.CREATE_OR_DERIVE_CREDENTIALS not in execution_route_keys()
 
 
 def test_route_set_has_no_value_transfer_operations() -> None:

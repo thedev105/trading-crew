@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "protocol_version": "polymarket-clob-2026-08-29-v2",
+  "order_acknowledgement_states": [
+    {
+      "wire": "live",
+      "meaning": "RESTING"
+    },
+    {
+      "wire": "matched",
+      "meaning": "MATCHED_IMMEDIATELY"
+    },
+    {
+      "wire": "delayed",
+      "meaning": "MATCHING_DELAY_PENDING"
+    },
+    {
+      "wire": "unmatched",
+      "meaning": "MARKETABLE_DELAY_FAILED_PLACEMENT_SUCCEEDED"
+    }
+  ],
+  "trade_settlement_states": [
+    {
+      "wire": "MATCHED_NOT_BROADCASTED",
+      "terminal": false
+    },
+    {
+      "wire": "MATCHED",
+      "terminal": false
+    },
+    {
+      "wire": "MINED",
+      "terminal": false
+    },
+    {
+      "wire": "CONFIRMED",
+      "terminal": true
+    },
+    {
+      "wire": "RETRYING",
+      "terminal": false
+    },
+    {
+      "wire": "FAILED",
+      "terminal": true
+    }
+  ],
+  "user_order_event": {
+    "event_type": "order",
+    "id": "<order_id>",
+    "owner": "<clob_api_key>",
+    "market": "<condition_id>",
+    "asset_id": "<token_id>",
+    "side": "BUY",
+    "order_owner": "<clob_api_key>",
+    "original_size": "10",
+    "size_matched": "0",
+    "price": "0.52",
+    "associate_trades": null,
+    "outcome": "Yes",
+    "type": "PLACEMENT",
+    "created_at": "1782753357",
+    "expiration": "0",
+    "order_type": "GTC",
+    "status": "LIVE",
+    "maker_address": "<maker_address>",
+    "timestamp": "1782753357257"
+  },
+  "user_trade_event": {
+    "event_type": "trade",
+    "type": "TRADE",
+    "id": "<trade_id>",
+    "taker_order_id": "<order_id>",
+    "market": "<condition_id>",
+    "asset_id": "<token_id>",
+    "side": "BUY",
+    "size": "10",
+    "fee_rate_bps": "0",
+    "price": "0.52",
+    "status": "MATCHED",
+    "match_time": "1782753357",
+    "last_update": "1782753357",
+    "outcome": "Yes",
+    "owner": "<clob_api_key>",
+    "trade_owner": "<clob_api_key>",
+    "maker_address": "<maker_address>",
+    "transaction_hash": null,
+    "bucket_index": 0,
+    "maker_orders": [
+      {
+        "order_id": "<maker_order_id>",
+        "owner": "<maker_clob_api_key>",
+        "maker_address": "<maker_address>",
+        "matched_amount": "10",
+        "price": "0.52",
+        "fee_rate_bps": "0",
+        "asset_id": "<token_id>",
+        "outcome": "Yes",
+        "outcome_index": 0,
+        "side": "SELL"
+      }
+    ],
+    "trader_side": "TAKER",
+    "timestamp": "1782753357257"
+  }
+}

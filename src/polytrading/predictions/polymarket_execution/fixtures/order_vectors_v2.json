@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "protocol_version": "polymarket-clob-2026-08-29-v2",
+  "amount_vectors": [
+    {
+      "vector_id": "limit_buy_10_at_0_52_tick_0_01",
+      "kind": "LIMIT",
+      "side": "BUY",
+      "tick_size": "0.01",
+      "price": "0.52",
+      "input_amount": "10",
+      "makerAmount": "5200000",
+      "takerAmount": "10000000"
+    },
+    {
+      "vector_id": "limit_sell_10_at_0_52_tick_0_01",
+      "kind": "LIMIT",
+      "side": "SELL",
+      "tick_size": "0.01",
+      "price": "0.52",
+      "input_amount": "10",
+      "makerAmount": "10000000",
+      "takerAmount": "5200000"
+    },
+    {
+      "vector_id": "market_buy_10_usd_max_0_52_tick_0_01",
+      "kind": "MARKET",
+      "side": "BUY",
+      "tick_size": "0.01",
+      "price": "0.52",
+      "input_amount": "10",
+      "makerAmount": "10000000",
+      "takerAmount": "19230800"
+    }
+  ],
+  "wire_vector": {
+    "vector_id": "fak_eoa_standard_market_buy",
+    "route": "/order",
+    "method": "POST",
+    "order_type": "FAK",
+    "typed_data": {
+      "domain": {
+        "name": "Polymarket CTF Exchange",
+        "version": "2",
+        "chainId": 137,
+        "verifyingContract": "0xE111180000d2663C0091e4f400237545B87B996B"
+      },
+      "primaryType": "Order",
+      "message": {
+        "salt": "61266405281602987928890035842188157345294560938635578309746055610613778445006",
+        "maker": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "signer": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "tokenId": "217426",
+        "makerAmount": "5100000",
+        "takerAmount": "10000000",
+        "side": 0,
+        "signatureType": 0,
+        "timestamp": "1787673600000",
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "builder": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "request_payload": {
+      "deferExec": false,
+      "order": {
+        "builder": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "expiration": "0",
+        "maker": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "makerAmount": "5100000",
+        "metadata": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "salt": 61266405281602987928890035842188157345294560938635578309746055610613778445006,
+        "side": "BUY",
+        "signatureType": 0,
+        "signer": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "takerAmount": "10000000",
+        "timestamp": "1787673600000",
+        "tokenId": "217426",
+        "signature": "0xf507e732b6cfd9518b0daa2081f06c0f60755499c80a409a8a59d5337b9d0cd712ba89c84c96ebf7efdc8e7271952e89a43ffe7e87744d625173be44f785c1341c"
+      },
+      "orderType": "FAK",
+      "owner": "00000000-0000-0000-0000-000000000000"
+    }
+  },
+  "heartbeat_preimage_vector": {
+    "timestamp": "1787673600",
+    "method": "POST",
+    "path": "/v1/heartbeats",
+    "body": "{\"heartbeat_id\":\"\"}",
+    "preimage": "1787673600POST/v1/heartbeats{\"heartbeat_id\":\"\"}"
+  }
+}

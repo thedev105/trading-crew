@@ -75,9 +75,31 @@ def test_current_schema_contains_prediction_core_tables(tmp_path: Path) -> None:
         "protocol_conformance_results",
         "execution_operation_claims",
         "authoritative_trade_economics",
+        "pilot_eligibility_attestation_refs",
+        "pilot_policy_profiles",
+        "pilot_activation_ceremonies",
+        "pilot_credential_provisioning_events",
+        "pilot_authorization_challenges",
+        "pilot_capability_events",
+        "pilot_nonce_claims",
+        "pilot_execution_sessions",
+        "pilot_presence_events",
+        "pilot_kill_clearance_events",
         "schema_migrations",
     } <= tables
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)]
+    assert versions == [
+        (1,),
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+        (6,),
+        (7,),
+        (8,),
+        (9,),
+        (10,),
+        (11,),
+    ]
     perpetual_futures_tables = {
         "raw_envelopes",
         "instrument_specs",

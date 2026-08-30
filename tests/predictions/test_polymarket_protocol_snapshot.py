@@ -61,6 +61,11 @@ def test_bundled_protocol_snapshot_is_self_hashing_and_current() -> None:
         "order_vectors_v1.json",
         "protocol_v1.json",
         "sources_v1.json",
+        "credential_vectors_v2.json",
+        "event_vectors_v2.json",
+        "order_vectors_v2.json",
+        "protocol_v2.json",
+        "sources_v2.json",
     }
 
 

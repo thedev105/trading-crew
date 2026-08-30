@@ -9,9 +9,55 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, model_validator
 
 POLYMARKET_PROTOCOL_VERSION = "polymarket-clob-2026-08-25-v1"
-_PROTOCOL_FIXTURE_NAME = "protocol_v1.json"
-_PROTOCOL_FIXTURE_SHA256 = "de7409eb9956cefe1d546adf611767ec2fecda11ff496172f90ddcd3525e751c"
+# The fresh checkpoint the local live pilot must run against (spec section 5.2). The v1 snapshot
+# stays loadable and byte-identical so historical conformance evidence keeps its meaning.
+POLYMARKET_PILOT_PROTOCOL_VERSION = "polymarket-clob-2026-08-29-v2"
+ProtocolVersion = Literal[
+    "polymarket-clob-2026-08-25-v1",
+    "polymarket-clob-2026-08-29-v2",
+]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_Iso8601Utc = Annotated[
+    str, StringConstraints(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotSpec:
+    fixture_name: str
+    fixture_sha256: str
+    source_manifest_path: str
+
+
+_SNAPSHOT_SPECS: dict[str, _SnapshotSpec] = {
+    POLYMARKET_PROTOCOL_VERSION: _SnapshotSpec(
+        "protocol_v1.json",
+        "de7409eb9956cefe1d546adf611767ec2fecda11ff496172f90ddcd3525e751c",
+        "sources_v1.json",
+    ),
+    POLYMARKET_PILOT_PROTOCOL_VERSION: _SnapshotSpec(
+        "protocol_v2.json",
+        "e0f41e5980ba1f4bb93e96423926abca84e39e138ec07ac9863820452fbe343f",
+        "sources_v2.json",
+    ),
+}
+
+
+class ProtocolSnapshotError(ValueError):
+    """A snapshot selection or account-model binding the protocol layer refuses."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
+def _snapshot_spec(version: str) -> _SnapshotSpec:
+    spec = _SNAPSHOT_SPECS.get(version)
+    if spec is None:
+        raise ProtocolSnapshotError(
+            "PROTOCOL_VERSION_UNKNOWN", f"no frozen snapshot for version {version!r}"
+        )
+    return spec
 
 
 class _FixtureModel(BaseModel):
@@ -240,9 +286,9 @@ class SourceNormalization(_FixtureModel):
 class ProtocolSource(_FixtureModel):
     source_id: str
     canonical_url: str
-    retrieved_at: Literal["2026-08-25T00:00:00Z"]
+    retrieved_at: _Iso8601Utc
     normalized_content_sha256: Sha256Digest
-    protocol_fixture_version: Literal["polymarket-clob-2026-08-25-v1"]
+    protocol_fixture_version: ProtocolVersion
     implementation_revision: str
     upstream_revision: str | None
     role: str
@@ -255,11 +301,39 @@ class SourceManifest(_FixtureModel):
     sources: tuple[ProtocolSource, ...]
 
 
+class UnsupportedWallet(_FixtureModel):
+    wallet: Literal["DEPOSIT"]
+    signature_type: int
+    reason: str
+    source_id: str
+
+
+class AccountSignatureModel(_FixtureModel):
+    """How the signer must bind one configured wallet before it may sign anything.
+
+    ``default_signature_type`` is deliberately ``None``: an ambiguous or undocumented account
+    form blocks activation instead of silently signing as an EOA (spec section 5.2).
+    """
+
+    discovery_rule: str
+    default_signature_type: None
+    allowed_signature_types: tuple[int, ...]
+    signature_type_names: dict[str, str]
+    signer_field: Literal["signer"]
+    funder_field: Literal["maker"]
+    requires_explicit_funder: Literal[True]
+    chain_id: Literal[137]
+    exchange_binding: str
+    unsupported_wallets: tuple[UnsupportedWallet, ...]
+    credential_routes: tuple[str, ...]
+    credential_vectors_path: str
+
+
 class PolymarketProtocolSnapshot(_FixtureModel):
     schema_version: Literal[1]
-    version: Literal["polymarket-clob-2026-08-25-v1"]
+    version: ProtocolVersion
     chain_id: Literal[137]
-    source_manifest_path: Literal["sources_v1.json"]
+    source_manifest_path: Literal["sources_v1.json", "sources_v2.json"]
     eip712: Eip712Contract
     authentication: AuthenticationContract
     routes: RouteCatalog
@@ -280,6 +354,7 @@ class PolymarketProtocolSnapshot(_FixtureModel):
         ...,
     ]
     fixture_hashes: tuple[FixtureHash, ...]
+    account_signature_model: AccountSignatureModel | None = None
     _fixture_root: Path = PrivateAttr()
     _sources: tuple[ProtocolSource, ...] = PrivateAttr()
 
@@ -311,6 +386,19 @@ class PolymarketProtocolSnapshot(_FixtureModel):
         return self
 
 
+class AccountSignatureBinding(_FixtureModel):
+    """One discovered wallet/funder/signature binding, frozen for a single account."""
+
+    signer_address: str
+    funder_address: str
+    signature_type: int
+    chain_id: Literal[137]
+    exchange_address: str
+    order_domain_verifying_contract: str
+    credential_route_hash: Sha256Digest
+    protocol_version: ProtocolVersion
+
+
 @dataclass(frozen=True, slots=True)
 class ProtocolReadiness:
     state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
@@ -326,26 +414,98 @@ def bundled_fixture_path() -> Path:
     return fixture_root
 
 
-def load_protocol_snapshot(root: Path | None = None) -> PolymarketProtocolSnapshot:
-    """Load the frozen protocol and source manifest with strict offline validation."""
+def load_protocol_snapshot(
+    root: Path | None = None,
+    *,
+    version: str = POLYMARKET_PROTOCOL_VERSION,
+) -> PolymarketProtocolSnapshot:
+    """Load one explicitly selected frozen protocol snapshot with strict offline validation."""
+    spec = _snapshot_spec(version)
     fixture_root = Path(root) if root is not None else bundled_fixture_path()
     snapshot = PolymarketProtocolSnapshot.model_validate_json(
-        (fixture_root / _PROTOCOL_FIXTURE_NAME).read_bytes(),
+        (fixture_root / spec.fixture_name).read_bytes(),
         strict=True,
     )
+    if snapshot.version != version or snapshot.source_manifest_path != spec.source_manifest_path:
+        raise ProtocolSnapshotError(
+            "PROTOCOL_VERSION_MISMATCH",
+            f"{spec.fixture_name} does not declare the requested checkpoint {version!r}",
+        )
     source_manifest = SourceManifest.model_validate_json(
         (fixture_root / snapshot.source_manifest_path).read_bytes(),
         strict=True,
     )
+    if any(source.protocol_fixture_version != version for source in source_manifest.sources):
+        raise ProtocolSnapshotError(
+            "SOURCE_MANIFEST_VERSION_MISMATCH",
+            f"{snapshot.source_manifest_path} cites another protocol checkpoint",
+        )
+    if version == POLYMARKET_PILOT_PROTOCOL_VERSION:
+        require_account_signature_model(snapshot)
     object.__setattr__(snapshot, "_fixture_root", fixture_root)
     object.__setattr__(snapshot, "_sources", source_manifest.sources)
     return snapshot
+
+
+def require_account_signature_model(
+    snapshot: PolymarketProtocolSnapshot,
+) -> AccountSignatureModel:
+    """Require the pilot checkpoint to state its wallet/funder/signature binding explicitly."""
+    model = snapshot.account_signature_model
+    if model is None:
+        raise ProtocolSnapshotError(
+            "ACCOUNT_SIGNATURE_MODEL_REQUIRED",
+            f"{snapshot.version} must bind an explicit account and signature model",
+        )
+    documented = {wallet.signature_type for wallet in snapshot.eip712.wallets}
+    if not model.allowed_signature_types or set(model.allowed_signature_types) != documented:
+        raise ProtocolSnapshotError(
+            "ACCOUNT_SIGNATURE_MODEL_UNSUPPORTED",
+            "allowed signature types must match the documented wallet paths exactly",
+        )
+    unsupported = {wallet.signature_type for wallet in model.unsupported_wallets}
+    if unsupported & set(model.allowed_signature_types):
+        raise ProtocolSnapshotError(
+            "ACCOUNT_SIGNATURE_MODEL_UNSUPPORTED",
+            "a wallet path cannot be both allowed and unsupported",
+        )
+    return model
+
+
+def bind_account_signature(
+    snapshot: PolymarketProtocolSnapshot,
+    *,
+    signer_address: str,
+    funder_address: str,
+    signature_type: int,
+    negative_risk: bool,
+    credential_route_hash: str,
+) -> AccountSignatureBinding:
+    """Bind one discovered account form, refusing anything ambiguous or undocumented."""
+    model = require_account_signature_model(snapshot)
+    if signature_type not in model.allowed_signature_types:
+        raise ProtocolSnapshotError(
+            "ACCOUNT_SIGNATURE_MODEL_UNSUPPORTED",
+            f"signature type {signature_type} is not a documented pilot wallet path",
+        )
+    exchange = snapshot.eip712.exchange_addresses
+    return AccountSignatureBinding(
+        signer_address=signer_address,
+        funder_address=funder_address,
+        signature_type=signature_type,
+        chain_id=snapshot.chain_id,
+        exchange_address=exchange.negative_risk if negative_risk else exchange.standard,
+        order_domain_verifying_contract=snapshot.eip712.order_domain.verifying_contract,
+        credential_route_hash=credential_route_hash,
+        protocol_version=snapshot.version,
+    )
 
 
 def verify_protocol_sources(
     snapshot: PolymarketProtocolSnapshot | None = None,
     *,
     root: Path | None = None,
+    version: str = POLYMARKET_PROTOCOL_VERSION,
 ) -> ProtocolReadiness:
     """Return fail-closed readiness without requiring fixture parsing to succeed first."""
     if snapshot is not None and root is not None:
@@ -357,22 +517,30 @@ def verify_protocol_sources(
         if root is not None
         else bundled_fixture_path()
     )
-    return _verify_fixture_root(fixture_root)
+    return _verify_fixture_root(fixture_root, version)
 
 
-def _verify_fixture_root(fixture_root: Path) -> ProtocolReadiness:
-    protocol_path = fixture_root / _PROTOCOL_FIXTURE_NAME
+def _verify_fixture_root(fixture_root: Path, version: str) -> ProtocolReadiness:
+    spec = _snapshot_spec(version)
+    protocol_path = fixture_root / spec.fixture_name
     try:
         protocol_bytes = protocol_path.read_bytes()
     except OSError:
-        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
-    if sha256(protocol_bytes).hexdigest() != _PROTOCOL_FIXTURE_SHA256:
-        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (spec.fixture_name,))
+    if sha256(protocol_bytes).hexdigest() != spec.fixture_sha256:
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (spec.fixture_name,))
 
     try:
         snapshot = PolymarketProtocolSnapshot.model_validate_json(protocol_bytes, strict=True)
     except ValueError:
-        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (_PROTOCOL_FIXTURE_NAME,))
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (spec.fixture_name,))
+    if snapshot.version != version:
+        return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (spec.fixture_name,))
+    if version == POLYMARKET_PILOT_PROTOCOL_VERSION:
+        try:
+            require_account_signature_model(snapshot)
+        except ProtocolSnapshotError:
+            return ProtocolReadiness("PROTOCOL_REVIEW_REQUIRED", (spec.fixture_name,))
 
     changed_paths: list[str] = []
     fixture_bytes: dict[str, bytes] = {}

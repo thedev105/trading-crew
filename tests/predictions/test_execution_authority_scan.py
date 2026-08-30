@@ -32,7 +32,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "52e5d9001f26989678e23a448bdf04ab0a249d471cb2f13e762509ef5ea15f4d",
     Path(
         "polymarket_execution/conformance.py"
-    ): "ee8a916c5d51994421cf109752fa4294845b3c3bea1be7551a7f0a9404bc04af",
+    ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
         "polymarket_execution/heartbeat.py"
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
@@ -44,13 +44,13 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
     Path(
         "polymarket_execution/protocol.py"
-    ): "e3cf77750b0fec996410a32b83505030b105a213bdbd6277205541477e04172a",
+    ): "88ad4405fcda17afaea96bfdcde710c598b68823c10da532b3ee761ead6db9fa",
     Path(
         "polymarket_execution/rest.py"
     ): "b672b6c791ee5d3b5ad279d3955f98b47b272eaff0516ebdb126a79e195847f7",
     Path(
         "polymarket_execution/routes.py"
-    ): "8b879b5f170004fad48eff2c008f589a7e03f9e8876df221e6fc59ba6f1f0dd9",
+    ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
     Path(
         "polymarket_execution/secrets.py"
     ): "67486fad3f47afadcffb28f68c950abe7b2eb1a3e8cfef6f80267983b9c0282b",
@@ -59,7 +59,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "93ccf2e93252747258b71ae8258efdd3e6fd4362877905af20a5fd4eaf6d2491",
     Path(
         "polymarket_execution/user_stream.py"
-    ): "e8d3d139b929a3be1625e383f711e2f075763c0cf61041f6664a4df4e1f684be",
+    ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
     Path("web_assets/api.js"): "834c1b5714da4bd534f901b1c4af3679889a4184b601a6fac2fb87e3897021ad",
     Path("web_assets/app.css"): "85b61f1ea0a74588bc1add20f0fb861342719ed232ffcbcc0f6c0868b450e5ed",
     Path("web_assets/app.js"): "b9bb0d52ba332f10fe363ed393d84f57a0c44b33ee72db9b670cd2d3b00fc4af",

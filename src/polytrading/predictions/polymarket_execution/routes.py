@@ -22,9 +22,13 @@ from polytrading.predictions.execution.models import (
     SignedOrderEnvelope,
     canonical_execution_hash,
 )
-from polytrading.predictions.polymarket_execution.protocol import load_protocol_snapshot
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    load_protocol_snapshot,
+)
 
 ROUTE_SET_VERSION = "polymarket-mutations-v1"
+CREDENTIAL_ROUTE_SET_VERSION = "polymarket-credential-provisioning-v1"
 
 
 class RouteKey(StrEnum):
@@ -36,6 +40,9 @@ class RouteKey(StrEnum):
     READ_BALANCE_ALLOWANCE = "READ_BALANCE_ALLOWANCE"
     HEARTBEAT = "HEARTBEAT"
     GEOBLOCK = "GEOBLOCK"
+    # Deliberately outside the execution route set: this route provisions credentials under its
+    # own one-time grant and can never carry an order, cancellation, or heartbeat.
+    CREATE_OR_DERIVE_CREDENTIALS = "CREATE_OR_DERIVE_CREDENTIALS"
 
 
 class RestCode(StrEnum):
@@ -68,7 +75,7 @@ class RouteSpec:
     host: str
     method: Literal["GET", "POST", "DELETE"]
     path_template: str
-    auth_level: Literal["PUBLIC", "L2", "L2_AND_ORDER_SIGNATURE"]
+    auth_level: Literal["PUBLIC", "L1", "L2", "L2_AND_ORDER_SIGNATURE"]
     mutation: bool
     query_fields: tuple[str, ...]
     request_fields: tuple[str, ...]
@@ -211,6 +218,27 @@ RouteRequest = Annotated[
     | GeoblockRequest,
     Field(discriminator="route"),
 ]
+
+
+class CredentialProvisioningRequest(_RouteRecord):
+    """One create-or-derive credential call, carrying public binding fields only.
+
+    It has no order, cancellation, heartbeat, or arbitrary-route surface, and it never carries
+    the returned API key, secret, or passphrase.
+    """
+
+    route: Literal[RouteKey.CREATE_OR_DERIVE_CREDENTIALS]
+    operation: Literal["CREATE", "DERIVE"]
+    signer_address: _EvmAddress
+    funder_address: _EvmAddress
+    signature_type: Literal[0, 1, 2]
+    timestamp: _AsciiInteger
+    nonce: Annotated[int, Field(ge=0)]
+    grant_digest: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+    @property
+    def spec(self) -> RouteSpec:
+        return CREDENTIAL_ROUTE_SPECS[self.operation]
 
 
 class OrderAckPayload(_RouteRecord):
@@ -380,7 +408,55 @@ def _route_specs() -> Mapping[RouteKey, RouteSpec]:
     )
 
 
+def _credential_route_specs() -> Mapping[Literal["CREATE", "DERIVE"], RouteSpec]:
+    """Resolve the credential-provisioning routes from the pilot protocol checkpoint only."""
+    routes = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION).routes
+    return MappingProxyType(
+        {
+            operation: RouteSpec(
+                key=RouteKey.CREATE_OR_DERIVE_CREDENTIALS,
+                host=route.host,
+                method=route.method,
+                path_template=route.path,
+                auth_level=route.auth_level,  # type: ignore[arg-type]
+                mutation=False,
+                query_fields=route.query_fields,
+                request_fields=route.request_fields,
+            )
+            for operation, route in (
+                ("CREATE", routes.create_api_key),
+                ("DERIVE", routes.derive_api_key),
+            )
+        }
+    )
+
+
 ROUTE_SPECS = _route_specs()
+CREDENTIAL_ROUTE_SPECS = _credential_route_specs()
+EXECUTION_ROUTE_KEYS = frozenset(ROUTE_SPECS)
+CREDENTIAL_ROUTE_SET_HASH = canonical_execution_hash(
+    {
+        "schema_version": 1,
+        "route_set_version": CREDENTIAL_ROUTE_SET_VERSION,
+        "routes": [
+            {
+                "operation": operation,
+                "host": spec.host,
+                "method": spec.method,
+                "path_template": spec.path_template,
+                "auth_level": spec.auth_level,
+            }
+            for operation, spec in sorted(CREDENTIAL_ROUTE_SPECS.items())
+        ],
+    }
+)
+
+
+def execution_route_keys() -> frozenset[RouteKey]:
+    """The only routes an execution capability may ever authorize."""
+    return EXECUTION_ROUTE_KEYS
+
+
 ROUTE_SET_HASH = canonical_execution_hash(
     {
         "schema_version": 1,

@@ -24,7 +24,10 @@ from polytrading.predictions.execution.models import (
     VenueTradeEvent,
     VenueTradeState,
 )
-from polytrading.predictions.polymarket_execution.protocol import load_protocol_snapshot
+from polytrading.predictions.polymarket_execution.protocol import (
+    PolymarketProtocolSnapshot,
+    load_protocol_snapshot,
+)
 from polytrading.predictions.polymarket_execution.routes import RouteKey
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 
@@ -1153,6 +1156,7 @@ def parse_user_event(
     frame: bytes,
     *,
     receipt_time: datetime,
+    snapshot: PolymarketProtocolSnapshot | None = None,
 ) -> VenueOrderEvent | VenueTradeEvent:
     """Parse one exact frozen user event into a venue-neutral lifecycle fact."""
     if type(frame) is not bytes or not frame or len(frame) > MAX_USER_STREAM_MESSAGE_BYTES:
@@ -1178,7 +1182,7 @@ def parse_user_event(
         timestamp=wire.timestamp,
         raw_event_hash=raw_event_hash,
     )
-    protocol_version = load_protocol_snapshot().version
+    protocol_version = (snapshot or load_protocol_snapshot()).version
     if isinstance(wire, _OrderWire):
         state: VenueOrderState | None = None
         with suppress(ValueError, TypeError):
