@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from pydantic import StringConstraints, field_validator, model_validator
 
-from polytrading.predictions.domain import Sha256
+from polytrading.predictions.domain import PredictionVenue, Sha256
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
@@ -84,6 +84,30 @@ class CapabilityIssueError(ValueError):
         self.code = code
 
 
+class VenueBinding(PilotRecord):
+    """The venue-side identity a grant must carry so the signer can verify it independently."""
+
+    venue: PredictionVenue
+    manifest_record_hash: Sha256
+    manifest_source_hashes: tuple[Sha256, ...]
+    eligibility_evidence_hashes: tuple[Sha256, ...]
+    strategy_policy_hash: Sha256
+    proof_policy_hash: Sha256
+    economics_policy_hash: Sha256
+    protocol_fixture_hash: Sha256
+    route_set_version: NonEmptyString
+    route_set_hash: Sha256
+
+    @field_validator("manifest_source_hashes", "eligibility_evidence_hashes")
+    @classmethod
+    def _sorted_unique_hashes(cls, value: tuple[Sha256, ...]) -> tuple[Sha256, ...]:
+        if not value:
+            raise ValueError("venue binding evidence must not be empty")
+        if value != tuple(sorted(set(value))):
+            raise ValueError("venue binding evidence must be sorted and unique")
+        return value
+
+
 class CapabilityRequest(PilotRecord):
     """Everything the server resolved for one approved action, before it is signed."""
 
@@ -92,6 +116,7 @@ class CapabilityRequest(PilotRecord):
     recovery_capability_id: UUID
     challenge_id: UUID
     mode: AuthorizationMode
+    venue_binding: VenueBinding
     account_fingerprint: Sha256
     wallet_fingerprint: Sha256
     browser_session_hash: Sha256
@@ -139,8 +164,10 @@ class CapabilityGrant(PilotRecord):
     challenge_id: UUID
     grant_kind: GrantKind
     mode: AuthorizationMode
+    venue_binding: VenueBinding
     account_fingerprint: Sha256
     wallet_fingerprint: Sha256
+    parent_action_id: UUID
     session_id: UUID | None
     effective_limits: PilotLimits
     requested_limits_hash: Sha256
@@ -373,8 +400,10 @@ class PilotCapabilityIssuer:
             challenge_id=request.challenge_id,
             grant_kind=grant_kind,
             mode=request.mode,
+            venue_binding=request.venue_binding,
             account_fingerprint=request.account_fingerprint,
             wallet_fingerprint=request.wallet_fingerprint,
+            parent_action_id=request.target_id,
             session_id=request.session_id,
             effective_limits=request.effective_limits,
             requested_limits_hash=request.requested_limits_hash,

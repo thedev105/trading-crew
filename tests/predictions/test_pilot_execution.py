@@ -12,6 +12,7 @@ from polytrading.predictions.execution.models import ExecutionOperation, Immedia
 from polytrading.predictions.pilot.capabilities import (
     CapabilityRequest,
     PilotCapabilityIssuer,
+    VenueBinding,
 )
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
@@ -49,6 +50,7 @@ from tests.predictions.pilot_helpers import (
     TARGET_ID,
     WALLET_FINGERPRINT,
     challenge_fields,
+    venue_binding_fields,
 )
 
 NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
@@ -135,6 +137,7 @@ def grants(mode: AuthorizationMode = AuthorizationMode.COMPLETE_STRATEGY):
             "recovery_capability_id": RECOVERY_CAPABILITY_ID,
             "challenge_id": CHALLENGE_ID,
             "mode": mode,
+            "venue_binding": VenueBinding.model_validate(venue_binding_fields(), strict=True),
             "account_fingerprint": ACCOUNT_FINGERPRINT,
             "wallet_fingerprint": WALLET_FINGERPRINT,
             "browser_session_hash": BROWSER_SESSION_HASH,

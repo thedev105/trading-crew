@@ -292,6 +292,23 @@ def presence_event_fields(**overrides: Any) -> dict[str, Any]:
     return values
 
 
+def venue_binding_fields(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "venue": PredictionVenue.POLYMARKET,
+        "manifest_record_hash": MANIFEST_RECORD_HASH,
+        "manifest_source_hashes": (EVIDENCE_HASH,),
+        "eligibility_evidence_hashes": (PROTOCOL_FIXTURE_HASH,),
+        "strategy_policy_hash": "7" * 64,
+        "proof_policy_hash": "8" * 64,
+        "economics_policy_hash": "9" * 64,
+        "protocol_fixture_hash": PROTOCOL_FIXTURE_HASH,
+        "route_set_version": "polymarket-mutations-v1",
+        "route_set_hash": "5" * 64,
+    }
+    values.update(overrides)
+    return values
+
+
 def kill_clearance_fields(**overrides: Any) -> dict[str, Any]:
     values: dict[str, Any] = {
         "schema_version": 1,

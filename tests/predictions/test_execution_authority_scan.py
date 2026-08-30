@@ -944,6 +944,11 @@ def _fetch_options_are_exact(options: str) -> tuple[bool, bool]:
 # clearance. Every other scanned surface -- the observer dashboard, the execution coordinator, and
 # the signer -- stays free of both.
 _PILOT_AUTHORITY_PREFIX = "pilot/"
+# The one reviewed adapter allowed to project a verified pilot grant into the authority layer's
+# sanitized capability. Every other module still may not name or construct that type.
+_CAPABILITY_PROJECTION_PATHS = frozenset(
+    {Path("execution/authority.py"), Path("pilot/verifier.py")}
+)
 
 
 def _is_pilot_authority(path: Path) -> bool:
@@ -1818,14 +1823,14 @@ def test_production_ast_has_no_issuer_kill_clearance_activation_or_test_reachabi
                 test_imports.append((path, node.module))
             if not isinstance(node, ast.Call):
                 if (
-                    path != Path("execution/authority.py")
+                    path not in _CAPABILITY_PROJECTION_PATHS
                     and isinstance(node, ast.Name)
                     and node.id in capability_aliases
                 ):
                     capability_references.append((path, node.lineno, node.id))
                 continue
             name = _call_name(node)
-            if name in capability_aliases:
+            if name in capability_aliases and path not in _CAPABILITY_PROJECTION_PATHS:
                 capability_construction.append((path, node.lineno, name))
             if name == "run_signer_sidecar":
                 signer_sidecar_call_sites.append((path, node.lineno))

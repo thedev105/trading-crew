@@ -15,6 +15,7 @@ from polytrading.predictions.pilot.capabilities import (
     CapabilityRequest,
     GrantKind,
     PilotCapabilityIssuer,
+    VenueBinding,
     verify_capability_signature,
 )
 from polytrading.predictions.pilot.models import (
@@ -41,6 +42,7 @@ from tests.predictions.pilot_helpers import (
     WALLET_FINGERPRINT,
     challenge_fields,
     limits_fields,
+    venue_binding_fields,
 )
 
 PORT = 8788
@@ -62,6 +64,7 @@ def request_fields(**overrides: Any) -> dict[str, Any]:
         "recovery_capability_id": RECOVERY_CAPABILITY_ID,
         "challenge_id": CHALLENGE_ID,
         "mode": AuthorizationMode.COMPLETE_STRATEGY,
+        "venue_binding": VenueBinding.model_validate(venue_binding_fields(), strict=True),
         "account_fingerprint": ACCOUNT_FINGERPRINT,
         "wallet_fingerprint": WALLET_FINGERPRINT,
         "browser_session_hash": BROWSER_SESSION_HASH,
