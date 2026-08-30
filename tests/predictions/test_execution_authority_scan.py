@@ -939,9 +939,10 @@ def _fetch_options_are_exact(options: str) -> tuple[bool, bool]:
     return method_exact, sorted(matched_names) == sorted(exact_properties)
 
 
-# The pilot package is the reviewed local capability authority (2026-08-27 pilot design, section
-# 4.3): it is the one place allowed to define capability issuance. Every other scanned surface --
-# the observer dashboard, the execution coordinator, and the signer -- stays free of it.
+# The pilot package is the reviewed local capability authority (2026-08-27 pilot design, sections
+# 4.3 and 9.5): it is the one place allowed to define capability issuance and operator kill
+# clearance. Every other scanned surface -- the observer dashboard, the execution coordinator, and
+# the signer -- stays free of both.
 _PILOT_AUTHORITY_PREFIX = "pilot/"
 
 
@@ -1017,9 +1018,13 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                     "issue",
                     "mint",
                 }
-                if (issues_capability and not _is_pilot_authority(source_path)) or (
-                    "kill" in words and words & {"clear", "disengage", "release", "reset"}
-                ):
+                clears_kill = "kill" in words and words & {
+                    "clear",
+                    "disengage",
+                    "release",
+                    "reset",
+                }
+                if (issues_capability or clears_kill) and not _is_pilot_authority(source_path):
                     violations.append(f"authority-definition:{source_path}:{node.lineno}")
                 if "verifier" in words and words & {"configured", "enabled"}:
                     violations.append(f"configured-verifier:{source_path}:{node.lineno}")
@@ -1776,9 +1781,13 @@ def test_production_ast_has_no_issuer_kill_clearance_activation_or_test_reachabi
                     "issue",
                     "mint",
                 }
-                if (issues_capability and not _is_pilot_authority(path)) or (
-                    "kill" in words and words & {"clear", "disengage", "release", "reset"}
-                ):
+                clears_kill = "kill" in words and words & {
+                    "clear",
+                    "disengage",
+                    "release",
+                    "reset",
+                }
+                if (issues_capability or clears_kill) and not _is_pilot_authority(path):
                     semantic_authority_definitions.append((path, node.lineno, node.name))
             if isinstance(node, ast.Import):
                 test_imports.extend(
@@ -2367,3 +2376,65 @@ def test_runbook_covers_every_required_recovery_and_remaining_gate() -> None:
     )
     missing = tuple(contract for contract in required_contracts if contract.casefold() not in text)
     assert missing == (), f"RUNBOOK_CONTRACTS_MISSING:{','.join(missing)}"
+
+
+# -- observer isolation from the pilot control plane ----------------------------------------
+
+_PILOT_ONLY_MODULES = (
+    "polytrading.predictions.pilot",
+    "polytrading.predictions.polymarket_execution.signer",
+    "polytrading.predictions.polymarket_execution.credentials",
+    "polytrading.predictions.polymarket_execution.keychain_macos",
+    "polytrading.predictions.polymarket_execution.auth",
+    "polytrading.predictions.polymarket_execution.rest",
+    "polytrading.predictions.polymarket_execution.user_stream",
+    "polytrading.predictions.polymarket_execution.ipc",
+)
+
+
+def _imported_modules(tree: ast.Module) -> set[str]:
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules.add(node.module)
+            modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return modules
+
+
+def test_the_observer_dashboard_cannot_reach_the_pilot_signer_or_credentials() -> None:
+    trees = _python_trees()
+    observer_paths = [
+        path
+        for path in trees
+        if path.name.startswith("dashboard") or path.as_posix().startswith("web_assets/")
+    ]
+
+    assert observer_paths
+    for path in observer_paths:
+        imported = _imported_modules(trees[path])
+        for module in _PILOT_ONLY_MODULES:
+            assert not any(name == module or name.startswith(f"{module}.") for name in imported), (
+                f"{path} imports {module}"
+            )
+
+
+def test_the_observer_browser_assets_never_reference_a_pilot_route() -> None:
+    for path in WEB_ASSETS_ROOT.iterdir():
+        if not path.is_file() or path.name == "__init__.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert "/api/v1/pilot" not in text, path
+        assert "pilot_session" not in text, path
+
+
+def test_the_pilot_control_plane_never_imports_the_observer_server() -> None:
+    trees = _python_trees()
+    pilot_paths = [path for path in trees if path.as_posix().startswith("pilot/")]
+
+    assert pilot_paths
+    for path in pilot_paths:
+        imported = _imported_modules(trees[path])
+        assert "polytrading.predictions.dashboard_server" not in imported, path
+        assert not any(name.startswith("tests") for name in imported), path

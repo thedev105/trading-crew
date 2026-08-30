@@ -58,6 +58,7 @@ from polytrading.predictions.health_report import (
 from polytrading.predictions.kalshi import KalshiAdapter
 from polytrading.predictions.limitless import LimitlessAdapter
 from polytrading.predictions.manifest import evaluate_collection_gate
+from polytrading.predictions.pilot.runtime import serve_polymarket_pilot
 from polytrading.predictions.polymarket import PolymarketAdapter
 from polytrading.predictions.polymarket_execution.conformance import run_conformance
 from polytrading.predictions.polymarket_execution.protocol import (
@@ -325,6 +326,18 @@ def add_predictions_subcommands(
     dashboard.add_argument("--db", required=True, type=Path)
     dashboard.add_argument("--port", required=True, type=int)
 
+    pilot = predictions_commands.add_parser(
+        "pilot", help="serve the loopback-only Polymarket pilot control plane"
+    )
+    pilot_commands = pilot.add_subparsers(dest="predictions_pilot_command", required=True)
+    # Deliberately the only pilot command, and deliberately without any credential, order,
+    # activation, capability, or kill-clearance argument: those are operator UI ceremonies.
+    pilot_polymarket = pilot_commands.add_parser(
+        "polymarket", help="serve the local Polymarket pilot"
+    )
+    pilot_polymarket.add_argument("--db", required=True, type=Path)
+    pilot_polymarket.add_argument("--port", required=True, type=int)
+
 
 def run_predictions_command(arguments: argparse.Namespace) -> int:
     if arguments.predictions_command == "venues":
@@ -350,6 +363,9 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
     if arguments.predictions_command == "dashboard":
         validate_prediction_dashboard_database(arguments.db)
         serve_prediction_dashboard(arguments.db, arguments.port)
+        return 0
+    if arguments.predictions_command == "pilot":
+        serve_polymarket_pilot(arguments.db, arguments.port)
         return 0
     return _run_health(arguments)
 
