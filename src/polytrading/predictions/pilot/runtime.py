@@ -17,8 +17,17 @@ from pathlib import Path
 from typing import Final, Literal
 
 from polytrading.lifecycle import owned_resource_cleanup
-from polytrading.predictions.pilot.passkeys import RP_ID, PasskeyError, pilot_origin
+from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
+from polytrading.predictions.pilot.passkeys import (
+    RP_ID,
+    PasskeyError,
+    PasskeyService,
+    PyWebAuthnPasskeyService,
+    pilot_origin,
+)
 from polytrading.predictions.pilot.policy import COMPILED_PILOT_CEILINGS
+from polytrading.predictions.pilot.presence import NativePresenceSource, PresenceMonitor
+from polytrading.predictions.pilot.presence_macos import MacOSPresenceSource
 from polytrading.predictions.pilot.server import (
     MAXIMUM_BODY_BYTES,
     PilotApplication,
@@ -26,6 +35,8 @@ from polytrading.predictions.pilot.server import (
     PilotRequestError,
     PilotResponse,
 )
+from polytrading.predictions.pilot.services import LivePilotServices, PilotEnvironment
+from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     MacOSKeychainSecretStore,
 )
@@ -119,8 +130,13 @@ class PilotRuntime:
     application: PilotApplication
     posture: PilotPosture
     store: PredictionMarketStore
+    issuer: PilotCapabilityIssuer | None = None
+    verifier: PilotCapabilityVerifier | None = None
 
     def close(self) -> None:
+        """Drop this launch's signing key first, then the database handle."""
+        if self.issuer is not None:
+            self.issuer.close()
         self.store.close()
 
 
@@ -130,10 +146,19 @@ def build_pilot_runtime(
     *,
     platform: str = "darwin",
     now: Callable[[], datetime] | None = None,
+    environment: PilotEnvironment | None = None,
+    passkeys: PasskeyService | None = None,
+    presence_source: NativePresenceSource | None = None,
+    key_id: str = "pilot-launch",
 ) -> PilotRuntime:
-    """Validate every launch gate, then compose a killed control plane."""
+    """Validate every launch gate, then compose a control plane that starts killed.
 
-    del now
+    Without an ``environment`` the pilot serves posture only. With one, the operator ceremonies
+    are reachable — and each still refuses until its own gates pass, because the launch begins
+    killed and every grant needs its own passkey assertion.
+    """
+
+    clock = now or (lambda: datetime.now(UTC))
     if not Path(database_path).is_file():
         raise PilotRuntimeError("PILOT_DATABASE_MISSING")
     try:
@@ -147,7 +172,7 @@ def build_pilot_runtime(
     if not secret_store_available:
         raise PilotRuntimeError("PILOT_SECRET_STORE_UNAVAILABLE")
     try:
-        store = PredictionMarketStore(Path(database_path), read_only=True)
+        store = PredictionMarketStore(Path(database_path), read_only=environment is None)
     except Exception as error:
         raise PilotRuntimeError("PILOT_DATABASE_SCHEMA_STALE") from error
     posture = PilotPosture(
@@ -157,11 +182,35 @@ def build_pilot_runtime(
         origin=origin,
         secret_store_available=secret_store_available,
     )
-    services = KilledPilotServices(
-        posture, ceilings=COMPILED_PILOT_CEILINGS.model_dump(mode="json")
+    if environment is None:
+        services: object = KilledPilotServices(
+            posture, ceilings=COMPILED_PILOT_CEILINGS.model_dump(mode="json")
+        )
+        return PilotRuntime(
+            application=PilotApplication(services, port=port), posture=posture, store=store
+        )
+
+    issuer = PilotCapabilityIssuer(key_id=key_id)
+    verifier = PilotCapabilityVerifier(issuer.public_verification_key)
+    monitor = PresenceMonitor(
+        source=presence_source or MacOSPresenceSource(platform=platform),
+        started_at=clock(),
+    )
+    services = LivePilotServices(
+        store=store,
+        environment=environment,
+        passkeys=passkeys or PyWebAuthnPasskeyService(port=port),
+        issuer=issuer,
+        verifier=verifier,
+        presence=monitor,
+        clock=clock,
     )
     return PilotRuntime(
-        application=PilotApplication(services, port=port), posture=posture, store=store
+        application=PilotApplication(services, port=port),
+        posture=posture,
+        store=store,
+        issuer=issuer,
+        verifier=verifier,
     )
 
 

@@ -9,6 +9,7 @@ carry stable identifiers only; the server resolves and recomputes all action mat
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from http import HTTPStatus
 from typing import Any, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
+_DIAGNOSTICS: Final = os.environ.get("POLYTRADING_PILOT_DIAGNOSTICS") == "1"
 MAXIMUM_TARGET_BYTES: Final = 1024
 MAXIMUM_BODY_BYTES: Final = 16_384
 MAXIMUM_HEADER_BYTES: Final = 4096
@@ -164,6 +166,11 @@ class PilotApplication:
     def origin(self) -> str:
         return self._origin
 
+    @property
+    def services(self) -> PilotServices:
+        """The composed services, exposed so a runtime can inspect what it wired."""
+        return self._services
+
     def respond(self, request: PilotRequest) -> PilotResponse:
         rejection = self._reject_transport(request)
         if rejection is not None:
@@ -278,7 +285,10 @@ class PilotApplication:
         except PilotRequestError as error:
             return _error(error.status, error.code)
         except Exception:
-            # Nothing about the failure reaches the browser: only a stable code.
+            # Nothing about the failure reaches the browser: only a stable code. The detail is
+            # re-raised for the operator's own process log when diagnostics are enabled.
+            if _DIAGNOSTICS:
+                raise
             return _error(HTTPStatus.INTERNAL_SERVER_ERROR, "PILOT_REQUEST_FAILED")
         return _json(HTTPStatus.OK, result)
 
