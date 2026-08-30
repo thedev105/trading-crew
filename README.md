@@ -199,6 +199,26 @@ database read-only and uses one captured UTC `as_of` across the complete screen.
 only when its observation time is no later than that cutoff, so later venue research cannot leak
 into a historical dashboard view.
 
+### Local Polymarket pilot console
+
+A separate, loopback-only console can authorize tightly bounded Polymarket execution for one
+locally present operator:
+
+```bash
+.venv/bin/polytrading predictions pilot polymarket \
+  --db var/predictions.duckdb \
+  --port 8788
+```
+
+`--db` and `--port` are the entire CLI surface: there is no credential, order, activation,
+capability, or kill-clearance flag. Every launch starts killed, secrets live only in the macOS
+Keychain and the signer process, and only the operator can trigger a live action, from the UI,
+after a typed confirmation and a platform-passkey ceremony. The evidence dashboard above stays
+observation-only and cannot reach the pilot, the signer, or any credential.
+
+See `docs/predictions/polymarket-live-pilot.md` for setup, the immutable ceilings, the three
+authorization modes, presence rules, staged activation, and the recovery playbooks.
+
 The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
 dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
 records exist. The economics table contains exactly one BTC, ETH, and SOL row selected from reports

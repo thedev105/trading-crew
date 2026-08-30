@@ -194,9 +194,7 @@ def test_policy_profile_binds_the_compiled_ceiling_hash() -> None:
 
 def test_unknown_loss_state_carries_no_amounts() -> None:
     with pytest.raises(ValidationError, match="UNKNOWN"):
-        PilotLossState.model_validate(
-            loss_state_fields(status=LossStatus.UNKNOWN), strict=True
-        )
+        PilotLossState.model_validate(loss_state_fields(status=LossStatus.UNKNOWN), strict=True)
     unknown = PilotLossState.model_validate(
         loss_state_fields(
             status=LossStatus.UNKNOWN,

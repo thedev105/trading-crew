@@ -344,12 +344,18 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
         "polytrading/carry/dossiers/hyperliquid-dydx-core-v1.json",
         "polytrading/carry/dossiers/lighter-dydx-core-v1.json",
     ]
+    fixture_root = "polytrading/predictions/polymarket_execution/fixtures"
     json_members = [
         *dossier_members,
-        ("polytrading/predictions/polymarket_execution/fixtures/event_vectors_v1.json"),
-        ("polytrading/predictions/polymarket_execution/fixtures/order_vectors_v1.json"),
-        "polytrading/predictions/polymarket_execution/fixtures/protocol_v1.json",
-        "polytrading/predictions/polymarket_execution/fixtures/sources_v1.json",
+        f"{fixture_root}/credential_vectors_v2.json",
+        f"{fixture_root}/event_vectors_v1.json",
+        f"{fixture_root}/event_vectors_v2.json",
+        f"{fixture_root}/order_vectors_v1.json",
+        f"{fixture_root}/order_vectors_v2.json",
+        f"{fixture_root}/protocol_v1.json",
+        f"{fixture_root}/protocol_v2.json",
+        f"{fixture_root}/sources_v1.json",
+        f"{fixture_root}/sources_v2.json",
     ]
 
     with ZipFile(built_wheel) as archive:
@@ -384,6 +390,7 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
             "polytrading/predictions/storage/schema/008_live_execution.sql",
             "polytrading/predictions/storage/schema/009_execution_operation_claims.sql",
             "polytrading/predictions/storage/schema/010_authoritative_trade_economics.sql",
+            "polytrading/predictions/storage/schema/011_polymarket_live_pilot.sql",
         ]
         prediction_web_asset_members = {
             name
@@ -400,6 +407,20 @@ def test_built_wheel_contains_valid_contract_dossier(built_wheel: Path) -> None:
             "polytrading/predictions/web_assets/store.js",
             "polytrading/predictions/web_assets/charts.js",
             "polytrading/predictions/web_assets/views.js",
+        }
+        pilot_web_asset_members = {
+            name
+            for name in archive.namelist()
+            if name.startswith("polytrading/predictions/pilot_web_assets/")
+            and name.endswith((".html", ".css", ".js"))
+        }
+        assert pilot_web_asset_members == {
+            "polytrading/predictions/pilot_web_assets/index.html",
+            "polytrading/predictions/pilot_web_assets/app.css",
+            "polytrading/predictions/pilot_web_assets/app.js",
+            "polytrading/predictions/pilot_web_assets/api.js",
+            "polytrading/predictions/pilot_web_assets/store.js",
+            "polytrading/predictions/pilot_web_assets/views.js",
         }
         dossiers = tuple(
             ContractCompatibilityDossier.model_validate_json(archive.read(member))
@@ -466,9 +487,14 @@ print(json.dumps({{
         "version": "polymarket-clob-2026-08-25-v1",
         "readiness": "CURRENT",
         "resources": [
+            "credential_vectors_v2.json",
             "event_vectors_v1.json",
+            "event_vectors_v2.json",
             "order_vectors_v1.json",
+            "order_vectors_v2.json",
             "protocol_v1.json",
+            "protocol_v2.json",
             "sources_v1.json",
+            "sources_v2.json",
         ],
     }
