@@ -49,6 +49,16 @@ AuthorityReason = Literal[
     "CAPABILITY_PROTOCOL_MISMATCH",
     "CAPABILITY_ROUTE_SET_MISMATCH",
     "CAPABILITY_OPERATION_NOT_ALLOWED",
+    "CAPABILITY_MODE_MISMATCH",
+    "CAPABILITY_GRANT_KIND_MISMATCH",
+    "CAPABILITY_ACTION_MISMATCH",
+    "CAPABILITY_SESSION_MISMATCH",
+    "CAPABILITY_CEILING_MISMATCH",
+    "CAPABILITY_REQUESTED_POLICY_MISMATCH",
+    "CAPABILITY_PLAN_MISMATCH",
+    "CAPABILITY_RECOVERY_POLICY_MISMATCH",
+    "CAPABILITY_CREDENTIAL_ROUTE_NOT_ALLOWED",
+    "OPERATOR_PRESENCE_LOST",
     "CAPABILITY_CAPITAL_LIMIT_EXCEEDED",
     "CAPABILITY_NOTIONAL_LIMIT_EXCEEDED",
     "CAPABILITY_POSITION_LIMIT_EXCEEDED",
@@ -64,6 +74,13 @@ AuthorityReason = Literal[
     "ACCOUNT_SCOPE_MISMATCH",
     "EXECUTION_KILL_ENGAGED",
 ]
+
+# Mode and grant kind travel as their pilot string values so this module stays independent of the
+# pilot package: the coordinator and signer both compare them without importing pilot code.
+AuthorizationModeValue = Literal["EXACT_ORDER", "COMPLETE_STRATEGY", "AUTOMATION_SESSION"]
+GrantKindValue = Literal["PRIMARY", "RECOVERY", "CREDENTIAL_PROVISIONING"]
+# Recovery may inspect account state or cancel a known bound order; it may never place one.
+_RECOVERY_MUTATIONS = frozenset({ExecutionOperation.CANCEL_ORDER})
 
 _MUTATING_OPERATIONS = frozenset(
     {
@@ -110,6 +127,25 @@ class _CapabilityFields(PredictionRecord):
     expires_at: datetime
     activation_nonce: NonEmptyString
     issuer_key_id: NonEmptyString
+    # Pilot grant bindings. A capability minted before the local pilot leaves them unset; a pilot
+    # grant sets them and then every boundary must state matching expectations or fail closed.
+    mode: AuthorizationModeValue | None = None
+    grant_kind: GrantKindValue | None = None
+    parent_action_id: UUID | None = None
+    session_id: UUID | None = None
+    requested_limits_hash: Sha256 | None = None
+    ceiling_hash: Sha256 | None = None
+    plan_hash: Sha256 | None = None
+    strategy_hash: Sha256 | None = None
+    proof_family_hash: Sha256 | None = None
+    recovery_policy_hash: Sha256 | None = None
+    presence_deadline: datetime | None = None
+    single_use: bool | None = None
+
+    @field_validator("presence_deadline")
+    @classmethod
+    def _presence_deadline_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _utc(value)
 
     @field_validator("manifest_source_hashes", "eligibility_evidence_hashes")
     @classmethod
@@ -260,6 +296,19 @@ class AuthorityContext(PredictionRecord):
     account_scope_expires_at: datetime | None
     kill_engaged: bool
     evidence_hashes: tuple[Sha256, ...]
+    # Pilot expectations assembled independently at this boundary.
+    expected_mode: AuthorizationModeValue | None = None
+    expected_grant_kind: GrantKindValue | None = None
+    action_id: UUID | None = None
+    session_id: UUID | None = None
+    requested_limits_hash: Sha256 | None = None
+    ceiling_hash: Sha256 | None = None
+    plan_hash: Sha256 | None = None
+    strategy_hash: Sha256 | None = None
+    proof_family_hash: Sha256 | None = None
+    recovery_policy_hash: Sha256 | None = None
+    operator_present: bool = True
+    credential_route_requested: bool = False
 
     @field_validator("now")
     @classmethod
@@ -339,6 +388,9 @@ def _verify_capability_fields(
         return _deny(context, "CAPABILITY_ROUTE_SET_MISMATCH")
     if operation not in _MUTATING_OPERATIONS or operation not in capability.allowed_operations:
         return _deny(context, "CAPABILITY_OPERATION_NOT_ALLOWED")
+    pilot_denial = _verify_pilot_grant_fields(context, operation)
+    if pilot_denial is not None:
+        return pilot_denial
     if context.capital_after > capability.maximum_capital:
         return _deny(context, "CAPABILITY_CAPITAL_LIMIT_EXCEEDED")
     if context.requested_notional > capability.maximum_per_intent_notional:
@@ -376,6 +428,58 @@ def _verify_capability_fields(
     if context.kill_engaged:
         return _deny(context, "EXECUTION_KILL_ENGAGED")
     return AuthorityDecision(True, None, context.evidence_hashes)
+
+
+def _verify_pilot_grant_fields(
+    context: AuthorityContext, operation: ExecutionOperation
+) -> AuthorityDecision | None:
+    """Compare the pilot bindings of one grant against this boundary's own expectations.
+
+    A grant that declares pilot bindings is only usable where the boundary states matching
+    expectations, so a primary grant can never satisfy a recovery operation, an automation
+    session's grant can never authorize an exact order, and a credential-provisioning grant can
+    never authorize a mutation at all.
+    """
+
+    capability = context.verified_capability
+    assert capability is not None  # narrowed by the caller
+    if context.credential_route_requested:
+        return _deny(context, "CAPABILITY_CREDENTIAL_ROUTE_NOT_ALLOWED")
+    if capability.grant_kind == "CREDENTIAL_PROVISIONING":
+        return _deny(context, "CAPABILITY_GRANT_KIND_MISMATCH")
+    if capability.grant_kind != context.expected_grant_kind:
+        return _deny(context, "CAPABILITY_GRANT_KIND_MISMATCH")
+    if capability.mode != context.expected_mode:
+        return _deny(context, "CAPABILITY_MODE_MISMATCH")
+    if capability.grant_kind is None:
+        return None
+    if capability.grant_kind == "RECOVERY" and operation not in _RECOVERY_MUTATIONS:
+        return _deny(context, "CAPABILITY_GRANT_KIND_MISMATCH")
+    if capability.parent_action_id != context.action_id:
+        return _deny(context, "CAPABILITY_ACTION_MISMATCH")
+    if capability.session_id != context.session_id:
+        return _deny(context, "CAPABILITY_SESSION_MISMATCH")
+    if capability.mode == "AUTOMATION_SESSION" and capability.session_id is None:
+        return _deny(context, "CAPABILITY_SESSION_MISMATCH")
+    if capability.ceiling_hash != context.ceiling_hash:
+        return _deny(context, "CAPABILITY_CEILING_MISMATCH")
+    if capability.requested_limits_hash != context.requested_limits_hash:
+        return _deny(context, "CAPABILITY_REQUESTED_POLICY_MISMATCH")
+    if (
+        capability.plan_hash != context.plan_hash
+        or capability.strategy_hash != context.strategy_hash
+        or capability.proof_family_hash != context.proof_family_hash
+    ):
+        return _deny(context, "CAPABILITY_PLAN_MISMATCH")
+    if capability.recovery_policy_hash != context.recovery_policy_hash:
+        return _deny(context, "CAPABILITY_RECOVERY_POLICY_MISMATCH")
+    if (
+        capability.presence_deadline is None
+        or not context.operator_present
+        or context.now > capability.presence_deadline
+    ):
+        return _deny(context, "OPERATOR_PRESENCE_LOST")
+    return None
 
 
 def verify_mutation_authority(

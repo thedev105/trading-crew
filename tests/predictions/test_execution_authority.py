@@ -200,21 +200,24 @@ def test_capability_exposes_deterministic_unsigned_bytes_without_signature_mater
     first = execution_capability(detached_signature=b"first-signature-canary")
     second = execution_capability(detached_signature=b"second-signature-canary")
     expected = (
-        b'{"account_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111",'
-        b'"activation_nonce":"activation-1","allowed_operations":["CANCEL_ORDER","HEARTBEAT",'
-        b'"SIGN_ORDER","SUBMIT_ORDER"],"capability_id":"11111111-1111-4111-8111-111111111111",'
-        b'"capability_version":1,"economics_policy_hash":"77777777777777777777777777777777777'
-        b'77777777777777777777777777777","eligibility_evidence_hashes":["4444444444444444444'
-        b'444444444444444444444444444444444444444444444"],"expires_at":"2026-08-25T16:01:00Z",'
-        b'"issuer_key_id":"fixture-key-1","manifest_record_hash":"363581cc4bba87b6df4473faa3bb95'
-        b'f7a262de4cf34089a6f71f52a9a91de391","manifest_source_hashes":["3333333333333333333'
-        b'333333333333333333333333333333333333333333333"],"maximum_capital":"100","maximum_loss":'
-        b'"5","maximum_per_intent_notional":"10","maximum_position":"50","not_before":"2026-08-'
-        b'25T15:59:00Z","proof_policy_hash":"66666666666666666666666666666666666666666666666666'
-        b'66666666666666","protocol_fixture_hash":"8888888888888888888888888888888888888888888888'
-        b'888888888888888888","route_set_hash":"dddddddddddddddddddddddddddddddddddddddddddddddd'
-        b'dddddddddddddddd","route_set_version":"polymarket-mutations-v1","strategy_policy_hash":"5'
-        b'555555555555555555555555555555555555555555555555555555555555555","venue":"polymarket"}'
+        b'{"account_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111'
+        b'","activation_nonce":"activation-1","allowed_operations":["CANCEL_ORDER","HEARTBEAT","SI'
+        b'GN_ORDER","SUBMIT_ORDER"],"capability_id":"11111111-1111-4111-8111-111111111111","capabi'
+        b'lity_version":1,"ceiling_hash":null,"economics_policy_hash":"777777777777777777777777777'
+        b'7777777777777777777777777777777777777","eligibility_evidence_hashes":["44444444444444444'
+        b'44444444444444444444444444444444444444444444444"],"expires_at":"2026-08-25T16:01:00Z","g'
+        b'rant_kind":null,"issuer_key_id":"fixture-key-1","manifest_record_hash":"363581cc4bba87b6'
+        b'df4473faa3bb95f7a262de4cf34089a6f71f52a9a91de391","manifest_source_hashes":["33333333333'
+        b'33333333333333333333333333333333333333333333333333333"],"maximum_capital":"100","maximum'
+        b'_loss":"5","maximum_per_intent_notional":"10","maximum_position":"50","mode":null,"not_b'
+        b'efore":"2026-08-25T15:59:00Z","parent_action_id":null,"plan_hash":null,"presence_deadlin'
+        b'e":null,"proof_family_hash":null,"proof_policy_hash":"6666666666666666666666666666666666'
+        b'666666666666666666666666666666","protocol_fixture_hash":"8888888888888888888888888888888'
+        b'888888888888888888888888888888888","recovery_policy_hash":null,"requested_limits_hash":n'
+        b'ull,"route_set_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"route_set_version":"polymarket-mutations-v1","session_id":null,"single_use":null,"strat'
+        b'egy_hash":null,"strategy_policy_hash":"5555555555555555555555555555555555555555555555555'
+        b'555555555555555","venue":"polymarket"}'
     )
     assert first.canonical_unsigned_bundle == expected
     assert second.canonical_unsigned_bundle == expected
@@ -563,3 +566,200 @@ def test_each_boundary_evaluates_the_snapshot_without_a_cached_pass() -> None:
 def test_manifest_hash_is_bound_to_the_current_manifest() -> None:
     context = authority_context()
     assert canonical_execution_hash(context.manifest) == context.manifest_record_hash
+
+
+# -- pilot grant bindings ------------------------------------------------------------------
+
+PILOT_ACTION_ID = UUID("22222222-2222-4222-8222-222222222222")
+PILOT_SESSION_ID = UUID("33333333-3333-4333-8333-333333333333")
+
+
+def pilot_capability(**overrides: object) -> VerifiedExecutionCapability:
+    fields: dict[str, object] = {
+        "mode": "COMPLETE_STRATEGY",
+        "grant_kind": "PRIMARY",
+        "parent_action_id": PILOT_ACTION_ID,
+        "session_id": None,
+        "requested_limits_hash": HASHES[1],
+        "ceiling_hash": HASHES[2],
+        "plan_hash": HASHES[3],
+        "strategy_hash": HASHES[4],
+        "proof_family_hash": HASHES[5],
+        "recovery_policy_hash": HASHES[6],
+        "presence_deadline": NOW + timedelta(seconds=30),
+        "single_use": True,
+    }
+    fields.update(overrides)
+    return verified_capability(**fields)
+
+
+def pilot_context(**overrides: object) -> AuthorityContext:
+    fields: dict[str, object] = {
+        "verified_capability": pilot_capability(),
+        "expected_mode": "COMPLETE_STRATEGY",
+        "expected_grant_kind": "PRIMARY",
+        "action_id": PILOT_ACTION_ID,
+        "session_id": None,
+        "requested_limits_hash": HASHES[1],
+        "ceiling_hash": HASHES[2],
+        "plan_hash": HASHES[3],
+        "strategy_hash": HASHES[4],
+        "proof_family_hash": HASHES[5],
+        "recovery_policy_hash": HASHES[6],
+        "operator_present": True,
+    }
+    fields.update(overrides)
+    return authority_context(**fields)
+
+
+def test_a_matching_pilot_grant_authorizes_its_own_action() -> None:
+    decision = verify_mutation_authority(pilot_context(), ExecutionOperation.SUBMIT_ORDER)
+
+    assert decision.allowed is True
+    assert decision.reason is None
+
+
+def test_a_capability_without_pilot_bindings_needs_a_boundary_without_expectations() -> None:
+    legacy = verify_mutation_authority(authority_context(), ExecutionOperation.SUBMIT_ORDER)
+    mismatched = verify_mutation_authority(
+        authority_context(expected_grant_kind="PRIMARY"), ExecutionOperation.SUBMIT_ORDER
+    )
+
+    assert legacy.allowed is True
+    assert mismatched.allowed is False
+    assert mismatched.reason == "CAPABILITY_GRANT_KIND_MISMATCH"
+
+
+def test_a_pilot_grant_is_refused_where_the_boundary_states_no_expectations() -> None:
+    decision = verify_mutation_authority(
+        authority_context(verified_capability=pilot_capability()),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_GRANT_KIND_MISMATCH"
+
+
+def test_a_session_grant_cannot_authorize_an_exact_order_boundary() -> None:
+    decision = verify_mutation_authority(
+        pilot_context(
+            verified_capability=pilot_capability(
+                mode="AUTOMATION_SESSION", session_id=PILOT_SESSION_ID
+            ),
+            expected_mode="EXACT_ORDER",
+        ),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_MODE_MISMATCH"
+
+
+def test_a_primary_grant_cannot_validate_a_recovery_boundary() -> None:
+    decision = verify_mutation_authority(
+        pilot_context(expected_grant_kind="RECOVERY"), ExecutionOperation.CANCEL_ORDER
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_GRANT_KIND_MISMATCH"
+
+
+def test_a_recovery_grant_may_cancel_but_never_submit() -> None:
+    recovery = pilot_context(
+        verified_capability=pilot_capability(grant_kind="RECOVERY"),
+        expected_grant_kind="RECOVERY",
+    )
+
+    assert verify_mutation_authority(recovery, ExecutionOperation.CANCEL_ORDER).allowed is True
+    submitted = verify_mutation_authority(recovery, ExecutionOperation.SUBMIT_ORDER)
+    assert submitted.allowed is False
+    assert submitted.reason == "CAPABILITY_GRANT_KIND_MISMATCH"
+
+
+def test_a_credential_provisioning_grant_never_authorizes_a_mutation() -> None:
+    decision = verify_mutation_authority(
+        pilot_context(
+            verified_capability=pilot_capability(grant_kind="CREDENTIAL_PROVISIONING"),
+            expected_grant_kind="CREDENTIAL_PROVISIONING",
+        ),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_GRANT_KIND_MISMATCH"
+
+
+def test_a_credential_route_is_never_reachable_through_an_execution_capability() -> None:
+    decision = verify_mutation_authority(
+        pilot_context(credential_route_requested=True), ExecutionOperation.SUBMIT_ORDER
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_CREDENTIAL_ROUTE_NOT_ALLOWED"
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("action_id", "CAPABILITY_ACTION_MISMATCH"),
+        ("session_id", "CAPABILITY_SESSION_MISMATCH"),
+    ],
+)
+def test_a_grant_for_another_action_or_session_is_refused(field: str, reason: str) -> None:
+    decision = verify_mutation_authority(
+        pilot_context(**{field: PILOT_SESSION_ID}), ExecutionOperation.SUBMIT_ORDER
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == reason
+
+
+def test_an_automation_session_grant_must_name_its_session() -> None:
+    decision = verify_mutation_authority(
+        pilot_context(
+            verified_capability=pilot_capability(mode="AUTOMATION_SESSION", session_id=None),
+            expected_mode="AUTOMATION_SESSION",
+        ),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "CAPABILITY_SESSION_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("ceiling_hash", "CAPABILITY_CEILING_MISMATCH"),
+        ("requested_limits_hash", "CAPABILITY_REQUESTED_POLICY_MISMATCH"),
+        ("plan_hash", "CAPABILITY_PLAN_MISMATCH"),
+        ("strategy_hash", "CAPABILITY_PLAN_MISMATCH"),
+        ("proof_family_hash", "CAPABILITY_PLAN_MISMATCH"),
+        ("recovery_policy_hash", "CAPABILITY_RECOVERY_POLICY_MISMATCH"),
+    ],
+)
+def test_every_pilot_hash_is_compared_independently(field: str, reason: str) -> None:
+    decision = verify_mutation_authority(
+        pilot_context(**{field: HASHES[11]}), ExecutionOperation.SUBMIT_ORDER
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == reason
+
+
+def test_operator_presence_is_required_for_the_whole_capability() -> None:
+    absent = verify_mutation_authority(
+        pilot_context(operator_present=False), ExecutionOperation.SUBMIT_ORDER
+    )
+    lapsed = verify_mutation_authority(
+        pilot_context(
+            verified_capability=pilot_capability(presence_deadline=NOW - timedelta(seconds=1))
+        ),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+    undeclared = verify_mutation_authority(
+        pilot_context(verified_capability=pilot_capability(presence_deadline=None)),
+        ExecutionOperation.SUBMIT_ORDER,
+    )
+
+    assert [absent.reason, lapsed.reason, undeclared.reason] == ["OPERATOR_PRESENCE_LOST"] * 3

@@ -12,7 +12,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "8ccd7ecf39674fc4644f01763716fcedb8b6201bcbc94cb9933c0f9ecda458de",
     Path(
         "execution/authority.py"
-    ): "917dd90fa38e9a0cb5a172793d285ab0d7d375780975d6c1deece8bfd0a943cc",
+    ): "06399152ed863f0c25510ba30fff3701c8252f01d9d3b8683d60ec30cc55d07a",
     Path(
         "execution/coordinator.py"
     ): "2b6cc79272e9ae938236111a9619b5b0540722d7bd00cc2a82e39e1c795f47a2",
