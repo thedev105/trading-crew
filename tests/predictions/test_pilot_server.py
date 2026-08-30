@@ -280,7 +280,7 @@ def test_duplicate_headers_or_cookies_are_refused() -> None:
 
 @pytest.mark.parametrize(
     "target",
-    ["/", "/api/v1/pilot", "/api/v1/pilot/unknown", "/api/v1/predictions-dashboard", "/healthz"],
+    ["/api/v1/pilot", "/api/v1/pilot/unknown", "/api/v1/predictions-dashboard", "/healthz"],
 )
 def test_only_the_fixed_route_table_is_reachable(target: str) -> None:
     app = application()
@@ -454,3 +454,54 @@ def test_the_route_table_is_exactly_the_reviewed_surface() -> None:
     }
     assert all(method in {"GET", "POST"} for method, _ in PILOT_ROUTES)
     assert all(path.startswith("/api/v1/pilot") for _, path in PILOT_ROUTES)
+
+
+# -- cockpit assets ---------------------------------------------------------------------------
+
+
+def test_the_cockpit_assets_are_served_from_the_exact_asset_map() -> None:
+    from polytrading.predictions.pilot.server import PILOT_ASSETS
+
+    app = application()
+    for path, (_name, content_type) in PILOT_ASSETS.items():
+        response = app.respond(request("GET", path))
+        assert response.status is HTTPStatus.OK, path
+        assert response.content_type == content_type
+        assert response.body
+        assert response.headers["Content-Security-Policy"].startswith("default-src 'none'")
+
+
+def test_assets_need_no_session_but_still_refuse_a_foreign_origin() -> None:
+    app = application()
+
+    anonymous = app.respond(request("GET", "/"))
+    foreign = app.respond(
+        PilotRequest(
+            method="GET",
+            target="/",
+            host=HOST,
+            received_at=NOW,
+            origin="http://evil.test",
+        )
+    )
+
+    assert anonymous.status is HTTPStatus.OK
+    assert foreign.status is HTTPStatus.FORBIDDEN
+
+
+@pytest.mark.parametrize(
+    "target", ["/assets/", "/assets/secret.js", "/assets/../app.js", "/index.html"]
+)
+def test_no_path_outside_the_asset_map_is_served(target: str) -> None:
+    response = application().respond(request("GET", target))
+
+    assert response.status in {HTTPStatus.NOT_FOUND, HTTPStatus.BAD_REQUEST}
+
+
+def test_assets_are_not_writable() -> None:
+    app = application()
+    credentials = opened(app)
+
+    response = authenticated(app, "POST", "/", credentials=credentials)
+
+    assert response.status is HTTPStatus.NOT_FOUND

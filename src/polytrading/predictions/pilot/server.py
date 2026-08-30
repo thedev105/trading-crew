@@ -46,6 +46,16 @@ PILOT_ROUTES: Final[Mapping[tuple[str, str], str]] = {
     ("POST", "/api/v1/pilot/kill/clear"): "clear_kill",
 }
 _PUBLIC_ROUTES: Final = frozenset({"create_browser_session"})
+# The cockpit's exact asset set: an unlisted path is a 404, and nothing is served from disk paths
+# a request can influence.
+PILOT_ASSETS: Final[Mapping[str, tuple[str, str]]] = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/api.js": ("api.js", "text/javascript; charset=utf-8"),
+    "/assets/store.js": ("store.js", "text/javascript; charset=utf-8"),
+    "/assets/views.js": ("views.js", "text/javascript; charset=utf-8"),
+}
 _ALLOWED_METHODS: Final = ("GET", "POST")
 
 # No CORS header appears anywhere: a cross-origin reader must get nothing, not a filtered answer.
@@ -159,6 +169,8 @@ class PilotApplication:
         if rejection is not None:
             return rejection
         path = urlsplit(request.target).path
+        if path in PILOT_ASSETS:
+            return _asset_response(path)
         handler_name = PILOT_ROUTES[(request.method, path)]
         if handler_name == "create_browser_session":
             return self._create_browser_session(request)
@@ -199,7 +211,9 @@ class PilotApplication:
                 "METHOD_NOT_ALLOWED",
                 headers={"Allow": ", ".join(_ALLOWED_METHODS)},
             )
-        if (request.method, parsed.path) not in PILOT_ROUTES:
+        if (request.method, parsed.path) not in PILOT_ROUTES and not (
+            request.method == "GET" and parsed.path in PILOT_ASSETS
+        ):
             if any(method == request.method for method, _ in PILOT_ROUTES):
                 return _error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
             return _error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
@@ -276,6 +290,20 @@ class PilotRequestError(Exception):
         super().__init__(code)
         self.status = status
         self.code = code
+
+
+def _asset_response(path: str) -> PilotResponse:
+    from importlib import resources
+
+    name, content_type = PILOT_ASSETS[path]
+    root = resources.files("polytrading.predictions.pilot_web_assets")
+    body = (root / name).read_bytes()
+    return PilotResponse(
+        status=HTTPStatus.OK,
+        content_type=content_type,
+        body=body,
+        headers=dict(SECURITY_HEADERS),
+    )
 
 
 def _bounded_headers(headers: Mapping[str, Sequence[str]]) -> bool:
@@ -355,6 +383,7 @@ PilotRouteName = Literal[
 __all__ = [
     "CSRF_HEADER",
     "MAXIMUM_BODY_BYTES",
+    "PILOT_ASSETS",
     "PILOT_ROUTES",
     "SECURITY_HEADERS",
     "SESSION_COOKIE",

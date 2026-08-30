@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en" data-view="readiness">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Polymarket Pilot — execution cockpit</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to cockpit</a>
+    <header class="masthead" role="banner">
+      <p class="wordmark">Market Atlas <span class="rail">Pilot</span></p>
+      <p class="posture" id="posture" role="status" aria-live="polite">Loading posture…</p>
+      <button id="stop" class="danger" type="button" aria-describedby="stop-help">
+        Stop and kill
+      </button>
+      <p id="stop-help" class="help">Revokes authority immediately. Clearance is a separate ceremony.</p>
+    </header>
+
+    <nav class="tabs" aria-label="Pilot views">
+      <button type="button" class="tab" data-target="readiness" aria-current="true">Readiness</button>
+      <button type="button" class="tab" data-target="limits">Limits</button>
+      <button type="button" class="tab" data-target="approval">Approval</button>
+      <button type="button" class="tab" data-target="live">Live session</button>
+    </nav>
+
+    <main id="main" tabindex="-1">
+      <section id="readiness" class="view" aria-labelledby="readiness-heading">
+        <h1 id="readiness-heading">Readiness</h1>
+        <dl id="readiness-facts" class="facts"></dl>
+        <h2 id="blockers-heading">Blockers</h2>
+        <ul id="blockers" class="blockers" aria-labelledby="blockers-heading"></ul>
+      </section>
+
+      <section id="limits" class="view" aria-labelledby="limits-heading" hidden>
+        <h1 id="limits-heading">Limits</h1>
+        <p class="note">Immutable ceilings are compiled. A request may only lower one.</p>
+        <table class="limits-table">
+          <caption>Immutable ceiling and requested limit</caption>
+          <thead>
+            <tr><th scope="col">Control</th><th scope="col">Ceiling</th><th scope="col">Requested</th></tr>
+          </thead>
+          <tbody id="limits-rows"></tbody>
+        </table>
+      </section>
+
+      <section id="approval" class="view" aria-labelledby="approval-heading" hidden>
+        <h1 id="approval-heading">Opportunity approval</h1>
+        <ul id="opportunities" class="cards"></ul>
+        <form id="approval-form" class="approval">
+          <h2 id="summary-heading">Exact approval summary</h2>
+          <dl id="approval-summary" class="facts" aria-labelledby="summary-heading"></dl>
+          <label for="confirmation">Type the confirmation text exactly</label>
+          <output id="confirmation-text" class="confirmation" for="confirmation"></output>
+          <input id="confirmation" name="confirmation" type="text" autocomplete="off"
+                 spellcheck="false" aria-describedby="confirmation-error" />
+          <p id="confirmation-error" class="error" role="alert"></p>
+          <button id="approve" type="submit" disabled>Approve with passkey</button>
+        </form>
+      </section>
+
+      <section id="live" class="view" aria-labelledby="live-heading" hidden>
+        <h1 id="live-heading">Live session</h1>
+        <dl id="live-facts" class="facts"></dl>
+        <h2 id="legs-heading">Legs and recovery</h2>
+        <ul id="legs" class="legs" aria-labelledby="legs-heading"></ul>
+        <p id="heartbeat" class="heartbeat" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <footer role="contentinfo">
+      <p id="evidence" class="evidence"></p>
+      <p class="disclaimer">
+        Cross-venue opportunities are visible and disabled. This console never holds a wallet key,
+        API credential, or capability bundle.
+      </p>
+    </footer>
+  </body>
+</html>

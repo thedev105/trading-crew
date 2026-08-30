@@ -40,6 +40,7 @@ where = ["src"]
 "polytrading.predictions.storage.schema" = ["*.sql"]
 "polytrading.predictions.polymarket_execution" = ["fixtures/*.json"]
 "polytrading.predictions.web_assets" = ["*.html", "*.css", "*.js"]
+"polytrading.predictions.pilot_web_assets" = ["*.html", "*.css", "*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
