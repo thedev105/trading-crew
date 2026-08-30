@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import httpx
+import pytest
+
+from polytrading.predictions.polymarket_execution.credential_client import (
+    MAXIMUM_RESPONSE_BYTES,
+    CredentialTransportError,
+    HttpxCredentialClient,
+)
+from polytrading.predictions.polymarket_execution.keychain_macos import (
+    CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
+)
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    bind_account_signature,
+    load_protocol_snapshot,
+)
+from polytrading.predictions.polymarket_execution.routes import CREDENTIAL_ROUTE_SET_HASH
+from polytrading.predictions.polymarket_execution.secrets import SecretBuffer
+
+SIGNER_ADDRESS = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+FUNDER_ADDRESS = "0x" + "11" * 20
+PRIVATE_KEY = (1).to_bytes(32, "big")
+TIMESTAMP = "1787673600"
+CREDENTIALS = {"apiKey": "key-canary", "secret": "secret-canary", "passphrase": "pass-canary"}
+
+
+def binding(**overrides: Any):
+    snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
+    bound = bind_account_signature(
+        snapshot,
+        signer_address=SIGNER_ADDRESS,
+        funder_address=FUNDER_ADDRESS,
+        signature_type=0,
+        negative_risk=False,
+        credential_route_hash=CREDENTIAL_ROUTE_SET_HASH,
+    )
+    if overrides:
+        return bound.model_copy(update=overrides)
+    return bound
+
+
+def client(handler: httpx.MockTransport) -> HttpxCredentialClient:
+    return HttpxCredentialClient(
+        private_key=PRIVATE_KEY,
+        timestamp=lambda: TIMESTAMP,
+        client_factory=lambda: httpx.Client(transport=handler),
+    )
+
+
+def responder(
+    *, status: int = 200, payload: Any = None, capture: list[httpx.Request] | None = None
+) -> httpx.MockTransport:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if capture is not None:
+            capture.append(request)
+        body = CREDENTIALS if payload is None else payload
+        return httpx.Response(status, json=body)
+
+    return httpx.MockTransport(handle)
+
+
+def test_a_create_call_signs_l1_headers_for_the_frozen_route() -> None:
+    captured: list[httpx.Request] = []
+
+    buffers = client(responder(capture=captured)).create_or_derive(
+        operation="CREATE", binding=binding()
+    )
+
+    request = captured[0]
+    assert str(request.url) == "https://clob.polymarket.com/auth/api-key"
+    assert request.method == "POST"
+    assert request.headers["POLY_ADDRESS"] == SIGNER_ADDRESS
+    assert request.headers["POLY_TIMESTAMP"] == TIMESTAMP
+    assert request.headers["POLY_NONCE"] == "0"
+    assert request.headers["POLY_SIGNATURE"].startswith("0x")
+    assert set(buffers) == {
+        CLOB_API_KEY_ACCOUNT,
+        CLOB_API_SECRET_ACCOUNT,
+        CLOB_PASSPHRASE_ACCOUNT,
+    }
+    assert buffers[CLOB_API_KEY_ACCOUNT].use(lambda view: bytes(view)) == b"key-canary"
+    for buffer in buffers.values():
+        buffer.close()
+
+
+def test_a_derive_call_uses_the_derive_route() -> None:
+    captured: list[httpx.Request] = []
+
+    buffers = client(responder(capture=captured)).create_or_derive(
+        operation="DERIVE", binding=binding()
+    )
+
+    assert str(captured[0].url).endswith("/auth/derive-api-key")
+    assert captured[0].method == "GET"
+    for buffer in buffers.values():
+        buffer.close()
+
+
+def test_returned_values_never_become_strings_in_the_result() -> None:
+    buffers = client(responder()).create_or_derive(operation="CREATE", binding=binding())
+
+    for buffer in buffers.values():
+        assert isinstance(buffer, SecretBuffer)
+        assert "canary" not in repr(buffer)
+        buffer.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"apiKey": "key"},
+        {"apiKey": "key", "secret": "s", "passphrase": ""},
+        {"apiKey": 1, "secret": "s", "passphrase": "p"},
+        ["not", "an", "object"],
+    ],
+)
+def test_an_incomplete_response_yields_no_buffer(payload: Any) -> None:
+    with pytest.raises(CredentialTransportError) as raised:
+        client(responder(payload=payload)).create_or_derive(operation="CREATE", binding=binding())
+    assert raised.value.code == "CREDENTIAL_RESPONSE_INVALID"
+
+
+def test_a_rejected_request_never_leaks_the_response_body() -> None:
+    with pytest.raises(CredentialTransportError) as raised:
+        client(
+            responder(status=403, payload={"error": "operator-identifying detail"})
+        ).create_or_derive(operation="CREATE", binding=binding())
+
+    assert raised.value.code == "CREDENTIAL_REQUEST_REJECTED"
+    assert "operator-identifying" not in str(raised.value)
+
+
+def test_a_transport_failure_is_a_stable_code() -> None:
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused to 127.0.0.1:1", request=request)
+
+    with pytest.raises(CredentialTransportError) as raised:
+        client(httpx.MockTransport(explode)).create_or_derive(operation="CREATE", binding=binding())
+
+    assert raised.value.code == "CREDENTIAL_TRANSPORT_UNAVAILABLE"
+    assert "127.0.0.1" not in str(raised.value)
+
+
+def test_an_oversize_response_is_refused() -> None:
+    payload = {**CREDENTIALS, "padding": "x" * (MAXIMUM_RESPONSE_BYTES + 1)}
+
+    with pytest.raises(CredentialTransportError) as raised:
+        client(responder(payload=payload)).create_or_derive(operation="CREATE", binding=binding())
+
+    assert raised.value.code == "CREDENTIAL_RESPONSE_INVALID"
+
+
+def test_a_binding_from_another_checkpoint_is_refused() -> None:
+    with pytest.raises(CredentialTransportError) as raised:
+        client(responder()).create_or_derive(
+            operation="CREATE",
+            binding=binding(protocol_version="polymarket-clob-2026-08-25-v1"),
+        )
+
+    assert raised.value.code == "CREDENTIAL_PROTOCOL_MISMATCH"
+
+
+def test_the_client_reaches_no_route_other_than_the_two_credential_routes() -> None:
+    source = json.dumps(
+        __import__("pathlib")
+        .Path("src/polytrading/predictions/polymarket_execution/credential_client.py")
+        .read_text(encoding="utf-8")
+    )
+
+    assert "/order" not in source
+    assert "/cancel" not in source
+    assert "heartbeat" not in source

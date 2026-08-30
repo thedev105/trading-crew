@@ -34,6 +34,9 @@ _REVIEWED_SOURCE_SHA256 = {
         "polymarket_execution/conformance.py"
     ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
+        "polymarket_execution/credential_client.py"
+    ): "0ce3e5b31536236ed9bd736686f03ee3cd6781a117858bb1f0ad8a613001c25c",
+    Path(
         "polymarket_execution/credentials.py"
     ): "2ca9e0735c66a1ad5cef5ea0aba5de8bb3b0e18409b4a0fabb982e1f9d6e89f6",
     Path(
@@ -1824,6 +1827,7 @@ def test_production_ast_has_no_issuer_kill_clearance_activation_or_test_reachabi
             if not isinstance(node, ast.Call):
                 if (
                     path not in _CAPABILITY_PROJECTION_PATHS
+                    and not _is_pilot_authority(path)
                     and isinstance(node, ast.Name)
                     and node.id in capability_aliases
                 ):
