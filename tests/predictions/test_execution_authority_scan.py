@@ -34,6 +34,12 @@ _REVIEWED_SOURCE_SHA256 = {
         "polymarket_execution/conformance.py"
     ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
+        "polymarket_execution/credentials.py"
+    ): "2ca9e0735c66a1ad5cef5ea0aba5de8bb3b0e18409b4a0fabb982e1f9d6e89f6",
+    Path(
+        "polymarket_execution/keychain_macos.py"
+    ): "18f18d029297c1ece2e94401e26b832002d8dec91dfd6aca6f5247f1bf0a1393",
+    Path(
         "polymarket_execution/heartbeat.py"
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
@@ -53,7 +59,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
     Path(
         "polymarket_execution/secrets.py"
-    ): "67486fad3f47afadcffb28f68c950abe7b2eb1a3e8cfef6f80267983b9c0282b",
+    ): "5e2ae32a263144bc77e0fe3d9afc22bb47cf6c3a5191b354b32d83d5bdfa54cb",
     Path(
         "polymarket_execution/signer.py"
     ): "93ccf2e93252747258b71ae8258efdd3e6fd4362877905af20a5fd4eaf6d2491",
