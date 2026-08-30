@@ -25,7 +25,10 @@ from polytrading.predictions.execution.models import (
     ExecutionOperation,
     SignedOrderEnvelope,
 )
-from polytrading.predictions.polymarket_execution.protocol import POLYMARKET_PROTOCOL_VERSION
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    POLYMARKET_PROTOCOL_VERSION,
+)
 from polytrading.predictions.polymarket_execution.routes import (
     BalanceAllowancePayload,
     CancellationPayload,
@@ -312,7 +315,9 @@ class SignerRequest(_SignerRecord):
     capability_digest: Sha256
     manifest_digest: Sha256
     account_fingerprint: Sha256
-    protocol_version: Literal[POLYMARKET_PROTOCOL_VERSION]
+    # A request may run under either reviewed checkpoint; the signer still compares this against
+    # the snapshot it loaded itself, so an unreviewed version never reaches an order.
+    protocol_version: Literal[POLYMARKET_PROTOCOL_VERSION, POLYMARKET_PILOT_PROTOCOL_VERSION]
     operation: ExecutionOperation
     deadline: datetime
     payload: SignerPayload

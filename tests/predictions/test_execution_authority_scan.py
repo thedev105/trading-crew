@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "403157106cc8939faf120374b4acc0fb213b886f107ec758140071ffc1876f58",
+    ): "1fc9230fa86d7ddf0bdc3f6defd3b5d42b100ed9bd47f93689f27a56326e6025",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
