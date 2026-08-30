@@ -578,7 +578,7 @@ def test_existing_migration_007_database_upgrades_without_changing_prior_hashes(
     versions = store._connection.execute(
         "SELECT version FROM schema_migrations ORDER BY version"
     ).fetchall()
-    assert versions[-1] == (10,)
+    assert versions[-1] == (len(PredictionMarketStore._migration_entries()),)
 
 
 def test_reopened_read_only_store_verifies_execution_readiness(tmp_path: Path) -> None:

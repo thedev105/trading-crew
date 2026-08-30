@@ -55,6 +55,19 @@ from polytrading.predictions.execution.models import (
 )
 from polytrading.predictions.experiments import ShadowExperiment, TrialFamily
 from polytrading.predictions.manifest import VenueManifest
+from polytrading.predictions.pilot.models import (
+    AuthorizationChallenge,
+    CredentialProvisioningEvent,
+    EligibilityAttestationRef,
+    PilotActivationCeremony,
+    PilotCapabilityEvent,
+    PilotExecutionSession,
+    PilotKillClearanceEvent,
+    PilotNonceClaim,
+    PilotPolicyProfile,
+    PilotPresenceEvent,
+    pilot_nonce_claim_key,
+)
 from polytrading.predictions.proofs_models import ProofArtifact
 from polytrading.predictions.shadow_ledger import LedgerPosting, ShadowReconciliation
 from polytrading.predictions.shadow_models import ShadowEvent, ShadowPlan
@@ -324,6 +337,7 @@ class PredictionMarketStore:
         self._connection = duckdb.connect(str(path), read_only=read_only)
         self._in_transaction = False
         self._execution_claim_lock = Lock()
+        self._pilot_nonce_lock = Lock()
         try:
             if read_only:
                 self._verify_current_schema()
@@ -1070,6 +1084,481 @@ class PredictionMarketStore:
                 record.as_of,
                 record.observed_at,
             ],
+        )
+
+    # -- polymarket local live pilot ------------------------------------
+
+    def append_pilot_eligibility_attestation(self, record: EligibilityAttestationRef) -> bool:
+        record = self._validated_execution_record(
+            record,
+            EligibilityAttestationRef,
+            "pilot_eligibility_attestation_refs",
+            "attestation_id",
+            record.attestation_id,
+        )
+        return self._append_hashed_record(
+            table="pilot_eligibility_attestation_refs",
+            identity_column="attestation_id",
+            identity=record.attestation_id,
+            columns=(
+                "attestation_id",
+                "account_fingerprint",
+                "wallet_fingerprint",
+                "reviewed_at",
+                "expires_at",
+            ),
+            values=(
+                record.attestation_id,
+                record.account_fingerprint,
+                record.wallet_fingerprint,
+                record.reviewed_at,
+                record.expires_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_policy_profile(self, record: PilotPolicyProfile) -> bool:
+        record = self._validated_execution_record(
+            record, PilotPolicyProfile, "pilot_policy_profiles", "policy_id", record.policy_id
+        )
+        return self._append_hashed_record(
+            table="pilot_policy_profiles",
+            identity_column="policy_id",
+            identity=record.policy_id,
+            columns=("policy_id", "account_fingerprint", "wallet_fingerprint", "created_at"),
+            values=(
+                record.policy_id,
+                record.account_fingerprint,
+                record.wallet_fingerprint,
+                record.created_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_activation_ceremony(self, record: PilotActivationCeremony) -> bool:
+        record = self._validated_execution_record(
+            record,
+            PilotActivationCeremony,
+            "pilot_activation_ceremonies",
+            "ceremony_id",
+            record.ceremony_id,
+        )
+        return self._append_hashed_record(
+            table="pilot_activation_ceremonies",
+            identity_column="ceremony_id",
+            identity=record.ceremony_id,
+            columns=("ceremony_id", "account_fingerprint", "stage", "occurred_at"),
+            values=(
+                record.ceremony_id,
+                record.account_fingerprint,
+                record.stage,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_credential_provisioning_event(
+        self, record: CredentialProvisioningEvent
+    ) -> bool:
+        record = self._validated_execution_record(
+            record,
+            CredentialProvisioningEvent,
+            "pilot_credential_provisioning_events",
+            "event_id",
+            record.event_id,
+        )
+        return self._append_hashed_record(
+            table="pilot_credential_provisioning_events",
+            identity_column="event_id",
+            identity=record.event_id,
+            columns=("event_id", "account_fingerprint", "wallet_fingerprint", "occurred_at"),
+            values=(
+                record.event_id,
+                record.account_fingerprint,
+                record.wallet_fingerprint,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_authorization_challenge(self, record: AuthorizationChallenge) -> bool:
+        record = self._validated_execution_record(
+            record,
+            AuthorizationChallenge,
+            "pilot_authorization_challenges",
+            "challenge_id",
+            record.challenge_id,
+        )
+        return self._append_hashed_record(
+            table="pilot_authorization_challenges",
+            identity_column="challenge_id",
+            identity=record.challenge_id,
+            columns=("challenge_id", "account_fingerprint", "not_before", "expires_at"),
+            values=(
+                record.challenge_id,
+                record.account_fingerprint,
+                record.not_before,
+                record.expires_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_capability_event(self, record: PilotCapabilityEvent) -> bool:
+        record = self._validated_execution_record(
+            record, PilotCapabilityEvent, "pilot_capability_events", "event_id", record.event_id
+        )
+        return self._append_hashed_record(
+            table="pilot_capability_events",
+            identity_column="event_id",
+            identity=record.event_id,
+            columns=(
+                "event_id",
+                "capability_id",
+                "challenge_id",
+                "account_fingerprint",
+                "occurred_at",
+            ),
+            values=(
+                record.event_id,
+                record.capability_id,
+                record.challenge_id,
+                record.account_fingerprint,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_execution_session(self, record: PilotExecutionSession) -> bool:
+        """Append one session transition; a reused session sequence number is a conflict."""
+
+        record = self._validated_execution_record(
+            record, PilotExecutionSession, "pilot_execution_sessions", "event_id", record.event_id
+        )
+        try:
+            return self._append_hashed_record(
+                table="pilot_execution_sessions",
+                identity_column="event_id",
+                identity=record.event_id,
+                columns=(
+                    "event_id",
+                    "session_id",
+                    "sequence_number",
+                    "account_fingerprint",
+                    "occurred_at",
+                ),
+                values=(
+                    record.event_id,
+                    record.session_id,
+                    record.sequence_number,
+                    record.account_fingerprint,
+                    record.occurred_at,
+                ),
+                record=record,
+            )
+        except duckdb.Error as error:
+            raise ConflictingRecordError(
+                "conflicting pilot execution session transition for its session sequence"
+            ) from error
+
+    def append_pilot_presence_event(self, record: PilotPresenceEvent) -> bool:
+        record = self._validated_execution_record(
+            record, PilotPresenceEvent, "pilot_presence_events", "event_id", record.event_id
+        )
+        return self._append_hashed_record(
+            table="pilot_presence_events",
+            identity_column="event_id",
+            identity=record.event_id,
+            columns=("event_id", "session_id", "account_fingerprint", "occurred_at"),
+            values=(
+                record.event_id,
+                record.session_id,
+                record.account_fingerprint,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def append_pilot_kill_clearance_event(self, record: PilotKillClearanceEvent) -> bool:
+        record = self._validated_execution_record(
+            record,
+            PilotKillClearanceEvent,
+            "pilot_kill_clearance_events",
+            "clearance_event_id",
+            record.clearance_event_id,
+        )
+        return self._append_hashed_record(
+            table="pilot_kill_clearance_events",
+            identity_column="clearance_event_id",
+            identity=record.clearance_event_id,
+            columns=(
+                "clearance_event_id",
+                "account_fingerprint",
+                "kill_event_id",
+                "occurred_at",
+            ),
+            values=(
+                record.clearance_event_id,
+                record.account_fingerprint,
+                record.kill_event_id,
+                record.occurred_at,
+            ),
+            record=record,
+        )
+
+    def claim_pilot_nonce(
+        self,
+        claim: PilotNonceClaim,
+        *,
+        capability_event: PilotCapabilityEvent | None = None,
+        session: PilotExecutionSession | None = None,
+    ) -> bool:
+        """Claim one pilot nonce, with its companion transition, in a single transaction.
+
+        The claim is durable before the mutation it authorizes: either the nonce row and its
+        companion event both commit, or neither does. A replay of the identical claim returns
+        ``False``; the same nonce with different content is a conflict, never a silent reuse.
+        """
+
+        try:
+            exact = PilotNonceClaim.model_validate(claim.model_dump(mode="python"), strict=True)
+        except (AttributeError, TypeError, ValidationError) as error:
+            raise ValueError("PILOT_NONCE_CLAIM_INVALID") from error
+        if self._read_only:
+            raise RuntimeError("pilot nonce claim requires a writable store")
+        claim_key = pilot_nonce_claim_key(exact)
+        with self._pilot_nonce_lock:
+            if self._in_transaction:
+                raise RuntimeError("pilot nonce claim requires its own transaction")
+            existing = self._verified_pilot_nonce_claim(claim_key)
+            if existing is not None:
+                if existing != exact:
+                    raise ConflictingRecordError(
+                        "conflicting pilot nonce claim for immutable identity"
+                    )
+                return False
+            with self.transaction():
+                self._connection.execute(
+                    """
+                    INSERT INTO pilot_nonce_claims (
+                        claim_key, scope, nonce, account_fingerprint, payload_hash,
+                        claimed_at, record_json, record_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        claim_key,
+                        exact.scope.value,
+                        exact.nonce,
+                        exact.account_fingerprint,
+                        exact.payload_hash,
+                        exact.claimed_at,
+                        _canonical_json(exact),
+                        _record_hash(exact),
+                    ],
+                )
+                if capability_event is not None:
+                    self.append_pilot_capability_event(capability_event)
+                if session is not None:
+                    self.append_pilot_execution_session(session)
+            return True
+
+    def _verified_pilot_nonce_claim(self, claim_key: str) -> PilotNonceClaim | None:
+        claims = self._verified_records(
+            table="pilot_nonce_claims",
+            model=PilotNonceClaim,
+            candidate_where="claim_key = ?",
+            candidate_parameters=(claim_key,),
+            index_columns=(
+                "scope",
+                "nonce",
+                "account_fingerprint",
+                "payload_hash",
+                "epoch_us(claimed_at)",
+            ),
+            indexed_values=lambda record: (
+                record.scope.value,
+                record.nonce,
+                record.account_fingerprint,
+                record.payload_hash,
+                _epoch_us(record.claimed_at),
+            ),
+            matches=lambda record: pilot_nonce_claim_key(record) == claim_key,
+            sort_key=lambda record: record.claimed_at,
+        )
+        if len(claims) > 1:
+            raise ConflictingRecordError("duplicate pilot nonce claim identity")
+        return claims[0] if claims else None
+
+    def verified_pilot_eligibility_attestations(
+        self, account_fingerprint: str
+    ) -> tuple[EligibilityAttestationRef, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_eligibility_attestation_refs",
+            model=EligibilityAttestationRef,
+            account_fingerprint=account_fingerprint,
+            identity_column="attestation_id",
+            identity=lambda record: str(record.attestation_id),
+            time_column="reviewed_at",
+            occurred_at=lambda record: record.reviewed_at,
+        )
+
+    def verified_pilot_policy_profiles(
+        self, account_fingerprint: str
+    ) -> tuple[PilotPolicyProfile, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_policy_profiles",
+            model=PilotPolicyProfile,
+            account_fingerprint=account_fingerprint,
+            identity_column="policy_id",
+            identity=lambda record: str(record.policy_id),
+            time_column="created_at",
+            occurred_at=lambda record: record.created_at,
+        )
+
+    def verified_pilot_activation_ceremonies(
+        self, account_fingerprint: str
+    ) -> tuple[PilotActivationCeremony, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_activation_ceremonies",
+            model=PilotActivationCeremony,
+            account_fingerprint=account_fingerprint,
+            identity_column="ceremony_id",
+            identity=lambda record: str(record.ceremony_id),
+            time_column="occurred_at",
+            occurred_at=lambda record: record.occurred_at,
+        )
+
+    def verified_pilot_credential_provisioning_events(
+        self, account_fingerprint: str
+    ) -> tuple[CredentialProvisioningEvent, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_credential_provisioning_events",
+            model=CredentialProvisioningEvent,
+            account_fingerprint=account_fingerprint,
+            identity_column="event_id",
+            identity=lambda record: str(record.event_id),
+            time_column="occurred_at",
+            occurred_at=lambda record: record.occurred_at,
+        )
+
+    def verified_pilot_authorization_challenges(
+        self, account_fingerprint: str
+    ) -> tuple[AuthorizationChallenge, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_authorization_challenges",
+            model=AuthorizationChallenge,
+            account_fingerprint=account_fingerprint,
+            identity_column="challenge_id",
+            identity=lambda record: str(record.challenge_id),
+            time_column="not_before",
+            occurred_at=lambda record: record.not_before,
+        )
+
+    def verified_pilot_capability_events(
+        self, account_fingerprint: str
+    ) -> tuple[PilotCapabilityEvent, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_capability_events",
+            model=PilotCapabilityEvent,
+            account_fingerprint=account_fingerprint,
+            identity_column="event_id",
+            identity=lambda record: str(record.event_id),
+            time_column="occurred_at",
+            occurred_at=lambda record: record.occurred_at,
+        )
+
+    def verified_pilot_presence_events(
+        self, account_fingerprint: str
+    ) -> tuple[PilotPresenceEvent, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_presence_events",
+            model=PilotPresenceEvent,
+            account_fingerprint=account_fingerprint,
+            identity_column="event_id",
+            identity=lambda record: str(record.event_id),
+            time_column="occurred_at",
+            occurred_at=lambda record: record.occurred_at,
+        )
+
+    def verified_pilot_kill_clearance_events(
+        self, account_fingerprint: str
+    ) -> tuple[PilotKillClearanceEvent, ...]:
+        return self._verified_pilot_account_records(
+            table="pilot_kill_clearance_events",
+            model=PilotKillClearanceEvent,
+            account_fingerprint=account_fingerprint,
+            identity_column="clearance_event_id",
+            identity=lambda record: str(record.clearance_event_id),
+            time_column="occurred_at",
+            occurred_at=lambda record: record.occurred_at,
+        )
+
+    def verified_pilot_execution_session_history(
+        self, session_id: UUID
+    ) -> tuple[PilotExecutionSession, ...]:
+        """Replay one session's immutable transitions in sequence order."""
+
+        history = self._verified_records(
+            table="pilot_execution_sessions",
+            model=PilotExecutionSession,
+            candidate_where=(
+                "session_id = ? OR TRY(json_extract_string(record_json, '$.session_id')) = ?"
+            ),
+            candidate_parameters=(session_id, str(session_id)),
+            index_columns=(
+                "CAST(event_id AS VARCHAR)",
+                "CAST(session_id AS VARCHAR)",
+                "sequence_number",
+                "account_fingerprint",
+                "epoch_us(occurred_at)",
+            ),
+            indexed_values=lambda record: (
+                str(record.event_id),
+                str(record.session_id),
+                record.sequence_number,
+                record.account_fingerprint,
+                _epoch_us(record.occurred_at),
+            ),
+            matches=lambda record: record.session_id == session_id,
+            sort_key=lambda record: (record.sequence_number, record.occurred_at),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
+        )
+        sequences = [record.sequence_number for record in history]
+        if len(set(sequences)) != len(sequences):
+            raise ConflictingRecordError("duplicate pilot session sequence number")
+        return history
+
+    def _verified_pilot_account_records[RecordT: BaseModel](
+        self,
+        *,
+        table: str,
+        model: type[RecordT],
+        account_fingerprint: str,
+        identity_column: str,
+        identity: Callable[[RecordT], str],
+        time_column: str,
+        occurred_at: Callable[[RecordT], datetime],
+    ) -> tuple[RecordT, ...]:
+        return self._verified_records(
+            table=table,
+            model=model,
+            candidate_where=(
+                "account_fingerprint = ? OR TRY(json_extract_string(record_json, "
+                "'$.account_fingerprint')) = ?"
+            ),
+            candidate_parameters=(account_fingerprint, account_fingerprint),
+            index_columns=(
+                f"CAST({identity_column} AS VARCHAR)",
+                "account_fingerprint",
+                f"epoch_us({time_column})",
+            ),
+            indexed_values=lambda record: (
+                identity(record),
+                record.account_fingerprint,
+                _epoch_us(occurred_at(record)),
+            ),
+            matches=lambda record: record.account_fingerprint == account_fingerprint,
+            sort_key=lambda record: (occurred_at(record), identity(record)),
+            maximum_records=_MAX_VERIFIED_LIVE_ACCOUNT_RECORDS,
         )
 
     def _append_keyed(
