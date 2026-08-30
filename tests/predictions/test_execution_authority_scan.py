@@ -18,7 +18,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "2b6cc79272e9ae938236111a9619b5b0540722d7bd00cc2a82e39e1c795f47a2",
     Path(
         "execution/kill_switch.py"
-    ): "4182844bef0e81258abe83187920e777b541f615047c53293cc2a388301bc4d3",
+    ): "2c718198102aceabf45437f07cb09ca44df081d98f67778c6029016be5307a42",
     Path("execution/ledger.py"): "3767947fd3a70eea588bff87a33442d662521fb0c8806dfa4d86d2322dee4e31",
     Path("execution/models.py"): "a5d55fe02802860d3664ee75cdb40946b115fd6e0f9802f4f1b959e454e67405",
     Path(

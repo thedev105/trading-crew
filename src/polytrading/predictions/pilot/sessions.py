@@ -313,14 +313,103 @@ class PilotExecutor:
         return outcomes
 
 
+class SessionDecision(PilotRecord):
+    """One tick's verdict, always derived from persisted and authoritative state."""
+
+    action: Literal["START_STRATEGY", "WAIT", "STOP"]
+    reason: StopReason | Literal["SESSION_EXPIRED", "FINAL_MINUTE", "STRATEGY_ACTIVE"] | None
+    strategies_started: Annotated[int, Field(ge=0)]
+    deployed_capital_usd: NonNegativeDecimal
+    observed_at: UtcTimestamp
+
+    @model_validator(mode="after")
+    def _reason_matches_action(self) -> SessionDecision:
+        if (self.action == "START_STRATEGY") == (self.reason is not None):
+            raise ValueError("only a non-starting decision names a reason")
+        return self
+
+
+class AutomationSessionRunner:
+    """Runs one 15-minute automation session, one strategy at a time, prompting only once."""
+
+    # No new strategy may start in the session's final minute (spec section 7.2).
+    FINAL_MINUTE = timedelta(seconds=60)
+
+    def __init__(
+        self,
+        *,
+        started_at: datetime,
+        limits: object,
+        state_reader: object,
+    ) -> None:
+        self._started_at = started_at
+        self._limits = limits
+        self._state_reader = state_reader
+        self._expires_at = started_at + limits.session_duration  # type: ignore[attr-defined]
+        self._stopped = False
+
+    @property
+    def expires_at(self) -> datetime:
+        return self._expires_at
+
+    def tick(self, now: datetime) -> SessionDecision:
+        """Read authoritative state and decide; the browser never supplies a counter."""
+
+        state = self._state_reader(now)  # type: ignore[operator]
+        if self._stopped or state.kill_engaged:
+            return self._decision("STOP", "PRESENCE_LOST", state, now)
+        if not state.presence_present:
+            return self._decision("STOP", "PRESENCE_LOST", state, now)
+        if state.loss_unknown:
+            return self._decision("STOP", "UNKNOWN_OUTCOME", state, now)
+        if state.session_loss_usd > self._limits.session_loss:  # type: ignore[attr-defined]
+            return self._decision("STOP", "LIMIT_BREACH", state, now)
+        if state.utc_day_loss_usd > self._limits.utc_day_loss:  # type: ignore[attr-defined]
+            return self._decision("STOP", "LIMIT_BREACH", state, now)
+        if now >= self._expires_at:
+            return self._decision("STOP", "SESSION_EXPIRED", state, now)
+        if state.active_strategies >= self._limits.concurrent_strategies:  # type: ignore[attr-defined]
+            return self._decision("WAIT", "STRATEGY_ACTIVE", state, now)
+        if now > self._expires_at - self.FINAL_MINUTE:
+            return self._decision("WAIT", "FINAL_MINUTE", state, now)
+        deployable = (
+            self._limits.session_deployed_capital - state.deployed_capital_usd  # type: ignore[attr-defined]
+        )
+        if deployable <= 0:
+            return self._decision("WAIT", "LIMIT_BREACH", state, now)
+        return self._decision("START_STRATEGY", None, state, now)
+
+    def stop(self, reason: StopReason, now: datetime) -> SessionDecision:
+        self._stopped = True
+        state = self._state_reader(now)  # type: ignore[operator]
+        return self._decision("STOP", reason, state, now)
+
+    def _decision(
+        self,
+        action: Literal["START_STRATEGY", "WAIT", "STOP"],
+        reason: object,
+        state: object,
+        now: datetime,
+    ) -> SessionDecision:
+        return SessionDecision(
+            action=action,
+            reason=reason,  # type: ignore[arg-type]
+            strategies_started=state.strategies_started,  # type: ignore[attr-defined]
+            deployed_capital_usd=state.deployed_capital_usd,  # type: ignore[attr-defined]
+            observed_at=now,
+        )
+
+
 __all__ = [
     "RECOVERY_GRACE",
+    "AutomationSessionRunner",
     "ContinuationDecision",
     "ExecutionPort",
     "ExecutionResult",
     "LegOutcome",
     "PilotExecutionError",
     "PilotExecutor",
+    "SessionDecision",
     "StopReason",
     "StopResult",
 ]
