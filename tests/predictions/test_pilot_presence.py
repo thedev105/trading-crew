@@ -163,3 +163,130 @@ def test_the_macos_source_uses_a_monotonic_clock() -> None:
     second = source.monotonic_ns()
 
     assert second >= first
+
+
+# -- the macOS notification bridge -----------------------------------------------------------
+
+
+class FakeCoreFoundation:
+    """A stand-in for CoreFoundation: records the subscription, runs no real loop."""
+
+    def __init__(self) -> None:
+        self.observed: list[str] = []
+        self.last_string = b""
+        self.removed = 0
+        self.stopped = 0
+        self.ran = False
+        self._callback = None
+
+    def CFNotificationCenterGetDistributedCenter(self) -> int:
+        return 1
+
+    def CFStringCreateWithCString(self, _allocator, value: bytes, _encoding) -> bytes:
+        self.last_string = value
+        return value
+
+    def CFNotificationCenterAddObserver(
+        self, _center, _observer, callback, name: bytes, _object, _behaviour
+    ) -> None:
+        self._callback = callback
+        self.observed.append(name.decode("utf-8"))
+
+    def CFNotificationCenterRemoveEveryObserver(self, _center, _observer) -> None:
+        self.removed += 1
+
+    def CFRunLoopGetCurrent(self) -> int:
+        return 2
+
+    def CFRunLoopRun(self) -> None:
+        self.ran = True
+
+    def CFRunLoopStop(self, _loop) -> None:
+        self.stopped += 1
+
+    def CFStringGetCString(self, _reference, buffer, _length, _encoding) -> bool:
+        buffer.value = self.last_string
+        return True
+
+
+def test_the_bridge_subscribes_to_exactly_the_four_lock_notifications() -> None:
+    from polytrading.predictions.pilot.presence_macos import _CoreFoundationBridge
+
+    core = FakeCoreFoundation()
+    published: list[str] = []
+    bridge = _CoreFoundationBridge(library=core)
+
+    bridge.observe(
+        (
+            "com.apple.screenIsLocked",
+            "com.apple.screenIsUnlocked",
+            "com.apple.screensaver.didstart",
+            "com.apple.screensaver.didstop",
+        ),
+        published.append,
+    )
+
+    assert core.observed == [
+        "com.apple.screenIsLocked",
+        "com.apple.screenIsUnlocked",
+        "com.apple.screensaver.didstart",
+        "com.apple.screensaver.didstop",
+    ]
+
+
+def test_starting_and_stopping_the_source_registers_and_releases_observers() -> None:
+    core = FakeCoreFoundation()
+    from polytrading.predictions.pilot.presence_macos import _CoreFoundationBridge
+
+    source = MacOSPresenceSource(platform="darwin")
+    source.start(bridge=_CoreFoundationBridge(library=core))
+    source.stop()
+
+    assert core.observed
+    assert core.ran is True
+    assert core.removed == 1
+    assert core.stopped == 1
+
+
+def test_an_unsupported_platform_never_subscribes() -> None:
+    source = MacOSPresenceSource(platform="linux")
+
+    with pytest.raises(RuntimeError, match="PRESENCE_SOURCE_UNSUPPORTED"):
+        source.start()
+
+
+def test_the_bridge_binds_the_real_core_foundation_symbols() -> None:
+    import sys
+
+    from polytrading.predictions.pilot.presence_macos import _load_core_foundation
+
+    if sys.platform != "darwin":
+        pytest.skip("CoreFoundation exists only on macOS")
+
+    core = _load_core_foundation()
+
+    assert core.CFNotificationCenterGetDistributedCenter() != 0
+    for symbol in (
+        "CFNotificationCenterAddObserver",
+        "CFNotificationCenterRemoveEveryObserver",
+        "CFRunLoopRun",
+        "CFRunLoopStop",
+        "CFStringGetCString",
+    ):
+        assert getattr(core, symbol) is not None
+
+
+def test_a_lock_notification_reaches_the_monitor_as_a_kill() -> None:
+    core = FakeCoreFoundation()
+    from polytrading.predictions.pilot.presence_macos import _CoreFoundationBridge
+
+    source = MacOSPresenceSource(platform="darwin")
+    bridge = _CoreFoundationBridge(library=core)
+    bridge.observe(("com.apple.screenIsLocked",), source.publish)
+    monitored, _source, killed = monitor(source=source)
+
+    # Exactly what the run loop would do when macOS posts the notification.
+    core._callback(1, None, b"com.apple.screenIsLocked", None, None)
+
+    assert monitored.record_native_state(NOW).kill_reason == "SCREEN_LOCKED"
+    assert killed == ["SCREEN_LOCKED"]

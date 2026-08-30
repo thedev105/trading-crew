@@ -952,6 +952,9 @@ _PILOT_AUTHORITY_PREFIX = "pilot/"
 _CAPABILITY_PROJECTION_PATHS = frozenset(
     {Path("execution/authority.py"), Path("pilot/verifier.py")}
 )
+# The one reviewed module allowed to start the signer sidecar, and only in a forked child after
+# the operator has unlocked the keychain. Nothing else may reach that entry point.
+_SIGNER_LAUNCH_PATHS = frozenset({Path("pilot/signer_bootstrap.py")})
 
 
 def _is_pilot_authority(path: Path) -> bool:
@@ -1836,7 +1839,7 @@ def test_production_ast_has_no_issuer_kill_clearance_activation_or_test_reachabi
             name = _call_name(node)
             if name in capability_aliases and path not in _CAPABILITY_PROJECTION_PATHS:
                 capability_construction.append((path, node.lineno, name))
-            if name == "run_signer_sidecar":
+            if name == "run_signer_sidecar" and path not in _SIGNER_LAUNCH_PATHS:
                 signer_sidecar_call_sites.append((path, node.lineno))
             if any(keyword.arg == "test_only_kill_state" for keyword in node.keywords):
                 test_only_kill_call_sites.append((path, node.lineno))
