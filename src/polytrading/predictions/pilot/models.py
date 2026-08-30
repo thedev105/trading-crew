@@ -183,7 +183,7 @@ class PilotSessionResult(StrEnum):
     FAILED = "FAILED"
 
 
-class LossKnowledge(StrEnum):
+class LossStatus(StrEnum):
     KNOWN = "KNOWN"
     UNKNOWN = "UNKNOWN"
 
@@ -242,7 +242,7 @@ PILOT_CEILING_HASH: Sha256 = canonical_execution_hash(PILOT_CEILINGS)
 class PilotLossState(PilotRecord):
     """Conservative session/day loss accounting, or an explicit UNKNOWN that stops execution."""
 
-    knowledge: LossKnowledge
+    status: LossStatus
     session_start_equity: NonNegativeDecimal | None
     realized_loss: NonNegativeDecimal | None
     unrealized_loss: NonNegativeDecimal | None
@@ -255,13 +255,11 @@ class PilotLossState(PilotRecord):
         return _sorted_unique(value, "evidence_hashes")
 
     @model_validator(mode="after")
-    def _require_consistent_knowledge(self) -> PilotLossState:
+    def _require_consistent_status(self) -> PilotLossState:
         amounts = (self.session_start_equity, self.realized_loss, self.unrealized_loss)
-        if self.knowledge is LossKnowledge.UNKNOWN and any(
-            amount is not None for amount in amounts
-        ):
+        if self.status is LossStatus.UNKNOWN and any(amount is not None for amount in amounts):
             raise ValueError("UNKNOWN loss state must not carry marked amounts")
-        if self.knowledge is LossKnowledge.KNOWN and any(amount is None for amount in amounts):
+        if self.status is LossStatus.KNOWN and any(amount is None for amount in amounts):
             raise ValueError("KNOWN loss state requires start equity and both loss components")
         return self
 

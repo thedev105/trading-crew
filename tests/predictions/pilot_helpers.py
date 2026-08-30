@@ -17,7 +17,7 @@ from polytrading.predictions.pilot.models import (
     EligibilityReviewerCategory,
     GrantKind,
     KillClearanceResult,
-    LossKnowledge,
+    LossStatus,
     NonceScope,
     PilotProofFamily,
     PilotSessionState,
@@ -116,7 +116,7 @@ def eligibility_fields(**overrides: Any) -> dict[str, Any]:
 
 def loss_state_fields(**overrides: Any) -> dict[str, Any]:
     values: dict[str, Any] = {
-        "knowledge": LossKnowledge.KNOWN,
+        "status": LossStatus.KNOWN,
         "session_start_equity": Decimal("200"),
         "realized_loss": Decimal("1"),
         "unrealized_loss": Decimal("0.5"),

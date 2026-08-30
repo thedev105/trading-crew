@@ -17,7 +17,7 @@ from polytrading.predictions.pilot.models import (
     CredentialProvisioningResult,
     EligibilityAttestationRef,
     GrantKind,
-    LossKnowledge,
+    LossStatus,
     NonceScope,
     PilotActivationCeremony,
     PilotCapabilityEvent,
@@ -195,11 +195,11 @@ def test_policy_profile_binds_the_compiled_ceiling_hash() -> None:
 def test_unknown_loss_state_carries_no_amounts() -> None:
     with pytest.raises(ValidationError, match="UNKNOWN"):
         PilotLossState.model_validate(
-            loss_state_fields(knowledge=LossKnowledge.UNKNOWN), strict=True
+            loss_state_fields(status=LossStatus.UNKNOWN), strict=True
         )
     unknown = PilotLossState.model_validate(
         loss_state_fields(
-            knowledge=LossKnowledge.UNKNOWN,
+            status=LossStatus.UNKNOWN,
             session_start_equity=None,
             realized_loss=None,
             unrealized_loss=None,
