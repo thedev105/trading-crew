@@ -81,6 +81,10 @@ _RECOVERY_OPERATIONS = frozenset(
 def _require_safe_field_name(name: str) -> None:
     if name.endswith(_SAFE_FIELD_SUFFIXES):
         return
+    # A ``public_`` prefix is the one way to name material that is public by construction --
+    # a WebAuthn credential public key, a public signature -- rather than a secret.
+    if name.startswith("public_"):
+        return
     if any(part in _SECRET_FIELD_TOKENS for part in name.split("_")):
         raise TypeError(
             f"pilot record field {name!r} names secret material; store a digest or fingerprint"

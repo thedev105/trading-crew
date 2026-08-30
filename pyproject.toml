@@ -9,11 +9,13 @@ description = "Point-in-time market-neutral trading research"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
+  "cryptography==50.0.1",
   "duckdb==1.5.4",
   "eth-account==0.13.7",
   "httpx==0.28.1",
   "pydantic==2.13.4",
   "scikit-learn==1.9.0",
+  "webauthn==3.0.0",
   "websockets==17.0.1",
 ]
 

@@ -933,6 +933,16 @@ def _fetch_options_are_exact(options: str) -> tuple[bool, bool]:
     return method_exact, sorted(matched_names) == sorted(exact_properties)
 
 
+# The pilot package is the reviewed local capability authority (2026-08-27 pilot design, section
+# 4.3): it is the one place allowed to define capability issuance. Every other scanned surface --
+# the observer dashboard, the execution coordinator, and the signer -- stays free of it.
+_PILOT_AUTHORITY_PREFIX = "pilot/"
+
+
+def _is_pilot_authority(path: Path) -> bool:
+    return path.as_posix().startswith(_PILOT_AUTHORITY_PREFIX)
+
+
 def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
     violations: list[str] = []
     for source_path, source in sources.items():
@@ -992,11 +1002,18 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                         re.sub(r"(?<!^)(?=[A-Z])", "_", node.name).casefold(),
                     )
                 )
-                if (
-                    "capability" in words
-                    and words
-                    & {"activate", "build", "create", "generate", "import", "issue", "mint"}
-                ) or ("kill" in words and words & {"clear", "disengage", "release", "reset"}):
+                issues_capability = "capability" in words and words & {
+                    "activate",
+                    "build",
+                    "create",
+                    "generate",
+                    "import",
+                    "issue",
+                    "mint",
+                }
+                if (issues_capability and not _is_pilot_authority(source_path)) or (
+                    "kill" in words and words & {"clear", "disengage", "release", "reset"}
+                ):
                     violations.append(f"authority-definition:{source_path}:{node.lineno}")
                 if "verifier" in words and words & {"configured", "enabled"}:
                     violations.append(f"configured-verifier:{source_path}:{node.lineno}")
@@ -1744,11 +1761,18 @@ def test_production_ast_has_no_issuer_kill_clearance_activation_or_test_reachabi
                 words = set(
                     re.findall(r"[a-z0-9]+", re.sub(r"(?<!^)(?=[A-Z])", "_", node.name).casefold())
                 )
-                if (
-                    "capability" in words
-                    and words
-                    & {"activate", "build", "create", "generate", "import", "issue", "mint"}
-                ) or ("kill" in words and words & {"clear", "disengage", "release", "reset"}):
+                issues_capability = "capability" in words and words & {
+                    "activate",
+                    "build",
+                    "create",
+                    "generate",
+                    "import",
+                    "issue",
+                    "mint",
+                }
+                if (issues_capability and not _is_pilot_authority(path)) or (
+                    "kill" in words and words & {"clear", "disengage", "release", "reset"}
+                ):
                     semantic_authority_definitions.append((path, node.lineno, node.name))
             if isinstance(node, ast.Import):
                 test_imports.extend(
