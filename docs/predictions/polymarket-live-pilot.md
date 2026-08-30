@@ -28,6 +28,8 @@ and the signer process that reads it through inherited descriptors.
 
 ## 2. What the console shows
 
+![Readiness view at 1440px: kill state, presence, manifest, protocol, secret store, live authority, and an empty blocker list](assets/polymarket-live-pilot/readiness-1440.png)
+
 **Readiness** — kill state, presence, manifest posture, protocol checkpoint, secret-store health,
 qualified proof families, evidence age and hashes, and a stable blocker code for anything missing.
 
@@ -45,14 +47,25 @@ only lower a ceiling; an attempted increase is rejected, never clamped.
 | Session realized plus unrealized loss | USD 5 |
 | UTC-day realized plus unrealized loss | USD 10 |
 
+![Opportunity approval at 900px: ranked strategy cards with proof, economics, incomplete exposure, recovery branches, tie-break field, and the typed confirmation ceremony](assets/polymarket-live-pilot/approval-900.png)
+
 **Approval** — each eligible strategy with its proof, legs, FAK/FOK types, current and
 five-second-stressed surplus, executable capacity, modeled incomplete-leg exposure, recovery
 branches, evidence age, rank, and the first ranking field that broke the tie. Cross-venue
 opportunities remain visible and disabled.
 
+![Live session at 1440px: mode, authority expiry, budgets, filled legs, and the presence heartbeat](assets/polymarket-live-pilot/live-1440.png)
+
 **Live session** — mode, authority expiry, presence heartbeat, strategies started, deployed
 capital, and loss budgets. Financial totals appear only when reconciliation is exact; otherwise the
 console says UNKNOWN rather than estimating.
+
+![Recovery at 900px: an UNKNOWN second leg, the frozen recovery unwind, and every financial total reported as UNKNOWN until reconciliation is exact](assets/polymarket-live-pilot/recovery-900.png)
+
+![Killed state at 390px: the mobile layout keeps the stop control and every blocker code visible](assets/polymarket-live-pilot/killed-390.png)
+
+Screenshots come from the fake-data pilot server: no database, signer, keychain, or authenticated
+transport is involved in producing them.
 
 ## 3. Concepts worth reading once
 

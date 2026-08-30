@@ -50,6 +50,7 @@ export function renderReadiness(state) {
     ]),
   );
   const codes = state.readiness.blockers ?? [];
+  blockers.dataset.empty = String(codes.length === 0);
   replaceChildren(
     blockers,
     codes.length === 0
@@ -182,7 +183,12 @@ export function renderLive(state) {
 export function renderEvidence(state) {
   const evidence = document.getElementById("evidence");
   const hashes = state.readiness?.evidence_hashes ?? [];
-  evidence.textContent = hashes.length ? `evidence ${hashes.join(" ")}` : "evidence none";
+  // Hashes are identity, not prose: show enough to compare, never enough to wrap a page.
+  const shortened = hashes.map((hash) => `${hash.slice(0, 12)}…`);
+  evidence.textContent = hashes.length
+    ? `evidence ${shortened.join("  ")}`
+    : "evidence none";
+  evidence.title = hashes.join(" ");
 }
 
 export function renderView(state) {
