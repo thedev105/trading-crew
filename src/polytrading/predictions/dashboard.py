@@ -162,8 +162,11 @@ class PredictionDashboardBuilder:
         manifest = self._store.verified_latest_venue_manifest_as_of(
             PredictionVenue.POLYMARKET, as_of
         )
-        if manifest is not None and manifest.implementation_state.value != "LIVE_DISABLED":
-            raise ValueError("database manifest contradicts shipped LIVE_DISABLED posture")
+        # The observer reports whichever posture the operator's own activation ceremony wrote;
+        # it can neither promote nor invalidate a manifest itself.
+        manifest_state = "MISSING" if manifest is None else manifest.implementation_state.value
+        if manifest_state not in ("MISSING", "LIVE_DISABLED", "LIVE_ELIGIBLE"):
+            raise ValueError("database manifest declares an unsupported posture")
         manifest_gate = evaluate_execution_gate(manifest, venue=PredictionVenue.POLYMARKET)
         capability = UnavailableProductionCapabilityVerifier().verify(
             capability_bundle=b"", now=as_of
@@ -337,7 +340,9 @@ class PredictionDashboardBuilder:
         readiness = ExecutionReadinessSummary(
             schema_version=1,
             as_of=as_of,
-            implementation_state="LIVE_DISABLED",
+            implementation_state=(
+                "LIVE_DISABLED" if manifest_state == "MISSING" else manifest_state
+            ),
             protocol_state=protocol.state,
             conformance_result=conformance_result,
             conformance_observed_at=(

@@ -148,7 +148,7 @@ class DashboardDomain(StrEnum):
 class ExecutionReadinessSummary(DashboardRecord):
     schema_version: Literal[1]
     as_of: datetime
-    implementation_state: Literal["LIVE_DISABLED"]
+    implementation_state: Literal["LIVE_DISABLED", "LIVE_ELIGIBLE"]
     protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
     conformance_result: Literal["CONFORMANT", "PROTOCOL_REVIEW_REQUIRED"]
     conformance_observed_at: datetime | None
@@ -250,7 +250,7 @@ class EvidenceStatus(DashboardRecord):
     as_of: datetime
     protocol_version: Literal["polymarket-clob-2026-08-25-v1"]
     protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
-    manifest_state: Literal["MISSING", "LIVE_DISABLED"]
+    manifest_state: Literal["MISSING", "LIVE_DISABLED", "LIVE_ELIGIBLE"]
     conformance_result: Literal["CONFORMANT", "PROTOCOL_REVIEW_REQUIRED"]
     conformance_observed_at: datetime | None
     account_count: NonNegativeCount

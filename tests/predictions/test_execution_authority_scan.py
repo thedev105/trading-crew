@@ -1725,8 +1725,8 @@ def test_production_policy_rejects_adversarial_bypass_spellings(
     assert any(item.startswith(expected_prefix) for item in violations), name
 
 
-def test_dashboard_rejects_a_database_that_claims_live_eligibility(tmp_path: Path) -> None:
-    database = tmp_path / "contradictory.duckdb"
+def test_dashboard_reports_live_eligibility_without_offering_any_action(tmp_path: Path) -> None:
+    database = tmp_path / "promoted.duckdb"
     store = PredictionMarketStore(database)
     store.append_venue_manifest(
         venue_manifest(
@@ -1736,9 +1736,24 @@ def test_dashboard_rejects_a_database_that_claims_live_eligibility(tmp_path: Pat
     )
     store.close()
 
-    with pytest.raises(
-        ValueError, match=r"^database manifest contradicts shipped LIVE_DISABLED posture$"
-    ):
+    snapshot = build_prediction_dashboard_snapshot(database, now=NOW)
+
+    # The observer mirrors the operator's own promotion and still grants nothing.
+    assert snapshot.execution_readiness.implementation_state == "LIVE_ELIGIBLE"
+    assert snapshot.execution_readiness.live_action_available is False
+    assert snapshot.execution_readiness.production_capability_available is False
+    assert snapshot.execution_readiness.kill_engaged is True
+
+
+def test_dashboard_rejects_a_manifest_posture_it_does_not_understand(tmp_path: Path) -> None:
+    database = tmp_path / "contradictory.duckdb"
+    store = PredictionMarketStore(database)
+    store.append_venue_manifest(
+        venue_manifest(implementation_state=AdapterImplementationState.SHADOW)
+    )
+    store.close()
+
+    with pytest.raises(ValueError, match=r"^database manifest declares an unsupported posture$"):
         build_prediction_dashboard_snapshot(database, now=NOW)
 
 

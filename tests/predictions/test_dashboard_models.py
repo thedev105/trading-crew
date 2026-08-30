@@ -2018,7 +2018,7 @@ def test_market_atlas_snapshot_never_infers_live_readiness_from_persisted_eviden
     assert "CAPABILITY_VERIFIER_NOT_CONFIGURED" in snapshot.execution_readiness.unmet_gates
 
 
-def test_market_atlas_rejects_database_manifest_that_contradicts_shipped_live_disabled(
+def test_market_atlas_reports_the_operator_promoted_posture_without_granting_action(
     tmp_path: Path,
 ) -> None:
     store = PredictionMarketStore(tmp_path / "predictions.duckdb")
@@ -2026,6 +2026,27 @@ def test_market_atlas_rejects_database_manifest_that_contradicts_shipped_live_di
         venue_manifest(
             implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
             jurisdiction_review_status="ELIGIBILITY_REVIEWED",
+            reviewed_at=NOW,
+        )
+    )
+
+    snapshot = PredictionDashboardBuilder(store, tmp_path / "predictions.duckdb").build(NOW)
+
+    # The observer reflects the pilot's own activation ceremony, and still offers no action.
+    assert snapshot.execution_readiness.implementation_state == "LIVE_ELIGIBLE"
+    assert snapshot.evidence_status.manifest_state == "LIVE_ELIGIBLE"
+    assert snapshot.execution_readiness.live_action_available is False
+    assert snapshot.execution_readiness.production_capability_available is False
+    assert snapshot.execution_readiness.kill_engaged is True
+
+
+def test_market_atlas_rejects_a_manifest_posture_it_does_not_understand(
+    tmp_path: Path,
+) -> None:
+    store = PredictionMarketStore(tmp_path / "predictions.duckdb")
+    store.append_venue_manifest(
+        venue_manifest(
+            implementation_state=AdapterImplementationState.SHADOW,
             reviewed_at=NOW,
         )
     )
