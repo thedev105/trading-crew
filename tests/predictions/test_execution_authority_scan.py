@@ -20,7 +20,7 @@ _REVIEWED_SOURCE_SHA256 = {
         "execution/kill_switch.py"
     ): "2c718198102aceabf45437f07cb09ca44df081d98f67778c6029016be5307a42",
     Path("execution/ledger.py"): "3767947fd3a70eea588bff87a33442d662521fb0c8806dfa4d86d2322dee4e31",
-    Path("execution/models.py"): "a5d55fe02802860d3664ee75cdb40946b115fd6e0f9802f4f1b959e454e67405",
+    Path("execution/models.py"): "6dfa3ea82f78ba986c33cab59cba08b32f116746425d6bd753f2bc4c3f595cba",
     Path(
         "execution/reconciliation.py"
     ): "b49db0ea6c31cbb833b08eeac69ed1b8ad257e829ec6f95e8fc7af90f9c64dbc",
@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "1fc9230fa86d7ddf0bdc3f6defd3b5d42b100ed9bd47f93689f27a56326e6025",
+    ): "9a23509b26669adb846aa5b23ddb0081a2f3c041b5d4da93aee42a67634fa8f5",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "5e2ae32a263144bc77e0fe3d9afc22bb47cf6c3a5191b354b32d83d5bdfa54cb",
     Path(
         "polymarket_execution/signer.py"
-    ): "93ccf2e93252747258b71ae8258efdd3e6fd4362877905af20a5fd4eaf6d2491",
+    ): "a7f8d0c64fb4bd275aff5b5158f71c05d7b4a98b55a1c466becb6be0a9d1dd24",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",

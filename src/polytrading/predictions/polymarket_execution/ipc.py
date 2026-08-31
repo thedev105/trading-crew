@@ -295,8 +295,13 @@ class ReadAccountPayload(_SignerRecord):
         return self
 
 
+class DescribeIdentityPayload(_SignerRecord):
+    operation: Literal[ExecutionOperation.DESCRIBE_IDENTITY]
+
+
 SignerPayload = Annotated[
-    SignOrderPayload
+    DescribeIdentityPayload
+    | SignOrderPayload
     | SubmitOrderPayload
     | CancelOrderPayload
     | HeartbeatPayload
@@ -361,6 +366,12 @@ class SignerRequest(_SignerRecord):
 class SignedEnvelopeResult(_SignerRecord):
     operation: Literal[ExecutionOperation.SIGN_ORDER]
     envelope: SignedOrderEnvelope
+
+
+class IdentityResult(_SignerRecord):
+    operation: Literal[ExecutionOperation.DESCRIBE_IDENTITY]
+    account_fingerprint: Sha256
+    wallet_fingerprint: Sha256
 
 
 class SanitizedOperationResult(_SignerRecord):
@@ -560,7 +571,7 @@ class SanitizedOperationResult(_SignerRecord):
 
 
 SignerResult = Annotated[
-    SignedEnvelopeResult | SanitizedOperationResult,
+    IdentityResult | SignedEnvelopeResult | SanitizedOperationResult,
     Field(discriminator="operation"),
 ]
 
@@ -767,7 +778,9 @@ def parse_signer_request(payload: bytes) -> SignerRequest:
 __all__ = [
     "MAX_FRAME_BYTES",
     "CancelOrderPayload",
+    "DescribeIdentityPayload",
     "HeartbeatPayload",
+    "IdentityResult",
     "ReadAccountPayload",
     "ReadOrdersPayload",
     "ReadTradesPayload",

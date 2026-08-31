@@ -22,6 +22,7 @@ from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
     CancelOrderPayload,
+    DescribeIdentityPayload,
     HeartbeatPayload,
     ReadAccountPayload,
     ReadOrdersPayload,
@@ -248,6 +249,8 @@ def _intent(**overrides: object) -> ExecutionIntent:
 
 
 def _payload(operation: ExecutionOperation) -> object:
+    if operation is ExecutionOperation.DESCRIBE_IDENTITY:
+        return DescribeIdentityPayload(operation=operation)
     if operation is ExecutionOperation.SIGN_ORDER:
         return SignOrderPayload(operation=operation, intent=_intent())
     if operation is ExecutionOperation.SUBMIT_ORDER:
@@ -298,6 +301,13 @@ def _request(
     }
     fields.update(overrides)
     return SignerRequest.model_validate(fields)
+
+
+def _describe_identity_request() -> SignerRequest:
+    return _request(
+        ExecutionOperation.DESCRIBE_IDENTITY,
+        account_fingerprint="0" * 64,
+    )
 
 
 def _handlers(**overrides: object) -> SignerOperationHandlers:
@@ -411,6 +421,42 @@ def _service(
         clock=lambda: now,
         max_cache_entries=max_cache_entries,
     )
+
+
+def test_describe_identity_returns_wallet_derived_fingerprints() -> None:
+    service = _service()
+    try:
+        response = service.handle(_describe_identity_request())
+    finally:
+        service.close()
+
+    expected = sha256(bytes.fromhex(Account.from_key(PRIVATE_KEY).address[2:])).hexdigest()
+    assert response.ok, response.error_code
+    assert response.result is not None
+    assert response.result.account_fingerprint == expected
+    assert response.result.wallet_fingerprint == expected
+
+
+def test_describe_identity_never_reflects_secret_bytes() -> None:
+    service = _service()
+    try:
+        response = service.handle(_describe_identity_request())
+    finally:
+        service.close()
+
+    assert PRIVATE_KEY.hex() not in response.model_dump_json()
+
+
+def test_describe_identity_is_the_only_account_gate_exempt_operation() -> None:
+    service = _service()
+    try:
+        response = service.handle(
+            _request(ExecutionOperation.READ_ACCOUNT, account_fingerprint="0" * 64)
+        )
+    finally:
+        service.close()
+
+    assert response.error_code == "ACCOUNT_FINGERPRINT_MISMATCH"
 
 
 def _child_service_factory(

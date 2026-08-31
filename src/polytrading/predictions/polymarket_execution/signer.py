@@ -32,6 +32,7 @@ from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
     CancelOrderPayload,
     HeartbeatPayload,
+    IdentityResult,
     ReadAccountPayload,
     ReadOrdersPayload,
     ReadTradesPayload,
@@ -320,6 +321,8 @@ class SignerService:
                 )
         if request.protocol_version != self._snapshot.version:
             return SignerResponse.rejected(request.request_id, "PROTOCOL_VERSION_MISMATCH")
+        if request.operation is ExecutionOperation.DESCRIBE_IDENTITY:
+            return self._describe_identity(request)
         if not self._secret_account_matches(request.account_fingerprint):
             return SignerResponse.rejected(request.request_id, "ACCOUNT_FINGERPRINT_MISMATCH")
 
@@ -337,6 +340,25 @@ class SignerService:
                 decision.reason or "AUTHORITY_GATE_FAILED",
             )
         return self._dispatch(request)
+
+    def _describe_identity(self, request: SignerRequest) -> SignerResponse:
+        private_key: bytes | None = None
+        try:
+            private_key = bytes(self._secrets.private_key)
+            address = Account.from_key(private_key).address
+            fingerprint = sha256(bytes.fromhex(address[2:])).hexdigest()
+        except Exception:
+            return SignerResponse.rejected(request.request_id, "IPC_REQUEST_INVALID")
+        finally:
+            private_key = None
+        return SignerResponse.accepted(
+            request.request_id,
+            IdentityResult(
+                operation=ExecutionOperation.DESCRIBE_IDENTITY,
+                account_fingerprint=fingerprint,
+                wallet_fingerprint=fingerprint,
+            ),
+        )
 
     def _secret_account_matches(self, account_fingerprint: str) -> bool:
         private_key: bytes | None = None
