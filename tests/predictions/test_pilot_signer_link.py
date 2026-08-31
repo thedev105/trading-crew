@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from base64 import b64encode
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -13,10 +14,12 @@ import pytest
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
+    ExecutionOperation,
     ImmediateOrderType,
     _intent_fingerprint,
     deterministic_intent_id,
 )
+from polytrading.predictions.pilot.capabilities import SignerKillDirective
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.signer_link import (
     SignerLinkError,
@@ -25,6 +28,9 @@ from polytrading.predictions.pilot.signer_link import (
 )
 from polytrading.predictions.polymarket_execution.ipc import (
     SanitizedOperationResult,
+    SignerCapabilityProof,
+    SignerKillPayload,
+    SignerKillResult,
     SignerResponse,
     canonical_response_bytes,
     parse_signer_request,
@@ -41,10 +47,19 @@ from polytrading.predictions.polymarket_execution.routes import (
     RestCode,
     RouteKey,
 )
-from tests.predictions.pilot_helpers import ACCOUNT_FINGERPRINT, WALLET_FINGERPRINT
+from tests.predictions.pilot_helpers import (
+    ACCOUNT_FINGERPRINT,
+    CAPABILITY_ID,
+    WALLET_FINGERPRINT,
+    signer_capability_grant,
+)
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 MANIFEST_DIGEST = "d" * 64
+SIGNER_PROOF = SignerCapabilityProof(
+    grant=signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=NOW),
+    signature=b64encode(b"test-signature"),
+)
 
 
 def intent(**overrides: Any) -> ExecutionIntent:
@@ -98,36 +113,49 @@ class FakeSignerChannel:
     def answer(self, frame: bytes) -> None:
         request = parse_signer_request(frame)
         self.requests.append(request)
-        code = self.codes.pop(0) if self.codes else _default_code(request.operation.value)
-        response = (
-            SignerResponse.accepted(
-                request.request_id,
-                SanitizedOperationResult(
-                    operation=request.operation,
-                    result_code=code,
-                    evidence_hashes=_evidence_for(request.operation.value),
-                    raw_body_hash="e" * 64,
-                    request_body_hash=(
-                        "f" * 64
-                        if request.operation.value in {"SUBMIT_ORDER", "CANCEL_ORDER"}
-                        else None
+        if request.operation is ExecutionOperation.SIGNER_KILL:
+            response = (
+                SignerResponse.accepted(
+                    request.request_id,
+                    SignerKillResult(
+                        operation=ExecutionOperation.SIGNER_KILL,
+                        result_code="SIGNER_KILL_ENGAGED",
                     ),
-                    venue_order_id=(
-                        "order-1"
-                        if request.operation.value in {"SUBMIT_ORDER", "CANCEL_ORDER"}
-                        and code not in {RestCode.ORDER_OUTCOME_UNKNOWN, RestCode.AUTH_REJECTED}
-                        else None
-                    ),
-                    route=_route_for(request.operation.value),
-                    observed_at=NOW,
-                    attempts=1,
-                    **_flags_for(request.operation.value, code, _payload_for(code)),
-                    public_payload=_payload_for(code),
-                ),
+                )
+                if self.ok
+                else SignerResponse.rejected(request.request_id, "EXECUTION_KILL_ENGAGED")
             )
-            if self.ok
-            else SignerResponse.rejected(request.request_id, "EXECUTION_KILL_ENGAGED")
-        )
+        else:
+            code = self.codes.pop(0) if self.codes else _default_code(request.operation.value)
+            response = (
+                SignerResponse.accepted(
+                    request.request_id,
+                    SanitizedOperationResult(
+                        operation=request.operation,
+                        result_code=code,
+                        evidence_hashes=_evidence_for(request.operation.value),
+                        raw_body_hash="e" * 64,
+                        request_body_hash=(
+                            "f" * 64
+                            if request.operation.value in {"SUBMIT_ORDER", "CANCEL_ORDER"}
+                            else None
+                        ),
+                        venue_order_id=(
+                            "order-1"
+                            if request.operation.value in {"SUBMIT_ORDER", "CANCEL_ORDER"}
+                            and code not in {RestCode.ORDER_OUTCOME_UNKNOWN, RestCode.AUTH_REJECTED}
+                            else None
+                        ),
+                        route=_route_for(request.operation.value),
+                        observed_at=NOW,
+                        attempts=1,
+                        **_flags_for(request.operation.value, code, _payload_for(code)),
+                        public_payload=_payload_for(code),
+                    ),
+                )
+                if self.ok
+                else SignerResponse.rejected(request.request_id, "EXECUTION_KILL_ENGAGED")
+            )
         payload = canonical_response_bytes(response)
         position = self._responses.tell()
         self._responses.seek(0, io.SEEK_END)
@@ -249,18 +277,23 @@ def port(channel: FakeSignerChannel, **overrides: Any) -> SignerLinkVenuePort:
         "manifest_digest": MANIFEST_DIGEST,
         "clock": lambda: NOW,
         "account_reader": account_state,
-        "signed_envelope": lambda _intent: _envelope(),
+        "signed_envelope": _envelope,
+        "proof_for": lambda capability_id: {CAPABILITY_ID: SIGNER_PROOF}[capability_id],
+        "kill_directive": lambda capability_ids: SignerKillDirective(
+            capability_ids=tuple(sorted(capability_ids, key=str)),
+            issued_at=NOW,
+            signature=b64encode(b"test-kill-signature"),
+        ),
     }
     arguments.update(overrides)
     return SignerLinkVenuePort(**arguments)
 
 
-def _envelope() -> Any:
+def _envelope(target: ExecutionIntent) -> Any:
     from polytrading.predictions.execution.models import SignedOrderEnvelope
     from tests.predictions.execution_helpers import public_unsigned_order_json
 
     order = json.loads(public_unsigned_order_json())
-    target = intent()
     return SignedOrderEnvelope(
         schema_version=1,
         intent_id=target.intent_id,
@@ -280,9 +313,9 @@ def _envelope() -> Any:
 
 def test_a_submission_speaks_the_signer_protocol_under_the_pilot_checkpoint() -> None:
     channel = FakeSignerChannel()
-    target = intent()
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.digest)
 
-    outcome = port(channel).submit(target, UUID(int=1))
+    outcome = port(channel).submit(target, CAPABILITY_ID)
 
     request = channel.requests[0]
     assert request.protocol_version == POLYMARKET_PILOT_PROTOCOL_VERSION
@@ -297,7 +330,9 @@ def test_a_submission_speaks_the_signer_protocol_under_the_pilot_checkpoint() ->
 def test_a_cancellation_uses_the_cancel_operation() -> None:
     channel = FakeSignerChannel()
 
-    outcome = port(channel).cancel(intent(), UUID(int=1))
+    outcome = port(channel).cancel(
+        intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+    )
 
     assert channel.requests[0].operation.value == "CANCEL_ORDER"
     assert outcome.state == "FILLED"
@@ -315,7 +350,9 @@ def test_a_cancellation_uses_the_cancel_operation() -> None:
 def test_every_venue_answer_maps_to_one_lifecycle_state(code: RestCode, state: str) -> None:
     channel = FakeSignerChannel(codes=[code])
 
-    outcome = port(channel).submit(intent(), UUID(int=1))
+    outcome = port(channel).submit(
+        intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+    )
 
     assert outcome.state == state
     if state != "FILLED":
@@ -326,7 +363,9 @@ def test_a_refused_request_raises_the_signers_own_code() -> None:
     channel = FakeSignerChannel(ok=False)
 
     with pytest.raises(SignerLinkError) as raised:
-        port(channel).submit(intent(), UUID(int=1))
+        port(channel).submit(
+            intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+        )
 
     assert raised.value.code == "EXECUTION_KILL_ENGAGED"
 
@@ -376,3 +415,36 @@ def test_no_tracked_token_means_no_claimed_position() -> None:
 
     assert port(channel).positions() == {}
     assert channel.requests == []
+
+
+def test_submit_serializes_the_matching_public_proof() -> None:
+    channel = FakeSignerChannel()
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.digest)
+
+    port(channel).submit(target, CAPABILITY_ID)
+
+    request = channel.requests[0]
+    assert request.authority_proof is not None
+    assert request.authority_proof.grant.capability_id == CAPABILITY_ID
+    assert request.capability_digest == SIGNER_PROOF.grant.digest
+    assert request.plan_digest == SIGNER_PROOF.grant.plan_hash
+
+
+def test_engage_kill_sends_only_a_signed_kill_payload() -> None:
+    channel = FakeSignerChannel()
+
+    port(channel).engage_kill([CAPABILITY_ID])
+
+    request = channel.requests[0]
+    assert request.operation is ExecutionOperation.SIGNER_KILL
+    assert isinstance(request.payload, SignerKillPayload)
+    assert request.authority_proof is None
+
+
+def test_engage_kill_raises_the_sanitized_rejection_code() -> None:
+    channel = FakeSignerChannel(ok=False)
+
+    with pytest.raises(SignerLinkError) as raised:
+        port(channel).engage_kill([CAPABILITY_ID])
+
+    assert raised.value.code == "EXECUTION_KILL_ENGAGED"

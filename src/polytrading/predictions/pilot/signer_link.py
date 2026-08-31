@@ -8,13 +8,14 @@ it touches the venue.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
 from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
+from polytrading.predictions.pilot.capabilities import SignerKillDirective
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.sessions import LegOutcome
 from polytrading.predictions.polymarket_execution.ipc import (
@@ -22,6 +23,8 @@ from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
     IdentityResult,
     ReadAccountPayload,
+    SignerCapabilityProof,
+    SignerKillPayload,
     SignerProtocolError,
     SignerRequest,
     SignerResponse,
@@ -62,6 +65,8 @@ class SignerLinkVenuePort:
         clock: Callable[[], datetime],
         account_reader: Callable[[Mapping[str, object]], PilotAccountState],
         signed_envelope: Callable[[ExecutionIntent], object],
+        proof_for: Callable[[UUID], SignerCapabilityProof],
+        kill_directive: Callable[[Iterable[UUID]], SignerKillDirective],
         tracked_tokens: tuple[str, ...] = (),
         position_reader: Callable[[Mapping[str, object]], Decimal] | None = None,
     ) -> None:
@@ -72,6 +77,8 @@ class SignerLinkVenuePort:
         self._clock = clock
         self._account_reader = account_reader
         self._signed_envelope = signed_envelope
+        self._proof_for = proof_for
+        self._kill_directive = kill_directive
         self._tracked_tokens = tracked_tokens
         self._position_reader = position_reader
 
@@ -91,6 +98,14 @@ class SignerLinkVenuePort:
         )
         response = self._exchange(intent, ExecutionOperation.CANCEL_ORDER, payload, capability_id)
         return self._outcome(intent, response)
+
+    def engage_kill(self, capability_ids: Iterable[UUID]) -> None:
+        """Engage the signer-local kill switch using only a signed fixed directive."""
+        payload = SignerKillPayload(
+            operation=ExecutionOperation.SIGNER_KILL,
+            directive=self._kill_directive(capability_ids),
+        )
+        self._exchange(None, ExecutionOperation.SIGNER_KILL, payload, None)
 
     def account_state(self) -> PilotAccountState:
         payload = ReadAccountPayload(
@@ -133,12 +148,19 @@ class SignerLinkVenuePort:
         capability_id: UUID | None,
     ) -> SignerResponse:
         now = self._clock()
+        authority_proof = self._mutation_proof(operation, capability_id)
         request = SignerRequest(
             schema_version=1,
             request_id=uuid4(),
             intent_id=intent.intent_id if intent is not None else uuid4(),
             intent_fingerprint=intent.intent_fingerprint if intent is not None else "0" * 64,
-            capability_digest=(intent.capability_fingerprint if intent is not None else "0" * 64),
+            capability_digest=(
+                authority_proof.grant.digest if authority_proof is not None else "0" * 64
+            ),
+            plan_digest=(
+                authority_proof.grant.plan_hash if authority_proof is not None else "0" * 64
+            ),
+            authority_proof=authority_proof,
             manifest_digest=self._manifest_digest,
             account_fingerprint=self._account_fingerprint,
             protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -146,7 +168,6 @@ class SignerLinkVenuePort:
             deadline=now + REQUEST_DEADLINE,
             payload=payload,  # type: ignore[arg-type]
         )
-        del capability_id  # the signer resolves authority from the request it verifies itself
         try:
             write_frame(self._request_stream, canonical_request_bytes(request))
             frame = read_frame(self._response_stream)
@@ -154,6 +175,26 @@ class SignerLinkVenuePort:
             raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
         response = SignerResponse.model_validate_json(frame)
         return _verified_response(request.request_id, response)
+
+    def _mutation_proof(
+        self,
+        operation: ExecutionOperation,
+        capability_id: UUID | None,
+    ) -> SignerCapabilityProof | None:
+        if operation not in {
+            ExecutionOperation.SUBMIT_ORDER,
+            ExecutionOperation.CANCEL_ORDER,
+        }:
+            return None
+        if capability_id is None:
+            raise SignerLinkError("CAPABILITY_PROOF_UNAVAILABLE")
+        try:
+            proof = self._proof_for(capability_id)
+        except LookupError as error:
+            raise SignerLinkError("CAPABILITY_PROOF_UNAVAILABLE") from error
+        if proof.grant.capability_id != capability_id:
+            raise SignerLinkError("CAPABILITY_PROOF_MISMATCH")
+        return proof
 
     def _outcome(self, intent: ExecutionIntent, response: SignerResponse) -> LegOutcome:
         result = response.result
