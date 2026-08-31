@@ -5,14 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from polytrading.predictions.execution.authority import AuthorityDecision
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    load_protocol_snapshot,
+)
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 from polytrading.predictions.polymarket_execution.signer import (
     SignerOperationHandlers,
     SignerService,
-)
-from polytrading.predictions.polymarket_execution.protocol import (
-    POLYMARKET_PILOT_PROTOCOL_VERSION,
-    load_protocol_snapshot,
 )
 
 

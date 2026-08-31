@@ -11,15 +11,15 @@ from polytrading.predictions.pilot.signer_services import offline_pilot_signer_s
 from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
     ReadAccountPayload,
-    SignOrderPayload,
     SignerRequest,
+    SignOrderPayload,
 )
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
-from tests.predictions.test_polymarket_order_signing import PRIVATE_KEY
 from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.test_polymarket_order_signing import PRIVATE_KEY
 
 ACCOUNT_FINGERPRINT = sha256(bytes.fromhex(Account.from_key(PRIVATE_KEY).address[2:])).hexdigest()
 
