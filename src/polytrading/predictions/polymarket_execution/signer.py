@@ -129,7 +129,7 @@ class ReadAccountHandler(Protocol):
     def __call__(self, payload: ReadAccountPayload) -> SanitizedOperationResult: ...
 
 
-AuthorityContextFactory = Callable[[SignerRequest, datetime], AuthorityContext]
+AuthorityContextFactory = Callable[[SignerRequest, datetime], AuthorityContext | AuthorityDecision]
 ReadGuard = Callable[[SignerRequest, datetime], AuthorityDecision]
 SignerServiceFactory = Callable[[SecretMaterial], "SignerService"]
 
@@ -379,6 +379,8 @@ class SignerService:
     ) -> AuthorityDecision | SignerErrorCode:
         try:
             context = self._authority_context_factory(request, now)
+            if type(context) is AuthorityDecision:
+                return context
             if type(context) is not AuthorityContext:
                 return "AUTHORITY_GATE_FAILED"
             capability = context.verified_capability
