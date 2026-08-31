@@ -440,11 +440,7 @@ git commit -m "feat(predictions): wire the pilot launch to the signer and eviden
 Run: `.venv/bin/python -m pytest -q`
 Expected: all green (≈4400+ tests).
 
-- [ ] **Step 3: Graph update**
-
-Run: `graphify update .`
-
-- [x] **Step 4: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/predictions/polymarket-live-pilot.md docs/superpowers/plans/2026-08-30-polymarket-pilot-live-launch-wiring.md
