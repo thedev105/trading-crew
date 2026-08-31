@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -14,6 +15,7 @@ from polytrading.predictions.pilot.runtime import (
     KilledPilotServices,
     PilotPosture,
     PilotRuntimeError,
+    build_launch_runtime,
     build_pilot_runtime,
 )
 from polytrading.predictions.pilot.server import (
@@ -21,6 +23,8 @@ from polytrading.predictions.pilot.server import (
     PilotRequest,
     PilotRequestError,
 )
+from polytrading.predictions.pilot.services import LivePilotServices
+from polytrading.predictions.pilot.signer_bootstrap import SignerBootstrapError, SignerChannel
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
 )
@@ -90,6 +94,45 @@ def test_the_runtime_opens_its_database_read_only(database: Path) -> None:
         assert runtime.store._read_only is True
     finally:
         runtime.close()
+
+
+def test_launch_falls_back_to_posture_only_when_signer_bootstrap_fails(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unavailable() -> object:
+        raise SignerBootstrapError("SECRET_ITEM_MISSING")
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=unavailable)  # type: ignore[arg-type]
+    try:
+        assert isinstance(runtime.application._services, KilledPilotServices)
+        assert (
+            "pilot: signer unavailable (SECRET_ITEM_MISSING); serving posture only"
+            in capsys.readouterr().err
+        )
+    finally:
+        runtime.close()
+
+
+def test_launch_composes_live_services_when_the_signer_bootstraps(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    channel = SignerChannel(
+        request_stream=io.BytesIO(), response_stream=io.BytesIO(), child_pid=None,
+        credentials_present=False,
+    )
+    monkeypatch.setattr(
+        "polytrading.predictions.pilot.runtime.describe_identity",
+        lambda *args, **kwargs: ("a" * 64, "a" * 64),
+    )
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=lambda: channel, now=lambda: NOW)
+    try:
+        assert isinstance(runtime.application._services, LivePilotServices)
+        assert runtime.application._services.readiness()["kill_engaged"] is True
+    finally:
+        runtime.close()
+    assert channel.request_stream.closed
+    assert channel.response_stream.closed
 
 
 def services() -> KilledPilotServices:

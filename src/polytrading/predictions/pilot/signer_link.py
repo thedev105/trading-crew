@@ -9,7 +9,7 @@ it touches the venue.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import BinaryIO
 from uuid import UUID, uuid4
@@ -19,6 +19,8 @@ from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.sessions import LegOutcome
 from polytrading.predictions.polymarket_execution.ipc import (
     CancelOrderPayload,
+    DescribeIdentityPayload,
+    IdentityResult,
     ReadAccountPayload,
     SignerProtocolError,
     SignerRequest,
@@ -33,6 +35,7 @@ from polytrading.predictions.polymarket_execution.protocol import (
 )
 
 REQUEST_DEADLINE = timedelta(seconds=20)
+IDENTITY_DEADLINE = timedelta(seconds=5)
 _FILLED_CODES = frozenset({"SUBMIT_ORDER_OK", "ORDER_ACK_MATCHED"})
 _REJECTED_CODES = frozenset({"ORDER_ACK_UNMATCHED", "AUTH_REJECTED", "PROTOCOL_RESPONSE_INVALID"})
 _CANCELLED_CODES = frozenset({"CANCEL_ORDER_OK", "CANCEL_ACKNOWLEDGED"})
@@ -182,4 +185,37 @@ class SignerLinkVenuePort:
         )
 
 
-__all__ = ["REQUEST_DEADLINE", "SignerLinkError", "SignerLinkVenuePort"]
+def describe_identity(
+    request_stream: BinaryIO,
+    response_stream: BinaryIO,
+    *,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> tuple[str, str]:
+    """Return the signer-derived public fingerprints before composing pilot services."""
+    now = clock()
+    request = SignerRequest(
+        schema_version=1,
+        request_id=uuid4(),
+        intent_id=uuid4(),
+        intent_fingerprint="0" * 64,
+        capability_digest="0" * 64,
+        manifest_digest="0" * 64,
+        account_fingerprint="0" * 64,
+        protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
+        operation=ExecutionOperation.DESCRIBE_IDENTITY,
+        deadline=now + IDENTITY_DEADLINE,
+        payload=DescribeIdentityPayload(operation=ExecutionOperation.DESCRIBE_IDENTITY),
+    )
+    try:
+        write_frame(request_stream, canonical_request_bytes(request))
+        response = SignerResponse.model_validate_json(read_frame(response_stream))
+    except SignerProtocolError as error:
+        raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
+    if response.request_id != request.request_id:
+        raise SignerLinkError("IPC_REQUEST_COLLISION")
+    if not response.ok or not isinstance(response.result, IdentityResult):
+        raise SignerLinkError(str(response.error_code or "IPC_REQUEST_INVALID"))
+    return response.result.account_fingerprint, response.result.wallet_fingerprint
+
+
+__all__ = ["REQUEST_DEADLINE", "SignerLinkError", "SignerLinkVenuePort", "describe_identity"]

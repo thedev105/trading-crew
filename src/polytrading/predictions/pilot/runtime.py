@@ -8,6 +8,7 @@ signer, and only after an operator ceremony that later increments gate.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from typing import Final, Literal
 
 from polytrading.lifecycle import owned_resource_cleanup
 from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
+from polytrading.predictions.pilot.launch import compose_pilot_environment
 from polytrading.predictions.pilot.passkeys import (
     RP_ID,
     PasskeyError,
@@ -36,6 +38,13 @@ from polytrading.predictions.pilot.server import (
     PilotResponse,
 )
 from polytrading.predictions.pilot.services import LivePilotServices, PilotEnvironment
+from polytrading.predictions.pilot.signer_bootstrap import (
+    SignerBootstrapError,
+    SignerChannel,
+    launch_signer_sidecar,
+)
+from polytrading.predictions.pilot.signer_link import describe_identity
+from polytrading.predictions.pilot.signer_services import offline_pilot_signer_service
 from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     MacOSKeychainSecretStore,
@@ -132,11 +141,14 @@ class PilotRuntime:
     store: PredictionMarketStore
     issuer: PilotCapabilityIssuer | None = None
     verifier: PilotCapabilityVerifier | None = None
+    signer_channel: SignerChannel | None = None
 
     def close(self) -> None:
         """Drop this launch's signing key first, then the database handle."""
         if self.issuer is not None:
             self.issuer.close()
+        if self.signer_channel is not None:
+            self.signer_channel.close()
         self.store.close()
 
 
@@ -211,6 +223,55 @@ def build_pilot_runtime(
         store=store,
         issuer=issuer,
         verifier=verifier,
+    )
+
+
+def build_launch_runtime(
+    database_path: Path,
+    port: int,
+    *,
+    platform: str = "darwin",
+    bootstrap: Callable[[], SignerChannel] | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> PilotRuntime:
+    """Launch the sidecar and compose live-but-killed services, or serve posture only."""
+    clock = now or (lambda: datetime.now(UTC))
+    try:
+        channel = (bootstrap or _bootstrap_signer(platform))()
+        account_fingerprint, wallet_fingerprint = describe_identity(
+            channel.request_stream, channel.response_stream, clock=clock
+        )
+    except (SignerBootstrapError, SecretStoreError) as error:
+        print(
+            f"pilot: signer unavailable ({error}); serving posture only",
+            file=sys.stderr,
+        )
+        return build_pilot_runtime(database_path, port, platform=platform, now=clock)
+    store = PredictionMarketStore(Path(database_path))
+    try:
+        environment = compose_pilot_environment(
+            store,
+            account_fingerprint=account_fingerprint,
+            wallet_fingerprint=wallet_fingerprint,
+            credentials_present=channel.credentials_present,
+            now=clock,
+        )
+    except BaseException:
+        channel.close()
+        raise
+    finally:
+        store.close()
+    runtime = build_pilot_runtime(
+        database_path, port, platform=platform, now=clock, environment=environment
+    )
+    object.__setattr__(runtime, "signer_channel", channel)
+    return runtime
+
+
+def _bootstrap_signer(platform: str) -> Callable[[], SignerChannel]:
+    return lambda: launch_signer_sidecar(
+        store=MacOSKeychainSecretStore(platform=platform),
+        service_factory=offline_pilot_signer_service,
     )
 
 
@@ -305,7 +366,7 @@ def _parse_cookies(header: str | None) -> dict[str, tuple[str, ...]]:
 def serve_polymarket_pilot(database_path: Path, port: int, *, platform: str = "darwin") -> None:
     """Serve the pilot on loopback only, refusing to start if any launch gate fails."""
 
-    runtime = build_pilot_runtime(database_path, port, platform=platform)
+    runtime = build_launch_runtime(database_path, port, platform=platform)
     with owned_resource_cleanup() as cleanup:
         cleanup.add(runtime.close)
         server = ThreadingHTTPServer((_LOOPBACK_ADDRESS, port), _handler_for(runtime.application))
@@ -319,6 +380,7 @@ __all__ = [
     "PilotPosture",
     "PilotRuntime",
     "PilotRuntimeError",
+    "build_launch_runtime",
     "build_pilot_runtime",
     "serve_polymarket_pilot",
 ]
