@@ -1,7 +1,7 @@
 # Polymarket Local Live Pilot
 
 **Date:** 2026-08-27
-**Status:** Design approved in chat; written specification awaiting user review
+**Status:** Design approved in chat on 2026-08-31; implementation planning pending review
 **Scope:** A capability-gated, loopback-only live-execution pilot for one individual operator,
 one dedicated Polymarket wallet, and deterministic single-Polymarket structural strategies
 **Operator context:** The operator is physically located in the Philippines and has stated that
@@ -41,14 +41,19 @@ Every single-Polymarket deterministic proof family may qualify. Cross-venue oppo
 visible but disabled until every participating venue receives a separate activation design,
 implementation, evidence checkpoint, and operator approval.
 
-The implementation ships all three authorization modes:
+The implementation contains all three authorization modes:
 
 1. one exact risk-reducing order;
 2. one exact complete strategy; and
 3. one 15-minute automation session.
 
-The first real action is nevertheless restricted to one small, complete deterministic strategy.
-All three modes become available only after that strategy reaches exact reconciliation.
+The first real action is restricted to a small, manually approved complete deterministic strategy.
+Automation-session authority is implemented at the server and signer boundaries but is hard-disabled:
+no UI input, stored record, or configuration value can issue or use it. Enabling automation is a
+separate, explicit activation decision after the evidence clock, shadow-run requirements, and
+manual-pilot reconciliation gates have passed. Every manual capability remains independently
+passkey-gated and must also pass every stage in this document before it can construct authenticated
+transport.
 
 ## 2. Goals and Success Definition
 
@@ -783,7 +788,8 @@ structure requires more than USD 5, activation stops; the system does not raise 
 
 Every leg, settlement, balance, allowance, position, and ledger entry must reconcile exactly. Any
 anomaly leaves the pilot killed. After a clean first strategy, a second explicit passkey ceremony
-unlocks the normal approved ceilings and all three modes. No automatic promotion exists.
+unlocks the normal approved ceilings for manual capabilities only. Automation remains hard-disabled
+until its separate activation decision. No automatic promotion exists.
 
 ## 15. Delivery Boundaries
 
