@@ -153,11 +153,7 @@ class SignerLinkVenuePort:
         except SignerProtocolError as error:
             raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
         response = SignerResponse.model_validate_json(frame)
-        if response.request_id != request.request_id:
-            raise SignerLinkError("IPC_REQUEST_COLLISION")
-        if not response.ok:
-            raise SignerLinkError(str(response.error_code))
-        return response
+        return _verified_response(request.request_id, response)
 
     def _outcome(self, intent: ExecutionIntent, response: SignerResponse) -> LegOutcome:
         result = response.result
@@ -211,11 +207,21 @@ def describe_identity(
         response = SignerResponse.model_validate_json(read_frame(response_stream))
     except SignerProtocolError as error:
         raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
-    if response.request_id != request.request_id:
-        raise SignerLinkError("IPC_REQUEST_COLLISION")
-    if not response.ok or not isinstance(response.result, IdentityResult):
-        raise SignerLinkError(str(response.error_code or "IPC_REQUEST_INVALID"))
+    _verified_response(request.request_id, response)
+    if not isinstance(response.result, IdentityResult):
+        raise SignerLinkError("IPC_REQUEST_INVALID")
     return response.result.account_fingerprint, response.result.wallet_fingerprint
+
+
+def _verified_response(request_id: UUID, response: SignerResponse) -> SignerResponse:
+    """Accept a reply bound to this request, preserving unbound sidecar failures."""
+    if response.request_id is None and not response.ok:
+        raise SignerLinkError(str(response.error_code))
+    if response.request_id != request_id:
+        raise SignerLinkError("IPC_REQUEST_COLLISION")
+    if not response.ok:
+        raise SignerLinkError(str(response.error_code))
+    return response
 
 
 __all__ = ["REQUEST_DEADLINE", "SignerLinkError", "SignerLinkVenuePort", "describe_identity"]

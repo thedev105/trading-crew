@@ -21,6 +21,7 @@ from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.signer_link import (
     SignerLinkError,
     SignerLinkVenuePort,
+    describe_identity,
 )
 from polytrading.predictions.polymarket_execution.ipc import (
     SanitizedOperationResult,
@@ -328,6 +329,22 @@ def test_a_refused_request_raises_the_signers_own_code() -> None:
         port(channel).submit(intent(), UUID(int=1))
 
     assert raised.value.code == "EXECUTION_KILL_ENGAGED"
+
+
+def test_an_unbound_sidecar_startup_failure_preserves_its_code() -> None:
+    response_stream = io.BytesIO()
+    write_frame(
+        response_stream,
+        canonical_response_bytes(
+            SignerResponse.rejected(None, "IPC_SERVICE_INITIALIZATION_FAILED")
+        ),
+    )
+    response_stream.seek(0)
+
+    with pytest.raises(SignerLinkError) as raised:
+        describe_identity(io.BytesIO(), response_stream, clock=lambda: NOW)
+
+    assert raised.value.code == "IPC_SERVICE_INITIALIZATION_FAILED"
 
 
 def test_an_account_read_returns_authoritative_state() -> None:
