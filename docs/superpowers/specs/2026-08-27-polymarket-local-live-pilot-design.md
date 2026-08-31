@@ -198,6 +198,14 @@ Capabilities are single-purpose and single-use where possible. They cannot be ex
 renewed, or converted between modes. Creating another capability always requires a new challenge
 and passkey assertion.
 
+Each signer request carries the corresponding signed capability bundle, whose public grant and
+signature contain no credential or wallet-secret material. The signer verifies the bundle against
+the launch's inherited public key, compares every request field to the grant, and records primary
+capability consumption locally before dispatch. It rejects a mismatched, expired, replayed, or
+locally revoked grant even if the control process asks it to proceed. A fixed signer-control
+operation carries a parent stop/kill revocation, while signer-side transport or protocol anomalies
+engage the local kill immediately. Neither operation accepts arbitrary authority state.
+
 ### 4.4 Signer sidecar and secret boundary
 
 The signer remains a separate minimum-dependency process. Secret material is retrieved from the OS
@@ -229,6 +237,8 @@ from the local UI.
 Authenticated Polymarket transport is constructed inside the signer only after the signer has
 independently verified the current capability, account, protocol, route set, limits, geoblock,
 kill, and reconciliation inputs. The transport closes when the action or session completes.
+The automation-session mode is rejected by both the control process and signer until a separate
+activation records the approved evidence and manual-pilot reconciliation gates.
 
 ### 4.5 Primary and recovery authority
 
