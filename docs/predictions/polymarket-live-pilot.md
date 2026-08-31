@@ -19,12 +19,14 @@ and the signer process that reads it through inherited descriptors.
 4. Start the console: `predictions pilot polymarket --db <path> --port <port>`. Those two flags are
    the entire CLI surface; there is no credential, order, activation, capability, or kill-clearance
    flag anywhere.
-5. Open `http://localhost:<port>` in a browser that supports platform passkeys, and register the
-   operator passkey. Registration requires the unlocked wallet and an empty credential registry.
-6. If the wallet has no CLOB API credentials, run the credential ceremony from the UI. The signer
-   performs one allowlisted create-or-derive call under a 60-second single-use grant and writes the
-   API key, secret, and passphrase straight into the Keychain. The browser, coordinator, database,
-   and logs only ever see fingerprints.
+5. If the wallet key is not enrolled or cannot be unlocked, the command writes
+   `pilot: signer unavailable (<CODE>); serving posture only` to stderr and serves only the
+   read-only killed posture console. It never accepts a secret from the CLI or browser.
+6. If the wallet key is available, the signer identifies the wallet and the operator ceremonies
+   become reachable, still killed. CLOB API credentials are optional for this launch, but the
+   credential ceremony and every execution path currently refuse `EXECUTION_UNAVAILABLE`: this
+   build constructs no venue transport. The browser, coordinator, database, and logs only ever see
+   public fingerprints.
 
 ## 2. What the console shows
 
