@@ -442,7 +442,7 @@ class SignerService:
         try:
             context = self._authority_context_factory(request, now)
             if type(context) is AuthorityDecision:
-                return context
+                return context if not context.allowed else "AUTHORITY_GATE_FAILED"
             if type(context) is not AuthorityContext:
                 return "AUTHORITY_GATE_FAILED"
             context = context.model_copy(update={"verified_capability": verified_capability})

@@ -2361,6 +2361,36 @@ def test_authority_factory_failure_is_sanitized_without_dispatch(
     service.close()
 
 
+def test_allowed_authority_decision_cannot_bypass_fresh_context_verification() -> None:
+    handler_calls = 0
+
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        raise AssertionError("ALLOWED_DECISION_MUST_NOT_DISPATCH")
+
+    service = SignerService(
+        secrets=SecretMaterial(
+            bytearray(PRIVATE_KEY),
+            bytearray(API_KEY),
+            bytearray(API_SECRET),
+            bytearray(PASSPHRASE),
+        ),
+        authority_context_factory=lambda request, observed_at: AuthorityDecision(True, None, ()),
+        read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
+        handlers=_handlers(submit_order=submit),
+        clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
+    )
+
+    response = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER))
+
+    assert response.error_code == "AUTHORITY_GATE_FAILED"
+    assert handler_calls == 0
+    service.close()
+
+
 def test_malformed_authority_context_is_sanitized_without_dispatch() -> None:
     service = SignerService(
         secrets=SecretMaterial(

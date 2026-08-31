@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "8bb22bc24df93ad1b6c395af140529779ab91b443bedf70e468ff320519f35b6",
+    ): "1bf51d12a8a1c4c76cb561804531c312a42b3ec7fa543467d5f36fd683d8e15b",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",

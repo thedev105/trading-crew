@@ -9,6 +9,9 @@
   protocol fixture, plan, allowed operation, validity window, request deadline, and presence
   deadline, rejects automation grants, and projects only the verified grant into the authority
   layer.
+- Review fix: restricted `AuthorityDecision` factory shortcuts to denials. An allowed decision is
+  rejected as `AUTHORITY_GATE_FAILED`, so dispatch always requires a fresh `AuthorityContext` to
+  pass `verify_mutation_authority`.
 - Added irreversible signer-local kill state. A signed `SIGNER_KILL` never reaches a venue handler;
   invalid directives cannot engage or clear kill, and route results with `kill_required=True`
   latch kill before the response returns.
@@ -29,8 +32,8 @@
 ## Tests
 
 - `rtk .venv/bin/python -m pytest tests/predictions/test_polymarket_signer_ipc.py tests/predictions/test_execution_authority_scan.py -q`
-  - 203 passed in 12.02s, including the spawned sidecar tests run with permission for the local
-    multiprocessing Unix-domain helper socket.
+  - 204 passed in 12.52s after review fix round 1, including spawned sidecar tests run with
+    permission for the local multiprocessing Unix-domain helper socket.
 - `rtk .venv/bin/python -m pytest tests/predictions/test_pilot_capabilities.py tests/predictions/test_pilot_signer_services.py -q`
   - 22 passed in 0.54s.
 - `rtk .venv/bin/ruff check src/polytrading/predictions/polymarket_execution/ipc.py src/polytrading/predictions/polymarket_execution/signer.py tests/predictions/test_polymarket_signer_ipc.py tests/predictions/test_execution_authority_scan.py`
@@ -52,6 +55,11 @@
   - The adjacent suite first had 21 passed / 1 failed because the empty-key offline signer returned
     `CAPABILITY_SIGNATURE_INVALID`; after the fail-closed sentinel fix it passed 22/22 with
     `EXECUTION_UNAVAILABLE` restored.
+- Review fix round 1 RED/GREEN:
+  - `rtk .venv/bin/python -m pytest tests/predictions/test_polymarket_signer_ipc.py -q -k "allowed_authority_decision"`
+  - RED: 1 failed, 135 deselected; the allowed factory decision reached the handler and produced
+    `HANDLER_FAILED`.
+  - GREEN: 1 passed, 135 deselected after allowed decision shortcuts were rejected.
 
 ## Self-review
 
@@ -61,6 +69,8 @@
 - Verified proof signature validation precedes every grant-field comparison and precedes the
   authority context factory, so a valid grant from another issuer never reaches injected authority
   code.
+- Verified the authority factory may return a direct denial for fail-closed composition, but a
+  direct allowed decision cannot bypass fresh context verification or reach a handler.
 - Verified signed kill has a dedicated response type, has no handler path, cannot be cleared by any
   IPC request, and blocks only mutations while preserving identity/read posture.
 - Verified the authority-source manifest permits capability projection only in the reviewed
