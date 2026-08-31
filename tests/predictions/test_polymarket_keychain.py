@@ -7,6 +7,7 @@ from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_API_KEY_ACCOUNT,
     CLOB_SERVICE,
     MAXIMUM_ITEM_BYTES,
+    WALLET_PRIVATE_KEY_ACCOUNT,
     MacOSKeychainSecretStore,
 )
 from polytrading.predictions.polymarket_execution.secrets import (
@@ -86,6 +87,21 @@ def test_a_written_item_reads_back_as_a_buffer_never_a_string() -> None:
     assert isinstance(value, SecretBuffer)
     assert value.use(lambda view: bytes(view)) == SECRET
     assert SECRET.decode() not in repr(value)
+
+
+@pytest.mark.parametrize("prefix", (b"", b"0x"))
+def test_a_wallet_hex_key_is_normalized_to_the_signer_key_bytes(prefix: bytes) -> None:
+    keychain = store()
+    private_key = bytes(range(32))
+    keychain.write_protected(
+        CLOB_SERVICE,
+        WALLET_PRIVATE_KEY_ACCOUNT,
+        SecretBuffer.from_bytes(prefix + private_key.hex().encode("ascii")),
+    )
+
+    value = keychain.read_required(CLOB_SERVICE, WALLET_PRIVATE_KEY_ACCOUNT, "unlock")
+
+    assert value.use(lambda view: bytes(view)) == private_key
 
 
 def test_writing_twice_updates_rather_than_duplicating() -> None:

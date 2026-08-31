@@ -41,7 +41,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "2ca9e0735c66a1ad5cef5ea0aba5de8bb3b0e18409b4a0fabb982e1f9d6e89f6",
     Path(
         "polymarket_execution/keychain_macos.py"
-    ): "18f18d029297c1ece2e94401e26b832002d8dec91dfd6aca6f5247f1bf0a1393",
+    ): "cef992e7f01359e1aeb4828fc7b87b8e21299f66eb7b4d2e8d8200b65d5cf270",
     Path(
         "polymarket_execution/heartbeat.py"
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",

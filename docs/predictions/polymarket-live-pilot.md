@@ -12,8 +12,10 @@ and the signer process that reads it through inherited descriptors.
 
 1. Create and back up the dedicated wallet **outside this application**. It holds only pilot funds.
 2. Enrol the wallet key in the macOS Keychain with the native Keychain interface, under service
-   `polytrading.polymarket.pilot` and account `wallet-private-key`. Never use the Pilot UI or CLI
-   to enter a secret, and never use `security -w` or a shell helper that prints a secret.
+   `polytrading.polymarket.pilot` and account `wallet-private-key`. Store the wallet private key as
+   exactly 64 hexadecimal characters (an optional `0x` prefix is accepted); the signer decodes it
+   to its 32-byte key form. Never use the Pilot UI or CLI to enter a secret, and never use
+   `security -w` or a shell helper that prints a secret.
 3. Fund the wallet and set the venue allowance manually, outside this application. The pilot never
    deposits, withdraws, transfers, approves, splits, merges, converts, or redeems.
 4. Start the console: `predictions pilot polymarket --db <path> --port <port>`. Those two flags are

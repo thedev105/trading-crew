@@ -7,6 +7,7 @@ string: values move as :class:`SecretBuffer` and every OS status becomes a stabl
 
 from __future__ import annotations
 
+import binascii
 import sys
 from typing import Final, Protocol
 
@@ -208,6 +209,8 @@ class MacOSKeychainSecretStore:
         self._raise_for_status(status)
         if not value or len(value) > MAXIMUM_ITEM_BYTES:
             raise SecretStoreError("SECRET_VALUE_INVALID") from None
+        if account == WALLET_PRIVATE_KEY_ACCOUNT:
+            value = _normalize_wallet_private_key(value)
         buffer = SecretBuffer.from_bytes(value)
         value = b""
         return buffer
@@ -236,6 +239,18 @@ class MacOSKeychainSecretStore:
         if status == _ERR_SEC_ITEM_NOT_FOUND:
             return
         self._raise_for_status(status)
+
+
+def _normalize_wallet_private_key(value: bytes) -> bytes:
+    """Decode the exact hexadecimal form used by the native Keychain UI."""
+    encoded = value[2:] if value[:2] in (b"0x", b"0X") else value
+    if len(encoded) != 64:
+        return value
+    try:
+        decoded = binascii.unhexlify(encoded)
+    except binascii.Error:
+        return value
+    return decoded
 
 
 __all__ = [
