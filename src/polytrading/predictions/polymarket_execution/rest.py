@@ -1021,7 +1021,7 @@ def _build_request(
 
 
 class HttpxPolymarketRestTransport:
-    """Retain socket-free offline request proofs while live transport is unavailable."""
+    """Own a hardened HTTPX client for the closed Polymarket REST route set."""
 
     __slots__ = ("_client", "_clock", "_retry_policy", "_sleeper", "_timestamp")
 
@@ -1034,8 +1034,22 @@ class HttpxPolymarketRestTransport:
         sleeper: AsyncSleeper | None = None,
         timeouts: RestTimeouts | None = None,
     ) -> None:
-        del timestamp, clock, retry_policy, sleeper, timeouts
-        raise ClobAuthError("LIVE_TRANSPORT_UNAVAILABLE") from None
+        checked_timeouts, checked_retry_policy, checked_sleeper = self._validated_options(
+            retry_policy=retry_policy,
+            sleeper=sleeper,
+            timeouts=timeouts,
+        )
+        self._client = httpx.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            timeout=checked_timeouts.as_httpx(),
+            headers={},
+            cookies={},
+        )
+        self._timestamp = timestamp
+        self._clock = clock
+        self._retry_policy = checked_retry_policy
+        self._sleeper = checked_sleeper
 
     @classmethod
     def _for_test(
@@ -1074,9 +1088,11 @@ class HttpxPolymarketRestTransport:
     ) -> None:
         if type(transport) is not httpx.MockTransport:
             raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")
-        checked_timeouts = timeouts or RestTimeouts()
-        if not isinstance(checked_timeouts, RestTimeouts):
-            raise TypeError("REST_TIMEOUTS_REQUIRED")
+        checked_timeouts, checked_retry_policy, checked_sleeper = self._validated_options(
+            retry_policy=retry_policy,
+            sleeper=sleeper,
+            timeouts=timeouts,
+        )
         self._client = httpx.AsyncClient(
             transport=transport,
             follow_redirects=False,
@@ -1087,14 +1103,27 @@ class HttpxPolymarketRestTransport:
         )
         self._timestamp = timestamp
         self._clock = clock
-        self._retry_policy = retry_policy or ReadRetryPolicy()
-        if not isinstance(self._retry_policy, ReadRetryPolicy):
+        self._retry_policy = checked_retry_policy
+        self._sleeper = checked_sleeper
+
+    @staticmethod
+    def _validated_options(
+        *,
+        retry_policy: ReadRetryPolicy | None,
+        sleeper: AsyncSleeper | None,
+        timeouts: RestTimeouts | None,
+    ) -> tuple[RestTimeouts, ReadRetryPolicy, AsyncSleeper | None]:
+        checked_timeouts = timeouts or RestTimeouts()
+        if not isinstance(checked_timeouts, RestTimeouts):
+            raise TypeError("REST_TIMEOUTS_REQUIRED")
+        checked_retry_policy = retry_policy or ReadRetryPolicy()
+        if not isinstance(checked_retry_policy, ReadRetryPolicy):
             raise TypeError("READ_RETRY_POLICY_REQUIRED")
         if sleeper is not None and not callable(sleeper):
             raise TypeError("ASYNC_SLEEPER_REQUIRED")
-        if self._retry_policy.max_attempts == 2 and sleeper is None:
+        if checked_retry_policy.max_attempts == 2 and sleeper is None:
             raise TypeError("ASYNC_SLEEPER_REQUIRED")
-        self._sleeper = sleeper
+        return checked_timeouts, checked_retry_policy, sleeper
 
     async def execute(
         self,

@@ -56,7 +56,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "88ad4405fcda17afaea96bfdcde710c598b68823c10da532b3ee761ead6db9fa",
     Path(
         "polymarket_execution/rest.py"
-    ): "b672b6c791ee5d3b5ad279d3955f98b47b272eaff0516ebdb126a79e195847f7",
+    ): "45eaec54dc3f9ea3a21e3b43612fb5b922a04ccbd14a26efef87e42aa97469b4",
     Path(
         "polymarket_execution/routes.py"
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
@@ -475,7 +475,7 @@ def _method_arguments_are_exact(
     )
 
 
-def _rest_client_owner_is_exact(tree: ast.Module, call: ast.Call) -> bool:
+def _rest_client_owners_are_exact(tree: ast.Module) -> bool:
     client_attributes = [
         item
         for item in ast.walk(tree)
@@ -487,7 +487,6 @@ def _rest_client_owner_is_exact(tree: ast.Module, call: ast.Call) -> bool:
         item
         for item in ast.walk(tree)
         if isinstance(item, ast.Assign)
-        and item.value is call
         and len(item.targets) == 1
         and isinstance(item.targets[0], ast.Attribute)
         and isinstance(item.targets[0].value, ast.Name)
@@ -503,7 +502,16 @@ def _rest_client_owner_is_exact(tree: ast.Module, call: ast.Call) -> bool:
         and isinstance(item.args[1], ast.Constant)
         and item.args[1].value == "_client"
     ]
-    return len(client_attributes) == 1 and len(direct_owners) == 1 and not reflective_writes
+    return (
+        len(client_attributes) == 2
+        and len(direct_owners) == 2
+        and all(
+            isinstance(item.value, ast.Call)
+            and _resolved_python_name(item.value.func, {"httpx": "httpx"}) == "httpx.AsyncClient"
+            for item in direct_owners
+        )
+        and not reflective_writes
+    )
 
 
 def _allowed_mock_async_client_call(
@@ -559,7 +567,7 @@ def _allowed_mock_async_client_call(
         and _method_argument_has_no_default(initialize, "transport")
         and _method_argument_has_no_default(for_test, "transport")
         and _transport_flow_is_exact(initialize, forwarded_call=call)
-        and _rest_client_owner_is_exact(tree, call)
+        and _rest_client_owners_are_exact(tree)
     ):
         return False
     initialize_calls = [
@@ -580,6 +588,59 @@ def _allowed_mock_async_client_call(
         and isinstance(forwarded[0].value, ast.Name)
         and forwarded[0].value.id == "transport"
         and _transport_flow_is_exact(for_test, forwarded_call=initialize_call)
+    )
+
+
+def _allowed_hardened_live_async_client_call(
+    source_path: Path,
+    tree: ast.Module,
+    call: ast.Call,
+) -> bool:
+    if source_path != Path("polymarket_execution/rest.py") or call.args:
+        return False
+    transport_class = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.ClassDef) and item.name == "HttpxPolymarketRestTransport"
+        ),
+        None,
+    )
+    if transport_class is None:
+        return False
+    methods = {
+        item.name: item for item in transport_class.body if isinstance(item, ast.FunctionDef)
+    }
+    initialize = methods.get("__init__")
+    if initialize is None or not (
+        initialize.lineno <= call.lineno <= (initialize.end_lineno or 0)
+        and _method_arguments_are_exact(
+            initialize,
+            positional=("self",),
+            keyword_only=("timestamp", "clock", "retry_policy", "sleeper", "timeouts"),
+        )
+        and _rest_client_owners_are_exact(tree)
+    ):
+        return False
+    keywords = {item.arg: item.value for item in call.keywords}
+    timeout = keywords.get("timeout")
+    return (
+        set(keywords) == {"follow_redirects", "trust_env", "timeout", "headers", "cookies"}
+        and isinstance(keywords["follow_redirects"], ast.Constant)
+        and keywords["follow_redirects"].value is False
+        and isinstance(keywords["trust_env"], ast.Constant)
+        and keywords["trust_env"].value is False
+        and isinstance(keywords["headers"], ast.Dict)
+        and not keywords["headers"].keys
+        and isinstance(keywords["cookies"], ast.Dict)
+        and not keywords["cookies"].keys
+        and isinstance(timeout, ast.Call)
+        and not timeout.args
+        and not timeout.keywords
+        and isinstance(timeout.func, ast.Attribute)
+        and isinstance(timeout.func.value, ast.Name)
+        and timeout.func.value.id == "checked_timeouts"
+        and timeout.func.attr == "as_httpx"
     )
 
 
@@ -1014,9 +1075,7 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                 if isinstance(node, ast.Call)
                 and _resolved_python_name(node.func, aliases, constants) == "httpx.AsyncClient"
             ]
-            if len(async_client_calls) != 1 or not _rest_client_owner_is_exact(
-                tree, async_client_calls[0]
-            ):
+            if len(async_client_calls) != 2 or not _rest_client_owners_are_exact(tree):
                 violations.append(f"rest-client-owner:{source_path}")
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
@@ -1107,7 +1166,10 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                     "httpx.Timeout",
                 } or (
                     resolved == "httpx.AsyncClient"
-                    and _allowed_mock_async_client_call(source_path, tree, node)
+                    and (
+                        _allowed_mock_async_client_call(source_path, tree, node)
+                        or _allowed_hardened_live_async_client_call(source_path, tree, node)
+                    )
                 )
                 if not allowed_httpx_call:
                     violations.append(f"socket-http-constructor:{source_path}:{node.lineno}")
@@ -1386,7 +1448,7 @@ def test_shipped_posture_is_live_disabled_unverifiable_and_killed(tmp_path: Path
 
 def test_production_httpx_constructor_inventory_is_mock_only_and_nonvacuous() -> None:
     inventory = _httpx_constructor_inventory(_python_trees())
-    assert len(inventory) == 3
+    assert len(inventory) == 4
     assert {(source_path, resolved) for source_path, _line, resolved in inventory} == {
         (Path("polymarket_execution/rest.py"), "httpx.AsyncClient"),
         (Path("polymarket_execution/rest.py"), "httpx.Request"),
@@ -1566,39 +1628,51 @@ def test_mock_async_client_allowlist_requires_exact_guard_and_transport_provenan
         1,
     )
     rebound_transport = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
-        "transport = None\n        checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
+        (
+            "        transport = None\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
+        ),
         1,
     )
     annotated_rebound = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
         (
-            "transport: httpx.MockTransport | None = None\n"
-            "        checked_timeouts = timeouts or RestTimeouts()"
+            "        transport: httpx.MockTransport | None = None\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
         ),
         1,
     )
     named_rebound = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
-        "(transport := None)\n        checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
+        (
+            "        (transport := None)\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
+        ),
         1,
     )
     deleted_transport = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
-        "del transport\n        checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
+        (
+            "        del transport\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
+        ),
         1,
     )
     captured_transport = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
         (
-            "replace_transport = lambda: transport\n"
-            "        checked_timeouts = timeouts or RestTimeouts()"
+            "        replace_transport = lambda: transport\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
         ),
         1,
     )
     mutated_transport = source.replace(
-        "checked_timeouts = timeouts or RestTimeouts()",
-        "transport.close()\n        checked_timeouts = timeouts or RestTimeouts()",
+        "        self._client = httpx.AsyncClient(\n            transport=transport,",
+        (
+            "        transport.close()\n"
+            "        self._client = httpx.AsyncClient(\n            transport=transport,"
+        ),
         1,
     )
     optional_transport = source.replace(
@@ -2045,12 +2119,16 @@ def test_mutation_auth_and_io_call_graph_is_closed_behind_signer_dispatch() -> N
         <= client_send_lines[0]
         <= (transport_methods["_execute"].end_lineno or 0)
     )
-    assert not [
+    live_client_calls = [
         node
         for node in ast.walk(transport_methods["__init__"])
         if isinstance(node, ast.Call)
         and (_resolved_python_name(node.func, {"httpx": "httpx"}) or "").startswith("httpx.")
     ]
+    assert len(live_client_calls) == 1
+    assert _allowed_hardened_live_async_client_call(
+        Path("polymarket_execution/rest.py"), rest_tree, live_client_calls[0]
+    )
 
     signer_functions = {
         node.name: node

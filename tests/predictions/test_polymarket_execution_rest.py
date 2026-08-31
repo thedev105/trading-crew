@@ -4,9 +4,7 @@ import copy
 import hashlib
 import json
 import pickle
-import ssl
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID
 
 import httpx
@@ -93,19 +91,33 @@ def clob_credentials() -> ClobCredentials:
     )
 
 
-def test_live_disabled_ordinary_transport_constructor_is_stably_unavailable(
+def test_live_constructor_uses_no_proxy_redirect_cookie_or_ambient_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def socket_capable_transport_must_not_be_constructed(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise AssertionError("SOCKET_CAPABLE_TRANSPORT_CONSTRUCTION_ATTEMPTED")
+    captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        httpx, "AsyncHTTPTransport", socket_capable_transport_must_not_be_constructed
+    def capture_async_client_arguments(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(httpx, "AsyncClient", capture_async_client_arguments)
+
+    HttpxPolymarketRestTransport(
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
     )
 
-    with pytest.raises(ClobAuthError, match=r"^LIVE_TRANSPORT_UNAVAILABLE$"):
+    assert captured["follow_redirects"] is False
+    assert captured["trust_env"] is False
+    assert captured["headers"] == {}
+    assert captured["cookies"] == {}
+    assert isinstance(captured["timeout"], httpx.Timeout)
+
+
+def test_live_constructor_rejects_non_default_test_transport_injection() -> None:
+    with pytest.raises(TypeError):
         HttpxPolymarketRestTransport(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200)),  # type: ignore[call-arg]
             timestamp=lambda: TIMESTAMP,
             clock=lambda: NOW,
         )
@@ -1742,30 +1754,6 @@ def test_redirect_is_rejected_without_following_the_location() -> None:
     assert result.code is RestCode.PROTOCOL_RESPONSE_INVALID
     assert calls == 1
     assert "attacker.invalid" not in repr(result)
-
-
-@pytest.mark.parametrize("variable", ("SSL_CERT_FILE", "SSL_CERT_DIR"))
-def test_live_disabled_transport_rejects_before_ambient_tls_trust(
-    variable: str,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    hostile_path = str(tmp_path / "missing-ambient-ca")
-    other_variable = "SSL_CERT_DIR" if variable == "SSL_CERT_FILE" else "SSL_CERT_FILE"
-    monkeypatch.delenv(other_variable, raising=False)
-    monkeypatch.setenv(variable, hostile_path)
-
-    def reject_tls_context(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise AssertionError("TLS_CONTEXT_CONSTRUCTION_ATTEMPTED")
-
-    monkeypatch.setattr(ssl, "create_default_context", reject_tls_context)
-
-    with pytest.raises(ClobAuthError, match=r"^LIVE_TRANSPORT_UNAVAILABLE$"):
-        HttpxPolymarketRestTransport(
-            timestamp=lambda: TIMESTAMP,
-            clock=lambda: NOW,
-        )
 
 
 def test_trusted_transport_test_seam_uses_exclusively_owned_bounded_client() -> None:
