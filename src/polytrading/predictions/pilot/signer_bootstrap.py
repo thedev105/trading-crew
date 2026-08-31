@@ -67,6 +67,7 @@ class SignerChannel:
     request_stream: BinaryIO
     response_stream: BinaryIO
     child_pid: int | None
+    credentials_present: bool
 
     def close(self) -> None:
         for stream in (self.request_stream, self.response_stream):
@@ -89,6 +90,7 @@ def launch_signer_sidecar(
     """Read the launch secrets once, hand them to a child, and keep only the IPC streams."""
 
     secrets = _read_secrets(store, service=service, prompt=prompt)
+    credentials_present = len(secrets[1]) > 0
     secret_pipes = [os.pipe() for _ in SECRET_ACCOUNTS]
     request_pipe = os.pipe()
     response_pipe = os.pipe()
@@ -129,29 +131,45 @@ def launch_signer_sidecar(
         request_stream=os.fdopen(request_pipe[1], "wb", buffering=0),
         response_stream=os.fdopen(response_pipe[0], "rb", buffering=0),
         child_pid=child,
+        credentials_present=credentials_present,
     )
 
 
 def _read_secrets(store: SecretStore, *, service: str, prompt: str) -> list[SecretBuffer]:
     buffers: list[SecretBuffer] = []
     try:
-        for account in SECRET_ACCOUNTS:
-            buffers.append(store.read_required(service, account, prompt))
+        for index, account in enumerate(SECRET_ACCOUNTS):
+            try:
+                buffers.append(store.read_required(service, account, prompt))
+            except SecretStoreError as error:
+                if index > 0 and error.code == "SECRET_ITEM_MISSING":
+                    buffers.append(SecretBuffer.empty())
+                    continue
+                raise
+        clob = buffers[1:]
+        if any(len(buffer) == 0 for buffer in clob) and any(len(buffer) > 0 for buffer in clob):
+            raise SignerBootstrapError("SECRET_ITEM_MISSING")
     except SecretStoreError as error:
         for buffer in buffers:
             buffer.close()
         raise SignerBootstrapError(error.code) from error
+    except BaseException:
+        for buffer in buffers:
+            buffer.close()
+        raise
     return buffers
 
 
 def _write_framed_secret(descriptor: int, buffer: SecretBuffer) -> None:
     length = len(buffer)
-    if not 0 < length <= MAXIMUM_SECRET_BYTES:
+    if not 0 <= length <= MAXIMUM_SECRET_BYTES:
         raise SignerBootstrapError("SECRET_VALUE_INVALID")
 
     def _write(view: memoryview) -> None:
         header = length.to_bytes(_LENGTH_HEADER_BYTES, "big")
         os.write(descriptor, header)
+        if length == 0:
+            return
         written = 0
         while written < length:
             written += os.write(descriptor, view[written:])

@@ -36,10 +36,12 @@ class SecretMaterial:
         passphrase: bytearray,
     ) -> None:
         values = (private_key, api_key, api_secret, passphrase)
+        clob = values[1:]
         if (
             any(type(value) is not bytearray for value in values)
             or len(private_key) != 32
-            or any(not 0 < len(value) <= _MAX_SECRET_BYTES for value in values[1:])
+            or any(len(value) > _MAX_SECRET_BYTES for value in clob)
+            or (any(len(value) == 0 for value in clob) and any(len(value) > 0 for value in clob))
         ):
             raise SecretBoundaryError("SECRET_MATERIAL_INVALID") from None
         object.__setattr__(self, "_private_key", private_key)
@@ -68,6 +70,10 @@ class SecretMaterial:
     @property
     def passphrase(self) -> bytearray:
         return self._passphrase
+
+    @property
+    def credentials_present(self) -> bool:
+        return len(self._api_key) > 0
 
     def __repr__(self) -> str:
         return "SecretMaterial(<redacted>)"
@@ -140,6 +146,14 @@ class SecretBuffer:
         if type(value) not in (bytes, bytearray):
             raise SecretStoreError("SECRET_VALUE_INVALID") from None
         return cls(bytearray(value))
+
+    @classmethod
+    def empty(cls) -> SecretBuffer:
+        """Create the internal marker for an intentionally absent optional secret."""
+        buffer = object.__new__(cls)
+        buffer._value = bytearray()
+        buffer._closed = False
+        return buffer
 
     def __len__(self) -> int:
         return 0 if self._closed else len(self._value)
@@ -299,11 +313,11 @@ def _read_descriptor_exact(descriptor: int, size: int) -> bytearray:
     return value
 
 
-def _read_secret_descriptor(descriptor: int) -> bytearray:
+def _read_secret_descriptor(descriptor: int, *, allow_empty: bool = False) -> bytearray:
     length_raw = _read_descriptor_exact(descriptor, _DESCRIPTOR_HEADER_BYTES)
     length = int.from_bytes(length_raw, "big")
     _zeroize(length_raw)
-    if length <= 0 or length > _MAX_SECRET_BYTES:
+    if length > _MAX_SECRET_BYTES or (length == 0 and not allow_empty):
         raise SecretBoundaryError("SECRET_DESCRIPTOR_SIZE_INVALID") from None
     value = _read_descriptor_exact(descriptor, length)
     read_failed = False
@@ -341,8 +355,8 @@ def read_secret_descriptors(
         ):
             raise SecretBoundaryError("SECRET_DESCRIPTOR_INVALID") from None
         _disable_core_dumps()
-        for descriptor in descriptors:
-            loaded.append(_read_secret_descriptor(descriptor))
+        for index, descriptor in enumerate(descriptors):
+            loaded.append(_read_secret_descriptor(descriptor, allow_empty=index > 0))
         if len(loaded[0]) != 32:
             raise SecretBoundaryError("SECRET_PRIVATE_KEY_SIZE_INVALID") from None
         return SecretMaterial(*loaded)

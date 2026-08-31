@@ -32,10 +32,11 @@ VALUES = {
 }
 
 
-def store(*, missing: str | None = None, denied: str | None = None) -> Any:
+def store(*, missing: str | set[str] | None = None, denied: str | None = None) -> Any:
     memory = InMemorySecretStore()
+    missing_accounts = {missing} if type(missing) is str else missing or set()
     for account, value in VALUES.items():
-        if account == missing:
+        if account in missing_accounts:
             continue
         memory.write_protected(CLOB_SERVICE, account, SecretBuffer.from_bytes(value))
     if denied is None:
@@ -115,6 +116,38 @@ def test_the_child_reads_exactly_the_four_inherited_descriptors() -> None:
         assert bytes(material.passphrase) == PASSPHRASE
         material.close()
         assert bytes(material.api_secret) == b"\x00" * len(API_SECRET)
+    finally:
+        channel.close()
+
+
+def test_bootstrap_launches_wallet_only_and_reports_credentials_absent() -> None:
+    loaded: dict[str, Any] = {}
+
+    def spawn(launch: ChildLaunch) -> int | None:
+        loaded["material"] = read_secret_descriptors(*launch.secret_descriptors)
+        return None
+
+    channel = launch_signer_sidecar(
+        store=store(missing={"clob-api-key", "clob-api-secret", "clob-passphrase"}),
+        service_factory=lambda secrets: secrets,
+        spawn=spawn,
+    )
+    try:
+        material = loaded["material"]
+        assert channel.credentials_present is False
+        assert bytes(material.private_key) == PRIVATE_KEY
+        assert bytes(material.api_key) == b""
+        material.close()
+    finally:
+        channel.close()
+
+
+def test_bootstrap_reports_credentials_present_when_all_four_exist() -> None:
+    channel = launch_signer_sidecar(
+        store=store(), service_factory=lambda secrets: secrets, spawn=lambda launch: None
+    )
+    try:
+        assert channel.credentials_present is True
     finally:
         channel.close()
 

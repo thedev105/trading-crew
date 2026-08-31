@@ -152,7 +152,7 @@ def test_descriptor_loader_closes_every_fd_when_one_descriptor_is_truncated() ->
 @pytest.mark.parametrize(
     ("invalid_wire", "error_code"),
     (
-        (b"\x00\x00\x00\x00", "SECRET_DESCRIPTOR_SIZE_INVALID"),
+        (b"\x00\x00\x00\x00", "SECRET_MATERIAL_INVALID"),
         ((4097).to_bytes(4, "big"), "SECRET_DESCRIPTOR_SIZE_INVALID"),
         (_encoded_secret(b"api-key") + b"x", "SECRET_DESCRIPTOR_TRAILING_BYTES"),
     ),
@@ -209,7 +209,7 @@ def test_descriptor_loader_requires_an_exact_32_byte_private_key(
             bytearray(b"p"),
         ),
     ),
-    ids=("private-key-size", "empty", "oversized"),
+    ids=("private-key-size", "partial-clob", "oversized"),
 )
 def test_secret_material_constructor_enforces_the_descriptor_size_contract(
     values: tuple[bytearray, ...],
@@ -217,6 +217,16 @@ def test_secret_material_constructor_enforces_the_descriptor_size_contract(
     error = _captured_boundary_error(lambda: SecretMaterial(*values))
 
     assert str(error) == "SECRET_MATERIAL_INVALID"
+
+
+def test_secret_material_accepts_an_all_empty_clob_trio() -> None:
+    material = SecretMaterial(bytearray(32), bytearray(), bytearray(), bytearray())
+
+    try:
+        assert material.credentials_present is False
+        assert len(material.api_key) == 0
+    finally:
+        material.close()
 
 
 @pytest.mark.parametrize("invalid_kind", ("negative", "duplicate"))
