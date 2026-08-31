@@ -74,6 +74,7 @@ AuthorityReason = Literal[
     "ACCOUNT_SCOPE_MISMATCH",
     "EXECUTION_KILL_ENGAGED",
     "EXECUTION_UNAVAILABLE",
+    "CREDENTIALS_UNAVAILABLE",
 ]
 
 # Mode and grant kind travel as their pilot string values so this module stays independent of the

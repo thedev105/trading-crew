@@ -21,10 +21,14 @@ from polytrading.predictions.polymarket_execution.keychain_macos import (
 )
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBuffer,
+    SecretMaterial,
     SecretStore,
     SecretStoreError,
 )
-from polytrading.predictions.polymarket_execution.signer import run_signer_sidecar
+from polytrading.predictions.polymarket_execution.signer import (
+    SignerService,
+    run_signer_sidecar,
+)
 
 # The exact order the sidecar's descriptor contract expects.
 SECRET_ACCOUNTS: Final = (
@@ -47,7 +51,7 @@ class SignerBootstrapError(RuntimeError):
 
 
 class SignerServiceFactory(Protocol):
-    def __call__(self, secrets: object) -> object: ...
+    def __call__(self, secrets: SecretMaterial) -> SignerService: ...
 
 
 @dataclass(frozen=True, slots=True)

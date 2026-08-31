@@ -12,7 +12,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "8ccd7ecf39674fc4644f01763716fcedb8b6201bcbc94cb9933c0f9ecda458de",
     Path(
         "execution/authority.py"
-    ): "fbc19d3edc16e6a4882f33993dcc4738d48f89919e69880e2c42099638ef25b9",
+    ): "b75176699088f3d61ddf899b965fb89b8b83a1ddafdafb33e22667e5265cdeb5",
     Path(
         "execution/coordinator.py"
     ): "2b6cc79272e9ae938236111a9619b5b0540722d7bd00cc2a82e39e1c795f47a2",
@@ -644,6 +644,66 @@ def _allowed_hardened_live_async_client_call(
     )
 
 
+def _allowed_live_signer_transport_composition(
+    source_path: Path,
+    tree: ast.Module,
+    call: ast.Call,
+    aliases: dict[str, str],
+    constants: dict[str, str],
+) -> bool:
+    if source_path != Path("pilot/signer_services.py") or call.args:
+        return False
+    live_factory = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "live_pilot_signer_service"
+        ),
+        None,
+    )
+    if live_factory is None:
+        return False
+    child_factory = next(
+        (
+            item
+            for item in live_factory.body
+            if isinstance(item, ast.FunctionDef) and item.name == "factory"
+        ),
+        None,
+    )
+    if child_factory is None or not (
+        child_factory.lineno <= call.lineno <= (child_factory.end_lineno or 0)
+    ):
+        return False
+    composition_calls = [
+        item
+        for item in ast.walk(child_factory)
+        if isinstance(item, ast.Call)
+        and (
+            (resolved := _resolved_python_name(item.func, aliases, constants)) is not None
+            and resolved.endswith(
+                (".HttpxPolymarketRestTransport", ".SignerRestHandlers")
+            )
+        )
+    ]
+    if len(composition_calls) != 2:
+        return False
+    resolved = _resolved_python_name(call.func, aliases, constants)
+    keywords = {item.arg: item.value for item in call.keywords}
+    if resolved is not None and resolved.endswith(".HttpxPolymarketRestTransport"):
+        return set(keywords) == {"timestamp", "clock"}
+    if resolved is not None and resolved.endswith(".SignerRestHandlers"):
+        return (
+            set(keywords) == {"credentials", "transport"}
+            and isinstance(keywords["credentials"], ast.Name)
+            and keywords["credentials"].id == "credentials"
+            and isinstance(keywords["transport"], ast.Name)
+            and keywords["transport"].id == "transport"
+        )
+    return False
+
+
 def _expression_references_httpx(node: ast.expr, aliases: dict[str, str]) -> bool:
     for item in ast.walk(node):
         if isinstance(item, ast.Name) and aliases.get(item.id, item.id).startswith("httpx"):
@@ -1158,6 +1218,12 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                     violations.append(f"clear-kill:{source_path}:{node.lineno}")
             if resolved is not None and resolved.endswith(
                 (".HttpxPolymarketRestTransport", ".SignerRestHandlers")
+            ) and not _allowed_live_signer_transport_composition(
+                source_path,
+                tree,
+                node,
+                aliases,
+                constants,
             ):
                 violations.append(f"transport-composition:{source_path}:{node.lineno}")
             if resolved is not None and resolved.startswith("httpx."):
