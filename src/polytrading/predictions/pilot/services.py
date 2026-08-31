@@ -117,7 +117,7 @@ class PilotEnvironment:
 
     account_fingerprint: Sha256
     wallet_fingerprint: Sha256
-    venue_binding: VenueBinding
+    venue_binding: VenueBinding | None
     manifest: VenueManifest | None
     manifest_state: str
     protocol_state: str
@@ -584,6 +584,8 @@ class LivePilotServices:
     def _issue(
         self, challenge: AuthorizationChallenge, assertion: VerifiedOperatorAssertion
     ) -> IssuedGrantPair:
+        if self._environment.venue_binding is None:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "MANIFEST_NOT_ELIGIBLE")
         now = self._clock()
         limits = (
             COMPILED_PILOT_CEILINGS
