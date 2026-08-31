@@ -50,6 +50,7 @@ class ImmediateOrderType(StrEnum):
 
 class ExecutionOperation(StrEnum):
     DESCRIBE_IDENTITY = "DESCRIBE_IDENTITY"
+    SIGNER_KILL = "SIGNER_KILL"
     SIGN_ORDER = "SIGN_ORDER"
     SUBMIT_ORDER = "SUBMIT_ORDER"
     CANCEL_ORDER = "CANCEL_ORDER"

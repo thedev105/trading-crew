@@ -7,6 +7,7 @@ from uuid import UUID
 
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.execution.models import ExecutionOperation
+from polytrading.predictions.pilot.capabilities import CapabilityGrant, VenueBinding
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     ActivationResult,
@@ -19,6 +20,7 @@ from polytrading.predictions.pilot.models import (
     KillClearanceResult,
     LossStatus,
     NonceScope,
+    PilotLimits,
     PilotProofFamily,
     PilotSessionState,
     PresenceEventType,
@@ -90,6 +92,54 @@ def limits_fields(**overrides: Any) -> dict[str, Any]:
         name: _money(value) if name in _LIMIT_MONEY_FIELDS else value
         for name, value in values.items()
     }
+
+
+def signer_capability_grant(
+    *,
+    account_fingerprint: str,
+    now: datetime,
+) -> CapabilityGrant:
+    """A complete public grant fixture for signer IPC contract tests."""
+    return CapabilityGrant(
+        schema_version=1,
+        capability_id=CAPABILITY_ID,
+        challenge_id=CHALLENGE_ID,
+        grant_kind=GrantKind.PRIMARY,
+        mode=AuthorizationMode.COMPLETE_STRATEGY,
+        venue_binding=VenueBinding(
+            venue=PredictionVenue.POLYMARKET,
+            manifest_record_hash=MANIFEST_RECORD_HASH,
+            manifest_source_hashes=(PROTOCOL_FIXTURE_HASH,),
+            eligibility_evidence_hashes=(EVIDENCE_HASH,),
+            strategy_policy_hash=POLICY_HASH,
+            proof_policy_hash=PASSKEY_ASSERTION_DIGEST,
+            economics_policy_hash=RECONCILIATION_HASH,
+            protocol_fixture_hash=PROTOCOL_FIXTURE_HASH,
+            route_set_version="fixture-v1",
+            route_set_hash=READINESS_DIGEST,
+        ),
+        account_fingerprint=account_fingerprint,
+        wallet_fingerprint=WALLET_FINGERPRINT,
+        parent_action_id=TARGET_ID,
+        session_id=None,
+        effective_limits=PilotLimits.model_validate(limits_fields(), strict=True),
+        requested_limits_hash=POLICY_HASH,
+        ceiling_hash=PILOT_CEILING_HASH,
+        plan_hash=PROTOCOL_FIXTURE_HASH,
+        strategy_hash=EVIDENCE_HASH,
+        proof_family_hash=CONFIRMATION_TEXT_HASH,
+        recovery_policy_hash=PASSKEY_ASSERTION_DIGEST,
+        browser_session_hash=BROWSER_SESSION_HASH,
+        passkey_assertion_digest=PASSKEY_ASSERTION_DIGEST,
+        evidence_hashes=(EVIDENCE_HASH, PROTOCOL_FIXTURE_HASH),
+        allowed_operations=(ExecutionOperation.SIGN_ORDER, ExecutionOperation.SUBMIT_ORDER),
+        single_use=True,
+        nonce="signer-capability-grant-fixture",
+        issuer_key_id="fixture-key",
+        not_before=now - timedelta(minutes=1),
+        expires_at=now + timedelta(minutes=1),
+        presence_deadline=now + timedelta(minutes=1),
+    )
 
 
 def eligibility_fields(**overrides: Any) -> dict[str, Any]:

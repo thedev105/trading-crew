@@ -9,6 +9,7 @@ from typing import Annotated, BinaryIO, Final, Literal, Self, get_args
 from uuid import UUID
 
 from pydantic import (
+    Base64Bytes,
     ConfigDict,
     Field,
     StringConstraints,
@@ -25,6 +26,7 @@ from polytrading.predictions.execution.models import (
     ExecutionOperation,
     SignedOrderEnvelope,
 )
+from polytrading.predictions.pilot.capabilities import CapabilityGrant, SignerKillDirective
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     POLYMARKET_PROTOCOL_VERSION,
@@ -299,8 +301,19 @@ class DescribeIdentityPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.DESCRIBE_IDENTITY]
 
 
+class SignerKillPayload(_SignerRecord):
+    operation: Literal[ExecutionOperation.SIGNER_KILL]
+    directive: SignerKillDirective
+
+
+class SignerCapabilityProof(_SignerRecord):
+    grant: CapabilityGrant
+    signature: Base64Bytes
+
+
 SignerPayload = Annotated[
     DescribeIdentityPayload
+    | SignerKillPayload
     | SignOrderPayload
     | SubmitOrderPayload
     | CancelOrderPayload
@@ -318,6 +331,7 @@ class SignerRequest(_SignerRecord):
     intent_id: UUID
     intent_fingerprint: Sha256
     capability_digest: Sha256
+    authority_proof: SignerCapabilityProof | None = None
     manifest_digest: Sha256
     account_fingerprint: Sha256
     # A request may run under either reviewed checkpoint; the signer still compares this against
@@ -336,6 +350,22 @@ class SignerRequest(_SignerRecord):
     def _bind_payload(self) -> SignerRequest:
         if self.payload.operation is not self.operation:
             raise ValueError("operation must match payload")
+        proof_free_operations = frozenset(
+            {
+                ExecutionOperation.DESCRIBE_IDENTITY,
+                ExecutionOperation.SIGNER_KILL,
+                ExecutionOperation.READ_ORDERS,
+                ExecutionOperation.READ_TRADES,
+                ExecutionOperation.READ_ACCOUNT,
+            }
+        )
+        if self.operation in proof_free_operations:
+            if self.authority_proof is not None:
+                raise ValueError("this operation must not carry an authority proof")
+        elif self.authority_proof is None:
+            raise ValueError("mutating operations require an authority proof")
+        elif self.authority_proof.grant.digest != self.capability_digest:
+            raise ValueError("authority proof does not match capability digest")
         if isinstance(self.payload, SignOrderPayload):
             intent = self.payload.intent
             if (
@@ -787,7 +817,9 @@ __all__ = [
     "SanitizedOperationResult",
     "SignOrderPayload",
     "SignedEnvelopeResult",
+    "SignerCapabilityProof",
     "SignerErrorCode",
+    "SignerKillPayload",
     "SignerProtocolError",
     "SignerRequest",
     "SignerResponse",

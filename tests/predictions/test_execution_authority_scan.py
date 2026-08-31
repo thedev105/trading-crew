@@ -20,7 +20,7 @@ _REVIEWED_SOURCE_SHA256 = {
         "execution/kill_switch.py"
     ): "2c718198102aceabf45437f07cb09ca44df081d98f67778c6029016be5307a42",
     Path("execution/ledger.py"): "3767947fd3a70eea588bff87a33442d662521fb0c8806dfa4d86d2322dee4e31",
-    Path("execution/models.py"): "6dfa3ea82f78ba986c33cab59cba08b32f116746425d6bd753f2bc4c3f595cba",
+    Path("execution/models.py"): "53ce057ec1198494e2429f839991ca4dd2b90f360fb65cfab74e9165377b8ef6",
     Path(
         "execution/reconciliation.py"
     ): "b49db0ea6c31cbb833b08eeac69ed1b8ad257e829ec6f95e8fc7af90f9c64dbc",
@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "9a23509b26669adb846aa5b23ddb0081a2f3c041b5d4da93aee42a67634fa8f5",
+    ): "0c6ab005997c5f74856a9b9a4785e7abea0c5d80526b844df9dac40134961145",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -150,10 +150,12 @@ from polytrading.predictions.polymarket_execution.signer import (
 )
 from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.manifest_helpers import venue_manifest
+from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_execution_authority import (
     HASHES,
     MANIFEST_HASH,
     authority_context,
+    verified_capability,
 )
 from tests.predictions.test_execution_coordinator import (
     ACCOUNT_FINGERPRINT,
@@ -1907,6 +1909,7 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
             account_fingerprint=request.account_fingerprint,
             account_scope_account_fingerprint=request.account_fingerprint,
             manifest_record_hash=request.manifest_digest,
+            verified_capability=verified_capability(capability_digest=request.capability_digest),
         )
         contexts.append(("signer", context))
         return context
@@ -1933,12 +1936,17 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
         ),
         clock=lambda: NOW,
     )
+    grant = signer_capability_grant(account_fingerprint=HASHES[0], now=NOW)
     request = SignerRequest(
         schema_version=1,
         request_id=UUID("11111111-1111-4111-8111-111111111111"),
         intent_id=intent.intent_id,
         intent_fingerprint=intent.intent_fingerprint,
-        capability_digest=HASHES[8],
+        capability_digest=grant.digest,
+        authority_proof={
+            "grant": grant,
+            "signature": b"cHVibGljLXNpZ25hdHVyZQ==",
+        },
         manifest_digest=MANIFEST_HASH,
         account_fingerprint=HASHES[0],
         protocol_version="polymarket-clob-2026-08-25-v1",

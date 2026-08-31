@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from polytrading.predictions.execution.models import ExecutionOperation
@@ -17,6 +18,7 @@ from polytrading.predictions.pilot.capabilities import (
     PilotCapabilityIssuer,
     VenueBinding,
     verify_capability_signature,
+    verify_kill_directive,
 )
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
@@ -132,6 +134,17 @@ def test_issued_grants_are_signed_by_this_launch_only() -> None:
     assert pair.recovery.grant.grant_kind is GrantKind.RECOVERY
     assert pair.primary.grant.single_use is True
     assert pair.primary.grant.passkey_assertion_digest == approved(challenge()).assertion_digest
+
+
+def test_kill_directive_verifies_only_for_the_launch_issuer() -> None:
+    authority = PilotCapabilityIssuer(key_id="test")
+    directive = authority.issue_kill_directive([CAPABILITY_ID], issued_at=NOW)
+
+    assert verify_kill_directive(directive, authority.public_verification_key)
+    assert not verify_kill_directive(
+        directive,
+        Ed25519PrivateKey.generate().public_key().public_bytes_raw(),
+    )
 
 
 def test_a_closed_issuer_drops_its_private_key_and_refuses_to_sign() -> None:

@@ -8,6 +8,8 @@ can be widened, renewed, or converted into the other.
 
 from __future__ import annotations
 
+from base64 import b64encode
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
@@ -19,9 +21,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from pydantic import StringConstraints, field_validator, model_validator
+from pydantic import Base64Bytes, StringConstraints, field_validator, model_validator
 
-from polytrading.predictions.domain import PredictionVenue, Sha256
+from polytrading.predictions.domain import (
+    PredictionRecord,
+    PredictionVenue,
+    Sha256,
+    normalize_utc_timestamp,
+)
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
@@ -192,6 +199,33 @@ class CapabilityGrant(PilotRecord):
         return canonical_execution_hash(self)
 
 
+class SignerKillDirective(PredictionRecord):
+    """A public, launch-bound directive that revokes the listed signer capabilities."""
+
+    capability_ids: tuple[UUID, ...]
+    issued_at: UtcTimestamp
+    signature: Base64Bytes
+
+    @field_validator("capability_ids")
+    @classmethod
+    def _sorted_unique_capability_ids(cls, value: tuple[UUID, ...]) -> tuple[UUID, ...]:
+        if not value:
+            raise ValueError("kill directive must identify at least one capability")
+        if value != tuple(sorted(set(value), key=str)):
+            raise ValueError("capability ids must be sorted and unique")
+        return value
+
+    @property
+    def signature_digest(self) -> Sha256:
+        return canonical_execution_hash(
+            {
+                "kind": "signer-kill-v1",
+                "capability_ids": self.capability_ids,
+                "issued_at": self.issued_at,
+            }
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SignedCapability:
     """A grant plus its detached Ed25519 signature. Never persisted: bundles stay ephemeral."""
@@ -214,6 +248,17 @@ def verify_capability_signature(capability: SignedCapability, public_key: bytes)
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(
             capability.signature, capability.grant.digest.encode("ascii")
+        )
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def verify_kill_directive(directive: SignerKillDirective, public_key: bytes) -> bool:
+    """Verify a kill directive using only this launch's public verification key."""
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            directive.signature, directive.signature_digest.encode("ascii")
         )
     except (InvalidSignature, ValueError):
         return False
@@ -259,6 +304,29 @@ class PilotCapabilityIssuer:
         self._require_open()
         self._verify_assertion_binding(request, assertion, challenge)
         return self._sign_primary_and_recovery(request, assertion)
+
+    def issue_kill_directive(
+        self,
+        capability_ids: Iterable[UUID],
+        *,
+        issued_at: datetime,
+    ) -> SignerKillDirective:
+        """Sign a canonical, non-replayable kill directive for this launch."""
+        self._require_open()
+        normalized_ids = tuple(sorted(set(capability_ids), key=str))
+        normalized_issued_at = normalize_utc_timestamp(issued_at)
+        unsigned = {
+            "kind": "signer-kill-v1",
+            "capability_ids": normalized_ids,
+            "issued_at": normalized_issued_at,
+        }
+        assert self._private_key is not None  # narrowed by _require_open
+        signature = self._private_key.sign(canonical_execution_hash(unsigned).encode("ascii"))
+        return SignerKillDirective(
+            capability_ids=normalized_ids,
+            issued_at=normalized_issued_at,
+            signature=b64encode(signature),
+        )
 
     def _require_open(self) -> None:
         if self._closed or self._private_key is None:

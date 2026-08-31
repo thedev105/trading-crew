@@ -17,6 +17,7 @@ from eth_account import Account
 
 from polytrading.predictions.execution.authority import AuthorityDecision
 from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
+from polytrading.predictions.pilot.capabilities import SignerKillDirective
 from polytrading.predictions.polymarket_execution import signer as signer_module
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
@@ -29,6 +30,8 @@ from polytrading.predictions.polymarket_execution.ipc import (
     ReadTradesPayload,
     SanitizedOperationResult,
     SignedEnvelopeResult,
+    SignerCapabilityProof,
+    SignerKillPayload,
     SignerProtocolError,
     SignerRequest,
     SignerResponse,
@@ -56,6 +59,7 @@ from polytrading.predictions.polymarket_execution.signer import (
     run_signer_sidecar,
 )
 from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_execution_authority import (
     MANIFEST_HASH,
     authority_context,
@@ -67,12 +71,21 @@ from tests.predictions.test_polymarket_order_signing import (
 )
 
 NOW = datetime(2026, 8, 25, 16, tzinfo=UTC)
-CAPABILITY_DIGEST = "9" * 64
 API_KEY = b"task-7-api-key"
 API_SECRET = b"dGFzay03LXNlY3JldA=="
 PASSPHRASE = b"task-7-passphrase"
 _CHILD_SECRET_MATERIAL: SecretMaterial | None = None
 _CANARY_ASSERTION_FAILED = "IPC_CANARY_DETECTED"
+
+
+def _authority_proof() -> SignerCapabilityProof:
+    return SignerCapabilityProof(
+        grant=signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=NOW),
+        signature=b"cHVibGljLXNpZ25hdHVyZQ==",
+    )
+
+
+CAPABILITY_DIGEST = _authority_proof().grant.digest
 
 
 class _ShortReader:
@@ -251,6 +264,15 @@ def _intent(**overrides: object) -> ExecutionIntent:
 def _payload(operation: ExecutionOperation) -> object:
     if operation is ExecutionOperation.DESCRIBE_IDENTITY:
         return DescribeIdentityPayload(operation=operation)
+    if operation is ExecutionOperation.SIGNER_KILL:
+        return SignerKillPayload(
+            operation=operation,
+            directive=SignerKillDirective(
+                capability_ids=(UUID("11111111-1111-4111-8111-111111111112"),),
+                issued_at=NOW,
+                signature=b"cHVibGljLXNpZ25hdHVyZQ==",
+            ),
+        )
     if operation is ExecutionOperation.SIGN_ORDER:
         return SignOrderPayload(operation=operation, intent=_intent())
     if operation is ExecutionOperation.SUBMIT_ORDER:
@@ -292,6 +314,18 @@ def _request(
         "intent_id": intent.intent_id,
         "intent_fingerprint": intent.intent_fingerprint,
         "capability_digest": CAPABILITY_DIGEST,
+        "authority_proof": (
+            None
+            if operation
+            in {
+                ExecutionOperation.DESCRIBE_IDENTITY,
+                ExecutionOperation.SIGNER_KILL,
+                ExecutionOperation.READ_ORDERS,
+                ExecutionOperation.READ_TRADES,
+                ExecutionOperation.READ_ACCOUNT,
+            }
+            else _authority_proof()
+        ),
         "manifest_digest": MANIFEST_HASH,
         "account_fingerprint": ACCOUNT_FINGERPRINT,
         "protocol_version": "polymarket-clob-2026-08-25-v1",
@@ -308,6 +342,11 @@ def _describe_identity_request() -> SignerRequest:
         ExecutionOperation.DESCRIBE_IDENTITY,
         account_fingerprint="0" * 64,
     )
+
+
+def test_mutation_request_requires_a_capability_proof() -> None:
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+        _request(authority_proof=None)
 
 
 def _handlers(**overrides: object) -> SignerOperationHandlers:
@@ -637,6 +676,7 @@ def test_request_and_response_have_exact_strict_public_field_allowlists() -> Non
         "intent_id",
         "intent_fingerprint",
         "capability_digest",
+        "authority_proof",
         "manifest_digest",
         "account_fingerprint",
         "protocol_version",

@@ -11,6 +11,7 @@ from polytrading.predictions.pilot.signer_services import offline_pilot_signer_s
 from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
     ReadAccountPayload,
+    SignerCapabilityProof,
     SignerRequest,
     SignOrderPayload,
 )
@@ -19,6 +20,7 @@ from polytrading.predictions.polymarket_execution.protocol import (
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_polymarket_order_signing import PRIVATE_KEY
 
 ACCOUNT_FINGERPRINT = sha256(bytes.fromhex(Account.from_key(PRIVATE_KEY).address[2:])).hexdigest()
@@ -26,10 +28,11 @@ ACCOUNT_FINGERPRINT = sha256(bytes.fromhex(Account.from_key(PRIVATE_KEY).address
 
 def _request(operation: ExecutionOperation) -> SignerRequest:
     now = datetime.now(UTC)
+    grant = signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=now)
     intent = ExecutionIntent(
         **execution_intent_fields(
             account_fingerprint=ACCOUNT_FINGERPRINT,
-            capability_fingerprint="0" * 64,
+            capability_fingerprint=grant.digest,
             created_at=now,
             deadline=now + timedelta(seconds=10),
             protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -52,7 +55,15 @@ def _request(operation: ExecutionOperation) -> SignerRequest:
         request_id=UUID("00000000-0000-4000-8000-000000000001"),
         intent_id=intent.intent_id,
         intent_fingerprint=intent.intent_fingerprint,
-        capability_digest="0" * 64,
+        capability_digest=grant.digest,
+        authority_proof=(
+            None
+            if operation in {ExecutionOperation.DESCRIBE_IDENTITY, ExecutionOperation.READ_ACCOUNT}
+            else SignerCapabilityProof(
+                grant=grant,
+                signature=b"cHVibGljLXNpZ25hdHVyZQ==",
+            )
+        ),
         manifest_digest="0" * 64,
         account_fingerprint="0" * 64
         if operation is ExecutionOperation.DESCRIBE_IDENTITY

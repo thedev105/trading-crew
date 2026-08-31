@@ -35,6 +35,7 @@ from polytrading.predictions.polymarket_execution.ipc import (
     ReadOrdersPayload,
     ReadTradesPayload,
     SanitizedOperationResult,
+    SignerCapabilityProof,
     SignerProtocolError,
     SignerRequest,
     SubmitOrderPayload,
@@ -67,6 +68,7 @@ from polytrading.predictions.polymarket_execution.user_stream import (
 )
 from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_execution_authority import (
     HASHES,
     MANIFEST_HASH,
@@ -90,7 +92,13 @@ def _submit_material(
 ) -> tuple[SubmitOrderRequest, ClobCredentials]:
     account = Account.from_key(private_key)
     account_fingerprint = sha256(bytes.fromhex(account.address[2:])).hexdigest()
-    intent = ExecutionIntent(**execution_intent_fields(account_fingerprint=account_fingerprint))
+    grant = signer_capability_grant(account_fingerprint=account_fingerprint, now=NOW)
+    intent = ExecutionIntent(
+        **execution_intent_fields(
+            account_fingerprint=account_fingerprint,
+            capability_fingerprint=grant.digest,
+        )
+    )
     envelope = sign_order(intent, private_key, load_protocol_snapshot())
     return (
         SubmitOrderRequest(
@@ -254,7 +262,13 @@ def test_named_auth_header_and_signed_body_canaries_are_actual_request_bytes() -
     canaries = _Canaries.generate()
     account = Account.from_key(canaries.private_key)
     account_fingerprint = sha256(bytes.fromhex(account.address[2:])).hexdigest()
-    intent = ExecutionIntent(**execution_intent_fields(account_fingerprint=account_fingerprint))
+    grant = signer_capability_grant(account_fingerprint=account_fingerprint, now=NOW)
+    intent = ExecutionIntent(
+        **execution_intent_fields(
+            account_fingerprint=account_fingerprint,
+            capability_fingerprint=grant.digest,
+        )
+    )
     envelope = sign_order(intent, canaries.private_key, load_protocol_snapshot())
     request = SubmitOrderRequest(
         route=RouteKey.SUBMIT_ORDER,
@@ -394,12 +408,20 @@ def test_runtime_canaries_never_cross_any_public_observable(
         )
     )
 
+    grant = signer_capability_grant(
+        account_fingerprint=submit_request.intent.account_fingerprint,
+        now=NOW,
+    )
     mutation_request = SignerRequest(
         schema_version=1,
         request_id=UUID("33333333-3333-4333-8333-333333333333"),
         intent_id=submit_request.intent.intent_id,
         intent_fingerprint=submit_request.intent.intent_fingerprint,
         capability_digest=submit_request.intent.capability_fingerprint,
+        authority_proof=SignerCapabilityProof(
+            grant=grant,
+            signature=b"cHVibGljLXNpZ25hdHVyZQ==",
+        ),
         manifest_digest=MANIFEST_HASH,
         account_fingerprint=submit_request.intent.account_fingerprint,
         protocol_version=submit_request.intent.protocol_version,
