@@ -4,20 +4,33 @@ import io
 import json
 import multiprocessing
 import os
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from multiprocessing import reduction
 from threading import Event, Lock
 from uuid import UUID, uuid4
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from eth_account import Account
 
 from polytrading.predictions.execution.authority import AuthorityDecision
-from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
-from polytrading.predictions.pilot.capabilities import SignerKillDirective
+from polytrading.predictions.execution.models import (
+    ExecutionIntent,
+    ExecutionOperation,
+    canonical_execution_hash,
+)
+from polytrading.predictions.pilot.capabilities import (
+    CapabilityGrant,
+    SignerKillDirective,
+)
+from polytrading.predictions.pilot.models import AuthorizationMode
+from polytrading.predictions.pilot.verifier import verified_capability_from_grant
 from polytrading.predictions.polymarket_execution import signer as signer_module
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
@@ -63,7 +76,6 @@ from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_execution_authority import (
     MANIFEST_HASH,
     authority_context,
-    verified_capability,
 )
 from tests.predictions.test_polymarket_order_signing import (
     ACCOUNT_FINGERPRINT,
@@ -78,11 +90,82 @@ _CHILD_SECRET_MATERIAL: SecretMaterial | None = None
 _CANARY_ASSERTION_FAILED = "IPC_CANARY_DETECTED"
 
 
-def _authority_proof() -> SignerCapabilityProof:
-    return SignerCapabilityProof(
-        grant=signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=NOW),
-        signature=b"cHVibGljLXNpZ25hdHVyZQ==",
+class _TestCapabilityIssuer:
+    def __init__(self, private_key: bytes) -> None:
+        self._private_key = Ed25519PrivateKey.from_private_bytes(private_key)
+
+    @property
+    def public_verification_key(self) -> bytes:
+        return self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    def proof(self, grant: CapabilityGrant) -> SignerCapabilityProof:
+        signature = self._private_key.sign(grant.digest.encode("ascii"))
+        return SignerCapabilityProof(grant=grant, signature=b64encode(signature))
+
+    def kill_directive(self, capability_ids: tuple[UUID, ...]) -> SignerKillDirective:
+        issued_at = NOW
+        digest = canonical_execution_hash(
+            {
+                "kind": "signer-kill-v1",
+                "capability_ids": capability_ids,
+                "issued_at": issued_at,
+            }
+        )
+        return SignerKillDirective(
+            capability_ids=capability_ids,
+            issued_at=issued_at,
+            signature=b64encode(self._private_key.sign(digest.encode("ascii"))),
+        )
+
+
+ISSUER = _TestCapabilityIssuer(b"\x01" * 32)
+OTHER_ISSUER = _TestCapabilityIssuer(b"\x02" * 32)
+
+
+def _protocol_fixture_hash() -> str:
+    snapshot = load_protocol_snapshot()
+    return canonical_execution_hash(
+        {
+            "version": snapshot.version,
+            "fixtures": [item.model_dump(mode="json") for item in snapshot.fixture_hashes],
+        }
     )
+
+
+def _capability_grant(**overrides: object) -> CapabilityGrant:
+    base = signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=NOW)
+    binding = base.venue_binding.model_copy(
+        update={
+            "manifest_record_hash": MANIFEST_HASH,
+            "manifest_source_hashes": ("3" * 64,),
+            "eligibility_evidence_hashes": ("4" * 64,),
+            "strategy_policy_hash": "5" * 64,
+            "proof_policy_hash": "6" * 64,
+            "economics_policy_hash": "7" * 64,
+            "protocol_fixture_hash": _protocol_fixture_hash(),
+            "route_set_version": "polymarket-mutations-v1",
+            "route_set_hash": "d" * 64,
+        }
+    )
+    return base.model_copy(
+        update={
+            "venue_binding": binding,
+            "allowed_operations": (
+                ExecutionOperation.CANCEL_ORDER,
+                ExecutionOperation.HEARTBEAT,
+                ExecutionOperation.SIGN_ORDER,
+                ExecutionOperation.SUBMIT_ORDER,
+            ),
+            **overrides,
+        }
+    )
+
+
+DEFAULT_GRANT = _capability_grant()
+
+
+def _authority_proof() -> SignerCapabilityProof:
+    return ISSUER.proof(DEFAULT_GRANT)
 
 
 CAPABILITY_DIGEST = _authority_proof().grant.digest
@@ -308,12 +391,14 @@ def _request(
     **overrides: object,
 ) -> SignerRequest:
     intent = _intent()
+    payload = overrides.pop("payload", None)
     fields: dict[str, object] = {
         "schema_version": 1,
         "request_id": UUID("11111111-1111-4111-8111-111111111111"),
         "intent_id": intent.intent_id,
         "intent_fingerprint": intent.intent_fingerprint,
         "capability_digest": CAPABILITY_DIGEST,
+        "plan_digest": DEFAULT_GRANT.plan_hash,
         "authority_proof": (
             None
             if operation
@@ -331,10 +416,44 @@ def _request(
         "protocol_version": "polymarket-clob-2026-08-25-v1",
         "operation": operation,
         "deadline": NOW + timedelta(seconds=5),
-        "payload": _payload(operation),
+        "payload": _payload(operation) if payload is None else payload,
     }
     fields.update(overrides)
     return SignerRequest.model_validate(fields)
+
+
+def _action_request(
+    operation: ExecutionOperation,
+    *,
+    plan_id: UUID | None = None,
+    request_id: UUID | None = None,
+    authority_proof: SignerCapabilityProof | None = None,
+) -> SignerRequest:
+    proof = authority_proof or _authority_proof()
+    intent_overrides: dict[str, object] = {"capability_fingerprint": proof.grant.digest}
+    if plan_id is not None:
+        intent_overrides["plan_id"] = plan_id
+    intent = _intent(**intent_overrides)
+    if operation is ExecutionOperation.SIGN_ORDER:
+        payload: object = SignOrderPayload(operation=operation, intent=intent)
+    elif operation is ExecutionOperation.SUBMIT_ORDER:
+        payload = SubmitOrderPayload(
+            operation=operation,
+            intent=intent,
+            envelope=sign_order(intent, PRIVATE_KEY, load_protocol_snapshot()),
+        )
+    else:
+        raise AssertionError("ACTION_REQUEST_OPERATION_INVALID") from None
+    return _request(
+        operation,
+        request_id=request_id or uuid4(),
+        intent_id=intent.intent_id,
+        intent_fingerprint=intent.intent_fingerprint,
+        capability_digest=proof.grant.digest,
+        plan_digest=proof.grant.plan_hash,
+        authority_proof=proof,
+        payload=payload,
+    )
 
 
 def _describe_identity_request() -> SignerRequest:
@@ -429,15 +548,37 @@ def _service(
     def context_factory(request: SignerRequest, observed_at: datetime) -> object:
         if authority_calls is not None:
             authority_calls.append(request.request_id)
-        capability = verified_capability(
-            account_fingerprint=request.account_fingerprint,
-            capability_digest=request.capability_digest,
-        )
+        assert request.authority_proof is not None
+        grant = request.authority_proof.grant
+        binding = grant.venue_binding
+        capability = verified_capability_from_grant(grant, verified_at=observed_at)
         return authority_context(
             now=observed_at if context_now is None else context_now,
             account_fingerprint=request.account_fingerprint,
             account_scope_account_fingerprint=request.account_fingerprint,
             manifest_record_hash=request.manifest_digest,
+            manifest_source_hashes=binding.manifest_source_hashes,
+            strategy_policy_hash=binding.strategy_policy_hash,
+            proof_policy_hash=binding.proof_policy_hash,
+            economics_policy_hash=binding.economics_policy_hash,
+            protocol_fixture_hash=binding.protocol_fixture_hash,
+            route_set_version=binding.route_set_version,
+            route_set_hash=binding.route_set_hash,
+            requested_notional=Decimal("0"),
+            capital_after=Decimal("0"),
+            position_after=Decimal("0"),
+            loss_after=Decimal("0"),
+            activation_nonce=grant.nonce,
+            expected_mode=grant.mode.value,
+            expected_grant_kind=grant.grant_kind.value,
+            action_id=grant.parent_action_id,
+            session_id=grant.session_id,
+            requested_limits_hash=grant.requested_limits_hash,
+            ceiling_hash=grant.ceiling_hash,
+            plan_hash=request.plan_digest,
+            strategy_hash=grant.strategy_hash,
+            proof_family_hash=grant.proof_family_hash,
+            recovery_policy_hash=grant.recovery_policy_hash,
             verified_capability=capability,
         )
 
@@ -458,6 +599,7 @@ def _service(
         read_guard=read_guard,
         handlers=handlers or _handlers(),
         clock=lambda: now,
+        capability_public_key=ISSUER.public_verification_key,
         max_cache_entries=max_cache_entries,
     )
 
@@ -508,15 +650,37 @@ def _child_service_factory(
     _CHILD_SECRET_MATERIAL = secrets
 
     def context_factory(request: SignerRequest, observed_at: datetime) -> object:
-        capability = verified_capability(
-            account_fingerprint=request.account_fingerprint,
-            capability_digest=request.capability_digest,
-        )
+        assert request.authority_proof is not None
+        grant = request.authority_proof.grant
+        binding = grant.venue_binding
+        capability = verified_capability_from_grant(grant, verified_at=observed_at)
         return authority_context(
             now=observed_at,
             account_fingerprint=request.account_fingerprint,
             account_scope_account_fingerprint=request.account_fingerprint,
             manifest_record_hash=request.manifest_digest,
+            manifest_source_hashes=binding.manifest_source_hashes,
+            strategy_policy_hash=binding.strategy_policy_hash,
+            proof_policy_hash=binding.proof_policy_hash,
+            economics_policy_hash=binding.economics_policy_hash,
+            protocol_fixture_hash=binding.protocol_fixture_hash,
+            route_set_version=binding.route_set_version,
+            route_set_hash=binding.route_set_hash,
+            requested_notional=Decimal("0"),
+            capital_after=Decimal("0"),
+            position_after=Decimal("0"),
+            loss_after=Decimal("0"),
+            activation_nonce=grant.nonce,
+            expected_mode=grant.mode.value,
+            expected_grant_kind=grant.grant_kind.value,
+            action_id=grant.parent_action_id,
+            session_id=grant.session_id,
+            requested_limits_hash=grant.requested_limits_hash,
+            ceiling_hash=grant.ceiling_hash,
+            plan_hash=request.plan_digest,
+            strategy_hash=grant.strategy_hash,
+            proof_family_hash=grant.proof_family_hash,
+            recovery_policy_hash=grant.recovery_policy_hash,
             verified_capability=capability,
         )
 
@@ -561,6 +725,7 @@ def _child_service_factory(
             read_account=result,
         ),
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
         max_cache_entries=8,
     )
 
@@ -676,6 +841,7 @@ def test_request_and_response_have_exact_strict_public_field_allowlists() -> Non
         "intent_id",
         "intent_fingerprint",
         "capability_digest",
+        "plan_digest",
         "authority_proof",
         "manifest_digest",
         "account_fingerprint",
@@ -816,6 +982,332 @@ def test_real_order_signer_returns_only_the_strict_public_envelope_result() -> N
     assert response.result.envelope.intent_id == _intent().intent_id
     assert response.result.envelope.public_signature.startswith("0x")
     assert PRIVATE_KEY.hex() not in response.model_dump_json()
+    service.close()
+
+
+def test_signer_rejects_a_valid_grant_signed_by_another_issuer_before_authority_factory() -> None:
+    authority_calls: list[UUID] = []
+    service = _service(authority_calls=authority_calls)
+    proof = OTHER_ISSUER.proof(DEFAULT_GRANT)
+
+    response = service.handle(
+        _action_request(
+            ExecutionOperation.SUBMIT_ORDER,
+            authority_proof=proof,
+        )
+    )
+
+    assert response.error_code == "CAPABILITY_SIGNATURE_INVALID"
+    assert authority_calls == []
+    service.close()
+
+
+def test_signer_consumes_a_primary_submission_before_handler_dispatch() -> None:
+    handler_calls = 0
+
+    def fail_submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        raise RuntimeError("HANDLER_FAILURE_MUST_NOT_RELEASE_AUTHORITY")
+
+    service = _service(handlers=_handlers(submit_order=fail_submit))
+    plan_id = UUID("11111111-1111-4111-8111-111111111119")
+    first = _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=plan_id)
+    replay = _action_request(
+        ExecutionOperation.SUBMIT_ORDER,
+        plan_id=plan_id,
+    )
+
+    assert service.handle(first).error_code == "HANDLER_FAILED"
+    assert service.handle(replay).error_code == "CAPABILITY_REPLAYED"
+    assert handler_calls == 1
+    service.close()
+
+
+def test_signed_kill_blocks_a_previously_valid_mutation_without_handler_dispatch() -> None:
+    handler_calls = 0
+
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        nonlocal handler_calls
+        del payload
+        handler_calls += 1
+        raise AssertionError("KILLED_SIGNER_MUST_NOT_DISPATCH")
+
+    service = _service(handlers=_handlers(submit_order=submit))
+    directive = ISSUER.kill_directive((DEFAULT_GRANT.capability_id,))
+    kill = _request(
+        ExecutionOperation.SIGNER_KILL,
+        request_id=uuid4(),
+        payload=SignerKillPayload(
+            operation=ExecutionOperation.SIGNER_KILL,
+            directive=directive,
+        ),
+    )
+
+    killed = service.handle(kill)
+    blocked = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER))
+
+    assert killed.ok is True
+    assert getattr(killed.result, "result_code", None) == "SIGNER_KILL_ENGAGED"
+    assert blocked.error_code == "PILOT_KILL_ENGAGED"
+    assert handler_calls == 0
+    service.close()
+
+
+def test_invalid_kill_directive_cannot_engage_or_clear_local_kill() -> None:
+    service = _service()
+    invalid = OTHER_ISSUER.kill_directive((DEFAULT_GRANT.capability_id,))
+    rejected = service.handle(
+        _request(
+            ExecutionOperation.SIGNER_KILL,
+            request_id=uuid4(),
+            payload=SignerKillPayload(
+                operation=ExecutionOperation.SIGNER_KILL,
+                directive=invalid,
+            ),
+        )
+    )
+
+    allowed = service.handle(_action_request(ExecutionOperation.SIGN_ORDER))
+    valid = ISSUER.kill_directive((DEFAULT_GRANT.capability_id,))
+    engaged = service.handle(
+        _request(
+            ExecutionOperation.SIGNER_KILL,
+            request_id=uuid4(),
+            payload=SignerKillPayload(
+                operation=ExecutionOperation.SIGNER_KILL,
+                directive=valid,
+            ),
+        )
+    )
+    rejected_after_kill = service.handle(
+        _request(
+            ExecutionOperation.SIGNER_KILL,
+            request_id=uuid4(),
+            payload=SignerKillPayload(
+                operation=ExecutionOperation.SIGNER_KILL,
+                directive=invalid,
+            ),
+        )
+    )
+    still_blocked = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER))
+
+    assert rejected.error_code == "CAPABILITY_SIGNATURE_INVALID"
+    assert allowed.ok is True
+    assert engaged.ok is True
+    assert rejected_after_kill.error_code == "CAPABILITY_SIGNATURE_INVALID"
+    assert still_blocked.error_code == "PILOT_KILL_ENGAGED"
+    service.close()
+
+
+def test_signer_binds_the_verified_grant_plan_hash_not_only_its_digest() -> None:
+    service = _service()
+    request = _action_request(ExecutionOperation.SUBMIT_ORDER)
+
+    response = service.handle(request.model_copy(update={"plan_digest": "f" * 64}))
+
+    assert response.error_code == "CAPABILITY_PLAN_MISMATCH"
+    service.close()
+
+
+@pytest.mark.parametrize(
+    ("grant", "operation", "request_updates", "error_code"),
+    (
+        (
+            _capability_grant(account_fingerprint="f" * 64),
+            ExecutionOperation.SUBMIT_ORDER,
+            {},
+            "CAPABILITY_ACCOUNT_MISMATCH",
+        ),
+        (
+            DEFAULT_GRANT,
+            ExecutionOperation.SUBMIT_ORDER,
+            {"manifest_digest": "f" * 64},
+            "CAPABILITY_MANIFEST_MISMATCH",
+        ),
+        (
+            _capability_grant(
+                venue_binding=DEFAULT_GRANT.venue_binding.model_copy(
+                    update={"protocol_fixture_hash": "f" * 64}
+                )
+            ),
+            ExecutionOperation.SUBMIT_ORDER,
+            {},
+            "CAPABILITY_PROTOCOL_MISMATCH",
+        ),
+        (
+            _capability_grant(allowed_operations=(ExecutionOperation.SIGN_ORDER,)),
+            ExecutionOperation.SUBMIT_ORDER,
+            {},
+            "CAPABILITY_OPERATION_NOT_ALLOWED",
+        ),
+        (
+            _capability_grant(not_before=NOW + timedelta(seconds=1)),
+            ExecutionOperation.SUBMIT_ORDER,
+            {},
+            "CAPABILITY_NOT_YET_VALID",
+        ),
+        (
+            _capability_grant(
+                expires_at=NOW + timedelta(seconds=2),
+                presence_deadline=NOW + timedelta(seconds=2),
+            ),
+            ExecutionOperation.SUBMIT_ORDER,
+            {},
+            "CAPABILITY_EXPIRED",
+        ),
+    ),
+    ids=("account", "manifest", "protocol", "operation", "not-before", "request-deadline"),
+)
+def test_signer_compares_signed_grant_bindings_before_authority_factory(
+    grant: CapabilityGrant,
+    operation: ExecutionOperation,
+    request_updates: dict[str, object],
+    error_code: str,
+) -> None:
+    authority_calls: list[UUID] = []
+    proof = ISSUER.proof(grant)
+    service = _service(authority_calls=authority_calls)
+    request = _action_request(operation, authority_proof=proof)
+
+    response = service.handle(request.model_copy(update=request_updates))
+
+    assert response.error_code == error_code
+    assert authority_calls == []
+    service.close()
+
+
+def test_complete_strategy_allows_sign_then_submit_and_distinct_plan_intents() -> None:
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code="SUBMIT_ORDER_OK",
+            evidence_hashes=(),
+            venue_order_id=str(payload.intent.intent_id),
+        )
+
+    service = _service(handlers=_handlers(submit_order=submit))
+    first_plan = UUID("22222222-2222-4222-8222-222222222221")
+    second_plan = UUID("22222222-2222-4222-8222-222222222222")
+
+    signed = service.handle(
+        _action_request(ExecutionOperation.SIGN_ORDER, plan_id=first_plan)
+    )
+    first = service.handle(
+        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan)
+    )
+    replay = service.handle(
+        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan)
+    )
+    second = service.handle(
+        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=second_plan)
+    )
+
+    assert signed.ok is True
+    assert first.ok is True
+    assert replay.error_code == "CAPABILITY_REPLAYED"
+    assert second.ok is True
+    service.close()
+
+
+def test_exact_order_capability_permits_only_one_intent() -> None:
+    grant = _capability_grant(mode=AuthorizationMode.EXACT_ORDER)
+    proof = ISSUER.proof(grant)
+    service = _service()
+    first_plan = UUID("33333333-3333-4333-8333-333333333331")
+    second_plan = UUID("33333333-3333-4333-8333-333333333332")
+
+    signed = service.handle(
+        _action_request(
+            ExecutionOperation.SIGN_ORDER,
+            plan_id=first_plan,
+            authority_proof=proof,
+        )
+    )
+    submitted = service.handle(
+        _action_request(
+            ExecutionOperation.SUBMIT_ORDER,
+            plan_id=first_plan,
+            authority_proof=proof,
+        )
+    )
+    denied = service.handle(
+        _action_request(
+            ExecutionOperation.SIGN_ORDER,
+            plan_id=second_plan,
+            authority_proof=proof,
+        )
+    )
+
+    assert signed.ok is True
+    assert submitted.ok is True
+    assert denied.error_code == "CAPABILITY_REPLAYED"
+    service.close()
+
+
+def test_automation_capability_is_rejected_before_authority_factory() -> None:
+    authority_calls: list[UUID] = []
+    grant = _capability_grant(
+        mode=AuthorizationMode.AUTOMATION_SESSION,
+        single_use=False,
+        session_id=UUID("44444444-4444-4444-8444-444444444444"),
+    )
+    service = _service(authority_calls=authority_calls)
+
+    response = service.handle(
+        _action_request(
+            ExecutionOperation.SUBMIT_ORDER,
+            authority_proof=ISSUER.proof(grant),
+        )
+    )
+
+    assert response.error_code == "CAPABILITY_MODE_MISMATCH"
+    assert authority_calls == []
+    service.close()
+
+
+def test_handler_result_requiring_kill_latches_local_signer_kill() -> None:
+    request_hash = "a" * 64
+    response_hash = "b" * 64
+
+    def submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
+        del payload
+        return SanitizedOperationResult(
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            result_code=RestCode.ORDER_ACK_DELAYED,
+            evidence_hashes=(request_hash, response_hash),
+            venue_order_id="order-delayed",
+            route=RouteKey.SUBMIT_ORDER,
+            observed_at=NOW,
+            raw_body_hash=response_hash,
+            request_body_hash=request_hash,
+            attempts=1,
+            recovery_required=True,
+            kill_required=True,
+            public_payload=OrderAckPayload(
+                kind="ORDER_ACK",
+                order_id="order-delayed",
+                status="delayed",
+                making_amount="1",
+                taking_amount="2",
+                transaction_hashes=(),
+                trade_ids=(),
+            ),
+        )
+
+    service = _service(handlers=_handlers(submit_order=submit))
+
+    result = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER))
+    blocked = service.handle(
+        _action_request(
+            ExecutionOperation.SIGN_ORDER,
+            plan_id=UUID("55555555-5555-4555-8555-555555555555"),
+        )
+    )
+
+    assert result.ok is True
+    assert blocked.error_code == "PILOT_KILL_ENGAGED"
     service.close()
 
 
@@ -1018,7 +1510,9 @@ def test_acknowledged_submit_binding_rejects_changed_intent_fingerprint(
     )
 
     assert submitted.ok is True
-    assert changed.error_code == "CANCEL_ORDER_BINDING_MISMATCH"
+    assert changed.error_code == (
+        "PILOT_KILL_ENGAGED" if requires_halt else "CANCEL_ORDER_BINDING_MISMATCH"
+    )
     assert cancel_calls == 0
     service.close()
 
@@ -1693,7 +2187,12 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
     private_key = configured["private_key"] if secret_name == "private_key" else PRIVATE_KEY
     maker = Account.from_key(private_key).address
     account_fingerprint = sha256(bytes.fromhex(maker[2:])).hexdigest()
-    intent = _intent(account_fingerprint=account_fingerprint)
+    grant = _capability_grant(account_fingerprint=account_fingerprint)
+    proof = ISSUER.proof(grant)
+    intent = _intent(
+        account_fingerprint=account_fingerprint,
+        capability_fingerprint=grant.digest,
+    )
     envelope = sign_order(intent, private_key, load_protocol_snapshot())
     canary = configured[secret_name]
 
@@ -1720,6 +2219,9 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
             request_id=uuid4(),
             intent_id=intent.intent_id,
             intent_fingerprint=intent.intent_fingerprint,
+            capability_digest=grant.digest,
+            plan_digest=grant.plan_hash,
+            authority_proof=proof,
             account_fingerprint=account_fingerprint,
             payload=SubmitOrderPayload(
                 operation=ExecutionOperation.SUBMIT_ORDER,
@@ -1734,6 +2236,9 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
             request_id=uuid4(),
             intent_id=intent.intent_id,
             intent_fingerprint=intent.intent_fingerprint,
+            capability_digest=grant.digest,
+            plan_digest=grant.plan_hash,
+            authority_proof=proof,
             account_fingerprint=account_fingerprint,
             payload=CancelOrderPayload(
                 operation=ExecutionOperation.CANCEL_ORDER,
@@ -1844,6 +2349,7 @@ def test_authority_factory_failure_is_sanitized_without_dispatch(
         read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
         handlers=_handlers(cancel_order=cancel),
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     response = service.handle(_request(ExecutionOperation.CANCEL_ORDER))
@@ -1867,6 +2373,7 @@ def test_malformed_authority_context_is_sanitized_without_dispatch() -> None:
         read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
         handlers=_handlers(),
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     response = service.handle(_request())
@@ -1900,6 +2407,7 @@ def test_read_guard_failure_uses_a_constant_code_without_dispatch() -> None:
         read_guard=fail_read_guard,
         handlers=_handlers(read_account=read_account),
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     response = service.handle(_request(ExecutionOperation.READ_ACCOUNT, request_id=uuid4()))
@@ -1924,6 +2432,7 @@ def test_service_close_zeroizes_owned_secret_buffers_and_refuses_uncached_work()
         read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
         handlers=_handlers(),
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     service.close()
@@ -1962,6 +2471,7 @@ def test_service_close_closes_handler_owner_before_zeroizing_secrets() -> None:
         read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
         handlers=handlers,
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     service.close()
@@ -1998,6 +2508,7 @@ def test_service_close_contains_handler_close_failure_and_zeroizes_secrets() -> 
         read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
         handlers=handlers,
         clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
     )
 
     service.close()

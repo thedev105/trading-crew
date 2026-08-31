@@ -20,6 +20,7 @@ from eth_account import Account
 from polytrading.predictions.execution.authority import (
     AuthorityContext,
     AuthorityDecision,
+    VerifiedExecutionCapability,
     verify_mutation_authority,
 )
 from polytrading.predictions.execution.models import (
@@ -27,6 +28,12 @@ from polytrading.predictions.execution.models import (
     ExecutionOperation,
     canonical_execution_hash,
 )
+from polytrading.predictions.pilot.capabilities import (
+    SignedCapability,
+    verify_capability_signature,
+    verify_kill_directive,
+)
+from polytrading.predictions.pilot.verifier import verified_capability_from_grant
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
@@ -39,6 +46,8 @@ from polytrading.predictions.polymarket_execution.ipc import (
     SanitizedOperationResult,
     SignedEnvelopeResult,
     SignerErrorCode,
+    SignerKillPayload,
+    SignerKillResult,
     SignerProtocolError,
     SignerRequest,
     SignerResponse,
@@ -167,11 +176,17 @@ class SignerService:
     __slots__ = (
         "_authority_context_factory",
         "_cache",
+        "_capability_public_key",
         "_clock",
         "_closed",
+        "_consumed_primary_capabilities",
+        "_consumed_primary_submissions",
+        "_exact_order_primary_intents",
         "_handlers",
+        "_kill_engaged",
         "_lock",
         "_max_cache_entries",
+        "_protocol_fixture_hash",
         "_read_guard",
         "_secrets",
         "_snapshot",
@@ -186,6 +201,7 @@ class SignerService:
         read_guard: ReadGuard,
         handlers: SignerOperationHandlers,
         clock: Callable[[], datetime],
+        capability_public_key: bytes = b"",
         max_cache_entries: int = 1024,
         snapshot: PolymarketProtocolSnapshot | None = None,
     ) -> None:
@@ -193,16 +209,31 @@ class SignerService:
             raise TypeError("SECRET_MATERIAL_REQUIRED")
         if type(max_cache_entries) is not int or not 1 <= max_cache_entries <= 10_000:
             raise ValueError("IPC_REPLAY_CACHE_SIZE_INVALID")
+        if type(capability_public_key) is not bytes or len(capability_public_key) not in (0, 32):
+            raise ValueError("CAPABILITY_PUBLIC_KEY_INVALID")
         self._secrets = secrets
         self._authority_context_factory = authority_context_factory
+        self._capability_public_key = capability_public_key
         self._read_guard = read_guard
         self._handlers = handlers
         self._lock = Lock()
         self._clock = clock
         self._max_cache_entries = max_cache_entries
         self._snapshot = snapshot or load_protocol_snapshot()
+        self._protocol_fixture_hash = canonical_execution_hash(
+            {
+                "version": self._snapshot.version,
+                "fixtures": [
+                    item.model_dump(mode="json") for item in self._snapshot.fixture_hashes
+                ],
+            }
+        )
         self._cache: dict[UUID, _ReplayEntry] = {}
         self._venue_order_bindings: dict[str, _VenueOrderBinding] = {}
+        self._consumed_primary_capabilities: set[UUID] = set()
+        self._consumed_primary_submissions: set[tuple[UUID, UUID]] = set()
+        self._exact_order_primary_intents: dict[UUID, UUID] = {}
+        self._kill_engaged = False
         self._closed = False
 
     def close(self) -> None:
@@ -323,11 +354,18 @@ class SignerService:
             return SignerResponse.rejected(request.request_id, "PROTOCOL_VERSION_MISMATCH")
         if request.operation is ExecutionOperation.DESCRIBE_IDENTITY:
             return self._describe_identity(request)
+        if request.operation is ExecutionOperation.SIGNER_KILL:
+            return self._engage_kill(request)
         if not self._secret_account_matches(request.account_fingerprint):
             return SignerResponse.rejected(request.request_id, "ACCOUNT_FINGERPRINT_MISMATCH")
 
         if request.operation in _MUTATING_OPERATIONS:
-            decision = self._verify_mutation(request, now)
+            if self._kill_engaged:
+                return SignerResponse.rejected(request.request_id, "PILOT_KILL_ENGAGED")
+            verified = self._verify_proof(request, now)
+            if isinstance(verified, str):
+                return SignerResponse.rejected(request.request_id, verified)
+            decision = self._verify_mutation(request, now, verified)
         elif request.operation in _READ_OPERATIONS:
             decision = self._verify_read(request, now)
         else:
@@ -339,7 +377,30 @@ class SignerService:
                 request.request_id,
                 decision.reason or "AUTHORITY_GATE_FAILED",
             )
+        if request.operation in _MUTATING_OPERATIONS:
+            assert isinstance(verified, VerifiedExecutionCapability)
+            replay = self._consume_primary_authority(request, verified)
+            if replay is not None:
+                return SignerResponse.rejected(request.request_id, replay)
         return self._dispatch(request)
+
+    def _engage_kill(self, request: SignerRequest) -> SignerResponse:
+        if not isinstance(request.payload, SignerKillPayload) or not verify_kill_directive(
+            request.payload.directive,
+            self._capability_public_key,
+        ):
+            return SignerResponse.rejected(
+                request.request_id,
+                "CAPABILITY_SIGNATURE_INVALID",
+            )
+        self._kill_engaged = True
+        return SignerResponse.accepted(
+            request.request_id,
+            SignerKillResult(
+                operation=ExecutionOperation.SIGNER_KILL,
+                result_code="SIGNER_KILL_ENGAGED",
+            ),
+        )
 
     def _describe_identity(self, request: SignerRequest) -> SignerResponse:
         private_key: bytes | None = None
@@ -376,6 +437,7 @@ class SignerService:
         self,
         request: SignerRequest,
         now: datetime,
+        verified_capability: VerifiedExecutionCapability,
     ) -> AuthorityDecision | SignerErrorCode:
         try:
             context = self._authority_context_factory(request, now)
@@ -383,7 +445,8 @@ class SignerService:
                 return context
             if type(context) is not AuthorityContext:
                 return "AUTHORITY_GATE_FAILED"
-            capability = context.verified_capability
+            context = context.model_copy(update={"verified_capability": verified_capability})
+            capability = verified_capability
             manifest_hash = (
                 canonical_execution_hash(context.manifest) if context.manifest is not None else None
             )
@@ -401,6 +464,77 @@ class SignerService:
             return verify_mutation_authority(context, request.operation)
         except Exception:
             return "AUTHORITY_GATE_FAILED"
+
+    def _verify_proof(
+        self,
+        request: SignerRequest,
+        now: datetime,
+    ) -> VerifiedExecutionCapability | SignerErrorCode:
+        proof = request.authority_proof
+        if proof is None:
+            return "CAPABILITY_MISSING"
+        if not self._capability_public_key:
+            return "EXECUTION_UNAVAILABLE"
+        grant = proof.grant
+        capability = SignedCapability(
+            grant=grant,
+            signature=bytes(proof.signature),
+            public_verification_key=self._capability_public_key,
+        )
+        if not verify_capability_signature(capability, self._capability_public_key):
+            return "CAPABILITY_SIGNATURE_INVALID"
+        if not hmac.compare_digest(grant.digest, request.capability_digest):
+            return "CAPABILITY_CANONICAL_BYTES_INVALID"
+        if not hmac.compare_digest(grant.account_fingerprint, request.account_fingerprint):
+            return "CAPABILITY_ACCOUNT_MISMATCH"
+        if not hmac.compare_digest(
+            grant.venue_binding.manifest_record_hash,
+            request.manifest_digest,
+        ):
+            return "CAPABILITY_MANIFEST_MISMATCH"
+        if not hmac.compare_digest(
+            grant.venue_binding.protocol_fixture_hash,
+            self._protocol_fixture_hash,
+        ):
+            return "CAPABILITY_PROTOCOL_MISMATCH"
+        if not hmac.compare_digest(grant.plan_hash, request.plan_digest):
+            return "CAPABILITY_PLAN_MISMATCH"
+        if request.operation not in grant.allowed_operations:
+            return "CAPABILITY_OPERATION_NOT_ALLOWED"
+        if grant.mode.value == "AUTOMATION_SESSION":
+            return "CAPABILITY_MODE_MISMATCH"
+        if now < grant.not_before:
+            return "CAPABILITY_NOT_YET_VALID"
+        if now >= grant.expires_at or request.deadline > grant.expires_at:
+            return "CAPABILITY_EXPIRED"
+        if now > grant.presence_deadline or request.deadline > grant.presence_deadline:
+            return "OPERATOR_PRESENCE_LOST"
+        try:
+            return verified_capability_from_grant(grant, verified_at=now)
+        except Exception:
+            return "CAPABILITY_CANONICAL_BYTES_INVALID"
+
+    def _consume_primary_authority(
+        self,
+        request: SignerRequest,
+        capability: VerifiedExecutionCapability,
+    ) -> SignerErrorCode | None:
+        if capability.grant_kind != "PRIMARY" or capability.single_use is not True:
+            return None
+        capability_id = capability.capability_id
+        intent_id = request.intent_id
+        if capability.mode == "EXACT_ORDER":
+            existing_intent = self._exact_order_primary_intents.get(capability_id)
+            if existing_intent is not None and existing_intent != intent_id:
+                return "CAPABILITY_REPLAYED"
+            self._exact_order_primary_intents.setdefault(capability_id, intent_id)
+        if request.operation is ExecutionOperation.SUBMIT_ORDER:
+            submission = (capability_id, intent_id)
+            if submission in self._consumed_primary_submissions:
+                return "CAPABILITY_REPLAYED"
+            self._consumed_primary_submissions.add(submission)
+        self._consumed_primary_capabilities.add(capability_id)
+        return None
 
     def _verify_read(
         self,
@@ -485,6 +619,8 @@ class SignerService:
                         request.request_id,
                         "IPC_OPERATION_RESULT_INVALID",
                     )
+                if result.kill_required is True:
+                    self._kill_engaged = True
             return SignerResponse.accepted(request.request_id, result)
         except OrderSigningError:
             return SignerResponse.rejected(request.request_id, "ORDER_SIGNING_FAILED")

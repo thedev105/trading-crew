@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "0c6ab005997c5f74856a9b9a4785e7abea0c5d80526b844df9dac40134961145",
+    ): "50a0ab53c1634e73a514c0737955ea5b6a8bdfa2c51e8ab7cce47ff030f92e51",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "62b0842e418cf9f335e23981743576a5637fc080c9554bc0e3aa7d445c75fe28",
+    ): "8bb22bc24df93ad1b6c395af140529779ab91b443bedf70e468ff320519f35b6",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
@@ -949,10 +949,14 @@ def _fetch_options_are_exact(options: str) -> tuple[bool, bool]:
 # clearance. Every other scanned surface -- the observer dashboard, the execution coordinator, and
 # the signer -- stays free of both.
 _PILOT_AUTHORITY_PREFIX = "pilot/"
-# The one reviewed adapter allowed to project a verified pilot grant into the authority layer's
-# sanitized capability. Every other module still may not name or construct that type.
+# The reviewed adapter and signer boundary may project a verified pilot grant into the authority
+# layer's sanitized capability. Every other module still may not name or construct that type.
 _CAPABILITY_PROJECTION_PATHS = frozenset(
-    {Path("execution/authority.py"), Path("pilot/verifier.py")}
+    {
+        Path("execution/authority.py"),
+        Path("pilot/verifier.py"),
+        Path("polymarket_execution/signer.py"),
+    }
 )
 # The one reviewed module allowed to start the signer sidecar, and only in a forked child after
 # the operator has unlocked the keychain. Nothing else may reach that entry point.
@@ -1957,7 +1961,11 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
             heartbeat_id="",
         ),
     )
-    decision = signer._verify_mutation(request, NOW)
+    decision = signer._verify_mutation(
+        request,
+        NOW,
+        verified_capability(capability_digest=request.capability_digest),
+    )
     assert not isinstance(decision, str)
     assert decision.allowed
     assert [source for source, _context in contexts] == ["coordinator", "signer"]

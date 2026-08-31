@@ -94,6 +94,8 @@ SignerErrorCode = Literal[
     "ACCOUNT_FINGERPRINT_MISMATCH",
     "AUTHORITY_CONTEXT_TIME_MISMATCH",
     "AUTHORITY_GATE_FAILED",
+    "CAPABILITY_REPLAYED",
+    "PILOT_KILL_ENGAGED",
     "READ_GUARD_FAILED",
     "ORDER_ENVELOPE_MISMATCH",
     "CANCEL_ORDER_UNKNOWN",
@@ -331,6 +333,7 @@ class SignerRequest(_SignerRecord):
     intent_id: UUID
     intent_fingerprint: Sha256
     capability_digest: Sha256
+    plan_digest: Sha256 = "0" * 64
     authority_proof: SignerCapabilityProof | None = None
     manifest_digest: Sha256
     account_fingerprint: Sha256
@@ -396,6 +399,11 @@ class SignerRequest(_SignerRecord):
 class SignedEnvelopeResult(_SignerRecord):
     operation: Literal[ExecutionOperation.SIGN_ORDER]
     envelope: SignedOrderEnvelope
+
+
+class SignerKillResult(_SignerRecord):
+    operation: Literal[ExecutionOperation.SIGNER_KILL]
+    result_code: Literal["SIGNER_KILL_ENGAGED"]
 
 
 class IdentityResult(_SignerRecord):
@@ -601,7 +609,7 @@ class SanitizedOperationResult(_SignerRecord):
 
 
 SignerResult = Annotated[
-    IdentityResult | SignedEnvelopeResult | SanitizedOperationResult,
+    IdentityResult | SignerKillResult | SignedEnvelopeResult | SanitizedOperationResult,
     Field(discriminator="operation"),
 ]
 
@@ -820,6 +828,7 @@ __all__ = [
     "SignerCapabilityProof",
     "SignerErrorCode",
     "SignerKillPayload",
+    "SignerKillResult",
     "SignerProtocolError",
     "SignerRequest",
     "SignerResponse",
