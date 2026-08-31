@@ -155,10 +155,10 @@ class SignerLinkVenuePort:
             intent_id=intent.intent_id if intent is not None else uuid4(),
             intent_fingerprint=intent.intent_fingerprint if intent is not None else "0" * 64,
             capability_digest=(
-                authority_proof.grant.digest if authority_proof is not None else "0" * 64
+                intent.capability_fingerprint if intent is not None else "0" * 64
             ),
-            plan_digest=(
-                authority_proof.grant.plan_hash if authority_proof is not None else "0" * 64
+            authority_digest=(
+                authority_proof.grant.digest if authority_proof is not None else "0" * 64
             ),
             authority_proof=authority_proof,
             manifest_digest=self._manifest_digest,
@@ -236,6 +236,7 @@ def describe_identity(
         intent_id=uuid4(),
         intent_fingerprint="0" * 64,
         capability_digest="0" * 64,
+        authority_digest="0" * 64,
         manifest_digest="0" * 64,
         account_fingerprint="0" * 64,
         protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,

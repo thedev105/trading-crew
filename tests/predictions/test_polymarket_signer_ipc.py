@@ -337,7 +337,7 @@ def _intent(**overrides: object) -> ExecutionIntent:
         **execution_intent_fields(
             **{
                 "account_fingerprint": ACCOUNT_FINGERPRINT,
-                "capability_fingerprint": CAPABILITY_DIGEST,
+                "capability_fingerprint": DEFAULT_GRANT.plan_hash,
                 **overrides,
             }
         )
@@ -392,23 +392,23 @@ def _request(
 ) -> SignerRequest:
     intent = _intent()
     payload = overrides.pop("payload", None)
+    proof_free_operations = {
+        ExecutionOperation.DESCRIBE_IDENTITY,
+        ExecutionOperation.SIGNER_KILL,
+        ExecutionOperation.READ_ORDERS,
+        ExecutionOperation.READ_TRADES,
+        ExecutionOperation.READ_ACCOUNT,
+    }
     fields: dict[str, object] = {
         "schema_version": 1,
         "request_id": UUID("11111111-1111-4111-8111-111111111111"),
         "intent_id": intent.intent_id,
         "intent_fingerprint": intent.intent_fingerprint,
-        "capability_digest": CAPABILITY_DIGEST,
-        "plan_digest": DEFAULT_GRANT.plan_hash,
+        "capability_digest": DEFAULT_GRANT.plan_hash,
+        "authority_digest": "0" * 64 if operation in proof_free_operations else CAPABILITY_DIGEST,
         "authority_proof": (
             None
-            if operation
-            in {
-                ExecutionOperation.DESCRIBE_IDENTITY,
-                ExecutionOperation.SIGNER_KILL,
-                ExecutionOperation.READ_ORDERS,
-                ExecutionOperation.READ_TRADES,
-                ExecutionOperation.READ_ACCOUNT,
-            }
+            if operation in proof_free_operations
             else _authority_proof()
         ),
         "manifest_digest": MANIFEST_HASH,
@@ -430,7 +430,7 @@ def _action_request(
     authority_proof: SignerCapabilityProof | None = None,
 ) -> SignerRequest:
     proof = authority_proof or _authority_proof()
-    intent_overrides: dict[str, object] = {"capability_fingerprint": proof.grant.digest}
+    intent_overrides: dict[str, object] = {"capability_fingerprint": proof.grant.plan_hash}
     if plan_id is not None:
         intent_overrides["plan_id"] = plan_id
     intent = _intent(**intent_overrides)
@@ -449,8 +449,8 @@ def _action_request(
         request_id=request_id or uuid4(),
         intent_id=intent.intent_id,
         intent_fingerprint=intent.intent_fingerprint,
-        capability_digest=proof.grant.digest,
-        plan_digest=proof.grant.plan_hash,
+        capability_digest=proof.grant.plan_hash,
+        authority_digest=proof.grant.digest,
         authority_proof=proof,
         payload=payload,
     )
@@ -575,7 +575,7 @@ def _service(
             session_id=grant.session_id,
             requested_limits_hash=grant.requested_limits_hash,
             ceiling_hash=grant.ceiling_hash,
-            plan_hash=request.plan_digest,
+            plan_hash=request.capability_digest,
             strategy_hash=grant.strategy_hash,
             proof_family_hash=grant.proof_family_hash,
             recovery_policy_hash=grant.recovery_policy_hash,
@@ -677,7 +677,7 @@ def _child_service_factory(
             session_id=grant.session_id,
             requested_limits_hash=grant.requested_limits_hash,
             ceiling_hash=grant.ceiling_hash,
-            plan_hash=request.plan_digest,
+            plan_hash=request.capability_digest,
             strategy_hash=grant.strategy_hash,
             proof_family_hash=grant.proof_family_hash,
             recovery_policy_hash=grant.recovery_policy_hash,
@@ -841,7 +841,7 @@ def test_request_and_response_have_exact_strict_public_field_allowlists() -> Non
         "intent_id",
         "intent_fingerprint",
         "capability_digest",
-        "plan_digest",
+        "authority_digest",
         "authority_proof",
         "manifest_digest",
         "account_fingerprint",
@@ -1103,9 +1103,9 @@ def test_invalid_kill_directive_cannot_engage_or_clear_local_kill() -> None:
 
 def test_signer_binds_the_verified_grant_plan_hash_not_only_its_digest() -> None:
     service = _service()
-    request = _action_request(ExecutionOperation.SUBMIT_ORDER)
+    request = _request(ExecutionOperation.CANCEL_ORDER, capability_digest="f" * 64)
 
-    response = service.handle(request.model_copy(update={"plan_digest": "f" * 64}))
+    response = service.handle(request)
 
     assert response.error_code == "CAPABILITY_PLAN_MISMATCH"
     service.close()
@@ -2191,7 +2191,7 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
     proof = ISSUER.proof(grant)
     intent = _intent(
         account_fingerprint=account_fingerprint,
-        capability_fingerprint=grant.digest,
+        capability_fingerprint=grant.plan_hash,
     )
     envelope = sign_order(intent, private_key, load_protocol_snapshot())
     canary = configured[secret_name]
@@ -2219,8 +2219,8 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
             request_id=uuid4(),
             intent_id=intent.intent_id,
             intent_fingerprint=intent.intent_fingerprint,
-            capability_digest=grant.digest,
-            plan_digest=grant.plan_hash,
+            capability_digest=grant.plan_hash,
+            authority_digest=grant.digest,
             authority_proof=proof,
             account_fingerprint=account_fingerprint,
             payload=SubmitOrderPayload(
@@ -2236,8 +2236,8 @@ def test_owned_secret_in_valid_handler_result_is_sanitized_before_binding(
             request_id=uuid4(),
             intent_id=intent.intent_id,
             intent_fingerprint=intent.intent_fingerprint,
-            capability_digest=grant.digest,
-            plan_digest=grant.plan_hash,
+            capability_digest=grant.plan_hash,
+            authority_digest=grant.digest,
             authority_proof=proof,
             account_fingerprint=account_fingerprint,
             payload=CancelOrderPayload(

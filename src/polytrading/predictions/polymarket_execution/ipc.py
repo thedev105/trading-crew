@@ -333,7 +333,7 @@ class SignerRequest(_SignerRecord):
     intent_id: UUID
     intent_fingerprint: Sha256
     capability_digest: Sha256
-    plan_digest: Sha256 = "0" * 64
+    authority_digest: Sha256
     authority_proof: SignerCapabilityProof | None = None
     manifest_digest: Sha256
     account_fingerprint: Sha256
@@ -363,11 +363,11 @@ class SignerRequest(_SignerRecord):
             }
         )
         if self.operation in proof_free_operations:
-            if self.authority_proof is not None:
+            if self.authority_proof is not None or self.authority_digest != "0" * 64:
                 raise ValueError("this operation must not carry an authority proof")
         elif self.authority_proof is None:
             raise ValueError("mutating operations require an authority proof")
-        elif self.authority_proof.grant.digest != self.capability_digest:
+        elif self.authority_proof.grant.digest != self.authority_digest:
             raise ValueError("authority proof does not match capability digest")
         if isinstance(self.payload, SignOrderPayload):
             intent = self.payload.intent

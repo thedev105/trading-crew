@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "50a0ab53c1634e73a514c0737955ea5b6a8bdfa2c51e8ab7cce47ff030f92e51",
+    ): "75a8924093123463a9833a79e54f1ccefa12121b1d78d7c1a2c85f327183a73a",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "1bf51d12a8a1c4c76cb561804531c312a42b3ec7fa543467d5f36fd683d8e15b",
+    ): "368d2950ad4367a8c26c393f174e872f655df9b49c98f9da3937d111975255c5",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
@@ -2053,7 +2053,7 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
             account_fingerprint=request.account_fingerprint,
             account_scope_account_fingerprint=request.account_fingerprint,
             manifest_record_hash=request.manifest_digest,
-            verified_capability=verified_capability(capability_digest=request.capability_digest),
+            verified_capability=verified_capability(capability_digest=request.authority_digest),
         )
         contexts.append(("signer", context))
         return context
@@ -2086,7 +2086,8 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
         request_id=UUID("11111111-1111-4111-8111-111111111111"),
         intent_id=intent.intent_id,
         intent_fingerprint=intent.intent_fingerprint,
-        capability_digest=grant.digest,
+        capability_digest=grant.plan_hash,
+        authority_digest=grant.digest,
         authority_proof={
             "grant": grant,
             "signature": b"cHVibGljLXNpZ25hdHVyZQ==",
@@ -2104,7 +2105,7 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
     decision = signer._verify_mutation(
         request,
         NOW,
-        verified_capability(capability_digest=request.capability_digest),
+        verified_capability(capability_digest=request.authority_digest),
     )
     assert not isinstance(decision, str)
     assert decision.allowed

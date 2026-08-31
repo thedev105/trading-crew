@@ -40,7 +40,7 @@ def _request(
     intent = ExecutionIntent(
         **execution_intent_fields(
             account_fingerprint=ACCOUNT_FINGERPRINT,
-            capability_fingerprint=grant.digest,
+            capability_fingerprint=grant.plan_hash,
             created_at=now,
             deadline=now + timedelta(seconds=10),
             protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -69,7 +69,12 @@ def _request(
         ),
         intent_id=intent.intent_id,
         intent_fingerprint=intent.intent_fingerprint,
-        capability_digest=grant.digest,
+        capability_digest=grant.plan_hash,
+        authority_digest=(
+            "0" * 64
+            if operation in {ExecutionOperation.DESCRIBE_IDENTITY, ExecutionOperation.READ_ACCOUNT}
+            else grant.digest
+        ),
         authority_proof=(
             None
             if operation in {ExecutionOperation.DESCRIBE_IDENTITY, ExecutionOperation.READ_ACCOUNT}

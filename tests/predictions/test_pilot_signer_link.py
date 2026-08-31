@@ -20,7 +20,9 @@ from polytrading.predictions.execution.models import (
     deterministic_intent_id,
 )
 from polytrading.predictions.pilot.capabilities import SignerKillDirective
-from polytrading.predictions.pilot.selector import PilotAccountState
+from polytrading.predictions.pilot.execution_port import CoordinatorExecutionPort
+from polytrading.predictions.pilot.models import PILOT_CEILINGS
+from polytrading.predictions.pilot.selector import FrozenPilotPlan, PilotAccountState, PilotLeg
 from polytrading.predictions.pilot.signer_link import (
     SignerLinkError,
     SignerLinkVenuePort,
@@ -313,7 +315,7 @@ def _envelope(target: ExecutionIntent) -> Any:
 
 def test_a_submission_speaks_the_signer_protocol_under_the_pilot_checkpoint() -> None:
     channel = FakeSignerChannel()
-    target = intent(capability_fingerprint=SIGNER_PROOF.grant.digest)
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash)
 
     outcome = port(channel).submit(target, CAPABILITY_ID)
 
@@ -331,7 +333,7 @@ def test_a_cancellation_uses_the_cancel_operation() -> None:
     channel = FakeSignerChannel()
 
     outcome = port(channel).cancel(
-        intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+        intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash), CAPABILITY_ID
     )
 
     assert channel.requests[0].operation.value == "CANCEL_ORDER"
@@ -351,7 +353,7 @@ def test_every_venue_answer_maps_to_one_lifecycle_state(code: RestCode, state: s
     channel = FakeSignerChannel(codes=[code])
 
     outcome = port(channel).submit(
-        intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+        intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash), CAPABILITY_ID
     )
 
     assert outcome.state == state
@@ -364,7 +366,7 @@ def test_a_refused_request_raises_the_signers_own_code() -> None:
 
     with pytest.raises(SignerLinkError) as raised:
         port(channel).submit(
-            intent(capability_fingerprint=SIGNER_PROOF.grant.digest), CAPABILITY_ID
+            intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash), CAPABILITY_ID
         )
 
     assert raised.value.code == "EXECUTION_KILL_ENGAGED"
@@ -419,15 +421,68 @@ def test_no_tracked_token_means_no_claimed_position() -> None:
 
 def test_submit_serializes_the_matching_public_proof() -> None:
     channel = FakeSignerChannel()
-    target = intent(capability_fingerprint=SIGNER_PROOF.grant.digest)
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash)
 
     port(channel).submit(target, CAPABILITY_ID)
 
     request = channel.requests[0]
     assert request.authority_proof is not None
     assert request.authority_proof.grant.capability_id == CAPABILITY_ID
-    assert request.capability_digest == SIGNER_PROOF.grant.digest
-    assert request.plan_digest == SIGNER_PROOF.grant.plan_hash
+    assert request.capability_digest == target.capability_fingerprint
+    assert request.authority_digest == SIGNER_PROOF.grant.digest
+
+
+def test_submit_serializes_a_coordinator_intent_under_its_matching_grant() -> None:
+    frozen = FrozenPilotPlan.model_validate(
+        {
+            "schema_version": 1,
+            "proof_id": UUID("00000000-0000-0000-0000-000000006001"),
+            "proposal_id": UUID("70000000-0000-0000-0000-000000000001"),
+            "account_fingerprint": ACCOUNT_FINGERPRINT,
+            "wallet_fingerprint": WALLET_FINGERPRINT,
+            "legs": (
+                PilotLeg(
+                    leg_index=0,
+                    outcome_token_id="217426",
+                    side="buy",
+                    limit_price=Decimal("0.40"),
+                    size=Decimal("10"),
+                    order_type=ImmediateOrderType.FAK,
+                ),
+            ),
+            "recovery_branches": (),
+            "gross_notional_usd": Decimal("4"),
+            "deployed_capital_usd": Decimal("4"),
+            "worst_case_incomplete_loss_usd": Decimal("0"),
+            "effective_limits": PILOT_CEILINGS,
+            "evidence_hashes": ("e" * 64,),
+            "deadline": NOW + timedelta(seconds=30),
+            "information_cutoff": NOW,
+        },
+        strict=True,
+    )
+    coordinator = CoordinatorExecutionPort(
+        store=object(),  # type: ignore[arg-type]
+        signer=object(),  # type: ignore[arg-type]
+        verifier=object(),  # type: ignore[arg-type]
+        grants={},
+        evidence=lambda: object(),  # type: ignore[return-value]
+        clock=lambda: NOW,
+    )
+    target = coordinator._intent_for(frozen, frozen.legs[0])
+    proof = SIGNER_PROOF.model_copy(
+        update={"grant": SIGNER_PROOF.grant.model_copy(update={"plan_hash": frozen.plan_hash})}
+    )
+    channel = FakeSignerChannel()
+
+    port(channel, proof_for=lambda capability_id: {CAPABILITY_ID: proof}[capability_id]).submit(
+        target, CAPABILITY_ID
+    )
+
+    request = channel.requests[0]
+    assert request.capability_digest == target.capability_fingerprint
+    assert request.authority_digest == proof.grant.digest
+    assert request.authority_proof == proof
 
 
 def test_engage_kill_sends_only_a_signed_kill_payload() -> None:

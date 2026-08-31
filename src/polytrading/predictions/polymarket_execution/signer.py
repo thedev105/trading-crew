@@ -459,7 +459,7 @@ class SignerService:
                 or manifest_hash != request.manifest_digest
             ):
                 return AuthorityDecision(False, "CAPABILITY_MANIFEST_MISMATCH", ())
-            if capability is None or capability.capability_digest != request.capability_digest:
+            if capability is None or capability.capability_digest != request.authority_digest:
                 return AuthorityDecision(False, "CAPABILITY_CANONICAL_BYTES_INVALID", ())
             return verify_mutation_authority(context, request.operation)
         except Exception:
@@ -483,7 +483,7 @@ class SignerService:
         )
         if not verify_capability_signature(capability, self._capability_public_key):
             return "CAPABILITY_SIGNATURE_INVALID"
-        if not hmac.compare_digest(grant.digest, request.capability_digest):
+        if not hmac.compare_digest(grant.digest, request.authority_digest):
             return "CAPABILITY_CANONICAL_BYTES_INVALID"
         if not hmac.compare_digest(grant.account_fingerprint, request.account_fingerprint):
             return "CAPABILITY_ACCOUNT_MISMATCH"
@@ -497,7 +497,7 @@ class SignerService:
             self._protocol_fixture_hash,
         ):
             return "CAPABILITY_PROTOCOL_MISMATCH"
-        if not hmac.compare_digest(grant.plan_hash, request.plan_digest):
+        if not hmac.compare_digest(grant.plan_hash, request.capability_digest):
             return "CAPABILITY_PLAN_MISMATCH"
         if request.operation not in grant.allowed_operations:
             return "CAPABILITY_OPERATION_NOT_ALLOWED"

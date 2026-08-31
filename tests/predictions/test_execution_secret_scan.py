@@ -372,10 +372,10 @@ def test_runtime_canaries_never_cross_any_public_observable(
             account_scope_evidence_hash=HASHES[11],
             verified_capability=verified_capability(
                 account_fingerprint=request.account_fingerprint,
-                capability_digest=request.capability_digest,
+                capability_digest=request.authority_digest,
             ),
             evidence_hashes=tuple(
-                sorted((HASHES[2], request.capability_digest, HASHES[9], HASHES[11]))
+                sorted((HASHES[2], request.authority_digest, HASHES[9], HASHES[11]))
             ),
         ),
         read_guard=read_guard,
@@ -418,6 +418,7 @@ def test_runtime_canaries_never_cross_any_public_observable(
         intent_id=submit_request.intent.intent_id,
         intent_fingerprint=submit_request.intent.intent_fingerprint,
         capability_digest=submit_request.intent.capability_fingerprint,
+        authority_digest=grant.digest,
         authority_proof=SignerCapabilityProof(
             grant=grant,
             signature=b"cHVibGljLXNpZ25hdHVyZQ==",
@@ -435,7 +436,7 @@ def test_runtime_canaries_never_cross_any_public_observable(
     )
     mutation_response = signer.handle(mutation_request)
     mutation_response, mutation_bytes = signer._sanitized_response_bytes(mutation_response)
-    assert mutation_response.error_code == "HANDLER_FAILED"
+    assert mutation_response.error_code == "EXECUTION_UNAVAILABLE"
     observables.extend(
         (
             mutation_response,
@@ -452,6 +453,7 @@ def test_runtime_canaries_never_cross_any_public_observable(
             intent_id=UUID("22222222-2222-4222-8222-222222222222"),
             intent_fingerprint="1" * 64,
             capability_digest="2" * 64,
+            authority_digest="0" * 64,
             manifest_digest="3" * 64,
             account_fingerprint=submit_request.intent.account_fingerprint,
             protocol_version="polymarket-clob-2026-08-25-v1",
