@@ -16,6 +16,7 @@ from typing import Annotated, Literal
 from pydantic import Field, model_validator
 
 from polytrading.predictions.domain import Sha256
+from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.pilot.models import (
     LossStatus,
     PilotLimits,
@@ -43,12 +44,13 @@ BlockerCode = Literal[
     "CREDENTIALS_MISSING",
     "RECONCILIATION_INCOMPLETE",
 ]
+ManifestState = Literal["MISSING"] | AdapterImplementationState
 
 
 class PilotReadinessView(PilotRecord):
     kill_engaged: bool
     presence_state: PresenceState
-    manifest_state: Literal["MISSING", "LIVE_DISABLED", "LIVE_ELIGIBLE"]
+    manifest_state: ManifestState
     protocol_state: Literal["CURRENT", "PROTOCOL_REVIEW_REQUIRED"]
     protocol_version: str
     qualified_families: tuple[PilotProofFamily, ...]
@@ -161,10 +163,15 @@ def build_readiness_view(
         blockers.append("CREDENTIALS_MISSING")
     if not reconciliation_complete:
         blockers.append("RECONCILIATION_INCOMPLETE")
+    normalized_manifest_state: ManifestState = (
+        "MISSING"
+        if manifest_state == "MISSING"
+        else AdapterImplementationState(manifest_state)
+    )
     return PilotReadinessView(
         kill_engaged=kill_engaged,
         presence_state=presence_state,
-        manifest_state=manifest_state,  # type: ignore[arg-type]
+        manifest_state=normalized_manifest_state,
         protocol_state=protocol_state,  # type: ignore[arg-type]
         protocol_version=protocol_version,
         qualified_families=tuple(

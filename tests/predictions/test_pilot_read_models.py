@@ -186,6 +186,7 @@ def test_a_ready_pilot_reports_no_blockers() -> None:
     [
         ({"kill_engaged": True}, "KILL_ENGAGED"),
         ({"presence_state": PresenceState.TERMINAL}, "PRESENCE_LOST"),
+        ({"manifest_state": "READ_ONLY"}, "MANIFEST_NOT_ELIGIBLE"),
         ({"manifest_state": "LIVE_DISABLED"}, "MANIFEST_NOT_ELIGIBLE"),
         ({"protocol_state": "PROTOCOL_REVIEW_REQUIRED"}, "PROTOCOL_REVIEW_REQUIRED"),
         ({"qualifications": (qualification(qualified=False),)}, "QUALIFICATION_INCOMPLETE"),
