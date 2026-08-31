@@ -422,6 +422,40 @@ def test_a_handler_failure_never_reaches_the_browser() -> None:
     assert services.calls == []
 
 
+def test_terminal_diagnostics_record_only_safe_unexpected_failure_details() -> None:
+    class ExplodingServices(RecordingServices):
+        def readiness(self) -> dict[str, object]:
+            raise RuntimeError("wallet-private-key=super-secret")
+
+    diagnostics: list[str] = []
+    app = PilotApplication(ExplodingServices(), port=PORT, error_reporter=diagnostics.append)
+    response = authenticated(app, "GET", "/api/v1/pilot/readiness")
+
+    assert response.status is HTTPStatus.INTERNAL_SERVER_ERROR
+    assert _body(response) == {"error": "PILOT_REQUEST_FAILED"}
+    assert diagnostics == [
+        '{"error":"PILOT_REQUEST_FAILED","exception":"RuntimeError",'
+        '"method":"GET","route":"readiness","status":500,'
+        '"timestamp":"2026-08-29T12:00:00+00:00"}'
+    ]
+    assert "super-secret" not in diagnostics[0]
+    assert "wallet-private-key" not in diagnostics[0]
+
+
+def test_terminal_diagnostics_never_record_an_invalid_request_target() -> None:
+    diagnostics: list[str] = []
+    app = application(error_reporter=diagnostics.append)
+    response = app.respond(request("GET", "/api/v1/pilot/readiness?token=super-secret"))
+
+    assert response.status is HTTPStatus.BAD_REQUEST
+    assert _body(response) == {"error": "REQUEST_TARGET_INVALID"}
+    assert diagnostics == [
+        '{"error":"REQUEST_TARGET_INVALID","method":"GET","route":null,'
+        '"status":400,"timestamp":"2026-08-29T12:00:00+00:00"}'
+    ]
+    assert "super-secret" not in diagnostics[0]
+
+
 def test_a_typed_handler_rejection_keeps_its_code() -> None:
     services = RecordingServices(
         failure=PilotRequestError(HTTPStatus.CONFLICT, "PILOT_KILL_ENGAGED")

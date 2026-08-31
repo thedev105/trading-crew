@@ -9,16 +9,15 @@ carry stable identifiers only; the server resolves and recomputes all action mat
 from __future__ import annotations
 
 import json
-import os
 import secrets
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from typing import Any, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
-_DIAGNOSTICS: Final = os.environ.get("POLYTRADING_PILOT_DIAGNOSTICS") == "1"
 MAXIMUM_TARGET_BYTES: Final = 1024
 MAXIMUM_BODY_BYTES: Final = 16_384
 MAXIMUM_HEADER_BYTES: Final = 4096
@@ -151,6 +150,7 @@ class PilotApplication:
         *,
         port: int,
         clock: Any = None,
+        error_reporter: Callable[[str], None] | None = None,
     ) -> None:
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("PILOT_PORT_INVALID")
@@ -159,6 +159,7 @@ class PilotApplication:
         self._origin = f"http://localhost:{port}"
         self._host = f"localhost:{port}"
         self._clock = clock
+        self._error_reporter = error_reporter or _write_terminal_diagnostic
         self._sessions: dict[str, _BrowserSession] = {}
         self._requests: dict[str, list[datetime]] = {}
 
@@ -172,31 +173,42 @@ class PilotApplication:
         return self._services
 
     def respond(self, request: PilotRequest) -> PilotResponse:
+        exception: str | None = None
+        try:
+            response, exception = self._response_for(request)
+        except Exception as error:
+            response = _error(HTTPStatus.INTERNAL_SERVER_ERROR, "PILOT_REQUEST_FAILED")
+            exception = type(error).__name__
+        if response.status >= HTTPStatus.BAD_REQUEST:
+            self._report_error(request, response, exception)
+        return response
+
+    def _response_for(self, request: PilotRequest) -> tuple[PilotResponse, str | None]:
         rejection = self._reject_transport(request)
         if rejection is not None:
-            return rejection
+            return rejection, None
         path = urlsplit(request.target).path
         if path in PILOT_ASSETS:
-            return _asset_response(path)
+            return _asset_response(path), None
         handler_name = PILOT_ROUTES[(request.method, path)]
         if handler_name == "create_browser_session":
-            return self._create_browser_session(request)
+            return self._create_browser_session(request), None
         session = self._authenticated_session(request)
         if session is None:
-            return _error(HTTPStatus.UNAUTHORIZED, "SESSION_REQUIRED")
+            return _error(HTTPStatus.UNAUTHORIZED, "SESSION_REQUIRED"), None
         if not self._within_rate_limit(session, request.received_at):
-            return _error(HTTPStatus.TOO_MANY_REQUESTS, "RATE_LIMITED")
+            return _error(HTTPStatus.TOO_MANY_REQUESTS, "RATE_LIMITED"), None
         if request.method == "POST":
             csrf = _single_header(request.headers, CSRF_HEADER)
             if csrf is None or not secrets.compare_digest(csrf, session.csrf_token):
-                return _error(HTTPStatus.FORBIDDEN, "CSRF_TOKEN_INVALID")
+                return _error(HTTPStatus.FORBIDDEN, "CSRF_TOKEN_INVALID"), None
             payload = _parse_json_object(request.body)
             if payload is None:
-                return _error(HTTPStatus.BAD_REQUEST, "REQUEST_BODY_INVALID")
+                return _error(HTTPStatus.BAD_REQUEST, "REQUEST_BODY_INVALID"), None
             payload = {**payload, "browser_session_hash": session.session_hash}
             return self._dispatch(handler_name, payload)
         if request.body:
-            return _error(HTTPStatus.BAD_REQUEST, "REQUEST_BODY_NOT_ALLOWED")
+            return _error(HTTPStatus.BAD_REQUEST, "REQUEST_BODY_NOT_ALLOWED"), None
         return self._dispatch(handler_name, None)
 
     def _reject_transport(self, request: PilotRequest) -> PilotResponse | None:
@@ -276,21 +288,42 @@ class PilotApplication:
         self._requests[session.session_token] = recent
         return len(recent) <= RATE_LIMIT_REQUESTS
 
-    def _dispatch(self, handler_name: str, payload: Mapping[str, object] | None) -> PilotResponse:
+    def _dispatch(
+        self, handler_name: str, payload: Mapping[str, object] | None
+    ) -> tuple[PilotResponse, str | None]:
         handler = getattr(self._services, handler_name, None)
         if handler is None:
-            return _error(HTTPStatus.NOT_FOUND, "NOT_FOUND")
+            return _error(HTTPStatus.NOT_FOUND, "NOT_FOUND"), None
         try:
             result = handler() if payload is None else handler(payload)
         except PilotRequestError as error:
-            return _error(error.status, error.code)
+            return _error(error.status, error.code), type(error).__name__
+        except Exception as error:
+            # Neither exception text nor a traceback reaches the browser or terminal: either can
+            # contain request or secret data. The type is sufficient to classify an unexpected
+            # failure alongside its stable browser code.
+            return _error(HTTPStatus.INTERNAL_SERVER_ERROR, "PILOT_REQUEST_FAILED"), type(
+                error
+            ).__name__
+        return _json(HTTPStatus.OK, result), None
+
+    def _report_error(
+        self, request: PilotRequest, response: PilotResponse, exception: str | None
+    ) -> None:
+        event: dict[str, object] = {
+            "timestamp": _diagnostic_timestamp(request.received_at),
+            "method": request.method if request.method in _ALLOWED_METHODS else "OTHER",
+            "route": _diagnostic_route(request),
+            "status": int(response.status),
+            "error": _diagnostic_error_code(response),
+        }
+        if exception is not None:
+            event["exception"] = exception
+        try:
+            self._error_reporter(json.dumps(event, separators=(",", ":"), sort_keys=True))
         except Exception:
-            # Nothing about the failure reaches the browser: only a stable code. The detail is
-            # re-raised for the operator's own process log when diagnostics are enabled.
-            if _DIAGNOSTICS:
-                raise
-            return _error(HTTPStatus.INTERNAL_SERVER_ERROR, "PILOT_REQUEST_FAILED")
-        return _json(HTTPStatus.OK, result)
+            # Diagnostics must never alter a browser response or availability of the local pilot.
+            return
 
 
 class PilotRequestError(Exception):
@@ -343,6 +376,43 @@ def _parse_json_object(body: bytes) -> dict[str, object] | None:
     if type(parsed) is not dict or any(type(key) is not str for key in parsed):
         return None
     return parsed
+
+
+def _write_terminal_diagnostic(event: str) -> None:
+    print(f"pilot: diagnostic {event}", file=sys.stderr)
+
+
+def _diagnostic_timestamp(value: object) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        return "UNKNOWN"
+    return value.astimezone(UTC).isoformat()
+
+
+def _diagnostic_route(request: PilotRequest) -> str | None:
+    try:
+        parsed = urlsplit(request.target)
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        return None
+    return PILOT_ROUTES.get((request.method, parsed.path))
+
+
+def _diagnostic_error_code(response: PilotResponse) -> str:
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return "PILOT_REQUEST_FAILED"
+    code = payload.get("error") if type(payload) is dict else None
+    if (
+        type(code) is str
+        and 0 < len(code) <= 128
+        and code.isascii()
+        and code == code.upper()
+        and all(character.isalnum() or character == "_" for character in code)
+    ):
+        return code
+    return "PILOT_REQUEST_FAILED"
 
 
 def _reject_constant(value: str) -> object:
