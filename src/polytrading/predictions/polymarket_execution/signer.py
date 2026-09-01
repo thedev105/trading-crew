@@ -185,6 +185,7 @@ class SignerService:
         "_capability_public_key",
         "_clock",
         "_closed",
+        "_consumed_mutation_evidence_nonces",
         "_consumed_primary_capabilities",
         "_consumed_primary_submissions",
         "_exact_order_primary_intents",
@@ -238,6 +239,7 @@ class SignerService:
         self._venue_order_bindings: dict[str, _VenueOrderBinding] = {}
         self._consumed_primary_capabilities: set[UUID] = set()
         self._consumed_primary_submissions: set[tuple[UUID, UUID]] = set()
+        self._consumed_mutation_evidence_nonces: set[UUID] = set()
         self._exact_order_primary_intents: dict[UUID, UUID] = {}
         self._kill_engaged = False
         self._closed = False
@@ -385,7 +387,7 @@ class SignerService:
             )
         if request.operation in _MUTATING_OPERATIONS:
             assert isinstance(verified, VerifiedExecutionCapability)
-            replay = self._consume_primary_authority(request, verified)
+            replay = self._consume_mutation_authority(request, verified)
             if replay is not None:
                 return SignerResponse.rejected(request.request_id, replay)
         return self._dispatch(request)
@@ -586,12 +588,21 @@ class SignerService:
         except Exception:
             return "CAPABILITY_CANONICAL_BYTES_INVALID"
 
-    def _consume_primary_authority(
+    def _consume_mutation_authority(
         self,
         request: SignerRequest,
         capability: VerifiedExecutionCapability,
     ) -> SignerErrorCode | None:
+        signed_evidence = request.mutation_evidence
+        evidence_nonce = None if signed_evidence is None else signed_evidence.evidence.nonce
+        if (
+            evidence_nonce is not None
+            and evidence_nonce in self._consumed_mutation_evidence_nonces
+        ):
+            return "MUTATION_EVIDENCE_REPLAYED"
         if capability.grant_kind != "PRIMARY" or capability.single_use is not True:
+            if evidence_nonce is not None:
+                self._consumed_mutation_evidence_nonces.add(evidence_nonce)
             return None
         capability_id = capability.capability_id
         intent_id = request.intent_id
@@ -599,12 +610,16 @@ class SignerService:
             existing_intent = self._exact_order_primary_intents.get(capability_id)
             if existing_intent is not None and existing_intent != intent_id:
                 return "CAPABILITY_REPLAYED"
-            self._exact_order_primary_intents.setdefault(capability_id, intent_id)
         if request.operation is ExecutionOperation.SUBMIT_ORDER:
             submission = (capability_id, intent_id)
             if submission in self._consumed_primary_submissions:
                 return "CAPABILITY_REPLAYED"
-            self._consumed_primary_submissions.add(submission)
+        if evidence_nonce is not None:
+            self._consumed_mutation_evidence_nonces.add(evidence_nonce)
+        if capability.mode == "EXACT_ORDER":
+            self._exact_order_primary_intents.setdefault(capability_id, intent_id)
+        if request.operation is ExecutionOperation.SUBMIT_ORDER:
+            self._consumed_primary_submissions.add((capability_id, intent_id))
         self._consumed_primary_capabilities.add(capability_id)
         return None
 

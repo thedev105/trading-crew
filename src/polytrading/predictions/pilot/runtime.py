@@ -18,7 +18,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from polytrading.lifecycle import owned_resource_cleanup
 from polytrading.predictions.domain import PredictionVenue
@@ -311,11 +311,12 @@ def build_launch_runtime(
             ),
             signed_envelope=None,
             proof_for=lambda capability_id: proofs[capability_id],
-            mutation_evidence=lambda intent, operation, proof: _mutation_evidence_for(
+            mutation_evidence=lambda intent, operation, proof, request_id: _mutation_evidence_for(
                 issuer=issuer,
                 intent=intent,
                 operation=operation,
                 proof=proof,
+                request_id=request_id,
                 current_evidence=evidence_providers.get(proof.grant.capability_id),
                 clock=clock,
             ),
@@ -391,6 +392,9 @@ def build_launch_runtime(
         if channel is not None:
             channel.close()
         issuer.close()
+        if composition_store is not None:
+            composition_store.close()
+            composition_store = None
         print("pilot: signer unavailable; serving posture only", file=sys.stderr)
         return build_pilot_runtime(database_path, port, platform=platform, now=clock)
     finally:
@@ -413,11 +417,11 @@ def _mutation_evidence_for(
     intent: ExecutionIntent,
     operation: ExecutionOperation,
     proof: SignerCapabilityProof,
+    request_id: UUID,
     current_evidence: Callable[[], ExecutionEvidence] | None,
     clock: Callable[[], datetime],
 ) -> SignedMutationEvidence:
     """Sign one action-local public snapshot or refuse before writing IPC."""
-    del operation
     if current_evidence is None:
         raise SignerLinkError("MUTATION_EVIDENCE_UNAVAILABLE")
     evidence = current_evidence()
@@ -446,6 +450,10 @@ def _mutation_evidence_for(
     limits = proof.grant.effective_limits
     snapshot = MutationEvidence(
         schema_version=1,
+        nonce=uuid4(),
+        request_id=request_id,
+        intent_fingerprint=intent.intent_fingerprint,
+        operation=operation,
         manifest=evidence.manifest,
         manifest_record_hash=canonical_execution_hash(evidence.manifest),
         account_fingerprint=account.account_fingerprint,

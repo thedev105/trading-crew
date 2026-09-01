@@ -89,11 +89,7 @@ def _read_account(
     result_codes: list[str],
     observation_times: list[str],
 ) -> int:
-    try:
-        account = port.account_state()
-    except Exception:
-        result_codes.append("ACCOUNT_READ_FAILED")
-        return 1
+    account = port.account_state()
     if type(account) is not PilotAccountState:
         result_codes.append("ACCOUNT_READ_MISSING")
         return 1
@@ -112,11 +108,7 @@ def _read_positions(
     public_ids: list[str],
     result_codes: list[str],
 ) -> int:
-    try:
-        positions = port.positions()
-    except Exception:
-        result_codes.append("POSITIONS_READ_FAILED")
-        return 1
+    positions = port.positions()
     if not isinstance(positions, Mapping):
         result_codes.append("POSITIONS_READ_MISSING")
         return 1
@@ -139,11 +131,7 @@ def _read_orders(
     result_codes: list[str],
     observation_times: list[str],
 ) -> tuple[int, int]:
-    try:
-        result = port.orders()
-    except Exception:
-        result_codes.append("ORDERS_READ_FAILED")
-        return 0, 1
+    result = port.orders()
     payload = _validated_result(
         result,
         operation=ExecutionOperation.READ_ORDERS,
@@ -169,11 +157,7 @@ def _read_trades(
     result_codes: list[str],
     observation_times: list[str],
 ) -> int:
-    try:
-        result = port.trades()
-    except Exception:
-        result_codes.append("TRADES_READ_FAILED")
-        return 1
+    result = port.trades()
     payload = _validated_result(
         result,
         operation=ExecutionOperation.READ_TRADES,

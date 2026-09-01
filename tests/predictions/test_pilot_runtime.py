@@ -13,6 +13,7 @@ import pytest
 
 from polytrading.predictions.cli import add_predictions_subcommands
 from polytrading.predictions.execution.models import ExecutionOperation
+from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
 from polytrading.predictions.pilot.models import PILOT_CEILINGS
 from polytrading.predictions.pilot.passkeys import RP_ID
 from polytrading.predictions.pilot.runtime import (
@@ -159,15 +160,23 @@ def test_launch_composes_live_services_when_the_signer_bootstraps(
 class _LaunchSignerChannel:
     """Answer the production signer link in memory, without a venue or secret store."""
 
-    def __init__(self, *, ambiguous: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        ambiguous: bool = False,
+        fail_operation: ExecutionOperation | None = None,
+    ) -> None:
         self.requests: list[Any] = []
         self.responses = io.BytesIO()
         self.request_stream = _LaunchRequestStream(self)
         self.ambiguous = ambiguous
+        self.fail_operation = fail_operation
 
     def answer(self, frame: bytes) -> None:
         request = parse_signer_request(frame)
         self.requests.append(request)
+        if request.operation is self.fail_operation:
+            raise OSError("secret signer read detail")
         if request.operation is ExecutionOperation.DESCRIBE_IDENTITY:
             result: object = IdentityResult(
                 operation=ExecutionOperation.DESCRIBE_IDENTITY,
@@ -274,9 +283,14 @@ def _open_order() -> OrderReadPayload:
 
 
 def live_launch_bootstrap(
-    *, ambiguous: bool = False
+    *,
+    ambiguous: bool = False,
+    fail_operation: ExecutionOperation | None = None,
 ) -> tuple[SignerChannel, Any]:
-    fake = _LaunchSignerChannel(ambiguous=ambiguous)
+    fake = _LaunchSignerChannel(
+        ambiguous=ambiguous,
+        fail_operation=fail_operation,
+    )
     channel = SignerChannel(
         request_stream=fake.request_stream,
         response_stream=fake.responses,
@@ -337,6 +351,62 @@ def test_launch_remains_killed_when_reconciliation_is_not_complete(database: Pat
         assert "RECONCILIATION_INCOMPLETE" in readiness["blockers"]
     finally:
         runtime.close()
+
+
+def test_reconciliation_exception_closes_the_writer_before_posture_fallback(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel, bootstrap = live_launch_bootstrap()
+
+    def fail_composition(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("secret reconciliation detail")
+
+    monkeypatch.setattr(
+        "polytrading.predictions.pilot.runtime.compose_pilot_environment",
+        fail_composition,
+    )
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        assert isinstance(runtime.application.services, KilledPilotServices)
+        assert runtime.store._read_only is True
+    finally:
+        runtime.close()
+    assert channel.request_stream.closed
+    assert channel.response_stream.closed
+
+
+def test_signer_read_exception_serves_only_killed_posture(
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issuers: list[PilotCapabilityIssuer] = []
+
+    class TrackingIssuer(PilotCapabilityIssuer):
+        def __init__(self, *, key_id: str) -> None:
+            super().__init__(key_id=key_id)
+            issuers.append(self)
+
+    monkeypatch.setattr(
+        "polytrading.predictions.pilot.runtime.PilotCapabilityIssuer",
+        TrackingIssuer,
+    )
+    channel, bootstrap = live_launch_bootstrap(
+        fail_operation=ExecutionOperation.READ_ORDERS,
+    )
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        assert isinstance(runtime.application.services, KilledPilotServices)
+        assert runtime.store._read_only is True
+    finally:
+        runtime.close()
+    assert channel.request_stream.closed
+    assert channel.response_stream.closed
+    assert len(issuers) == 1
+    assert issuers[0].closed is True
 
 
 def services() -> KilledPilotServices:

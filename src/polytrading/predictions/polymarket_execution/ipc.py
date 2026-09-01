@@ -101,6 +101,7 @@ SignerErrorCode = Literal[
     "MUTATION_EVIDENCE_SIGNATURE_INVALID",
     "MUTATION_EVIDENCE_STALE",
     "MUTATION_EVIDENCE_UNAVAILABLE",
+    "MUTATION_EVIDENCE_REPLAYED",
     "CAPABILITY_REPLAYED",
     "PILOT_KILL_ENGAGED",
     "READ_GUARD_FAILED",
@@ -386,6 +387,9 @@ class SignerRequest(_SignerRecord):
             if (
                 evidence.plan_digest != self.capability_digest
                 or evidence.authority_digest != self.authority_digest
+                or evidence.request_id != self.request_id
+                or evidence.intent_fingerprint != self.intent_fingerprint
+                or evidence.operation is not self.operation
                 or evidence.manifest_record_hash != self.manifest_digest
                 or evidence.account_fingerprint != self.account_fingerprint
             ):

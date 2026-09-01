@@ -85,3 +85,37 @@ and the envelope preserves reconciliation and account-scope hashes independently
 - Used only fake transports and in-memory framed channels; no real venue request was made.
 - No real Keychain access, wallet secret, UI change, new CLI flag, authority bypass, or subagent
   was used.
+
+## Fix round 1
+
+- Mutation evidence now binds a one-use nonce, signer request ID, intent fingerprint, operation,
+  plan digest, and capability authority digest. The signer validates those bindings and consumes
+  the evidence nonce under its dispatch lock before `SIGN_ORDER`, `SUBMIT_ORDER`, or
+  `CANCEL_ORDER`; failed dispatch cannot release it, fresh-request replay is rejected, and evidence
+  prepared before signer kill cannot execute afterward.
+- Launch fallback closes the write-capable composition store before opening the posture-only
+  read-only runtime. Reconciliation-time exceptions now return killed posture without the nested
+  DuckDB configuration/schema error, after closing the signer channel and issuer.
+- Startup reconciliation now propagates signer transport/read exceptions to launch cleanup.
+  Unknown venue state remains representable only when the signer returned a typed sanitized result,
+  such as a sanitized `READ_FAILED` or a valid snapshot containing an open order.
+- Execution evidence no longer derives geoblock authority from manifest status or substitutes the
+  reconciliation hash. A narrowly typed current geoblock provider supplies the exact decision,
+  evidence hash, and expiry; absence, malformed output, provider failure, a blocked decision, or
+  expiry engages the mutation kill gate.
+
+### Fix-round regressions and verification
+
+- RED reproduced: evidence-schema fields were rejected as unknown; replay was accepted without
+  nonce consumption; launch fallback raised nested `PILOT_DATABASE_SCHEMA_STALE`; signer read
+  failure still composed live services; and `PilotEnvironment` had no current geoblock provider.
+- GREEN regressions cover failed-dispatch nonce consumption, fresh-request replay, evidence held
+  across signer kill, writer-before-reader fallback ordering, signer read cleanup (including issuer
+  destruction), sanitized venue ambiguity, and exact geoblock provider binding/failure.
+- Full predictions verification excluding the eleven sandbox-incompatible spawned-sidecar cases:
+  `3118 passed, 11 deselected, 13 warnings`. The complete signer IPC module passed outside the
+  sandbox (`143 passed`); the warnings remain the existing Pydantic dashboard-model deprecations.
+- Targeted Ruff, `git diff --check`, authority/secret scans, and refreshed sealed hashes passed.
+  Final reviewed hashes are `3f0b48457620138613c822e1dd6bf7bbd4e074169b55b909e99047c426dc1523`
+  for `ipc.py` and `4dff9154f95dd69d93eeebf5bc340f530f642070e0577bb7c106f1f16c63a81d`
+  for `signer.py`.

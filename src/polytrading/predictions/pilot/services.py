@@ -38,7 +38,7 @@ from polytrading.predictions.pilot.capabilities import (
     PilotCapabilityIssuer,
     VenueBinding,
 )
-from polytrading.predictions.pilot.execution_port import ExecutionEvidence
+from polytrading.predictions.pilot.execution_port import ExecutionEvidence, GeoblockEvidence
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     AuthorizationChallenge,
@@ -145,6 +145,7 @@ class PilotEnvironment:
     activation_inputs: ActivationInputs | None = None
     manifest_provider: Callable[[], VenueManifest | None] | None = None
     reconciliation_provider: Callable[[], PilotReconciliationState] | None = None
+    geoblock_provider: Callable[[], GeoblockEvidence] | None = None
 
 
 @dataclass
@@ -847,15 +848,14 @@ class LivePilotServices:
         except Exception:
             pass
 
-        activation_inputs = environment.activation_inputs
-        geoblock_allowed = (
-            activation_inputs.geoblock_allowed
-            if activation_inputs is not None
-            else (
-                manifest is not None
-                and manifest.jurisdiction_review_status == "ELIGIBILITY_REVIEWED"
-            )
-        )
+        geoblock: GeoblockEvidence | None = None
+        try:
+            provider = environment.geoblock_provider
+            candidate = None if provider is None else provider()
+            if type(candidate) is GeoblockEvidence:
+                geoblock = candidate
+        except Exception:
+            pass
         reconciliation_expires_at = (
             None
             if reconciliation is None
@@ -872,11 +872,9 @@ class LivePilotServices:
         return ExecutionEvidence(
             manifest=manifest,
             account=account,
-            geoblock_allowed=geoblock_allowed,
-            geoblock_evidence_hash=(
-                None if reconciliation is None else reconciliation.reconciliation_hash
-            ),
-            geoblock_expires_at=environment.eligibility_expires_at,
+            geoblock_allowed=None if geoblock is None else geoblock.allowed,
+            geoblock_evidence_hash=None if geoblock is None else geoblock.evidence_hash,
+            geoblock_expires_at=None if geoblock is None else geoblock.expires_at,
             account_scope_evidence_hash=(
                 None if reconciliation is None else reconciliation.reconciliation_hash
             ),
@@ -885,6 +883,9 @@ class LivePilotServices:
                 self._state.kill_engaged
                 or not self._manifest_is_current(manifest)
                 or not self._eligibility_is_current(now)
+                or geoblock is None
+                or not geoblock.allowed
+                or now >= geoblock.expires_at
                 or not self._reconciliation_is_current(reconciliation, now)
                 or not self._account_is_current(account, now)
             ),

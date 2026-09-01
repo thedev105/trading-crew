@@ -80,7 +80,7 @@ class SignerLinkVenuePort:
         proof_for: Callable[[UUID], SignerCapabilityProof],
         kill_directive: Callable[[Iterable[UUID]], SignerKillDirective],
         mutation_evidence: Callable[
-            [ExecutionIntent, ExecutionOperation, SignerCapabilityProof],
+            [ExecutionIntent, ExecutionOperation, SignerCapabilityProof, UUID],
             SignedMutationEvidence | None,
         ]
         | None = None,
@@ -202,14 +202,20 @@ class SignerLinkVenuePort:
         capability_id: UUID | None,
     ) -> SignerResponse:
         now = self._clock()
+        request_id = uuid4()
         authority_proof = self._mutation_proof(operation, capability_id)
-        mutation_evidence = self._evidence_for(intent, operation, authority_proof)
+        mutation_evidence = self._evidence_for(
+            intent,
+            operation,
+            authority_proof,
+            request_id,
+        )
         deadline = now + REQUEST_DEADLINE
         if mutation_evidence is not None:
             deadline = min(deadline, mutation_evidence.evidence.expires_at)
         request = SignerRequest(
             schema_version=1,
-            request_id=uuid4(),
+            request_id=request_id,
             intent_id=intent.intent_id if intent is not None else uuid4(),
             intent_fingerprint=intent.intent_fingerprint if intent is not None else "0" * 64,
             capability_digest=(intent.capability_fingerprint if intent is not None else "0" * 64),
@@ -238,13 +244,14 @@ class SignerLinkVenuePort:
         intent: ExecutionIntent | None,
         operation: ExecutionOperation,
         proof: SignerCapabilityProof | None,
+        request_id: UUID,
     ) -> SignedMutationEvidence | None:
         if proof is None:
             return None
         if intent is None or self._mutation_evidence is None:
             return None
         try:
-            return self._mutation_evidence(intent, operation, proof)
+            return self._mutation_evidence(intent, operation, proof, request_id)
         except SignerLinkError:
             raise
         except Exception as error:

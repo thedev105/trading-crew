@@ -164,16 +164,37 @@ def test_startup_reconciliation_marks_a_clean_authoritative_snapshot_complete() 
 
 
 @pytest.mark.parametrize("failed_read", ["account_state", "positions", "orders", "trades"])
-def test_startup_reconciliation_fails_closed_when_a_read_is_ambiguous(
+def test_startup_reconciliation_propagates_transport_read_failures(
     failed_read: str,
 ) -> None:
     port = FakeVenuePort(fail=failed_read)
 
-    state = reconcile_startup(port, account_fingerprint=ACCOUNT, now=lambda: NOW)
+    with pytest.raises(RuntimeError, match="secret transport detail"):
+        reconcile_startup(port, account_fingerprint=ACCOUNT, now=lambda: NOW)
+
+
+def test_sanitized_venue_read_failure_remains_an_unknown_outcome() -> None:
+    failed = SanitizedOperationResult(
+        operation=ExecutionOperation.READ_ORDERS,
+        result_code=RestCode.READ_FAILED,
+        evidence_hashes=("3" * 64,),
+        route=RouteKey.READ_OPEN_ORDERS,
+        observed_at=NOW,
+        raw_body_hash="3" * 64,
+        attempts=1,
+        recovery_required=True,
+        kill_required=True,
+        public_payload=None,
+    )
+
+    state = reconcile_startup(
+        FakeVenuePort(orders=failed),
+        account_fingerprint=ACCOUNT,
+        now=lambda: NOW,
+    )
 
     assert state.reconciliation_complete is False
     assert state.unknown_outcomes == 1
-    assert port.reads == ["account_state", "positions", "orders", "trades"]
 
 
 def test_an_open_order_is_an_active_unknown_submission() -> None:

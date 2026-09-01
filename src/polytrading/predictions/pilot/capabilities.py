@@ -232,6 +232,10 @@ class MutationEvidence(PilotRecord):
     """One short-lived, public mutation snapshot signed by the launch issuer."""
 
     schema_version: Literal[1]
+    nonce: UUID
+    request_id: UUID
+    intent_fingerprint: Sha256
+    operation: ExecutionOperation
     manifest: VenueManifest
     manifest_record_hash: Sha256
     account_fingerprint: Sha256
@@ -252,6 +256,19 @@ class MutationEvidence(PilotRecord):
     loss_after: NonNegativeDecimal
     issued_at: UtcTimestamp
     expires_at: UtcTimestamp
+
+    @field_validator("operation")
+    @classmethod
+    def _operation_is_a_venue_mutation(
+        cls, value: ExecutionOperation
+    ) -> ExecutionOperation:
+        if value not in {
+            ExecutionOperation.SIGN_ORDER,
+            ExecutionOperation.SUBMIT_ORDER,
+            ExecutionOperation.CANCEL_ORDER,
+        }:
+            raise ValueError("mutation evidence operation invalid")
+        return value
 
     @model_validator(mode="after")
     def _bind_manifest_and_lifetime(self) -> MutationEvidence:

@@ -12,7 +12,7 @@ from polytrading.predictions.execution.models import ExecutionOperation, canonic
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import VenueBinding
-from polytrading.predictions.pilot.execution_port import VenueSubmissionPort
+from polytrading.predictions.pilot.execution_port import GeoblockEvidence, VenueSubmissionPort
 from polytrading.predictions.pilot.models import PilotProofFamily
 from polytrading.predictions.pilot.qualification import evaluate_pilot_qualification
 from polytrading.predictions.pilot.reconciliation import reconcile_startup
@@ -45,6 +45,7 @@ def compose_pilot_environment(
     executor_factory: ExecutorFactory | None = None,
     manifest_provider: Callable[[], VenueManifest | None] | None = None,
     reconciliation_provider: Callable[[], PilotReconciliationState] | None = None,
+    geoblock_provider: Callable[[], GeoblockEvidence] | None = None,
 ) -> PilotEnvironment:
     """Load evidence, using authoritative signer reads when a venue port is available."""
     observed_at = now()
@@ -115,6 +116,7 @@ def compose_pilot_environment(
         executor_factory=executor_factory,
         manifest_provider=manifest_provider,
         reconciliation_provider=reconciliation_provider,
+        geoblock_provider=geoblock_provider,
     )
 
 

@@ -25,7 +25,7 @@ from polytrading.predictions.pilot.capabilities import (
     PilotCapabilityIssuer,
     VenueBinding,
 )
-from polytrading.predictions.pilot.execution_port import ExecutionEvidence
+from polytrading.predictions.pilot.execution_port import ExecutionEvidence, GeoblockEvidence
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     PILOT_CEILINGS,
@@ -383,6 +383,11 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
         account_state=current_account,
         manifest_provider=current_manifest,
         reconciliation_provider=current_reconciliation,
+        geoblock_provider=lambda: GeoblockEvidence(
+            allowed=True,
+            evidence_hash="9" * 64,
+            expires_at=NOW + timedelta(minutes=1),
+        ),
     )
     services = LivePilotServices(
         store=object(),  # type: ignore[arg-type]
@@ -410,6 +415,9 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
     assert fresh.account == account_state
     assert fresh.reconciliation_hash == "8" * 64
     assert fresh.reconciliation_observed_at == NOW
+    assert fresh.geoblock_allowed is True
+    assert fresh.geoblock_evidence_hash == "9" * 64
+    assert fresh.geoblock_expires_at == NOW + timedelta(minutes=1)
     assert fresh.kill_engaged is False
     assert provider_calls == {"manifest": 1, "reconciliation": 1}
 
@@ -447,6 +455,27 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
     )
     fallback_services._state.kill_engaged = False
     assert fallback_services._execution_evidence().kill_engaged is False
+
+    unavailable_geoblock_services = LivePilotServices(
+        store=object(),  # type: ignore[arg-type]
+        environment=replace(
+            environment,
+            geoblock_provider=lambda: (_ for _ in ()).throw(
+                RuntimeError("secret geoblock detail")
+            ),
+        ),
+        passkeys=object(),  # type: ignore[arg-type]
+        issuer=object(),  # type: ignore[arg-type]
+        verifier=PilotCapabilityVerifier(pair.primary.public_verification_key),
+        presence=_PresentMonitor(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    unavailable_geoblock_services._state.kill_engaged = False
+    missing_geoblock = unavailable_geoblock_services._execution_evidence()
+    assert missing_geoblock.geoblock_allowed is None
+    assert missing_geoblock.geoblock_evidence_hash is None
+    assert missing_geoblock.geoblock_expires_at is None
+    assert missing_geoblock.kill_engaged is True
 
     available = False
     unavailable_account = evidence()

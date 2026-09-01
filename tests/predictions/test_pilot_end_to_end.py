@@ -25,6 +25,7 @@ from polytrading.predictions.pilot.capabilities import VenueBinding
 from polytrading.predictions.pilot.execution_port import (
     CoordinatorExecutionPort,
     ExecutionEvidence,
+    GeoblockEvidence,
 )
 from polytrading.predictions.pilot.passkeys import FakePasskeyService, action_challenge_digest
 from polytrading.predictions.pilot.runtime import build_launch_runtime, build_pilot_runtime
@@ -219,6 +220,11 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
         executor_factory=executor_factory,
         manifest_provider=lambda: provider_state["manifest"],
         reconciliation_provider=lambda: provider_state["reconciliation"],
+        geoblock_provider=lambda: GeoblockEvidence(
+            allowed=True,
+            evidence_hash="a" * 64,
+            expires_at=NOW + timedelta(minutes=1),
+        ),
     )
     runtime = build_pilot_runtime(
         database,

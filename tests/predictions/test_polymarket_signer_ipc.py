@@ -186,8 +186,13 @@ CAPABILITY_DIGEST = _authority_proof().grant.digest
 
 
 def _mutation_evidence(**overrides: object) -> SignedMutationEvidence:
+    target = _intent()
     fields: dict[str, object] = {
         "schema_version": 1,
+        "nonce": UUID("22222222-2222-4222-8222-222222222222"),
+        "request_id": UUID("11111111-1111-4111-8111-111111111111"),
+        "intent_fingerprint": target.intent_fingerprint,
+        "operation": ExecutionOperation.SIGN_ORDER,
         "manifest": ELIGIBLE_MANIFEST,
         "manifest_record_hash": MANIFEST_HASH,
         "account_fingerprint": ACCOUNT_FINGERPRINT,
@@ -211,6 +216,18 @@ def _mutation_evidence(**overrides: object) -> SignedMutationEvidence:
     }
     fields.update(overrides)
     return ISSUER.mutation_evidence(MutationEvidence.model_validate(fields, strict=True))
+
+
+def _evidence_for_request(
+    request: SignerRequest,
+    **overrides: object,
+) -> SignedMutationEvidence:
+    return _mutation_evidence(
+        request_id=request.request_id,
+        intent_fingerprint=request.intent_fingerprint,
+        operation=request.operation,
+        **overrides,
+    )
 
 
 class _ShortReader:
@@ -1092,9 +1109,8 @@ def _evidence_service() -> SignerService:
 
 def test_signer_builds_mutation_authority_only_from_verified_public_evidence() -> None:
     service = _evidence_service()
-    request = _action_request(ExecutionOperation.SIGN_ORDER).model_copy(
-        update={"mutation_evidence": _mutation_evidence()}
-    )
+    request = _action_request(ExecutionOperation.SIGN_ORDER)
+    request = request.model_copy(update={"mutation_evidence": _evidence_for_request(request)})
 
     response = service.handle(request)
 
@@ -1103,33 +1119,108 @@ def test_signer_builds_mutation_authority_only_from_verified_public_evidence() -
     service.close()
 
 
+def test_signer_consumes_mutation_evidence_before_dispatch_and_rejects_nonce_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_sign(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OrderSigningError("signing failure")
+
+    monkeypatch.setattr(signer_module, "sign_order", fail_sign)
+    service = _evidence_service()
+    first = _action_request(ExecutionOperation.SIGN_ORDER)
+    replay = _action_request(ExecutionOperation.SIGN_ORDER)
+    nonce = UUID("22222222-2222-4222-8222-222222222229")
+    first = first.model_copy(
+        update={
+            "mutation_evidence": _mutation_evidence(
+                nonce=nonce,
+                request_id=first.request_id,
+                intent_fingerprint=first.intent_fingerprint,
+                operation=first.operation,
+            )
+        }
+    )
+    replay = replay.model_copy(
+        update={
+            "mutation_evidence": _mutation_evidence(
+                nonce=nonce,
+                request_id=replay.request_id,
+                intent_fingerprint=replay.intent_fingerprint,
+                operation=replay.operation,
+            )
+        }
+    )
+
+    assert service.handle(first).error_code == "ORDER_SIGNING_FAILED"
+    assert service.handle(replay).error_code == "MUTATION_EVIDENCE_REPLAYED"
+    service.close()
+
+
+def test_signed_mutation_evidence_cannot_be_replayed_under_a_fresh_request_id() -> None:
+    service = _evidence_service()
+    request = _action_request(ExecutionOperation.SIGN_ORDER)
+    request = request.model_copy(
+        update={
+            "mutation_evidence": _mutation_evidence(
+                request_id=request.request_id,
+                intent_fingerprint=request.intent_fingerprint,
+                operation=request.operation,
+            )
+        }
+    )
+
+    assert service.handle(request).ok is True
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+        request.model_copy(update={"request_id": uuid4()})
+    service.close()
+
+
+def test_mutation_evidence_prepared_before_kill_cannot_dispatch_after_kill() -> None:
+    service = _evidence_service()
+    mutation = _action_request(ExecutionOperation.SIGN_ORDER)
+    mutation = mutation.model_copy(
+        update={"mutation_evidence": _evidence_for_request(mutation)}
+    )
+    kill = _request(
+        ExecutionOperation.SIGNER_KILL,
+        request_id=uuid4(),
+        payload=SignerKillPayload(
+            operation=ExecutionOperation.SIGNER_KILL,
+            directive=ISSUER.kill_directive((DEFAULT_GRANT.capability_id,)),
+        ),
+    )
+
+    assert service.handle(kill).ok is True
+    assert service.handle(mutation).error_code == "PILOT_KILL_ENGAGED"
+    service.close()
+
+
 def test_signer_rejects_missing_tampered_stale_or_killed_mutation_evidence() -> None:
     service = _evidence_service()
     request = _action_request(ExecutionOperation.SIGN_ORDER)
-    valid = _mutation_evidence()
+    invalid_request = _action_request(ExecutionOperation.SIGN_ORDER)
+    valid = _evidence_for_request(invalid_request)
     invalid_signature = SignedMutationEvidence(
         evidence=valid.evidence,
         signature=b64encode(b"not-the-launch-signature"),
     )
-    stale = _mutation_evidence(
+    stale_request = _action_request(ExecutionOperation.SIGN_ORDER)
+    stale = _evidence_for_request(
+        stale_request,
         issued_at=NOW - timedelta(seconds=6),
         expires_at=NOW - timedelta(seconds=1),
     )
-    killed = _mutation_evidence(kill_engaged=True)
+    killed_request = _action_request(ExecutionOperation.SIGN_ORDER)
+    killed = _evidence_for_request(killed_request, kill_engaged=True)
 
     responses = (
         service.handle(request),
         service.handle(
-            request.model_copy(
-                update={"request_id": uuid4(), "mutation_evidence": invalid_signature}
-            )
+            invalid_request.model_copy(update={"mutation_evidence": invalid_signature})
         ),
-        service.handle(
-            request.model_copy(update={"request_id": uuid4(), "mutation_evidence": stale})
-        ),
-        service.handle(
-            request.model_copy(update={"request_id": uuid4(), "mutation_evidence": killed})
-        ),
+        service.handle(stale_request.model_copy(update={"mutation_evidence": stale})),
+        service.handle(killed_request.model_copy(update={"mutation_evidence": killed})),
     )
 
     assert [response.error_code for response in responses] == [

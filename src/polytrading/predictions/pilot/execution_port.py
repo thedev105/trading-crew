@@ -29,6 +29,7 @@ from polytrading.predictions.execution.models import (
     deterministic_intent_id,
 )
 from polytrading.predictions.manifest import VenueManifest
+from polytrading.predictions.pilot.models import PilotRecord, UtcTimestamp
 from polytrading.predictions.pilot.selector import (
     FrozenPilotPlan,
     PilotAccountState,
@@ -72,6 +73,14 @@ class VenueSubmissionPort(Protocol):
     def trades(self) -> SanitizedOperationResult: ...
 
     def engage_kill(self, capability_ids: Iterable[UUID]) -> None: ...
+
+
+class GeoblockEvidence(PilotRecord):
+    """One current public geoblock decision, with its own source and expiry."""
+
+    allowed: bool
+    evidence_hash: Sha256
+    expires_at: UtcTimestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +274,7 @@ class CoordinatorExecutionPort:
 __all__ = [
     "CoordinatorExecutionPort",
     "ExecutionEvidence",
+    "GeoblockEvidence",
     "PilotExecutionPortError",
     "VenueSubmissionPort",
 ]

@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from polytrading.predictions.execution.models import ExecutionOperation
+from polytrading.predictions.pilot.execution_port import GeoblockEvidence
 from polytrading.predictions.pilot.launch import compose_pilot_environment
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.server import PilotRequestError
@@ -72,6 +73,11 @@ def _empty_result(
 def test_compose_uses_the_authoritative_venue_snapshot_for_reconciliation(tmp_path) -> None:
     store = PredictionMarketStore(tmp_path / "pilot.duckdb")
     venue_port = CleanVenuePort()
+    geoblock = GeoblockEvidence(
+        allowed=True,
+        evidence_hash="9" * 64,
+        expires_at=NOW,
+    )
     try:
         environment = compose_pilot_environment(
             store,
@@ -80,12 +86,15 @@ def test_compose_uses_the_authoritative_venue_snapshot_for_reconciliation(tmp_pa
             credentials_present=False,
             now=lambda: NOW,
             venue_port=venue_port,
+            geoblock_provider=lambda: geoblock,
         )
         assert environment.manifest is None
         assert environment.manifest_state == "MISSING"
         assert environment.venue_binding is None
         assert environment.credentials_present is False
         assert environment.executor_factory is None
+        assert environment.geoblock_provider is not None
+        assert environment.geoblock_provider() == geoblock
         assert environment.reconciliation.reconciliation_complete is True
         assert environment.account_state() == venue_port.account_state()
     finally:

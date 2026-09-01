@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "23ed588bd81fe7c5260f0f55da72ab9b09ae635f99e7706879287ff955dbef40",
+    ): "3f0b48457620138613c822e1dd6bf7bbd4e074169b55b909e99047c426dc1523",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "5adcead1cae4c0f7e8fdffad55f1b65e16b7e9562b202acbb36e0ca3808f9bac",
+    ): "4dff9154f95dd69d93eeebf5bc340f530f642070e0577bb7c106f1f16c63a81d",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",

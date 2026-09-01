@@ -154,6 +154,10 @@ def test_kill_directive_verifies_only_for_the_launch_issuer() -> None:
 def mutation_evidence(**overrides: Any) -> MutationEvidence:
     fields: dict[str, Any] = {
         "schema_version": 1,
+        "nonce": UUID("22222222-2222-4222-8222-222222222222"),
+        "request_id": UUID("11111111-1111-4111-8111-111111111111"),
+        "intent_fingerprint": "b" * 64,
+        "operation": ExecutionOperation.SIGN_ORDER,
         "manifest": ELIGIBLE_MANIFEST,
         "manifest_record_hash": MANIFEST_HASH,
         "account_fingerprint": ACCOUNT_FINGERPRINT,

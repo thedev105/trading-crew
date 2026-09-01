@@ -79,6 +79,10 @@ SIGNER_PROOF = SignerCapabilityProof(
 MUTATION_EVIDENCE = SignedMutationEvidence(
     evidence=MutationEvidence(
         schema_version=1,
+        nonce=UUID("22222222-2222-4222-8222-222222222222"),
+        request_id=UUID("11111111-1111-4111-8111-111111111111"),
+        intent_fingerprint="c" * 64,
+        operation=ExecutionOperation.SIGN_ORDER,
         manifest=ELIGIBLE_MANIFEST,
         manifest_record_hash=MANIFEST_DIGEST,
         account_fingerprint=ACCOUNT_FINGERPRINT,
@@ -106,11 +110,16 @@ MUTATION_EVIDENCE = SignedMutationEvidence(
 
 def mutation_evidence_for(
     target: ExecutionIntent,
+    operation: ExecutionOperation,
     proof: SignerCapabilityProof,
+    request_id: UUID,
 ) -> SignedMutationEvidence:
     return SignedMutationEvidence(
         evidence=MUTATION_EVIDENCE.evidence.model_copy(
             update={
+                "request_id": request_id,
+                "intent_fingerprint": target.intent_fingerprint,
+                "operation": operation,
                 "account_fingerprint": target.account_fingerprint,
                 "plan_digest": target.capability_fingerprint,
                 "authority_digest": proof.grant.digest,
@@ -373,8 +382,8 @@ def port(channel: FakeSignerChannel, **overrides: Any) -> SignerLinkVenuePort:
         "account_reader": account_state,
         "signed_envelope": _envelope,
         "proof_for": lambda capability_id: {CAPABILITY_ID: SIGNER_PROOF}[capability_id],
-        "mutation_evidence": lambda intent, operation, proof: mutation_evidence_for(
-            intent, proof
+        "mutation_evidence": lambda intent, operation, proof, request_id: mutation_evidence_for(
+            intent, operation, proof, request_id
         ),
         "kill_directive": lambda capability_ids: SignerKillDirective(
             capability_ids=tuple(sorted(capability_ids, key=str)),
@@ -557,7 +566,16 @@ def test_submit_serializes_matching_short_lived_mutation_evidence() -> None:
     port(channel).submit(target, CAPABILITY_ID)
 
     request = channel.requests[0]
-    assert request.mutation_evidence == MUTATION_EVIDENCE
+    assert request.mutation_evidence == mutation_evidence_for(
+        target,
+        request.operation,
+        SIGNER_PROOF,
+        request.request_id,
+    )
+    assert request.mutation_evidence.evidence.request_id == request.request_id
+    assert request.mutation_evidence.evidence.intent_fingerprint == request.intent_fingerprint
+    assert request.mutation_evidence.evidence.operation is request.operation
+    assert request.mutation_evidence.evidence.authority_digest == request.authority_digest
     assert request.deadline == MUTATION_EVIDENCE.evidence.expires_at
 
 
@@ -583,6 +601,7 @@ def test_runtime_envelope_keeps_reconciliation_and_account_scope_hashes_distinct
             intent=target,
             operation=ExecutionOperation.SUBMIT_ORDER,
             proof=SIGNER_PROOF,
+            request_id=UUID("11111111-1111-4111-8111-111111111119"),
             current_evidence=lambda: current,
             clock=lambda: NOW,
         )
