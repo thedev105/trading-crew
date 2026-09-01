@@ -38,6 +38,7 @@ from polytrading.predictions.pilot.verifier import (
     PilotCapabilityVerifier,
     build_authority_context,
 )
+from polytrading.predictions.polymarket_execution.ipc import SanitizedOperationResult
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
 )
@@ -64,6 +65,10 @@ class VenueSubmissionPort(Protocol):
     def account_state(self) -> PilotAccountState: ...
 
     def positions(self) -> Mapping[str, Decimal]: ...
+
+    def orders(self) -> SanitizedOperationResult: ...
+
+    def trades(self) -> SanitizedOperationResult: ...
 
 
 @dataclass(frozen=True, slots=True)

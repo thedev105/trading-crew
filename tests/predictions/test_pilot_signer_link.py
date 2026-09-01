@@ -46,8 +46,10 @@ from polytrading.predictions.polymarket_execution.routes import (
     BalanceAllowancePayload,
     CancellationPayload,
     OrderAckPayload,
+    OrdersReadPayload,
     RestCode,
     RouteKey,
+    TradesReadPayload,
 )
 from tests.predictions.pilot_helpers import (
     ACCOUNT_FINGERPRINT,
@@ -128,7 +130,9 @@ class FakeSignerChannel:
                 else SignerResponse.rejected(request.request_id, "EXECUTION_KILL_ENGAGED")
             )
         else:
-            code = self.codes.pop(0) if self.codes else _default_code(request.operation.value)
+            operation = request.operation.value
+            code = self.codes.pop(0) if self.codes else _default_code(operation)
+            public_payload = _payload_for(operation, code)
             response = (
                 SignerResponse.accepted(
                     request.request_id,
@@ -151,8 +155,8 @@ class FakeSignerChannel:
                         route=_route_for(request.operation.value),
                         observed_at=NOW,
                         attempts=1,
-                        **_flags_for(request.operation.value, code, _payload_for(code)),
-                        public_payload=_payload_for(code),
+                        **_flags_for(operation, code, public_payload),
+                        public_payload=public_payload,
                     ),
                 )
                 if self.ok
@@ -189,7 +193,7 @@ _ACK_STATUS = {
 }
 
 
-def _payload_for(code: RestCode) -> object | None:
+def _payload_for(operation: str, code: RestCode) -> object | None:
     if code in {
         RestCode.ORDER_ACK_MATCHED,
         RestCode.ORDER_ACK_DELAYED,
@@ -210,6 +214,10 @@ def _payload_for(code: RestCode) -> object | None:
             kind="CANCELLATION", order_id="order-1", confirmation_required=True
         )
     if code is RestCode.READ_OK:
+        if operation == "READ_ORDERS":
+            return OrdersReadPayload(kind="ORDERS_READ", items=())
+        if operation == "READ_TRADES":
+            return TradesReadPayload(kind="TRADES_READ", items=())
         return BalanceAllowancePayload(
             kind="BALANCE_ALLOWANCE",
             balance="200",
@@ -222,6 +230,8 @@ def _route_for(operation: str) -> RouteKey:
     return {
         "SUBMIT_ORDER": RouteKey.SUBMIT_ORDER,
         "CANCEL_ORDER": RouteKey.CANCEL_ORDER,
+        "READ_ORDERS": RouteKey.READ_OPEN_ORDERS,
+        "READ_TRADES": RouteKey.READ_TRADES,
         "READ_ACCOUNT": RouteKey.READ_BALANCE_ALLOWANCE,
     }[operation]
 
@@ -230,6 +240,8 @@ def _default_code(operation: str) -> RestCode:
     return {
         "SUBMIT_ORDER": RestCode.ORDER_ACK_MATCHED,
         "CANCEL_ORDER": RestCode.CANCEL_ACKNOWLEDGED,
+        "READ_ORDERS": RestCode.READ_OK,
+        "READ_TRADES": RestCode.READ_OK,
         "READ_ACCOUNT": RestCode.READ_OK,
     }[operation]
 
@@ -417,6 +429,29 @@ def test_no_tracked_token_means_no_claimed_position() -> None:
 
     assert port(channel).positions() == {}
     assert channel.requests == []
+
+
+def test_orders_exposes_only_the_typed_sanitized_open_order_read() -> None:
+    channel = FakeSignerChannel()
+
+    result = port(channel).orders()
+
+    request = channel.requests[0]
+    assert request.operation is ExecutionOperation.READ_ORDERS
+    assert request.payload.venue_order_id is None
+    assert type(result) is SanitizedOperationResult
+    assert type(result.public_payload) is OrdersReadPayload
+
+
+def test_trades_exposes_only_the_typed_sanitized_trade_read() -> None:
+    channel = FakeSignerChannel()
+
+    result = port(channel).trades()
+
+    request = channel.requests[0]
+    assert request.operation is ExecutionOperation.READ_TRADES
+    assert type(result) is SanitizedOperationResult
+    assert type(result.public_payload) is TradesReadPayload
 
 
 def test_submit_serializes_the_matching_public_proof() -> None:

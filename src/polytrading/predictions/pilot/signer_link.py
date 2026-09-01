@@ -23,6 +23,9 @@ from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
     IdentityResult,
     ReadAccountPayload,
+    ReadOrdersPayload,
+    ReadTradesPayload,
+    SanitizedOperationResult,
     SignerCapabilityProof,
     SignerKillPayload,
     SignerProtocolError,
@@ -138,6 +141,26 @@ class SignerLinkVenuePort:
             positions[token_id] = self._position_reader(response.result.model_dump(mode="json"))
         return positions
 
+    def orders(self) -> SanitizedOperationResult:
+        """Read the complete open-order collection through the one fixed signer operation."""
+        response = self._exchange(
+            None,
+            ExecutionOperation.READ_ORDERS,
+            ReadOrdersPayload(operation=ExecutionOperation.READ_ORDERS),
+            None,
+        )
+        return _sanitized_read_result(response, ExecutionOperation.READ_ORDERS)
+
+    def trades(self) -> SanitizedOperationResult:
+        """Read the complete trade collection through the one fixed signer operation."""
+        response = self._exchange(
+            None,
+            ExecutionOperation.READ_TRADES,
+            ReadTradesPayload(operation=ExecutionOperation.READ_TRADES),
+            None,
+        )
+        return _sanitized_read_result(response, ExecutionOperation.READ_TRADES)
+
     # -- internals ----------------------------------------------------------------------
 
     def _exchange(
@@ -154,9 +177,7 @@ class SignerLinkVenuePort:
             request_id=uuid4(),
             intent_id=intent.intent_id if intent is not None else uuid4(),
             intent_fingerprint=intent.intent_fingerprint if intent is not None else "0" * 64,
-            capability_digest=(
-                intent.capability_fingerprint if intent is not None else "0" * 64
-            ),
+            capability_digest=(intent.capability_fingerprint if intent is not None else "0" * 64),
             authority_digest=(
                 authority_proof.grant.digest if authority_proof is not None else "0" * 64
             ),
@@ -264,6 +285,16 @@ def _verified_response(request_id: UUID, response: SignerResponse) -> SignerResp
     if not response.ok:
         raise SignerLinkError(str(response.error_code))
     return response
+
+
+def _sanitized_read_result(
+    response: SignerResponse,
+    operation: ExecutionOperation,
+) -> SanitizedOperationResult:
+    result = response.result
+    if type(result) is not SanitizedOperationResult or result.operation is not operation:
+        raise SignerLinkError("IPC_REQUEST_INVALID")
+    return result
 
 
 __all__ = ["REQUEST_DEADLINE", "SignerLinkError", "SignerLinkVenuePort", "describe_identity"]

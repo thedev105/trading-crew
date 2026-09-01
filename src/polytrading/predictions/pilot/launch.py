@@ -4,16 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from decimal import Decimal
-from http import HTTPStatus
 
 from polytrading.predictions.domain import PredictionVenue, Sha256
 from polytrading.predictions.execution.models import canonical_execution_hash
-from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import VenueBinding
+from polytrading.predictions.pilot.execution_port import VenueSubmissionPort
 from polytrading.predictions.pilot.models import PilotProofFamily
 from polytrading.predictions.pilot.qualification import evaluate_pilot_qualification
-from polytrading.predictions.pilot.server import PilotRequestError
+from polytrading.predictions.pilot.reconciliation import reconcile_startup
 from polytrading.predictions.pilot.services import PilotEnvironment
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -30,50 +28,44 @@ def compose_pilot_environment(
     wallet_fingerprint: Sha256,
     credentials_present: bool,
     now: Callable[[], datetime],
+    venue_port: VenueSubmissionPort,
 ) -> PilotEnvironment:
-    """Load only verified persisted evidence; absent transport remains an explicit refusal."""
+    """Load verified persisted evidence and the signer's authoritative account snapshot."""
     observed_at = now()
     manifest = store.verified_latest_venue_manifest_as_of(PredictionVenue.POLYMARKET, observed_at)
     attestations = store.verified_pilot_eligibility_attestations(account_fingerprint)
     fixture_hash = _protocol_fixture_hash()
-    venue_binding = None if manifest is None else VenueBinding(
-        venue=PredictionVenue.POLYMARKET,
-        manifest_record_hash=canonical_execution_hash(manifest),
-        manifest_source_hashes=manifest.source_hashes,
-        eligibility_evidence_hashes=tuple(
-            sorted({fixture_hash, *(item.document_hash for item in attestations)})
-        ),
-        strategy_policy_hash=canonical_execution_hash({"strategy": "pilot-frozen-v1"}),
-        proof_policy_hash=canonical_execution_hash({"proof": "persisted-qualification-v1"}),
-        economics_policy_hash=canonical_execution_hash({"economics": "persisted-shadow-v1"}),
-        protocol_fixture_hash=fixture_hash,
-        route_set_version=ROUTE_SET_VERSION,
-        route_set_hash=ROUTE_SET_HASH,
+    venue_binding = (
+        None
+        if manifest is None
+        else VenueBinding(
+            venue=PredictionVenue.POLYMARKET,
+            manifest_record_hash=canonical_execution_hash(manifest),
+            manifest_source_hashes=manifest.source_hashes,
+            eligibility_evidence_hashes=tuple(
+                sorted({fixture_hash, *(item.document_hash for item in attestations)})
+            ),
+            strategy_policy_hash=canonical_execution_hash({"strategy": "pilot-frozen-v1"}),
+            proof_policy_hash=canonical_execution_hash({"proof": "persisted-qualification-v1"}),
+            economics_policy_hash=canonical_execution_hash({"economics": "persisted-shadow-v1"}),
+            protocol_fixture_hash=fixture_hash,
+            route_set_version=ROUTE_SET_VERSION,
+            route_set_hash=ROUTE_SET_HASH,
+        )
     )
     reports = (
         tuple(
-            evaluate_pilot_qualification(store, family, observed_at)
-            for family in PilotProofFamily
+            evaluate_pilot_qualification(store, family, observed_at) for family in PilotProofFamily
         )
         if store.verified_scan_reports_as_of(observed_at)
         else ()
     )
     latest_attestation = max(attestations, key=lambda item: item.reviewed_at, default=None)
-    reconciliation_hash = canonical_execution_hash(
-        {"account": account_fingerprint, "reconciliation": "transport-unavailable"}
-    )
-    reconciliation = PilotReconciliationState(
+    reconciliation = reconcile_startup(
+        venue_port,
         account_fingerprint=account_fingerprint,
-        active_submissions=0,
-        unknown_outcomes=0,
-        reconciliation_complete=False,
-        unexplained_difference_usd=Decimal("0"),
-        reconciliation_hash=reconciliation_hash,
-        observed_at=observed_at,
+        now=lambda: observed_at,
     )
-
-    def unavailable_account_state() -> object:
-        raise PilotRequestError(HTTPStatus.CONFLICT, "EXECUTION_UNAVAILABLE")
 
     return PilotEnvironment(
         account_fingerprint=account_fingerprint,
@@ -88,7 +80,7 @@ def compose_pilot_environment(
         ),
         credentials_present=credentials_present,
         reconciliation=reconciliation,
-        account_state=unavailable_account_state,  # type: ignore[arg-type]
+        account_state=venue_port.account_state,
     )
 
 
