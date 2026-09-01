@@ -2,8 +2,8 @@
 
 Startup proves the database schema, the origin and RP ID, the pilot protocol checkpoint, and the
 secret-store posture before anything is served, and the process always starts killed. No wallet
-key, credential, or authenticated transport is constructed here: those exist only inside the
-signer, and only after an operator ceremony that later increments gate.
+key, credential, or authenticated transport is constructed in the parent: those exist only inside
+the signer behind fixed route handlers and inherited descriptors.
 """
 
 from __future__ import annotations
@@ -245,6 +245,11 @@ def build_pilot_runtime(
         source=presence_source or MacOSPresenceSource(platform=platform),
         started_at=clock(),
     )
+
+    def engage_signer_kill() -> None:
+        if signer_port is not None:
+            signer_port.engage_kill(issuer.issued_capability_ids)
+
     services = LivePilotServices(
         store=store,
         environment=environment,
@@ -253,6 +258,7 @@ def build_pilot_runtime(
         verifier=verifier,
         presence=monitor,
         clock=clock,
+        signer_kill=engage_signer_kill if signer_port is not None else None,
     )
     return PilotRuntime(
         application=PilotApplication(services, port=port),

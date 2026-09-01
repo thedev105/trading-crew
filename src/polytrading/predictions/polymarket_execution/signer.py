@@ -603,10 +603,7 @@ class SignerService:
     ) -> SignerErrorCode | None:
         signed_evidence = request.mutation_evidence
         evidence_nonce = None if signed_evidence is None else signed_evidence.evidence.nonce
-        if (
-            evidence_nonce is not None
-            and evidence_nonce in self._consumed_mutation_evidence_nonces
-        ):
+        if evidence_nonce is not None and evidence_nonce in self._consumed_mutation_evidence_nonces:
             return "MUTATION_EVIDENCE_REPLAYED"
         if capability.grant_kind != "PRIMARY" or capability.single_use is not True:
             if evidence_nonce is not None:
@@ -701,16 +698,16 @@ class SignerService:
                             strict=True,
                         )
                     except Exception:
-                        return SignerResponse.rejected(
-                            request.request_id,
+                        return self._dispatch_failure(
+                            request,
                             "IPC_OPERATION_RESULT_INVALID",
                         )
                     if (
                         not isinstance(request.payload, ReadGeoblockPayload)
                         or result.operation is not request.operation
                     ):
-                        return SignerResponse.rejected(
-                            request.request_id,
+                        return self._dispatch_failure(
+                            request,
                             "IPC_OPERATION_RESULT_INVALID",
                         )
                 else:
@@ -721,8 +718,8 @@ class SignerService:
                                 strict=True,
                             )
                         except Exception:
-                            return SignerResponse.rejected(
-                                request.request_id,
+                            return self._dispatch_failure(
+                                request,
                                 "IPC_OPERATION_RESULT_INVALID",
                             )
                     if (
@@ -731,19 +728,24 @@ class SignerService:
                         or result.operation is not request.operation
                         or not self._result_matches_request(request, result)
                     ):
-                        return SignerResponse.rejected(
-                            request.request_id,
+                        return self._dispatch_failure(
+                            request,
                             "IPC_OPERATION_RESULT_INVALID",
                         )
                 if type(result) is SanitizedOperationResult and result.kill_required is True:
                     self._kill_engaged = True
             return SignerResponse.accepted(request.request_id, result)
         except OrderSigningError:
-            return SignerResponse.rejected(request.request_id, "ORDER_SIGNING_FAILED")
+            return self._dispatch_failure(request, "ORDER_SIGNING_FAILED")
         except ClobAuthError:
-            return SignerResponse.rejected(request.request_id, "AUTH_HANDLER_FAILED")
+            return self._dispatch_failure(request, "AUTH_HANDLER_FAILED")
         except Exception:
-            return SignerResponse.rejected(request.request_id, "HANDLER_FAILED")
+            return self._dispatch_failure(request, "HANDLER_FAILED")
+
+    def _dispatch_failure(self, request: SignerRequest, code: SignerErrorCode) -> SignerResponse:
+        if request.operation in _MUTATING_OPERATIONS:
+            self._kill_engaged = True
+        return SignerResponse.rejected(request.request_id, code)
 
     @staticmethod
     def _intent_for(request: SignerRequest) -> ExecutionIntent | None:

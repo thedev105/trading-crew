@@ -127,9 +127,7 @@ class _TestCapabilityIssuer:
     def mutation_evidence(self, evidence: MutationEvidence) -> SignedMutationEvidence:
         return SignedMutationEvidence(
             evidence=evidence,
-            signature=b64encode(
-                self._private_key.sign(evidence.digest.encode("ascii"))
-            ),
+            signature=b64encode(self._private_key.sign(evidence.digest.encode("ascii"))),
         )
 
 
@@ -548,11 +546,7 @@ def _request(
         "intent_fingerprint": intent.intent_fingerprint,
         "capability_digest": DEFAULT_GRANT.plan_hash,
         "authority_digest": "0" * 64 if operation in proof_free_operations else CAPABILITY_DIGEST,
-        "authority_proof": (
-            None
-            if operation in proof_free_operations
-            else _authority_proof()
-        ),
+        "authority_proof": (None if operation in proof_free_operations else _authority_proof()),
         "manifest_digest": MANIFEST_HASH,
         "account_fingerprint": ACCOUNT_FINGERPRINT,
         "protocol_version": "polymarket-clob-2026-08-25-v1",
@@ -734,11 +728,13 @@ def test_read_geoblock_rejects_a_generic_authenticated_read_result() -> None:
     service = _service(handlers=handlers)
     try:
         response = service.handle(_request(ExecutionOperation.READ_GEOBLOCK))
+        mutation = service.handle(_action_request(ExecutionOperation.SIGN_ORDER))
     finally:
         service.close()
 
     assert response.ok is False
     assert response.error_code == "IPC_OPERATION_RESULT_INVALID"
+    assert mutation.ok is True
 
 
 def _balance_operation_result(
@@ -1278,7 +1274,7 @@ def test_signer_builds_mutation_authority_only_from_verified_public_evidence() -
     service.close()
 
 
-def test_signer_consumes_mutation_evidence_before_dispatch_and_rejects_nonce_replay(
+def test_signing_failure_latches_kill_before_a_replayed_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_sign(*args: object, **kwargs: object) -> object:
@@ -1312,7 +1308,7 @@ def test_signer_consumes_mutation_evidence_before_dispatch_and_rejects_nonce_rep
     )
 
     assert service.handle(first).error_code == "ORDER_SIGNING_FAILED"
-    assert service.handle(replay).error_code == "MUTATION_EVIDENCE_REPLAYED"
+    assert service.handle(replay).error_code == "PILOT_KILL_ENGAGED"
     service.close()
 
 
@@ -1338,9 +1334,7 @@ def test_signed_mutation_evidence_cannot_be_replayed_under_a_fresh_request_id() 
 def test_mutation_evidence_prepared_before_kill_cannot_dispatch_after_kill() -> None:
     service = _evidence_service()
     mutation = _action_request(ExecutionOperation.SIGN_ORDER)
-    mutation = mutation.model_copy(
-        update={"mutation_evidence": _evidence_for_request(mutation)}
-    )
+    mutation = mutation.model_copy(update={"mutation_evidence": _evidence_for_request(mutation)})
     kill = _request(
         ExecutionOperation.SIGNER_KILL,
         request_id=uuid4(),
@@ -1375,9 +1369,7 @@ def test_signer_rejects_missing_tampered_stale_or_killed_mutation_evidence() -> 
 
     responses = (
         service.handle(request),
-        service.handle(
-            invalid_request.model_copy(update={"mutation_evidence": invalid_signature})
-        ),
+        service.handle(invalid_request.model_copy(update={"mutation_evidence": invalid_signature})),
         service.handle(stale_request.model_copy(update={"mutation_evidence": stale})),
         service.handle(killed_request.model_copy(update={"mutation_evidence": killed})),
     )
@@ -1392,7 +1384,7 @@ def test_signer_rejects_missing_tampered_stale_or_killed_mutation_evidence() -> 
     service.close()
 
 
-def test_signer_consumes_a_primary_submission_before_handler_dispatch() -> None:
+def test_handler_failure_latches_kill_before_a_replayed_submission() -> None:
     handler_calls = 0
 
     def fail_submit(payload: SubmitOrderPayload) -> SanitizedOperationResult:
@@ -1410,7 +1402,7 @@ def test_signer_consumes_a_primary_submission_before_handler_dispatch() -> None:
     )
 
     assert service.handle(first).error_code == "HANDLER_FAILED"
-    assert service.handle(replay).error_code == "CAPABILITY_REPLAYED"
+    assert service.handle(replay).error_code == "PILOT_KILL_ENGAGED"
     assert handler_calls == 1
     service.close()
 
@@ -1581,18 +1573,10 @@ def test_complete_strategy_allows_sign_then_submit_and_distinct_plan_intents() -
     first_plan = UUID("22222222-2222-4222-8222-222222222221")
     second_plan = UUID("22222222-2222-4222-8222-222222222222")
 
-    signed = service.handle(
-        _action_request(ExecutionOperation.SIGN_ORDER, plan_id=first_plan)
-    )
-    first = service.handle(
-        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan)
-    )
-    replay = service.handle(
-        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan)
-    )
-    second = service.handle(
-        _action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=second_plan)
-    )
+    signed = service.handle(_action_request(ExecutionOperation.SIGN_ORDER, plan_id=first_plan))
+    first = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan))
+    replay = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=first_plan))
+    second = service.handle(_action_request(ExecutionOperation.SUBMIT_ORDER, plan_id=second_plan))
 
     assert signed.ok is True
     assert first.ok is True
@@ -2030,7 +2014,7 @@ def test_ipc_rejects_nonconservative_authenticated_read_results(
         )
 
 
-def test_handler_result_is_freshly_revalidated_before_binding_and_cache() -> None:
+def test_invalid_mutation_handler_result_latches_kill_before_a_fresh_mutation() -> None:
     cancel_calls = 0
     forged = SanitizedOperationResult(
         operation=ExecutionOperation.SUBMIT_ORDER,
@@ -2072,10 +2056,15 @@ def test_handler_result_is_freshly_revalidated_before_binding_and_cache() -> Non
 
     service = _service(handlers=_handlers(submit_order=submit, cancel_order=cancel))
     submitted = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
-    cancelled = service.handle(_request(ExecutionOperation.CANCEL_ORDER, request_id=uuid4()))
+    fresh = service.handle(
+        _action_request(
+            ExecutionOperation.SIGN_ORDER,
+            plan_id=UUID("77777777-7777-4777-8777-777777777777"),
+        )
+    )
 
     assert submitted.error_code == "IPC_OPERATION_RESULT_INVALID"
-    assert cancelled.error_code == "CANCEL_ORDER_UNKNOWN"
+    assert fresh.error_code == "PILOT_KILL_ENGAGED"
     assert cancel_calls == 0
     service.close()
 
@@ -2553,8 +2542,15 @@ def test_handler_exception_classes_map_to_constant_codes_without_reflection(
     service = _service(handlers=_handlers(submit_order=fail))
 
     response = service.handle(_request(ExecutionOperation.SUBMIT_ORDER, request_id=uuid4()))
+    fresh = service.handle(
+        _action_request(
+            ExecutionOperation.SIGN_ORDER,
+            plan_id=UUID("88888888-8888-4888-8888-888888888888"),
+        )
+    )
 
     assert response.error_code == error_code
+    assert fresh.error_code == "PILOT_KILL_ENGAGED"
     _assert_canaries_absent(
         response.model_dump_json(),
         "ORDER_ERROR_CANARY",

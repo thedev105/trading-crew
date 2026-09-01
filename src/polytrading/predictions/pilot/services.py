@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -175,6 +176,7 @@ class LivePilotServices:
         verifier: PilotCapabilityVerifier,
         presence: PresenceMonitor,
         clock: Callable[[], datetime],
+        signer_kill: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._environment = environment
@@ -183,6 +185,7 @@ class LivePilotServices:
         self._verifier = verifier
         self._presence = presence
         self._clock = clock
+        self._signer_kill = signer_kill
         self._state = _LaunchState()
 
     # -- reads --------------------------------------------------------------------------
@@ -393,18 +396,37 @@ class LivePilotServices:
         if not isinstance(credential, Mapping):
             raise PilotRequestError(HTTPStatus.BAD_REQUEST, "ASSERTION_INVALID")
         assertion = self._verified_assertion(challenge, dict(credential), payload)
+        now = self._clock()
+        try:
+            if self._environment.reconciliation_provider is None:
+                raise TypeError("RECONCILIATION_PROVIDER_UNAVAILABLE")
+            reconciliation = self._current_reconciliation()
+            account = self._current_account()
+            geoblock_provider = self._environment.geoblock_provider
+            geoblock = None if geoblock_provider is None else geoblock_provider()
+        except Exception as error:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE") from error
+        if (
+            not self._reconciliation_is_current(reconciliation, now)
+            or not self._account_is_current(account, now)
+            or type(geoblock) is not GeoblockEvidence
+            or not geoblock.allowed
+            or now >= geoblock.expires_at
+            or challenge.evidence_hashes != self._evidence_hashes(reconciliation)
+        ):
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE")
         kill_event_id = _uuid(payload.get("kill_event_id"), "KILL_EVENT_ID_INVALID")
         request = KillClearanceRequest(
             clearance_event_id=uuid4(),
             kill_event_id=kill_event_id,
             account_fingerprint=self._environment.account_fingerprint,
-            state=self._environment.reconciliation,
-            discrepancy_evidence_hashes=self._evidence_hashes(),
+            state=reconciliation,
+            discrepancy_evidence_hashes=self._evidence_hashes(reconciliation),
             confirmation_phrase=str(payload.get("confirmation_phrase", "")),
             assertion=assertion,
         )
         try:
-            event = clear_pilot_kill(request, now=self._clock())
+            event = clear_pilot_kill(request, now=now)
         except KillClearanceError as error:
             raise PilotRequestError(HTTPStatus.CONFLICT, error.code) from error
         self._store.append_pilot_kill_clearance_event(event)
@@ -729,9 +751,7 @@ class LivePilotServices:
             "plan_hash": result.plan_hash,
         }
 
-    def _freeze_plan(
-        self, challenge: AuthorizationChallenge, now: datetime
-    ) -> FrozenPilotPlan:
+    def _freeze_plan(self, challenge: AuthorizationChallenge, now: datetime) -> FrozenPilotPlan:
         """Re-resolve current server evidence and freeze exactly what the grants authorize."""
 
         if challenge.mode is AuthorizationMode.AUTOMATION_SESSION:
@@ -857,9 +877,7 @@ class LivePilotServices:
         except Exception:
             pass
         reconciliation_expires_at = (
-            None
-            if reconciliation is None
-            else reconciliation.observed_at + CHALLENGE_LIFETIME
+            None if reconciliation is None else reconciliation.observed_at + CHALLENGE_LIFETIME
         )
         account_expires_at = (
             None if account is None else account.observed_at + MAXIMUM_EQUITY_EVIDENCE_AGE
@@ -943,9 +961,7 @@ class LivePilotServices:
             and -CHALLENGE_LIFETIME <= age <= CHALLENGE_LIFETIME
         )
 
-    def _account_is_current(
-        self, account: PilotAccountState | None, now: datetime
-    ) -> bool:
+    def _account_is_current(self, account: PilotAccountState | None, now: datetime) -> bool:
         if account is None:
             return False
         age = now - account.observed_at
@@ -1019,6 +1035,9 @@ class LivePilotServices:
             self._verifier.revoke(grants.primary.grant.capability_id)
         self._state.kill_engaged = True
         self._state.kill_reason = reason
+        if self._signer_kill is not None:
+            with suppress(Exception):
+                self._signer_kill()
 
     def _authority_expiry(self) -> datetime | None:
         expiries = [grants.primary.grant.expires_at for grants in self._state.grants.values()]

@@ -335,6 +335,35 @@ def test_the_kill_must_be_cleared_before_anything_is_offered(cockpit: Cockpit) -
     assert opportunities[0]["rank"] == 1
 
 
+def test_kill_clearance_refuses_reconciliation_changed_after_the_challenge(
+    cockpit: Cockpit,
+) -> None:
+    options = cockpit.post(
+        "/api/v1/pilot/passkeys/authenticate/options",
+        {"mode": "COMPLETE_STRATEGY", "browser_session_hash": cockpit.session_hash},
+    )
+    assert options.status is HTTPStatus.OK, body(options)
+    challenge_id = body(options)["challenge_id"]
+    cockpit.execution_capture["provider_state"]["reconciliation"] = reconciliation().model_copy(
+        update={"reconciliation_hash": "7" * 64}
+    )
+
+    cleared = cockpit.post(
+        "/api/v1/pilot/kill/clear",
+        {
+            "challenge_id": challenge_id,
+            "kill_event_id": "00000000-0000-0000-0000-0000000000f1",
+            "confirmation_phrase": "CLEAR POLYMARKET PILOT KILL",
+            "browser_session_hash": cockpit.session_hash,
+            "assertion": _assertion(cockpit, challenge_id),
+        },
+    )
+
+    assert cleared.status is HTTPStatus.CONFLICT
+    assert body(cleared)["error"] == "EVIDENCE_STALE"
+    assert cockpit.get("/api/v1/pilot/readiness")["kill_engaged"] is True
+
+
 def clear_kill(cockpit: Cockpit) -> PilotResponse:
     options = cockpit.post(
         "/api/v1/pilot/passkeys/authenticate/options",

@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "900b0220da76bcb891df3ad38f9a8f29f80b81def8de0101d3d51fef03d09a2e",
+    ): "5bff3d0a9ec32f9db5865809e6d5fa7cc42b2d79882d253e0c5219553cb894c4",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
@@ -657,8 +657,7 @@ def _allowed_live_signer_transport_composition(
         (
             item
             for item in tree.body
-            if isinstance(item, ast.FunctionDef)
-            and item.name == "live_pilot_signer_service"
+            if isinstance(item, ast.FunctionDef) and item.name == "live_pilot_signer_service"
         ),
         None,
     )
@@ -682,9 +681,7 @@ def _allowed_live_signer_transport_composition(
         if isinstance(item, ast.Call)
         and (
             (resolved := _resolved_python_name(item.func, aliases, constants)) is not None
-            and resolved.endswith(
-                (".HttpxPolymarketRestTransport", ".SignerRestHandlers")
-            )
+            and resolved.endswith((".HttpxPolymarketRestTransport", ".SignerRestHandlers"))
         )
     ]
     if len(composition_calls) != 2:
@@ -1216,14 +1213,16 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
                 )
                 if not (isinstance(engaged, ast.Constant) and engaged.value is True):
                     violations.append(f"clear-kill:{source_path}:{node.lineno}")
-            if resolved is not None and resolved.endswith(
-                (".HttpxPolymarketRestTransport", ".SignerRestHandlers")
-            ) and not _allowed_live_signer_transport_composition(
-                source_path,
-                tree,
-                node,
-                aliases,
-                constants,
+            if (
+                resolved is not None
+                and resolved.endswith((".HttpxPolymarketRestTransport", ".SignerRestHandlers"))
+                and not _allowed_live_signer_transport_composition(
+                    source_path,
+                    tree,
+                    node,
+                    aliases,
+                    constants,
+                )
             ):
                 violations.append(f"transport-composition:{source_path}:{node.lineno}")
             if resolved is not None and resolved.startswith("httpx."):

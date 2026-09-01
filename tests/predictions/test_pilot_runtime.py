@@ -167,6 +167,49 @@ def test_launch_composes_live_services_when_the_signer_bootstraps(
     assert channel.response_stream.closed
 
 
+def test_operator_stop_sends_signer_kill_and_parent_kill_survives_link_failure(
+    database: Path,
+) -> None:
+    channel, bootstrap = live_launch_bootstrap(
+        fail_operation=ExecutionOperation.SIGNER_KILL,
+    )
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        services = runtime.application.services
+        assert isinstance(services, LivePilotServices)
+
+        stopped = services.stop({})
+
+        assert stopped == {"kill_engaged": True, "reason": "OPERATOR_STOP"}
+        assert services.readiness()["kill_engaged"] is True
+        assert channel.request_stream._channel.requests[-1].operation is (  # type: ignore[attr-defined]
+            ExecutionOperation.SIGNER_KILL
+        )
+    finally:
+        runtime.close()
+
+
+def test_terminal_presence_sends_signer_kill_before_returning(database: Path) -> None:
+    channel, bootstrap = live_launch_bootstrap()
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        services = runtime.application.services
+        assert isinstance(services, LivePilotServices)
+
+        presence = services.presence({"kind": "PAGE_CLOSED"})
+
+        assert presence == {
+            "presence_state": "TERMINAL",
+            "kill_reason": "PAGE_CLOSED",
+            "kill_engaged": True,
+        }
+        assert channel.request_stream._channel.requests[-1].operation is (  # type: ignore[attr-defined]
+            ExecutionOperation.SIGNER_KILL
+        )
+    finally:
+        runtime.close()
+
+
 class _LaunchSignerChannel:
     """Answer the production signer link in memory, without a venue or secret store."""
 
@@ -200,9 +243,7 @@ class _LaunchSignerChannel:
                 BalanceAllowancePayload(
                     kind="BALANCE_ALLOWANCE",
                     balance="200",
-                    allowances=(
-                        AllowanceEntry(address="0x" + "11" * 20, amount="200"),
-                    ),
+                    allowances=(AllowanceEntry(address="0x" + "11" * 20, amount="200"),),
                 ),
             )
         elif request.operation is ExecutionOperation.READ_ORDERS:

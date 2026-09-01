@@ -2,20 +2,22 @@
 
 ## Current boundary
 
-This increment is capability- and evidence-gated. Polymarket execution starts killed on every
-launch and cannot become eligible merely because a process has started. The production verifier has
-no configured key, there is no production capability issuer or kill-clear callable, and the CLI
-exposes no credential, order, activation, or clearance flag. The public Polymarket collector remains
-separate from the authenticated execution package.
+This increment is capability- and evidence-gated. It includes a launch-scoped capability issuer,
+signer-owned authenticated transport, a loopback operator surface, kill clearance, and manual
+exact-order/complete-strategy execution. Polymarket execution still starts killed on every fresh
+launch and cannot become eligible merely because those components or a process exist. The CLI
+exposes no credential, order, activation, or clearance flags; the public Polymarket collector
+remains separate from the authenticated execution package.
 
-This is not a live pilot or an activation procedure. It neither authorizes authenticated venue
-access nor exposes an operator surface or authorized production path to place, cancel, sign,
-activate, fund, or transfer anything.
+Code completion is not activation authority. The external 45-day qualification, 30-day shadow
+evidence, legal/KYC/venue-terms and geoblock review, manual funding/allowance, and separately approved
+activation decision remain unsatisfied prerequisites and prevent authorization by default. Funding,
+transfers, withdrawals, and allowance mutation remain outside the application.
 
 ## Operator preflight boundary
 
-The following sequence records the gates a separate, explicitly approved operator pilot would have
-to satisfy; it does not create an authority path in this package. Keep the account killed until all
+The following sequence records the gates a separate, explicitly approved operator pilot must
+satisfy before the implemented manual path may be used. Keep the account killed until all
 of the following are current and successful: persisted 45-day qualification, 30-day queue-aware
 shadow execution, account eligibility, KYC, jurisdiction/geoblock review, protocol review, manual
 funding and allowance, exact reconciliation, passkey activation, and explicit operator action.
@@ -26,14 +28,14 @@ reconciliation; register and verify the passkey; obtain a separately approved ex
 decision only if every gate passes; manually authorize one bounded complete strategy in that
 separate pilot; inspect reconciliation; and stop/kill on uncertainty. The 45-day qualification,
 30-day shadow evidence, independent legal/KYC/venue-terms review, manual funding/allowance, and
-activation decision remain external prerequisites; completing this sequence in this repository does
-not authorize activation or trading. Automation is unavailable and must not be enabled, simulated
-with a script, or substituted for the manual-first strategy. A stale, missing, ambiguous, or
-contradictory item leaves the kill engaged.
+activation decision remain external prerequisites; completing the repository-local portion of this
+sequence does not replace the separate activation decision or authorize trading. Automation is
+unavailable and must not be enabled, simulated with a script, or substituted for the manual-first
+strategy. A stale, missing, ambiguous, or contradictory item leaves the kill engaged.
 
 ## Secret isolation
 
-The signer boundary is designed for a separately supervised local process. A wallet private key
+The signer boundary runs in a separately supervised local process. A wallet private key
 and the CLOB API key, secret, and passphrase may enter that process only through an inherited file
 descriptor at startup. They do not enter command-line arguments, environment variables, config
 files, DuckDB, logs, reports, dashboard payloads, or IPC request bodies. Startup reads the bounded
@@ -82,8 +84,8 @@ and it still requires independent authority at both boundaries. An HTTP success 
 Confirm the terminal order state through an authoritative read. A timeout, lost response,
 contradiction, or missed heartbeat creates cancellation ambiguity: assume neither that cancellation
 succeeded nor that the order is still resting, block new work, read order/trade/account state, and
-leave the kill switch engaged. Production currently has no capability with which to attempt a
-cancel.
+leave the kill switch engaged. A cancellation can use only an already issued, bounded recovery
+capability; a fresh killed launch has none.
 
 ### Reconnect and event gaps
 
@@ -114,8 +116,8 @@ On restart, keep admission closed. Scan the immutable store for submitting or `U
 delayed or unexpected-live acknowledgements, pending cancellation, nonterminal or failed trade
 histories, incomplete checkpoints, and unreconciled ledger entries. Perform read-only recovery at
 one bounded account-wide cutoff before considering any state resolved. Credentials are not loaded
-from serialized state; a future separately authorized signer launch would require fresh inherited
-descriptors. A restart does not clear a kill or restore authority.
+from serialized state; every signer launch requires fresh inherited descriptors. A restart does not
+clear a kill or restore authority.
 
 ## Source-hash review
 
@@ -146,10 +148,11 @@ contradiction, reconnect gap, heartbeat failure, unsafe rate limiting, settlemen
 divergence, risk breach, nonce/signature failure, and any secret-output detection.
 
 While killed, new plans and intents remain unavailable and read-only reconciliation remains
-available. There is no production clearance mechanism. Test fixtures can construct a cleared state
-only inside tests; no stored event, restart, dashboard interaction, or conformance result clears
-production kill state. A future clearance ceremony, if ever approved, belongs to a separate
-activation design.
+available. The production clearance ceremony requires a fresh same-account reconciliation, current
+account and allowed geoblock evidence, no active or unknown submission, the exact confirmation
+phrase, and a fresh passkey assertion. A changed provider snapshot invalidates the attempt.
+Clearance creates no capability: no stored event, restart, dashboard interaction, or conformance
+result authorizes the next action, which still needs its own manual approval.
 
 ## Market Atlas observer semantics
 
@@ -198,12 +201,12 @@ shadow execution with positive net results excluding rewards, no risk breach, an
 reconciliation. Replays, dense fixtures, or many observations on one date cannot compress either
 calendar gate.
 
-Passing that evidence would still not authorize a live call. A separately requested and approved
-design must complete current legal, jurisdiction, KYC, tax, venue-terms, and account eligibility
-review; custody, wallet funding, allowance, incident-response, and credential provisioning/rotation
-design; a production capability issuer, signature scheme, issuer-key custody, revocation, duration,
-and clearance ceremony; production monitoring and ownership; maximum-capital and loss limits; a
-pilot review (no more than the separately approved USD 250 ceiling); and explicit user approval.
+Passing that evidence would still not authorize a live call. A separate activation decision must
+confirm current legal, jurisdiction, KYC, tax, venue-terms, geoblock, and account eligibility review;
+custody, manual wallet funding and allowance, incident response, credential provisioning/rotation,
+issuer-key custody, revocation and clearance operations, production monitoring and ownership,
+maximum-capital and loss limits, a pilot review (no more than the separately approved USD 250
+ceiling), and explicit user approval.
 
 The system does not attempt geographic circumvention, and geoblock evidence is not legal advice.
 This documentation makes no claim of eligibility or profitability: it does not claim that any user
