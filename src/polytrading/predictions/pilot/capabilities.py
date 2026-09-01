@@ -12,6 +12,7 @@ from base64 import b64encode
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -21,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from pydantic import Base64Bytes, StringConstraints, field_validator, model_validator
+from pydantic import Base64Bytes, Field, StringConstraints, field_validator, model_validator
 
 from polytrading.predictions.domain import (
     PredictionRecord,
@@ -30,6 +31,7 @@ from polytrading.predictions.domain import (
     normalize_utc_timestamp,
 )
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
+from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     AuthorizationChallenge,
@@ -63,6 +65,8 @@ _RECOVERY_OPERATIONS = frozenset(
 )
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
+MAXIMUM_MUTATION_EVIDENCE_LIFETIME = timedelta(seconds=5)
 
 CapabilityIssueCode = Literal[
     "ISSUER_CLOSED",
@@ -209,8 +213,6 @@ class SignerKillDirective(PredictionRecord):
     @field_validator("capability_ids")
     @classmethod
     def _sorted_unique_capability_ids(cls, value: tuple[UUID, ...]) -> tuple[UUID, ...]:
-        if not value:
-            raise ValueError("kill directive must identify at least one capability")
         if value != tuple(sorted(set(value), key=str)):
             raise ValueError("capability ids must be sorted and unique")
         return value
@@ -224,6 +226,57 @@ class SignerKillDirective(PredictionRecord):
                 "issued_at": self.issued_at,
             }
         )
+
+
+class MutationEvidence(PilotRecord):
+    """One short-lived, public mutation snapshot signed by the launch issuer."""
+
+    schema_version: Literal[1]
+    manifest: VenueManifest
+    manifest_record_hash: Sha256
+    account_fingerprint: Sha256
+    reconciliation_hash: Sha256
+    reconciliation_observed_at: UtcTimestamp
+    geoblock_allowed: bool
+    geoblock_evidence_hash: Sha256
+    geoblock_expires_at: UtcTimestamp
+    account_scope_evidence_hash: Sha256
+    account_scope_expires_at: UtcTimestamp
+    kill_engaged: bool
+    operator_present: bool
+    plan_digest: Sha256
+    authority_digest: Sha256
+    requested_notional: NonNegativeDecimal
+    capital_after: NonNegativeDecimal
+    position_after: NonNegativeDecimal
+    loss_after: NonNegativeDecimal
+    issued_at: UtcTimestamp
+    expires_at: UtcTimestamp
+
+    @model_validator(mode="after")
+    def _bind_manifest_and_lifetime(self) -> MutationEvidence:
+        if canonical_execution_hash(self.manifest) != self.manifest_record_hash:
+            raise ValueError("mutation evidence manifest hash mismatch")
+        lifetime = self.expires_at - self.issued_at
+        if lifetime <= timedelta(0) or lifetime > MAXIMUM_MUTATION_EVIDENCE_LIFETIME:
+            raise ValueError("mutation evidence lifetime invalid")
+        return self
+
+    @property
+    def digest(self) -> Sha256:
+        return canonical_execution_hash(
+            {
+                "kind": "pilot-mutation-evidence-v1",
+                "evidence": self.model_dump(mode="json"),
+            }
+        )
+
+
+class SignedMutationEvidence(PredictionRecord):
+    """A public evidence snapshot plus its detached launch signature."""
+
+    evidence: MutationEvidence
+    signature: Base64Bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +318,17 @@ def verify_kill_directive(directive: SignerKillDirective, public_key: bytes) -> 
     return True
 
 
+def verify_mutation_evidence(evidence: SignedMutationEvidence, public_key: bytes) -> bool:
+    """Verify one public mutation snapshot against this launch and no other."""
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            evidence.signature, evidence.evidence.digest.encode("ascii")
+        )
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
 class PilotCapabilityIssuer:
     """The one local authority allowed to mint execution capabilities, for one launch only."""
 
@@ -290,6 +354,11 @@ class PilotCapabilityIssuer:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def issued_capability_ids(self) -> tuple[UUID, ...]:
+        """Return the public capability identities this launch must kill on shutdown."""
+        return tuple(sorted(self._issued_capabilities, key=str))
 
     def close(self) -> None:
         self._private_key = None
@@ -327,6 +396,16 @@ class PilotCapabilityIssuer:
             issued_at=normalized_issued_at,
             signature=b64encode(signature),
         )
+
+    def issue_mutation_evidence(
+        self,
+        evidence: MutationEvidence,
+    ) -> SignedMutationEvidence:
+        """Sign one already-validated public snapshot for immediate signer use."""
+        self._require_open()
+        assert self._private_key is not None  # narrowed by _require_open
+        signature = self._private_key.sign(evidence.digest.encode("ascii"))
+        return SignedMutationEvidence(evidence=evidence, signature=b64encode(signature))
 
     def _require_open(self) -> None:
         if self._closed or self._private_key is None:

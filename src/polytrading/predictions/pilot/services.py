@@ -889,6 +889,12 @@ class LivePilotServices:
                 or not self._account_is_current(account, now)
             ),
             operator_present=operator_present,
+            reconciliation_hash=(
+                None if reconciliation is None else reconciliation.reconciliation_hash
+            ),
+            reconciliation_observed_at=(
+                None if reconciliation is None else reconciliation.observed_at
+            ),
         )
 
     def _current_manifest(self) -> VenueManifest | None:

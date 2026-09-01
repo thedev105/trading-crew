@@ -26,7 +26,11 @@ from polytrading.predictions.execution.models import (
     ExecutionOperation,
     SignedOrderEnvelope,
 )
-from polytrading.predictions.pilot.capabilities import CapabilityGrant, SignerKillDirective
+from polytrading.predictions.pilot.capabilities import (
+    CapabilityGrant,
+    SignedMutationEvidence,
+    SignerKillDirective,
+)
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     POLYMARKET_PROTOCOL_VERSION,
@@ -94,6 +98,9 @@ SignerErrorCode = Literal[
     "ACCOUNT_FINGERPRINT_MISMATCH",
     "AUTHORITY_CONTEXT_TIME_MISMATCH",
     "AUTHORITY_GATE_FAILED",
+    "MUTATION_EVIDENCE_SIGNATURE_INVALID",
+    "MUTATION_EVIDENCE_STALE",
+    "MUTATION_EVIDENCE_UNAVAILABLE",
     "CAPABILITY_REPLAYED",
     "PILOT_KILL_ENGAGED",
     "READ_GUARD_FAILED",
@@ -335,6 +342,7 @@ class SignerRequest(_SignerRecord):
     capability_digest: Sha256
     authority_digest: Sha256
     authority_proof: SignerCapabilityProof | None = None
+    mutation_evidence: SignedMutationEvidence | None = None
     manifest_digest: Sha256
     account_fingerprint: Sha256
     # A request may run under either reviewed checkpoint; the signer still compares this against
@@ -363,12 +371,25 @@ class SignerRequest(_SignerRecord):
             }
         )
         if self.operation in proof_free_operations:
-            if self.authority_proof is not None or self.authority_digest != "0" * 64:
+            if (
+                self.authority_proof is not None
+                or self.mutation_evidence is not None
+                or self.authority_digest != "0" * 64
+            ):
                 raise ValueError("this operation must not carry an authority proof")
         elif self.authority_proof is None:
             raise ValueError("mutating operations require an authority proof")
         elif self.authority_proof.grant.digest != self.authority_digest:
             raise ValueError("authority proof does not match capability digest")
+        if self.mutation_evidence is not None:
+            evidence = self.mutation_evidence.evidence
+            if (
+                evidence.plan_digest != self.capability_digest
+                or evidence.authority_digest != self.authority_digest
+                or evidence.manifest_record_hash != self.manifest_digest
+                or evidence.account_fingerprint != self.account_fingerprint
+            ):
+                raise ValueError("mutation evidence does not match request")
         if isinstance(self.payload, SignOrderPayload):
             intent = self.payload.intent
             if (

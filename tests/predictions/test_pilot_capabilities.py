@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -15,10 +16,12 @@ from polytrading.predictions.pilot.capabilities import (
     CapabilityIssueError,
     CapabilityRequest,
     GrantKind,
+    MutationEvidence,
     PilotCapabilityIssuer,
     VenueBinding,
     verify_capability_signature,
     verify_kill_directive,
+    verify_mutation_evidence,
 )
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
@@ -46,6 +49,7 @@ from tests.predictions.pilot_helpers import (
     limits_fields,
     venue_binding_fields,
 )
+from tests.predictions.test_execution_authority import ELIGIBLE_MANIFEST, MANIFEST_HASH
 
 PORT = 8788
 ORIGIN = f"http://localhost:{PORT}"
@@ -145,6 +149,60 @@ def test_kill_directive_verifies_only_for_the_launch_issuer() -> None:
         directive,
         Ed25519PrivateKey.generate().public_key().public_bytes_raw(),
     )
+
+
+def mutation_evidence(**overrides: Any) -> MutationEvidence:
+    fields: dict[str, Any] = {
+        "schema_version": 1,
+        "manifest": ELIGIBLE_MANIFEST,
+        "manifest_record_hash": MANIFEST_HASH,
+        "account_fingerprint": ACCOUNT_FINGERPRINT,
+        "reconciliation_hash": EVIDENCE_HASH,
+        "reconciliation_observed_at": NOW,
+        "geoblock_allowed": True,
+        "geoblock_evidence_hash": "9" * 64,
+        "geoblock_expires_at": NOW + timedelta(minutes=1),
+        "account_scope_evidence_hash": "a" * 64,
+        "account_scope_expires_at": NOW + timedelta(minutes=1),
+        "kill_engaged": False,
+        "operator_present": True,
+        "plan_digest": PROTOCOL_FIXTURE_HASH,
+        "authority_digest": POLICY_HASH,
+        "requested_notional": Decimal("4"),
+        "capital_after": Decimal("20"),
+        "position_after": Decimal("20"),
+        "loss_after": Decimal("0"),
+        "issued_at": NOW,
+        "expires_at": NOW + timedelta(seconds=5),
+    }
+    fields.update(overrides)
+    return MutationEvidence.model_validate(fields, strict=True)
+
+
+def test_mutation_evidence_verifies_only_for_the_launch_issuer() -> None:
+    authority = PilotCapabilityIssuer(key_id="test")
+    signed = authority.issue_mutation_evidence(mutation_evidence())
+
+    assert verify_mutation_evidence(signed, authority.public_verification_key)
+    assert not verify_mutation_evidence(
+        signed,
+        Ed25519PrivateKey.generate().public_key().public_bytes_raw(),
+    )
+    tampered = signed.model_copy(
+        update={
+            "evidence": signed.evidence.model_copy(update={"kill_engaged": True})
+        }
+    )
+    assert not verify_mutation_evidence(tampered, authority.public_verification_key)
+
+
+def test_shutdown_kill_directive_can_engage_before_any_capability_exists() -> None:
+    authority = PilotCapabilityIssuer(key_id="test")
+
+    directive = authority.issue_kill_directive((), issued_at=NOW)
+
+    assert directive.capability_ids == ()
+    assert verify_kill_directive(directive, authority.public_verification_key)
 
 
 def test_a_closed_issuer_drops_its_private_key_and_refuses_to_sign() -> None:

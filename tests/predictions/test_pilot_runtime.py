@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from polytrading.predictions.cli import add_predictions_subcommands
+from polytrading.predictions.execution.models import ExecutionOperation
 from polytrading.predictions.pilot.models import PILOT_CEILINGS
 from polytrading.predictions.pilot.passkeys import RP_ID
 from polytrading.predictions.pilot.runtime import (
@@ -24,9 +28,31 @@ from polytrading.predictions.pilot.server import (
     PilotRequestError,
 )
 from polytrading.predictions.pilot.services import LivePilotServices
-from polytrading.predictions.pilot.signer_bootstrap import SignerBootstrapError, SignerChannel
+from polytrading.predictions.pilot.signer_bootstrap import (
+    SignerBootstrapError,
+    SignerChannel,
+    SignerServiceFactory,
+)
+from polytrading.predictions.polymarket_execution.ipc import (
+    IdentityResult,
+    SanitizedOperationResult,
+    SignerKillResult,
+    SignerResponse,
+    canonical_response_bytes,
+    parse_signer_request,
+    write_frame,
+)
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
+)
+from polytrading.predictions.polymarket_execution.routes import (
+    AllowanceEntry,
+    BalanceAllowancePayload,
+    OrderReadPayload,
+    OrdersReadPayload,
+    RestCode,
+    RouteKey,
+    TradesReadPayload,
 )
 from polytrading.predictions.storage.store import PredictionMarketStore
 
@@ -99,16 +125,15 @@ def test_the_runtime_opens_its_database_read_only(database: Path) -> None:
 def test_launch_falls_back_to_posture_only_when_signer_bootstrap_fails(
     database: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def unavailable() -> object:
+    def unavailable(_service_factory: SignerServiceFactory) -> object:
         raise SignerBootstrapError("SECRET_ITEM_MISSING")
 
     runtime = build_launch_runtime(database, PORT, bootstrap=unavailable)  # type: ignore[arg-type]
     try:
         assert isinstance(runtime.application._services, KilledPilotServices)
-        assert (
-            "pilot: signer unavailable (SECRET_ITEM_MISSING); serving posture only"
-            in capsys.readouterr().err
-        )
+        diagnostics = capsys.readouterr().err
+        assert "pilot: signer unavailable; serving posture only" in diagnostics
+        assert "SECRET_ITEM_MISSING" not in diagnostics
     finally:
         runtime.close()
 
@@ -116,27 +141,202 @@ def test_launch_falls_back_to_posture_only_when_signer_bootstrap_fails(
 def test_launch_composes_live_services_when_the_signer_bootstraps(
     database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    channel = SignerChannel(
-        request_stream=io.BytesIO(),
-        response_stream=io.BytesIO(),
-        child_pid=None,
-        credentials_present=False,
-    )
-    monkeypatch.setattr(
-        "polytrading.predictions.pilot.runtime.describe_identity",
-        lambda *args, **kwargs: ("a" * 64, "a" * 64),
-    )
+    del monkeypatch
+    channel, bootstrap = live_launch_bootstrap()
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=lambda: channel, now=lambda: NOW)
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
     try:
         assert isinstance(runtime.application._services, LivePilotServices)
         readiness = runtime.application._services.readiness()
         assert readiness["kill_engaged"] is True
-        assert "RECONCILIATION_INCOMPLETE" in readiness["blockers"]
+        assert "KILL_ENGAGED" in readiness["blockers"]
     finally:
         runtime.close()
     assert channel.request_stream.closed
     assert channel.response_stream.closed
+
+
+class _LaunchSignerChannel:
+    """Answer the production signer link in memory, without a venue or secret store."""
+
+    def __init__(self, *, ambiguous: bool = False) -> None:
+        self.requests: list[Any] = []
+        self.responses = io.BytesIO()
+        self.request_stream = _LaunchRequestStream(self)
+        self.ambiguous = ambiguous
+
+    def answer(self, frame: bytes) -> None:
+        request = parse_signer_request(frame)
+        self.requests.append(request)
+        if request.operation is ExecutionOperation.DESCRIBE_IDENTITY:
+            result: object = IdentityResult(
+                operation=ExecutionOperation.DESCRIBE_IDENTITY,
+                account_fingerprint="a" * 64,
+                wallet_fingerprint="b" * 64,
+            )
+        elif request.operation is ExecutionOperation.READ_ACCOUNT:
+            result = _read_result(
+                ExecutionOperation.READ_ACCOUNT,
+                RouteKey.READ_BALANCE_ALLOWANCE,
+                BalanceAllowancePayload(
+                    kind="BALANCE_ALLOWANCE",
+                    balance="200",
+                    allowances=(
+                        AllowanceEntry(address="0x" + "11" * 20, amount="200"),
+                    ),
+                ),
+            )
+        elif request.operation is ExecutionOperation.READ_ORDERS:
+            items = (_open_order(),) if self.ambiguous else ()
+            result = _read_result(
+                ExecutionOperation.READ_ORDERS,
+                RouteKey.READ_OPEN_ORDERS,
+                OrdersReadPayload(kind="ORDERS_READ", items=items),
+            )
+        elif request.operation is ExecutionOperation.READ_TRADES:
+            result = _read_result(
+                ExecutionOperation.READ_TRADES,
+                RouteKey.READ_TRADES,
+                TradesReadPayload(kind="TRADES_READ", items=()),
+            )
+        elif request.operation is ExecutionOperation.SIGNER_KILL:
+            result = SignerKillResult(
+                operation=ExecutionOperation.SIGNER_KILL,
+                result_code="SIGNER_KILL_ENGAGED",
+            )
+        else:  # pragma: no cover - a regression exposes the unexpected request in the assertion
+            raise AssertionError(request.operation)
+        response = SignerResponse.accepted(request.request_id, result)  # type: ignore[arg-type]
+        position = self.responses.tell()
+        self.responses.seek(0, io.SEEK_END)
+        write_frame(self.responses, canonical_response_bytes(response))
+        self.responses.seek(position)
+
+
+class _LaunchRequestStream(io.BytesIO):
+    def __init__(self, channel: _LaunchSignerChannel) -> None:
+        super().__init__()
+        self._channel = channel
+        self._pending = bytearray()
+
+    def write(self, payload: bytes) -> int:
+        self._pending.extend(payload)
+        while len(self._pending) >= 4:
+            size = int.from_bytes(self._pending[:4], "big")
+            if len(self._pending) < size + 4:
+                break
+            frame = bytes(self._pending[4 : size + 4])
+            del self._pending[: size + 4]
+            self._channel.answer(frame)
+        return len(payload)
+
+    def flush(self) -> None:
+        return None
+
+
+def _read_result(
+    operation: ExecutionOperation,
+    route: RouteKey,
+    payload: object,
+) -> SanitizedOperationResult:
+    return SanitizedOperationResult(
+        operation=operation,  # type: ignore[arg-type]
+        result_code=RestCode.READ_OK,
+        evidence_hashes=("1" * 64,),
+        route=route,
+        observed_at=NOW,
+        raw_body_hash="1" * 64,
+        attempts=1,
+        recovery_required=False,
+        kill_required=False,
+        public_payload=payload,  # type: ignore[arg-type]
+    )
+
+
+def _open_order() -> OrderReadPayload:
+    return OrderReadPayload(
+        kind="ORDER_READ",
+        id="order-1",
+        market="market-1",
+        asset_id="217426",
+        maker_address="0x" + "11" * 20,
+        side="BUY",
+        price="0.40",
+        original_size="10",
+        size_matched="0",
+        outcome="YES",
+        order_type="GTC",
+        status="LIVE",
+        associate_trades=(),
+        created_at="1788177600",
+        expiration="0",
+    )
+
+
+def live_launch_bootstrap(
+    *, ambiguous: bool = False
+) -> tuple[SignerChannel, Any]:
+    fake = _LaunchSignerChannel(ambiguous=ambiguous)
+    channel = SignerChannel(
+        request_stream=fake.request_stream,
+        response_stream=fake.responses,
+        child_pid=None,
+        credentials_present=True,
+    )
+
+    def bootstrap(_service_factory: SignerServiceFactory) -> SignerChannel:
+        return channel
+
+    return channel, bootstrap
+
+
+def test_launch_composes_live_session_from_signer_account_state(database: Path) -> None:
+    channel, bootstrap = live_launch_bootstrap()
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        services = runtime.application.services
+        assert isinstance(services, LivePilotServices)
+        assert services._environment.account_state().collateral_usd == Decimal("200")
+        opened = runtime.application.respond(
+            PilotRequest(
+                method="POST",
+                target="/api/v1/pilot/session",
+                host=f"localhost:{PORT}",
+                received_at=NOW,
+                origin=f"http://localhost:{PORT}",
+            )
+        )
+        token = opened.set_cookie.split(";", 1)[0].split("=", 1)[1]
+        response = runtime.application.respond(
+            PilotRequest(
+                method="GET",
+                target="/api/v1/pilot/live-session",
+                host=f"localhost:{PORT}",
+                received_at=NOW,
+                cookies={SESSION_COOKIE: (token,)},
+            )
+        )
+        assert response.status is HTTPStatus.OK
+        assert json.loads(response.body)["session"]["active"] is False
+    finally:
+        runtime.close()
+    assert channel.request_stream.closed
+    assert channel.response_stream.closed
+
+
+def test_launch_remains_killed_when_reconciliation_is_not_complete(database: Path) -> None:
+    _channel, bootstrap = live_launch_bootstrap(ambiguous=True)
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        services = runtime.application.services
+        assert isinstance(services, LivePilotServices)
+        readiness = services.readiness()
+        assert readiness["kill_engaged"] is True
+        assert "RECONCILIATION_INCOMPLETE" in readiness["blockers"]
+    finally:
+        runtime.close()
 
 
 def services() -> KilledPilotServices:

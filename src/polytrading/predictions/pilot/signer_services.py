@@ -117,7 +117,6 @@ def live_pilot_signer_service(
                 credentials=credentials,
                 transport=transport,
             ).as_operation_handlers()
-            authority_context_factory = _unavailable
         else:
             handlers = SignerOperationHandlers(
                 submit_order=_credentials_unreachable,
@@ -127,10 +126,11 @@ def live_pilot_signer_service(
                 read_trades=_credentials_unreachable,
                 read_account=_credentials_unreachable,
             )
-            authority_context_factory = _credentials_unavailable
         return SignerService(
             secrets=secrets,
-            authority_context_factory=authority_context_factory,
+            # Production mutations build authority only from the signed public evidence
+            # carried on the request plus signer-owned account, clock, and kill state.
+            authority_context_factory=None,
             read_guard=_live_read_guard(
                 account_fingerprint=account_fingerprint,
                 credentials_present=credentials_present,

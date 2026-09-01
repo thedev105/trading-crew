@@ -16,6 +16,7 @@ import pytest
 from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.execution.authority import VerifiedExecutionCapability
 from polytrading.predictions.execution.models import (
+    ExecutionOperation,
     canonical_execution_hash,
 )
 from polytrading.predictions.manifest import AdapterImplementationState
@@ -26,7 +27,7 @@ from polytrading.predictions.pilot.execution_port import (
     ExecutionEvidence,
 )
 from polytrading.predictions.pilot.passkeys import FakePasskeyService, action_challenge_digest
-from polytrading.predictions.pilot.runtime import build_pilot_runtime
+from polytrading.predictions.pilot.runtime import build_launch_runtime, build_pilot_runtime
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.server import (
     CSRF_HEADER,
@@ -47,6 +48,7 @@ from tests.predictions.pilot_helpers import (
 )
 from tests.predictions.test_pilot_execution_port import FakeSigner
 from tests.predictions.test_pilot_read_models import qualification
+from tests.predictions.test_pilot_runtime import live_launch_bootstrap
 from tests.predictions.test_pilot_selector import populated_store
 
 # The same cutoff the seeded evidence was collected at: a live decision needs current evidence.
@@ -105,6 +107,8 @@ def evidence() -> ExecutionEvidence:
         account_scope_expires_at=NOW + timedelta(minutes=1),
         kill_engaged=False,
         operator_present=True,
+        reconciliation_hash="8" * 64,
+        reconciliation_observed_at=NOW,
     )
 
 
@@ -244,6 +248,37 @@ class _StillSource:
 
     def monotonic_ns(self) -> int:
         return 0
+
+
+def test_live_launch_reconciles_killed_and_kills_the_signer_on_shutdown(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "launch.duckdb"
+    store = PredictionMarketStore(database)
+    store.close()
+    channel, bootstrap = live_launch_bootstrap()
+
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    issuer = runtime.issuer
+    assert issuer is not None
+    requests = channel.request_stream._channel.requests  # type: ignore[attr-defined]
+    try:
+        readiness = runtime.application.services.readiness()
+        assert readiness["kill_engaged"] is True
+        assert readiness["live_authority"] is False
+        assert [request.operation for request in requests] == [
+            ExecutionOperation.DESCRIBE_IDENTITY,
+            ExecutionOperation.READ_ACCOUNT,
+            ExecutionOperation.READ_ORDERS,
+            ExecutionOperation.READ_TRADES,
+        ]
+    finally:
+        runtime.close()
+
+    assert requests[-1].operation is ExecutionOperation.SIGNER_KILL
+    assert channel.request_stream.closed
+    assert channel.response_stream.closed
+    assert issuer.closed is True
 
 
 def test_a_launched_cockpit_reports_a_killed_posture(cockpit: Cockpit) -> None:

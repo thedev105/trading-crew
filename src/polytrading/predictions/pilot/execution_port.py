@@ -87,6 +87,8 @@ class ExecutionEvidence:
     account_scope_expires_at: datetime | None
     kill_engaged: bool
     operator_present: bool
+    reconciliation_hash: Sha256 | None
+    reconciliation_observed_at: datetime | None
 
 
 class CoordinatorExecutionPort:

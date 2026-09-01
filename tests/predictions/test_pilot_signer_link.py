@@ -17,11 +17,21 @@ from polytrading.predictions.execution.models import (
     ExecutionOperation,
     ImmediateOrderType,
     _intent_fingerprint,
+    canonical_execution_hash,
     deterministic_intent_id,
 )
-from polytrading.predictions.pilot.capabilities import SignerKillDirective
-from polytrading.predictions.pilot.execution_port import CoordinatorExecutionPort
+from polytrading.predictions.pilot.capabilities import (
+    MutationEvidence,
+    PilotCapabilityIssuer,
+    SignedMutationEvidence,
+    SignerKillDirective,
+)
+from polytrading.predictions.pilot.execution_port import (
+    CoordinatorExecutionPort,
+    ExecutionEvidence,
+)
 from polytrading.predictions.pilot.models import PILOT_CEILINGS
+from polytrading.predictions.pilot.runtime import _mutation_evidence_for
 from polytrading.predictions.pilot.selector import FrozenPilotPlan, PilotAccountState, PilotLeg
 from polytrading.predictions.pilot.signer_link import (
     SignerLinkError,
@@ -30,6 +40,7 @@ from polytrading.predictions.pilot.signer_link import (
 )
 from polytrading.predictions.polymarket_execution.ipc import (
     SanitizedOperationResult,
+    SignedEnvelopeResult,
     SignerCapabilityProof,
     SignerKillPayload,
     SignerKillResult,
@@ -57,13 +68,57 @@ from tests.predictions.pilot_helpers import (
     WALLET_FINGERPRINT,
     signer_capability_grant,
 )
+from tests.predictions.test_execution_authority import ELIGIBLE_MANIFEST
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
-MANIFEST_DIGEST = "d" * 64
+MANIFEST_DIGEST = canonical_execution_hash(ELIGIBLE_MANIFEST)
 SIGNER_PROOF = SignerCapabilityProof(
     grant=signer_capability_grant(account_fingerprint=ACCOUNT_FINGERPRINT, now=NOW),
     signature=b64encode(b"test-signature"),
 )
+MUTATION_EVIDENCE = SignedMutationEvidence(
+    evidence=MutationEvidence(
+        schema_version=1,
+        manifest=ELIGIBLE_MANIFEST,
+        manifest_record_hash=MANIFEST_DIGEST,
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        reconciliation_hash="8" * 64,
+        reconciliation_observed_at=NOW,
+        geoblock_allowed=True,
+        geoblock_evidence_hash="9" * 64,
+        geoblock_expires_at=NOW + timedelta(minutes=1),
+        account_scope_evidence_hash="a" * 64,
+        account_scope_expires_at=NOW + timedelta(minutes=1),
+        kill_engaged=False,
+        operator_present=True,
+        plan_digest=SIGNER_PROOF.grant.plan_hash,
+        authority_digest=SIGNER_PROOF.grant.digest,
+        requested_notional=Decimal("4"),
+        capital_after=Decimal("4"),
+        position_after=Decimal("4"),
+        loss_after=Decimal("0"),
+        issued_at=NOW,
+        expires_at=NOW + timedelta(seconds=5),
+    ),
+    signature=b64encode(b"test-evidence-signature"),
+)
+
+
+def mutation_evidence_for(
+    target: ExecutionIntent,
+    proof: SignerCapabilityProof,
+) -> SignedMutationEvidence:
+    return SignedMutationEvidence(
+        evidence=MUTATION_EVIDENCE.evidence.model_copy(
+            update={
+                "account_fingerprint": target.account_fingerprint,
+                "plan_digest": target.capability_fingerprint,
+                "authority_digest": proof.grant.digest,
+                "requested_notional": target.maximum_spend or Decimal("0"),
+            }
+        ),
+        signature=b64encode(MUTATION_EVIDENCE.signature),
+    )
 
 
 def intent(**overrides: Any) -> ExecutionIntent:
@@ -128,6 +183,14 @@ class FakeSignerChannel:
                 )
                 if self.ok
                 else SignerResponse.rejected(request.request_id, "EXECUTION_KILL_ENGAGED")
+            )
+        elif request.operation is ExecutionOperation.SIGN_ORDER:
+            response = SignerResponse.accepted(
+                request.request_id,
+                SignedEnvelopeResult(
+                    operation=ExecutionOperation.SIGN_ORDER,
+                    envelope=_envelope(request.payload.intent),
+                ),
             )
         else:
             operation = request.operation.value
@@ -310,6 +373,9 @@ def port(channel: FakeSignerChannel, **overrides: Any) -> SignerLinkVenuePort:
         "account_reader": account_state,
         "signed_envelope": _envelope,
         "proof_for": lambda capability_id: {CAPABILITY_ID: SIGNER_PROOF}[capability_id],
+        "mutation_evidence": lambda intent, operation, proof: mutation_evidence_for(
+            intent, proof
+        ),
         "kill_directive": lambda capability_ids: SignerKillDirective(
             capability_ids=tuple(sorted(capability_ids, key=str)),
             issued_at=NOW,
@@ -484,6 +550,63 @@ def test_submit_serializes_the_matching_public_proof() -> None:
     assert request.authority_digest == SIGNER_PROOF.grant.digest
 
 
+def test_submit_serializes_matching_short_lived_mutation_evidence() -> None:
+    channel = FakeSignerChannel()
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash)
+
+    port(channel).submit(target, CAPABILITY_ID)
+
+    request = channel.requests[0]
+    assert request.mutation_evidence == MUTATION_EVIDENCE
+    assert request.deadline == MUTATION_EVIDENCE.evidence.expires_at
+
+
+def test_runtime_envelope_keeps_reconciliation_and_account_scope_hashes_distinct() -> None:
+    issuer = PilotCapabilityIssuer(key_id="test-launch")
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash)
+    current = ExecutionEvidence(
+        manifest=ELIGIBLE_MANIFEST,
+        account=account_state({}),
+        reconciliation_hash="8" * 64,
+        reconciliation_observed_at=NOW,
+        geoblock_allowed=True,
+        geoblock_evidence_hash="9" * 64,
+        geoblock_expires_at=NOW + timedelta(minutes=1),
+        account_scope_evidence_hash="a" * 64,
+        account_scope_expires_at=NOW + timedelta(minutes=1),
+        kill_engaged=False,
+        operator_present=True,
+    )
+    try:
+        signed = _mutation_evidence_for(
+            issuer=issuer,
+            intent=target,
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            proof=SIGNER_PROOF,
+            current_evidence=lambda: current,
+            clock=lambda: NOW,
+        )
+    finally:
+        issuer.close()
+
+    assert signed.evidence.reconciliation_hash == "8" * 64
+    assert signed.evidence.account_scope_evidence_hash == "a" * 64
+
+
+def test_production_link_signs_then_submits_on_the_same_typed_channel() -> None:
+    channel = FakeSignerChannel()
+    target = intent(capability_fingerprint=SIGNER_PROOF.grant.plan_hash)
+
+    outcome = port(channel, signed_envelope=None).submit(target, CAPABILITY_ID)
+
+    assert [request.operation for request in channel.requests] == [
+        ExecutionOperation.SIGN_ORDER,
+        ExecutionOperation.SUBMIT_ORDER,
+    ]
+    assert channel.requests[1].payload.envelope == _envelope(target)
+    assert outcome.state == "FILLED"
+
+
 def test_submit_serializes_a_coordinator_intent_under_its_matching_grant() -> None:
     frozen = FrozenPilotPlan.model_validate(
         {
@@ -622,8 +745,9 @@ def test_a_real_signer_accepts_a_coordinator_intent_bound_to_the_frozen_plan() -
             signed_envelope=lambda intent: sign_order(
                 intent, PRIVATE_KEY, snapshot
             ),
-            proof_for=lambda capability_id: {grant.capability_id: proof}[capability_id],
-        ).submit(target, grant.capability_id)
+                proof_for=lambda capability_id: {grant.capability_id: proof}[capability_id],
+                mutation_evidence=None,
+            ).submit(target, grant.capability_id)
     finally:
         service.close()
 

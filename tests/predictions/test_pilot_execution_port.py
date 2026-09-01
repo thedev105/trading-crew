@@ -172,6 +172,8 @@ def evidence(**overrides: Any) -> ExecutionEvidence:
         "account_scope_expires_at": NOW + timedelta(minutes=1),
         "kill_engaged": False,
         "operator_present": True,
+        "reconciliation_hash": "8" * 64,
+        "reconciliation_observed_at": NOW,
     }
     fields.update(overrides)
     return ExecutionEvidence(**fields)

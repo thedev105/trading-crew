@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from threading import Lock
 from typing import Protocol
@@ -32,8 +32,12 @@ from polytrading.predictions.pilot.capabilities import (
     SignedCapability,
     verify_capability_signature,
     verify_kill_directive,
+    verify_mutation_evidence,
 )
-from polytrading.predictions.pilot.verifier import verified_capability_from_grant
+from polytrading.predictions.pilot.verifier import (
+    build_authority_context,
+    verified_capability_from_grant,
+)
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
@@ -86,6 +90,8 @@ _READ_OPERATIONS = frozenset(
         ExecutionOperation.READ_ACCOUNT,
     }
 )
+_MAXIMUM_RECONCILIATION_AGE = timedelta(minutes=5)
+_MAXIMUM_EVIDENCE_CLOCK_SKEW = timedelta(seconds=2)
 
 
 def _known_value_contains_secret(
@@ -197,7 +203,7 @@ class SignerService:
         self,
         *,
         secrets: SecretMaterial,
-        authority_context_factory: AuthorityContextFactory,
+        authority_context_factory: AuthorityContextFactory | None,
         read_guard: ReadGuard,
         handlers: SignerOperationHandlers,
         clock: Callable[[], datetime],
@@ -440,12 +446,21 @@ class SignerService:
         verified_capability: VerifiedExecutionCapability,
     ) -> AuthorityDecision | SignerErrorCode:
         try:
-            context = self._authority_context_factory(request, now)
-            if type(context) is AuthorityDecision:
-                return context if not context.allowed else "AUTHORITY_GATE_FAILED"
-            if type(context) is not AuthorityContext:
-                return "AUTHORITY_GATE_FAILED"
-            context = context.model_copy(update={"verified_capability": verified_capability})
+            if request.mutation_evidence is not None or self._authority_context_factory is None:
+                context = self._mutation_context_from_evidence(
+                    request,
+                    now,
+                    verified_capability,
+                )
+                if isinstance(context, str):
+                    return context
+            else:
+                context = self._authority_context_factory(request, now)
+                if type(context) is AuthorityDecision:
+                    return context if not context.allowed else "AUTHORITY_GATE_FAILED"
+                if type(context) is not AuthorityContext:
+                    return "AUTHORITY_GATE_FAILED"
+                context = context.model_copy(update={"verified_capability": verified_capability})
             capability = verified_capability
             manifest_hash = (
                 canonical_execution_hash(context.manifest) if context.manifest is not None else None
@@ -464,6 +479,63 @@ class SignerService:
             return verify_mutation_authority(context, request.operation)
         except Exception:
             return "AUTHORITY_GATE_FAILED"
+
+    def _mutation_context_from_evidence(
+        self,
+        request: SignerRequest,
+        now: datetime,
+        verified_capability: VerifiedExecutionCapability,
+    ) -> AuthorityContext | SignerErrorCode:
+        if not self._secrets.credentials_present:
+            return "CREDENTIALS_UNAVAILABLE"
+        signed = request.mutation_evidence
+        if signed is None:
+            return "MUTATION_EVIDENCE_UNAVAILABLE"
+        if not verify_mutation_evidence(signed, self._capability_public_key):
+            return "MUTATION_EVIDENCE_SIGNATURE_INVALID"
+        evidence = signed.evidence
+        if (
+            evidence.issued_at - now > _MAXIMUM_EVIDENCE_CLOCK_SKEW
+            or now >= evidence.expires_at
+            or request.deadline > evidence.expires_at
+            or evidence.reconciliation_observed_at - now > _MAXIMUM_EVIDENCE_CLOCK_SKEW
+            or now - evidence.reconciliation_observed_at > _MAXIMUM_RECONCILIATION_AGE
+        ):
+            return "MUTATION_EVIDENCE_STALE"
+        grant = request.authority_proof.grant if request.authority_proof is not None else None
+        if grant is None:
+            return "MUTATION_EVIDENCE_UNAVAILABLE"
+        evidence_hashes = tuple(
+            sorted(
+                {
+                    *grant.evidence_hashes,
+                    evidence.reconciliation_hash,
+                    evidence.geoblock_evidence_hash,
+                    evidence.account_scope_evidence_hash,
+                }
+            )
+        )
+        return build_authority_context(
+            capability=verified_capability,
+            manifest=evidence.manifest,
+            now=now,
+            account_fingerprint=request.account_fingerprint,
+            action_id=grant.parent_action_id,
+            requested_notional=evidence.requested_notional,
+            capital_after=evidence.capital_after,
+            position_after=evidence.position_after,
+            loss_after=evidence.loss_after,
+            used_activation_nonces=frozenset(),
+            revoked_capability_ids=frozenset(),
+            geoblock_allowed=evidence.geoblock_allowed,
+            geoblock_evidence_hash=evidence.geoblock_evidence_hash,
+            geoblock_expires_at=evidence.geoblock_expires_at,
+            account_scope_evidence_hash=evidence.account_scope_evidence_hash,
+            account_scope_expires_at=evidence.account_scope_expires_at,
+            kill_engaged=self._kill_engaged or evidence.kill_engaged,
+            operator_present=evidence.operator_present,
+            evidence_hashes=evidence_hashes,
+        )
 
     def _verify_proof(
         self,

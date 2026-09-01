@@ -27,6 +27,8 @@ from polytrading.predictions.execution.models import (
 )
 from polytrading.predictions.pilot.capabilities import (
     CapabilityGrant,
+    MutationEvidence,
+    SignedMutationEvidence,
     SignerKillDirective,
 )
 from polytrading.predictions.pilot.models import AuthorizationMode
@@ -77,6 +79,7 @@ from polytrading.predictions.polymarket_execution.signer import (
 from tests.predictions.execution_helpers import execution_intent_fields
 from tests.predictions.pilot_helpers import signer_capability_grant
 from tests.predictions.test_execution_authority import (
+    ELIGIBLE_MANIFEST,
     MANIFEST_HASH,
     authority_context,
 )
@@ -118,6 +121,14 @@ class _TestCapabilityIssuer:
             capability_ids=capability_ids,
             issued_at=issued_at,
             signature=b64encode(self._private_key.sign(digest.encode("ascii"))),
+        )
+
+    def mutation_evidence(self, evidence: MutationEvidence) -> SignedMutationEvidence:
+        return SignedMutationEvidence(
+            evidence=evidence,
+            signature=b64encode(
+                self._private_key.sign(evidence.digest.encode("ascii"))
+            ),
         )
 
 
@@ -172,6 +183,34 @@ def _authority_proof() -> SignerCapabilityProof:
 
 
 CAPABILITY_DIGEST = _authority_proof().grant.digest
+
+
+def _mutation_evidence(**overrides: object) -> SignedMutationEvidence:
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "manifest": ELIGIBLE_MANIFEST,
+        "manifest_record_hash": MANIFEST_HASH,
+        "account_fingerprint": ACCOUNT_FINGERPRINT,
+        "reconciliation_hash": "8" * 64,
+        "reconciliation_observed_at": NOW,
+        "geoblock_allowed": True,
+        "geoblock_evidence_hash": "9" * 64,
+        "geoblock_expires_at": NOW + timedelta(minutes=1),
+        "account_scope_evidence_hash": "a" * 64,
+        "account_scope_expires_at": NOW + timedelta(minutes=1),
+        "kill_engaged": False,
+        "operator_present": True,
+        "plan_digest": DEFAULT_GRANT.plan_hash,
+        "authority_digest": DEFAULT_GRANT.digest,
+        "requested_notional": Decimal("4"),
+        "capital_after": Decimal("4"),
+        "position_after": Decimal("4"),
+        "loss_after": Decimal("0"),
+        "issued_at": NOW,
+        "expires_at": NOW + timedelta(seconds=5),
+    }
+    fields.update(overrides)
+    return ISSUER.mutation_evidence(MutationEvidence.model_validate(fields, strict=True))
 
 
 class _ShortReader:
@@ -469,6 +508,33 @@ def _describe_identity_request() -> SignerRequest:
 def test_mutation_request_requires_a_capability_proof() -> None:
     with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
         _request(authority_proof=None)
+
+
+def test_mutation_evidence_is_bound_to_the_request_plan_authority_manifest_and_account() -> None:
+    evidence = _mutation_evidence()
+
+    request = _request(mutation_evidence=evidence)
+
+    assert request.mutation_evidence == evidence
+    for field, value in (
+        ("capability_digest", "b" * 64),
+        ("authority_digest", "c" * 64),
+        ("manifest_digest", "d" * 64),
+        ("account_fingerprint", "e" * 64),
+    ):
+        with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+            _request(mutation_evidence=evidence, **{field: value})
+
+
+def test_identity_and_reads_cannot_carry_mutation_evidence() -> None:
+    for operation in (
+        ExecutionOperation.DESCRIBE_IDENTITY,
+        ExecutionOperation.READ_ACCOUNT,
+        ExecutionOperation.READ_ORDERS,
+        ExecutionOperation.READ_TRADES,
+    ):
+        with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+            _request(operation, mutation_evidence=_mutation_evidence())
 
 
 def _handlers(**overrides: object) -> SignerOperationHandlers:
@@ -848,6 +914,7 @@ def test_request_and_response_have_exact_strict_public_field_allowlists() -> Non
         "capability_digest",
         "authority_digest",
         "authority_proof",
+        "mutation_evidence",
         "manifest_digest",
         "account_fingerprint",
         "protocol_version",
@@ -1004,6 +1071,74 @@ def test_signer_rejects_a_valid_grant_signed_by_another_issuer_before_authority_
 
     assert response.error_code == "CAPABILITY_SIGNATURE_INVALID"
     assert authority_calls == []
+    service.close()
+
+
+def _evidence_service() -> SignerService:
+    return SignerService(
+        secrets=SecretMaterial(
+            bytearray(PRIVATE_KEY),
+            bytearray(API_KEY),
+            bytearray(API_SECRET),
+            bytearray(PASSPHRASE),
+        ),
+        authority_context_factory=None,  # type: ignore[arg-type]
+        read_guard=lambda request, observed_at: AuthorityDecision(True, None, ()),
+        handlers=_handlers(),
+        clock=lambda: NOW,
+        capability_public_key=ISSUER.public_verification_key,
+    )
+
+
+def test_signer_builds_mutation_authority_only_from_verified_public_evidence() -> None:
+    service = _evidence_service()
+    request = _action_request(ExecutionOperation.SIGN_ORDER).model_copy(
+        update={"mutation_evidence": _mutation_evidence()}
+    )
+
+    response = service.handle(request)
+
+    assert response.ok is True, response.error_code
+    assert isinstance(response.result, SignedEnvelopeResult)
+    service.close()
+
+
+def test_signer_rejects_missing_tampered_stale_or_killed_mutation_evidence() -> None:
+    service = _evidence_service()
+    request = _action_request(ExecutionOperation.SIGN_ORDER)
+    valid = _mutation_evidence()
+    invalid_signature = SignedMutationEvidence(
+        evidence=valid.evidence,
+        signature=b64encode(b"not-the-launch-signature"),
+    )
+    stale = _mutation_evidence(
+        issued_at=NOW - timedelta(seconds=6),
+        expires_at=NOW - timedelta(seconds=1),
+    )
+    killed = _mutation_evidence(kill_engaged=True)
+
+    responses = (
+        service.handle(request),
+        service.handle(
+            request.model_copy(
+                update={"request_id": uuid4(), "mutation_evidence": invalid_signature}
+            )
+        ),
+        service.handle(
+            request.model_copy(update={"request_id": uuid4(), "mutation_evidence": stale})
+        ),
+        service.handle(
+            request.model_copy(update={"request_id": uuid4(), "mutation_evidence": killed})
+        ),
+    )
+
+    assert [response.error_code for response in responses] == [
+        "MUTATION_EVIDENCE_UNAVAILABLE",
+        "MUTATION_EVIDENCE_SIGNATURE_INVALID",
+        "MUTATION_EVIDENCE_STALE",
+        "EXECUTION_KILL_ENGAGED",
+    ]
+    assert all(response.result is None for response in responses)
     service.close()
 
 

@@ -10,16 +10,39 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Final, Literal
+from uuid import UUID
 
 from polytrading.lifecycle import owned_resource_cleanup
-from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
-from polytrading.predictions.pilot.launch import compose_pilot_environment
+from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.execution.authority import VerifiedExecutionCapability
+from polytrading.predictions.execution.models import (
+    ExecutionIntent,
+    ExecutionOperation,
+    canonical_execution_hash,
+)
+from polytrading.predictions.pilot.capabilities import (
+    MutationEvidence,
+    PilotCapabilityIssuer,
+    SignedMutationEvidence,
+)
+from polytrading.predictions.pilot.execution_port import (
+    CoordinatorExecutionPort,
+    ExecutionEvidence,
+    VenueSubmissionPort,
+)
+from polytrading.predictions.pilot.launch import (
+    compose_pilot_environment,
+    signer_account_reader,
+    signer_position_reader,
+)
 from polytrading.predictions.pilot.passkeys import (
     RP_ID,
     PasskeyError,
@@ -30,6 +53,7 @@ from polytrading.predictions.pilot.passkeys import (
 from polytrading.predictions.pilot.policy import COMPILED_PILOT_CEILINGS
 from polytrading.predictions.pilot.presence import NativePresenceSource, PresenceMonitor
 from polytrading.predictions.pilot.presence_macos import MacOSPresenceSource
+from polytrading.predictions.pilot.reconciliation import reconcile_startup
 from polytrading.predictions.pilot.server import (
     MAXIMUM_BODY_BYTES,
     PilotApplication,
@@ -38,14 +62,20 @@ from polytrading.predictions.pilot.server import (
     PilotResponse,
 )
 from polytrading.predictions.pilot.services import LivePilotServices, PilotEnvironment
+from polytrading.predictions.pilot.sessions import PilotExecutor
 from polytrading.predictions.pilot.signer_bootstrap import (
-    SignerBootstrapError,
     SignerChannel,
+    SignerServiceFactory,
     launch_signer_sidecar,
 )
-from polytrading.predictions.pilot.signer_link import describe_identity
-from polytrading.predictions.pilot.signer_services import offline_pilot_signer_service
+from polytrading.predictions.pilot.signer_link import (
+    SignerLinkError,
+    SignerLinkVenuePort,
+    describe_identity,
+)
+from polytrading.predictions.pilot.signer_services import live_pilot_signer_service
 from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
+from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     MacOSKeychainSecretStore,
 )
@@ -142,13 +172,17 @@ class PilotRuntime:
     issuer: PilotCapabilityIssuer | None = None
     verifier: PilotCapabilityVerifier | None = None
     signer_channel: SignerChannel | None = None
+    signer_port: VenueSubmissionPort | None = None
 
     def close(self) -> None:
-        """Drop this launch's signing key first, then the database handle."""
-        if self.issuer is not None:
-            self.issuer.close()
+        """Kill and close the signer before destroying this launch's issuing key."""
+        if self.signer_port is not None and self.issuer is not None:
+            with suppress(Exception):
+                self.signer_port.engage_kill(self.issuer.issued_capability_ids)
         if self.signer_channel is not None:
             self.signer_channel.close()
+        if self.issuer is not None:
+            self.issuer.close()
         self.store.close()
 
 
@@ -162,6 +196,9 @@ def build_pilot_runtime(
     passkeys: PasskeyService | None = None,
     presence_source: NativePresenceSource | None = None,
     key_id: str = "pilot-launch",
+    launch_issuer: PilotCapabilityIssuer | None = None,
+    signer_channel: SignerChannel | None = None,
+    signer_port: VenueSubmissionPort | None = None,
 ) -> PilotRuntime:
     """Validate every launch gate, then compose a control plane that starts killed.
 
@@ -202,7 +239,7 @@ def build_pilot_runtime(
             application=PilotApplication(services, port=port), posture=posture, store=store
         )
 
-    issuer = PilotCapabilityIssuer(key_id=key_id)
+    issuer = launch_issuer or PilotCapabilityIssuer(key_id=key_id)
     verifier = PilotCapabilityVerifier(issuer.public_verification_key)
     monitor = PresenceMonitor(
         source=presence_source or MacOSPresenceSource(platform=platform),
@@ -223,6 +260,8 @@ def build_pilot_runtime(
         store=store,
         issuer=issuer,
         verifier=verifier,
+        signer_channel=signer_channel,
+        signer_port=signer_port,
     )
 
 
@@ -231,48 +270,204 @@ def build_launch_runtime(
     port: int,
     *,
     platform: str = "darwin",
-    bootstrap: Callable[[], SignerChannel] | None = None,
+    bootstrap: Callable[[SignerServiceFactory], SignerChannel] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> PilotRuntime:
     """Launch the sidecar and compose live-but-killed services, or serve posture only."""
     clock = now or (lambda: datetime.now(UTC))
+    issuer = PilotCapabilityIssuer(key_id="pilot-launch")
+    channel: SignerChannel | None = None
+    venue_port: SignerLinkVenuePort | None = None
+    composition_store: PredictionMarketStore | None = None
     try:
-        channel = (bootstrap or _bootstrap_signer(platform))()
+        service_factory = live_pilot_signer_service(
+            capability_public_key=issuer.public_verification_key,
+            clock=clock,
+        )
+        channel = (bootstrap or _bootstrap_signer(platform))(service_factory)
         account_fingerprint, wallet_fingerprint = describe_identity(
             channel.request_stream, channel.response_stream, clock=clock
         )
-    except (SignerBootstrapError, SecretStoreError) as error:
-        print(
-            f"pilot: signer unavailable ({error}); serving posture only",
-            file=sys.stderr,
+        composition_store = PredictionMarketStore(Path(database_path))
+        observed_at = clock()
+        manifest = composition_store.verified_latest_venue_manifest_as_of(
+            PredictionVenue.POLYMARKET,
+            observed_at,
         )
-        return build_pilot_runtime(database_path, port, platform=platform, now=clock)
-    store = PredictionMarketStore(Path(database_path))
-    try:
+        manifest_digest = "0" * 64 if manifest is None else canonical_execution_hash(manifest)
+
+        proofs: dict[UUID, SignerCapabilityProof] = {}
+        evidence_providers: dict[UUID, Callable[[], ExecutionEvidence]] = {}
+        runtime_reference: dict[str, PilotRuntime] = {}
+        venue_port = SignerLinkVenuePort(
+            request_stream=channel.request_stream,
+            response_stream=channel.response_stream,
+            account_fingerprint=account_fingerprint,
+            manifest_digest=manifest_digest,
+            clock=clock,
+            account_reader=signer_account_reader(
+                account_fingerprint=account_fingerprint,
+                wallet_fingerprint=wallet_fingerprint,
+            ),
+            signed_envelope=None,
+            proof_for=lambda capability_id: proofs[capability_id],
+            mutation_evidence=lambda intent, operation, proof: _mutation_evidence_for(
+                issuer=issuer,
+                intent=intent,
+                operation=operation,
+                proof=proof,
+                current_evidence=evidence_providers.get(proof.grant.capability_id),
+                clock=clock,
+            ),
+            kill_directive=lambda capability_ids: issuer.issue_kill_directive(
+                capability_ids,
+                issued_at=clock(),
+            ),
+            position_reader=signer_position_reader,
+        )
+
+        def current_manifest():
+            runtime = runtime_reference["runtime"]
+            return runtime.store.verified_latest_venue_manifest_as_of(
+                PredictionVenue.POLYMARKET,
+                clock(),
+            )
+
+        def current_reconciliation():
+            return reconcile_startup(
+                venue_port,
+                account_fingerprint=account_fingerprint,
+                now=clock,
+            )
+
+        def executor_factory(
+            grants: Mapping[UUID, VerifiedExecutionCapability],
+            signer_proofs: Mapping[UUID, SignerCapabilityProof],
+            current_evidence: Callable[[], ExecutionEvidence],
+        ) -> PilotExecutor:
+            runtime = runtime_reference["runtime"]
+            if runtime.verifier is None:
+                raise SignerLinkError("MUTATION_EVIDENCE_UNAVAILABLE")
+            for capability_id, proof in signer_proofs.items():
+                proofs[capability_id] = proof
+                evidence_providers[capability_id] = current_evidence
+            coordinator = CoordinatorExecutionPort(
+                store=runtime.store,
+                signer=venue_port,
+                verifier=runtime.verifier,
+                grants=grants,
+                evidence=current_evidence,
+                clock=clock,
+            )
+            return PilotExecutor(coordinator, clock=clock)
+
         environment = compose_pilot_environment(
-            store,
+            composition_store,
             account_fingerprint=account_fingerprint,
             wallet_fingerprint=wallet_fingerprint,
             credentials_present=channel.credentials_present,
             now=clock,
+            venue_port=venue_port,
+            executor_factory=executor_factory,
+            manifest_provider=current_manifest,
+            reconciliation_provider=current_reconciliation,
         )
-    except BaseException:
-        channel.close()
-        raise
+        runtime = build_pilot_runtime(
+            database_path,
+            port,
+            platform=platform,
+            now=clock,
+            environment=environment,
+            launch_issuer=issuer,
+            signer_channel=channel,
+            signer_port=venue_port,
+        )
+        runtime_reference["runtime"] = runtime
+        return runtime
+    except Exception:
+        if venue_port is not None:
+            with suppress(Exception):
+                venue_port.engage_kill(issuer.issued_capability_ids)
+        if channel is not None:
+            channel.close()
+        issuer.close()
+        print("pilot: signer unavailable; serving posture only", file=sys.stderr)
+        return build_pilot_runtime(database_path, port, platform=platform, now=clock)
     finally:
-        store.close()
-    runtime = build_pilot_runtime(
-        database_path, port, platform=platform, now=clock, environment=environment
-    )
-    object.__setattr__(runtime, "signer_channel", channel)
-    return runtime
+        if composition_store is not None:
+            composition_store.close()
 
 
-def _bootstrap_signer(platform: str) -> Callable[[], SignerChannel]:
-    return lambda: launch_signer_sidecar(
+def _bootstrap_signer(
+    platform: str,
+) -> Callable[[SignerServiceFactory], SignerChannel]:
+    return lambda service_factory: launch_signer_sidecar(
         store=MacOSKeychainSecretStore(platform=platform),
-        service_factory=offline_pilot_signer_service,
+        service_factory=service_factory,
     )
+
+
+def _mutation_evidence_for(
+    *,
+    issuer: PilotCapabilityIssuer,
+    intent: ExecutionIntent,
+    operation: ExecutionOperation,
+    proof: SignerCapabilityProof,
+    current_evidence: Callable[[], ExecutionEvidence] | None,
+    clock: Callable[[], datetime],
+) -> SignedMutationEvidence:
+    """Sign one action-local public snapshot or refuse before writing IPC."""
+    del operation
+    if current_evidence is None:
+        raise SignerLinkError("MUTATION_EVIDENCE_UNAVAILABLE")
+    evidence = current_evidence()
+    account = evidence.account
+    if (
+        evidence.manifest is None
+        or account is None
+        or account.account_fingerprint != proof.grant.account_fingerprint
+        or evidence.reconciliation_hash is None
+        or evidence.reconciliation_observed_at is None
+        or type(evidence.geoblock_allowed) is not bool
+        or evidence.geoblock_evidence_hash is None
+        or evidence.geoblock_expires_at is None
+        or evidence.account_scope_evidence_hash is None
+        or evidence.account_scope_expires_at is None
+    ):
+        raise SignerLinkError("MUTATION_EVIDENCE_UNAVAILABLE")
+    issued_at = clock()
+    expires_at = min(
+        issued_at + timedelta(seconds=5),
+        proof.grant.expires_at,
+        intent.deadline,
+    )
+    if expires_at <= issued_at:
+        raise SignerLinkError("MUTATION_EVIDENCE_STALE")
+    limits = proof.grant.effective_limits
+    snapshot = MutationEvidence(
+        schema_version=1,
+        manifest=evidence.manifest,
+        manifest_record_hash=canonical_execution_hash(evidence.manifest),
+        account_fingerprint=account.account_fingerprint,
+        reconciliation_hash=evidence.reconciliation_hash,
+        reconciliation_observed_at=evidence.reconciliation_observed_at,
+        geoblock_allowed=evidence.geoblock_allowed,
+        geoblock_evidence_hash=evidence.geoblock_evidence_hash,
+        geoblock_expires_at=evidence.geoblock_expires_at,
+        account_scope_evidence_hash=evidence.account_scope_evidence_hash,
+        account_scope_expires_at=evidence.account_scope_expires_at,
+        kill_engaged=evidence.kill_engaged or account.kill_engaged,
+        operator_present=evidence.operator_present,
+        plan_digest=intent.capability_fingerprint,
+        authority_digest=proof.grant.digest,
+        requested_notional=intent.maximum_spend or Decimal("0"),
+        capital_after=limits.session_deployed_capital,
+        position_after=limits.strategy_gross_notional,
+        loss_after=Decimal("0"),
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    return issuer.issue_mutation_evidence(snapshot)
 
 
 def _secret_store_available(platform: str) -> bool:

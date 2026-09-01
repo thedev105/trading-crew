@@ -408,6 +408,8 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
     fresh = evidence()
     assert isinstance(fresh, ExecutionEvidence)
     assert fresh.account == account_state
+    assert fresh.reconciliation_hash == "8" * 64
+    assert fresh.reconciliation_observed_at == NOW
     assert fresh.kill_engaged is False
     assert provider_calls == {"manifest": 1, "reconciliation": 1}
 

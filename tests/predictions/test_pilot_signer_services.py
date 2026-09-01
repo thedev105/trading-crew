@@ -5,7 +5,6 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID
 
-import httpx
 import pytest
 from eth_account import Account
 
@@ -15,12 +14,18 @@ from polytrading.predictions.pilot.signer_services import offline_pilot_signer_s
 from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
     ReadAccountPayload,
+    SanitizedOperationResult,
     SignerCapabilityProof,
     SignerRequest,
     SignOrderPayload,
 )
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
+)
+from polytrading.predictions.polymarket_execution.routes import (
+    BalanceAllowancePayload,
+    RestCode,
+    RouteKey,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretMaterial
 from tests.predictions.execution_helpers import execution_intent_fields
@@ -146,20 +151,56 @@ def test_offline_service_refuses_mutations_with_execution_unavailable() -> None:
 def test_live_factory_constructs_fixed_rest_handlers_only_when_credentials_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_async_client = httpx.AsyncClient
+    class FakeTransport:
+        def __init__(self, *, timestamp: object, clock: object) -> None:
+            if not callable(timestamp) or not callable(clock):
+                raise TypeError("CALLABLES_REQUIRED")
 
-    async def venue(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "clob.polymarket.com"
-        return httpx.Response(
-            200,
-            content=b'{"balance":"10","allowances":{}}',
-            headers={"content-type": "application/json"},
-        )
+    class FakeRestHandlers:
+        def __init__(self, *, credentials: object, transport: object) -> None:
+            if type(credentials) is not signer_services.ClobCredentials:
+                raise TypeError("CLOB_CREDENTIALS_REQUIRED")
+            if type(transport) is not FakeTransport:
+                raise TypeError("FAKE_TRANSPORT_REQUIRED")
 
-    def offline_async_client(**kwargs: object) -> httpx.AsyncClient:
-        return real_async_client(transport=httpx.MockTransport(venue), **kwargs)
+        def as_operation_handlers(self) -> signer_services.SignerOperationHandlers:
+            def unreachable(*_args: object) -> object:
+                raise AssertionError("UNEXPECTED_OPERATION")
 
-    monkeypatch.setattr(httpx, "AsyncClient", offline_async_client)
+            return signer_services.SignerOperationHandlers(
+                submit_order=unreachable,
+                cancel_order=unreachable,
+                heartbeat=unreachable,
+                read_orders=unreachable,
+                read_trades=unreachable,
+                read_account=lambda _payload: SanitizedOperationResult(
+                    operation=ExecutionOperation.READ_ACCOUNT,
+                    result_code=RestCode.READ_OK,
+                    evidence_hashes=("1" * 64,),
+                    route=RouteKey.READ_BALANCE_ALLOWANCE,
+                    observed_at=NOW,
+                    raw_body_hash="1" * 64,
+                    attempts=1,
+                    recovery_required=False,
+                    kill_required=False,
+                    public_payload=BalanceAllowancePayload(
+                        kind="BALANCE_ALLOWANCE",
+                        balance="10",
+                        allowances=(),
+                    ),
+                ),
+            )
+
+    monkeypatch.setattr(
+        signer_services,
+        "HttpxPolymarketRestTransport",
+        FakeTransport,
+    )
+    monkeypatch.setattr(
+        signer_services,
+        "SignerRestHandlers",
+        FakeRestHandlers,
+    )
     service = signer_services.live_pilot_signer_service(
         capability_public_key=PUBLIC_KEY,
         clock=lambda: NOW,

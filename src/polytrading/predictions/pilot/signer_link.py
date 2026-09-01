@@ -14,8 +14,15 @@ from decimal import Decimal
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
-from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
-from polytrading.predictions.pilot.capabilities import SignerKillDirective
+from polytrading.predictions.execution.models import (
+    ExecutionIntent,
+    ExecutionOperation,
+    SignedOrderEnvelope,
+)
+from polytrading.predictions.pilot.capabilities import (
+    SignedMutationEvidence,
+    SignerKillDirective,
+)
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.sessions import LegOutcome
 from polytrading.predictions.polymarket_execution.ipc import (
@@ -26,11 +33,13 @@ from polytrading.predictions.polymarket_execution.ipc import (
     ReadOrdersPayload,
     ReadTradesPayload,
     SanitizedOperationResult,
+    SignedEnvelopeResult,
     SignerCapabilityProof,
     SignerKillPayload,
     SignerProtocolError,
     SignerRequest,
     SignerResponse,
+    SignOrderPayload,
     SubmitOrderPayload,
     canonical_request_bytes,
     read_frame,
@@ -67,9 +76,14 @@ class SignerLinkVenuePort:
         manifest_digest: str,
         clock: Callable[[], datetime],
         account_reader: Callable[[Mapping[str, object]], PilotAccountState],
-        signed_envelope: Callable[[ExecutionIntent], object],
+        signed_envelope: Callable[[ExecutionIntent], SignedOrderEnvelope] | None,
         proof_for: Callable[[UUID], SignerCapabilityProof],
         kill_directive: Callable[[Iterable[UUID]], SignerKillDirective],
+        mutation_evidence: Callable[
+            [ExecutionIntent, ExecutionOperation, SignerCapabilityProof],
+            SignedMutationEvidence | None,
+        ]
+        | None = None,
         tracked_tokens: tuple[str, ...] = (),
         position_reader: Callable[[Mapping[str, object]], Decimal] | None = None,
     ) -> None:
@@ -82,14 +96,20 @@ class SignerLinkVenuePort:
         self._signed_envelope = signed_envelope
         self._proof_for = proof_for
         self._kill_directive = kill_directive
+        self._mutation_evidence = mutation_evidence
         self._tracked_tokens = tracked_tokens
         self._position_reader = position_reader
 
     def submit(self, intent: ExecutionIntent, capability_id: UUID) -> LegOutcome:
+        envelope = (
+            self._signed_envelope(intent)
+            if self._signed_envelope is not None
+            else self._sign_order(intent, capability_id)
+        )
         payload = SubmitOrderPayload(
             operation=ExecutionOperation.SUBMIT_ORDER,
             intent=intent,
-            envelope=self._signed_envelope(intent),  # type: ignore[arg-type]
+            envelope=envelope,
         )
         response = self._exchange(intent, ExecutionOperation.SUBMIT_ORDER, payload, capability_id)
         return self._outcome(intent, response)
@@ -109,6 +129,17 @@ class SignerLinkVenuePort:
             directive=self._kill_directive(capability_ids),
         )
         self._exchange(None, ExecutionOperation.SIGNER_KILL, payload, None)
+
+    def _sign_order(self, intent: ExecutionIntent, capability_id: UUID) -> SignedOrderEnvelope:
+        response = self._exchange(
+            intent,
+            ExecutionOperation.SIGN_ORDER,
+            SignOrderPayload(operation=ExecutionOperation.SIGN_ORDER, intent=intent),
+            capability_id,
+        )
+        if not isinstance(response.result, SignedEnvelopeResult):
+            raise SignerLinkError("IPC_REQUEST_INVALID")
+        return response.result.envelope
 
     def account_state(self) -> PilotAccountState:
         payload = ReadAccountPayload(
@@ -172,6 +203,10 @@ class SignerLinkVenuePort:
     ) -> SignerResponse:
         now = self._clock()
         authority_proof = self._mutation_proof(operation, capability_id)
+        mutation_evidence = self._evidence_for(intent, operation, authority_proof)
+        deadline = now + REQUEST_DEADLINE
+        if mutation_evidence is not None:
+            deadline = min(deadline, mutation_evidence.evidence.expires_at)
         request = SignerRequest(
             schema_version=1,
             request_id=uuid4(),
@@ -182,11 +217,12 @@ class SignerLinkVenuePort:
                 authority_proof.grant.digest if authority_proof is not None else "0" * 64
             ),
             authority_proof=authority_proof,
+            mutation_evidence=mutation_evidence,
             manifest_digest=self._manifest_digest,
             account_fingerprint=self._account_fingerprint,
             protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
             operation=operation,
-            deadline=now + REQUEST_DEADLINE,
+            deadline=deadline,
             payload=payload,  # type: ignore[arg-type]
         )
         try:
@@ -197,12 +233,30 @@ class SignerLinkVenuePort:
         response = SignerResponse.model_validate_json(frame)
         return _verified_response(request.request_id, response)
 
+    def _evidence_for(
+        self,
+        intent: ExecutionIntent | None,
+        operation: ExecutionOperation,
+        proof: SignerCapabilityProof | None,
+    ) -> SignedMutationEvidence | None:
+        if proof is None:
+            return None
+        if intent is None or self._mutation_evidence is None:
+            return None
+        try:
+            return self._mutation_evidence(intent, operation, proof)
+        except SignerLinkError:
+            raise
+        except Exception as error:
+            raise SignerLinkError("MUTATION_EVIDENCE_UNAVAILABLE") from error
+
     def _mutation_proof(
         self,
         operation: ExecutionOperation,
         capability_id: UUID | None,
     ) -> SignerCapabilityProof | None:
         if operation not in {
+            ExecutionOperation.SIGN_ORDER,
             ExecutionOperation.SUBMIT_ORDER,
             ExecutionOperation.CANCEL_ORDER,
         }:
