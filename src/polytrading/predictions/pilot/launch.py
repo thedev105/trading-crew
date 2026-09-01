@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
+from http import HTTPStatus
 
 from polytrading.predictions.domain import PredictionVenue, Sha256
 from polytrading.predictions.execution.models import canonical_execution_hash
+from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import VenueBinding
 from polytrading.predictions.pilot.execution_port import VenueSubmissionPort
 from polytrading.predictions.pilot.models import PilotProofFamily
 from polytrading.predictions.pilot.qualification import evaluate_pilot_qualification
 from polytrading.predictions.pilot.reconciliation import reconcile_startup
+from polytrading.predictions.pilot.selector import PilotAccountState
+from polytrading.predictions.pilot.server import PilotRequestError
 from polytrading.predictions.pilot.services import PilotEnvironment
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -28,9 +33,9 @@ def compose_pilot_environment(
     wallet_fingerprint: Sha256,
     credentials_present: bool,
     now: Callable[[], datetime],
-    venue_port: VenueSubmissionPort,
+    venue_port: VenueSubmissionPort | None = None,
 ) -> PilotEnvironment:
-    """Load verified persisted evidence and the signer's authoritative account snapshot."""
+    """Load evidence, using authoritative signer reads when a venue port is available."""
     observed_at = now()
     manifest = store.verified_latest_venue_manifest_as_of(PredictionVenue.POLYMARKET, observed_at)
     attestations = store.verified_pilot_eligibility_attestations(account_fingerprint)
@@ -61,11 +66,26 @@ def compose_pilot_environment(
         else ()
     )
     latest_attestation = max(attestations, key=lambda item: item.reviewed_at, default=None)
-    reconciliation = reconcile_startup(
-        venue_port,
-        account_fingerprint=account_fingerprint,
-        now=lambda: observed_at,
-    )
+    if venue_port is None:
+        reconciliation = PilotReconciliationState(
+            account_fingerprint=account_fingerprint,
+            active_submissions=0,
+            unknown_outcomes=0,
+            reconciliation_complete=False,
+            unexplained_difference_usd=Decimal("0"),
+            reconciliation_hash=canonical_execution_hash(
+                {"account": account_fingerprint, "reconciliation": "transport-unavailable"}
+            ),
+            observed_at=observed_at,
+        )
+        account_state = _unavailable_account_state
+    else:
+        reconciliation = reconcile_startup(
+            venue_port,
+            account_fingerprint=account_fingerprint,
+            now=lambda: observed_at,
+        )
+        account_state = venue_port.account_state
 
     return PilotEnvironment(
         account_fingerprint=account_fingerprint,
@@ -80,8 +100,12 @@ def compose_pilot_environment(
         ),
         credentials_present=credentials_present,
         reconciliation=reconciliation,
-        account_state=venue_port.account_state,
+        account_state=account_state,
     )
+
+
+def _unavailable_account_state() -> PilotAccountState:
+    raise PilotRequestError(HTTPStatus.CONFLICT, "EXECUTION_UNAVAILABLE")
 
 
 def _protocol_fixture_hash() -> Sha256:

@@ -1,5 +1,22 @@
 # Task 6 report — authoritative startup reconciliation
 
+## Fix round 1 — preserve the Task 8 runtime boundary
+
+- Verified the review finding: the production `build_launch_runtime` caller does not yet own a
+  `VenueSubmissionPort`, so making the new argument mandatory caused a repeatable startup
+  `TypeError` after successful signer bootstrap.
+- Made `venue_port` optional. An explicit port still selects the new authoritative reconciliation
+  and account-state callback; `None` restores the prior `transport-unavailable`, incomplete
+  reconciliation and `EXECUTION_UNAVAILABLE` account-state refusal.
+- Left `runtime.py` production wiring unchanged. Concrete port construction remains Task 8, and
+  successful bootstrap still creates live services whose in-memory launch state starts killed.
+- RED: direct no-port composition and the existing successful-bootstrap runtime test both failed
+  with the missing-keyword `TypeError`.
+- GREEN: the no-port fallback, supplied-port path, and runtime regression passed (`3 passed`).
+- Combined verification:
+  `rtk .venv/bin/python -m pytest tests/predictions/test_pilot_reconciliation.py tests/predictions/test_pilot_launch.py tests/predictions/test_pilot_read_models.py tests/predictions/test_pilot_signer_link.py tests/predictions/test_pilot_execution_port.py tests/predictions/test_pilot_runtime.py -q`
+  passed (`82 passed`).
+
 ## Implemented
 
 - Extended `VenueSubmissionPort` with typed `orders()` and `trades()` reads that return only
@@ -12,9 +29,9 @@
 - Reconciliation hashes contain only sorted public identifiers, sorted sanitized result/status
   codes, and sorted observation times. Balances, position sizes, raw-body/evidence hashes, and
   venue payload details are excluded.
-- `compose_pilot_environment` now requires a `VenueSubmissionPort`, uses it for the environment's
-  account-state callback, and installs its authoritative startup reconciliation. No grant, kill
-  clearance, order, cancellation, or transport behavior was added or changed.
+- When supplied, `compose_pilot_environment` uses a `VenueSubmissionPort` for the environment's
+  account-state callback and authoritative startup reconciliation. No grant, kill clearance,
+  order, cancellation, or transport behavior was added or changed.
 
 ## TDD evidence
 

@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from polytrading.predictions.execution.models import ExecutionOperation
 from polytrading.predictions.pilot.launch import compose_pilot_environment
 from polytrading.predictions.pilot.selector import PilotAccountState
+from polytrading.predictions.pilot.server import PilotRequestError
 from polytrading.predictions.polymarket_execution.ipc import SanitizedOperationResult
 from polytrading.predictions.polymarket_execution.routes import (
     OrdersReadPayload,
@@ -85,5 +88,24 @@ def test_compose_uses_the_authoritative_venue_snapshot_for_reconciliation(tmp_pa
         assert environment.executor_factory is None
         assert environment.reconciliation.reconciliation_complete is True
         assert environment.account_state() == venue_port.account_state()
+    finally:
+        store.close()
+
+
+def test_compose_without_a_venue_port_preserves_the_unavailable_fallback(tmp_path) -> None:
+    store = PredictionMarketStore(tmp_path / "pilot.duckdb")
+    try:
+        environment = compose_pilot_environment(
+            store,
+            account_fingerprint="a" * 64,
+            wallet_fingerprint="a" * 64,
+            credentials_present=False,
+            now=lambda: NOW,
+        )
+
+        assert environment.reconciliation.reconciliation_complete is False
+        assert environment.reconciliation.unknown_outcomes == 0
+        with pytest.raises(PilotRequestError, match="EXECUTION_UNAVAILABLE"):
+            environment.account_state()
     finally:
         store.close()

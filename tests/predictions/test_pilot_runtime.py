@@ -117,7 +117,9 @@ def test_launch_composes_live_services_when_the_signer_bootstraps(
     database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     channel = SignerChannel(
-        request_stream=io.BytesIO(), response_stream=io.BytesIO(), child_pid=None,
+        request_stream=io.BytesIO(),
+        response_stream=io.BytesIO(),
+        child_pid=None,
         credentials_present=False,
     )
     monkeypatch.setattr(
@@ -128,7 +130,9 @@ def test_launch_composes_live_services_when_the_signer_bootstraps(
     runtime = build_launch_runtime(database, PORT, bootstrap=lambda: channel, now=lambda: NOW)
     try:
         assert isinstance(runtime.application._services, LivePilotServices)
-        assert runtime.application._services.readiness()["kill_engaged"] is True
+        readiness = runtime.application._services.readiness()
+        assert readiness["kill_engaged"] is True
+        assert "RECONCILIATION_INCOMPLETE" in readiness["blockers"]
     finally:
         runtime.close()
     assert channel.request_stream.closed
