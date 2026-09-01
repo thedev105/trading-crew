@@ -119,3 +119,52 @@ and the envelope preserves reconciliation and account-scope hashes independently
   Final reviewed hashes are `3f0b48457620138613c822e1dd6bf7bbd4e074169b55b909e99047c426dc1523`
   for `ipc.py` and `4dff9154f95dd69d93eeebf5bc340f530f642070e0577bb7c106f1f16c63a81d`
   for `signer.py`.
+
+## Fix round 2
+
+- Added one proof-free, fixed `READ_GEOBLOCK` signer IPC operation with an empty discriminated
+  payload and a dedicated result containing only `allowed`, the raw-evidence SHA-256,
+  `observed_at`, and `expires_at`. The result rejects extra fields, naive timestamps, and
+  nonpositive evidence lifetimes; it cannot carry the geoblock country, region, raw IP, or body.
+- The live signer read guard alone allows the operation. Offline composition retains an
+  unreachable handler and refuses it with `EXECUTION_UNAVAILABLE`. The signer freshly validates
+  the exact narrow handler result, rejects a generic authenticated-read result, and preserves
+  stable failures for guard, handler, malformed IPC, and rejected-response paths.
+- `SignerRestHandlers` calls the existing frozen `GEOBLOCK` route only through
+  `execute_geoblock_restricted`. No CLOB credentials are passed to that call. The raw IP and exact
+  response bytes stay in `RestrictedGeoblockEvidence` inside the sidecar; the handler projects
+  only the decision, same-response evidence hash, transport observation time, and a five-minute
+  expiry. Failed restricted reads produce no evidence, and a valid blocked response remains
+  `allowed=False`.
+- `SignerLinkVenuePort.geoblock_evidence()` sends only `ReadGeoblockPayload`, requires the exact
+  `GeoblockEvidenceResult`, and converts it to the existing pilot `GeoblockEvidence` type.
+  `VenueSubmissionPort` now declares the same method. `build_launch_runtime` installs that method
+  as the production `geoblock_provider`, closing the launch-composition gap that previously left
+  every live mutation without current geoblock evidence.
+
+### Fix-round-2 regressions and verification
+
+- RED/GREEN covered the missing operation and sanitized wire model, evidence lifetime validation,
+  read-guarded exact handler dispatch, restricted no-auth transport projection, live read
+  allowlisting, signer-link conversion, malformed IPC translation, and production launch wiring.
+- The production launch regression calls the wired provider, builds a signed mutation-evidence
+  envelope with the returned geoblock decision/hash/expiry, and asserts that no `SIGN_ORDER`,
+  `SUBMIT_ORDER`, or `CANCEL_ORDER` request occurred.
+- Explicit fail-closed regressions cover a failed restricted read, generic wrong-type handler
+  result, malformed IPC result containing a raw IP, sanitized signer rejection, offline-service
+  refusal, and a valid blocked response.
+- Final sandbox-safe predictions suite:
+  `rtk .venv/bin/python -m pytest tests/predictions -q -k 'not spawned_sidecar'` passed
+  (`3135 passed, 11 deselected, 13 warnings`). The warnings remain the existing Pydantic
+  dashboard-model deprecations.
+- The complete signer IPC module passed outside the sandbox so its multiprocessing tests could
+  create temporary local AF_UNIX resource-sharer sockets (`151 passed`). Authority and secret
+  scans passed (`71 passed`); targeted Ruff and `git diff --check` passed.
+- Refreshed reviewed hashes are
+  `a74145dc0d7ae4c0bf59fbce153dedbac901a3450da90cf4669b1eaeb9dcae34` for
+  `execution/models.py`, `568911250f12cdec4d7af9fecaf03b16a3d22a480d85b39f5601df59d100414d`
+  for `ipc.py`, `0114d8285617c6aa862abd6e43bd54b02d9674e896b70b070ac8e5a4dfd912d1`
+  for `rest.py`, and `900b0220da76bcb891df3ad38f9a8f29f80b81def8de0101d3d51fef03d09a2e`
+  for `signer.py`.
+- No real venue request, network access, Keychain access, browser transport, parent transport,
+  credential/authority/CLI surface, or subagent was used.

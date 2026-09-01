@@ -29,6 +29,7 @@ from polytrading.predictions.pilot.capabilities import (
 from polytrading.predictions.pilot.execution_port import (
     CoordinatorExecutionPort,
     ExecutionEvidence,
+    GeoblockEvidence,
 )
 from polytrading.predictions.pilot.models import PILOT_CEILINGS
 from polytrading.predictions.pilot.runtime import _mutation_evidence_for
@@ -39,6 +40,8 @@ from polytrading.predictions.pilot.signer_link import (
     describe_identity,
 )
 from polytrading.predictions.polymarket_execution.ipc import (
+    GeoblockEvidenceResult,
+    ReadGeoblockPayload,
     SanitizedOperationResult,
     SignedEnvelopeResult,
     SignerCapabilityProof,
@@ -200,6 +203,24 @@ class FakeSignerChannel:
                     operation=ExecutionOperation.SIGN_ORDER,
                     envelope=_envelope(request.payload.intent),
                 ),
+            )
+        elif request.operation is ExecutionOperation.READ_GEOBLOCK:
+            response = (
+                SignerResponse.accepted(
+                    request.request_id,
+                    GeoblockEvidenceResult(
+                        operation=ExecutionOperation.READ_GEOBLOCK,
+                        allowed=True,
+                        evidence_hash="9" * 64,
+                        observed_at=NOW,
+                        expires_at=NOW + timedelta(minutes=5),
+                    ),
+                )
+                if self.ok
+                else SignerResponse.rejected(
+                    request.request_id,
+                    "EXECUTION_KILL_ENGAGED",
+                )
             )
         else:
             operation = request.operation.value
@@ -544,6 +565,68 @@ def test_trades_exposes_only_the_typed_sanitized_trade_read() -> None:
     assert request.operation is ExecutionOperation.READ_TRADES
     assert type(result) is SanitizedOperationResult
     assert type(result.public_payload) is TradesReadPayload
+
+
+def test_geoblock_evidence_uses_only_the_fixed_sanitized_read() -> None:
+    channel = FakeSignerChannel()
+
+    evidence = port(channel).geoblock_evidence()
+
+    request = channel.requests[0]
+    assert request.operation is ExecutionOperation.READ_GEOBLOCK
+    assert type(request.payload) is ReadGeoblockPayload
+    assert request.payload.model_dump(mode="json") == {"operation": "READ_GEOBLOCK"}
+    assert request.authority_proof is None
+    assert request.mutation_evidence is None
+    assert evidence == GeoblockEvidence(
+        allowed=True,
+        evidence_hash="9" * 64,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+
+def test_geoblock_evidence_fails_closed_on_a_malformed_ipc_result() -> None:
+    class MalformedGeoblockChannel(FakeSignerChannel):
+        def answer(self, frame: bytes) -> None:
+            request = parse_signer_request(frame)
+            self.requests.append(request)
+            document = {
+                "schema_version": 1,
+                "request_id": str(request.request_id),
+                "ok": True,
+                "result": {
+                    "operation": "READ_GEOBLOCK",
+                    "allowed": True,
+                    "evidence_hash": "9" * 64,
+                    "observed_at": "2026-08-30T12:00:00Z",
+                    "expires_at": "2026-08-30T12:05:00Z",
+                    "raw_ip": "203.0.113.7",
+                },
+                "error_code": None,
+            }
+            position = self._responses.tell()
+            self._responses.seek(0, io.SEEK_END)
+            write_frame(
+                self._responses,
+                json.dumps(document, separators=(",", ":"), sort_keys=True).encode(),
+            )
+            self._responses.seek(position)
+
+    channel = MalformedGeoblockChannel()
+
+    with pytest.raises(SignerLinkError) as raised:
+        port(channel).geoblock_evidence()
+
+    assert raised.value.code == "IPC_EXCHANGE_FAILED"
+
+
+def test_geoblock_evidence_preserves_a_sanitized_signer_rejection() -> None:
+    channel = FakeSignerChannel(ok=False)
+
+    with pytest.raises(SignerLinkError) as raised:
+        port(channel).geoblock_evidence()
+
+    assert raised.value.code == "EXECUTION_KILL_ENGAGED"
 
 
 def test_submit_serializes_the_matching_public_proof() -> None:

@@ -58,6 +58,7 @@ class ExecutionOperation(StrEnum):
     READ_ORDERS = "READ_ORDERS"
     READ_TRADES = "READ_TRADES"
     READ_ACCOUNT = "READ_ACCOUNT"
+    READ_GEOBLOCK = "READ_GEOBLOCK"
 
 
 class VenueOrderState(StrEnum):

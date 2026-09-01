@@ -42,9 +42,11 @@ from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
     MAX_FRAME_BYTES,
     CancelOrderPayload,
+    GeoblockEvidenceResult,
     HeartbeatPayload,
     IdentityResult,
     ReadAccountPayload,
+    ReadGeoblockPayload,
     ReadOrdersPayload,
     ReadTradesPayload,
     SanitizedOperationResult,
@@ -88,6 +90,7 @@ _READ_OPERATIONS = frozenset(
         ExecutionOperation.READ_ORDERS,
         ExecutionOperation.READ_TRADES,
         ExecutionOperation.READ_ACCOUNT,
+        ExecutionOperation.READ_GEOBLOCK,
     }
 )
 _MAXIMUM_RECONCILIATION_AGE = timedelta(minutes=5)
@@ -144,6 +147,10 @@ class ReadAccountHandler(Protocol):
     def __call__(self, payload: ReadAccountPayload) -> SanitizedOperationResult: ...
 
 
+class ReadGeoblockHandler(Protocol):
+    def __call__(self, payload: ReadGeoblockPayload) -> GeoblockEvidenceResult: ...
+
+
 AuthorityContextFactory = Callable[[SignerRequest, datetime], AuthorityContext | AuthorityDecision]
 ReadGuard = Callable[[SignerRequest, datetime], AuthorityDecision]
 SignerServiceFactory = Callable[[SecretMaterial], "SignerService"]
@@ -159,6 +166,7 @@ class SignerOperationHandlers:
     read_orders: ReadOrdersHandler
     read_trades: ReadTradesHandler
     read_account: ReadAccountHandler
+    read_geoblock: ReadGeoblockHandler
     close: Callable[[], None] | None = None
 
 
@@ -686,9 +694,9 @@ class SignerService:
                         )
                 handler = self._handler_for(request.payload)
                 result = handler(request.payload)
-                if type(result) is SanitizedOperationResult:
+                if type(result) is GeoblockEvidenceResult:
                     try:
-                        result = SanitizedOperationResult.model_validate(
+                        result = GeoblockEvidenceResult.model_validate(
                             result.model_dump(mode="python"),
                             strict=True,
                         )
@@ -697,16 +705,37 @@ class SignerService:
                             request.request_id,
                             "IPC_OPERATION_RESULT_INVALID",
                         )
-                if (
-                    type(result) is not SanitizedOperationResult
-                    or result.operation is not request.operation
-                    or not self._result_matches_request(request, result)
-                ):
-                    return SignerResponse.rejected(
-                        request.request_id,
-                        "IPC_OPERATION_RESULT_INVALID",
-                    )
-                if result.kill_required is True:
+                    if (
+                        not isinstance(request.payload, ReadGeoblockPayload)
+                        or result.operation is not request.operation
+                    ):
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "IPC_OPERATION_RESULT_INVALID",
+                        )
+                else:
+                    if type(result) is SanitizedOperationResult:
+                        try:
+                            result = SanitizedOperationResult.model_validate(
+                                result.model_dump(mode="python"),
+                                strict=True,
+                            )
+                        except Exception:
+                            return SignerResponse.rejected(
+                                request.request_id,
+                                "IPC_OPERATION_RESULT_INVALID",
+                            )
+                    if (
+                        type(result) is not SanitizedOperationResult
+                        or isinstance(request.payload, ReadGeoblockPayload)
+                        or result.operation is not request.operation
+                        or not self._result_matches_request(request, result)
+                    ):
+                        return SignerResponse.rejected(
+                            request.request_id,
+                            "IPC_OPERATION_RESULT_INVALID",
+                        )
+                if type(result) is SanitizedOperationResult and result.kill_required is True:
                     self._kill_engaged = True
             return SignerResponse.accepted(request.request_id, result)
         except OrderSigningError:
@@ -828,7 +857,8 @@ class SignerService:
         | HeartbeatPayload
         | ReadOrdersPayload
         | ReadTradesPayload
-        | ReadAccountPayload,
+        | ReadAccountPayload
+        | ReadGeoblockPayload,
     ) -> (
         SubmitOrderHandler
         | CancelOrderHandler
@@ -836,6 +866,7 @@ class SignerService:
         | ReadOrdersHandler
         | ReadTradesHandler
         | ReadAccountHandler
+        | ReadGeoblockHandler
     ):
         if isinstance(payload, SubmitOrderPayload):
             return self._handlers.submit_order
@@ -847,6 +878,8 @@ class SignerService:
             return self._handlers.read_orders
         if isinstance(payload, ReadTradesPayload):
             return self._handlers.read_trades
+        if isinstance(payload, ReadGeoblockPayload):
+            return self._handlers.read_geoblock
         return self._handlers.read_account
 
 

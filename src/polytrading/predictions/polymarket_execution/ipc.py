@@ -307,6 +307,10 @@ class ReadAccountPayload(_SignerRecord):
         return self
 
 
+class ReadGeoblockPayload(_SignerRecord):
+    operation: Literal[ExecutionOperation.READ_GEOBLOCK]
+
+
 class DescribeIdentityPayload(_SignerRecord):
     operation: Literal[ExecutionOperation.DESCRIBE_IDENTITY]
 
@@ -330,7 +334,8 @@ SignerPayload = Annotated[
     | HeartbeatPayload
     | ReadOrdersPayload
     | ReadTradesPayload
-    | ReadAccountPayload,
+    | ReadAccountPayload
+    | ReadGeoblockPayload,
     Field(discriminator="operation"),
 ]
 
@@ -369,6 +374,7 @@ class SignerRequest(_SignerRecord):
                 ExecutionOperation.READ_ORDERS,
                 ExecutionOperation.READ_TRADES,
                 ExecutionOperation.READ_ACCOUNT,
+                ExecutionOperation.READ_GEOBLOCK,
             }
         )
         if self.operation in proof_free_operations:
@@ -435,6 +441,25 @@ class IdentityResult(_SignerRecord):
     operation: Literal[ExecutionOperation.DESCRIBE_IDENTITY]
     account_fingerprint: Sha256
     wallet_fingerprint: Sha256
+
+
+class GeoblockEvidenceResult(_SignerRecord):
+    operation: Literal[ExecutionOperation.READ_GEOBLOCK]
+    allowed: bool
+    evidence_hash: Sha256
+    observed_at: datetime
+    expires_at: datetime
+
+    @field_validator("observed_at", "expires_at")
+    @classmethod
+    def _timestamps_utc(cls, value: datetime) -> datetime:
+        return normalize_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def _expiry_follows_observation(self) -> GeoblockEvidenceResult:
+        if self.expires_at <= self.observed_at:
+            raise ValueError("geoblock evidence expiry must follow observation")
+        return self
 
 
 class SanitizedOperationResult(_SignerRecord):
@@ -634,7 +659,11 @@ class SanitizedOperationResult(_SignerRecord):
 
 
 SignerResult = Annotated[
-    IdentityResult | SignerKillResult | SignedEnvelopeResult | SanitizedOperationResult,
+    IdentityResult
+    | SignerKillResult
+    | SignedEnvelopeResult
+    | SanitizedOperationResult
+    | GeoblockEvidenceResult,
     Field(discriminator="operation"),
 ]
 
@@ -842,9 +871,11 @@ __all__ = [
     "MAX_FRAME_BYTES",
     "CancelOrderPayload",
     "DescribeIdentityPayload",
+    "GeoblockEvidenceResult",
     "HeartbeatPayload",
     "IdentityResult",
     "ReadAccountPayload",
+    "ReadGeoblockPayload",
     "ReadOrdersPayload",
     "ReadTradesPayload",
     "SanitizedOperationResult",

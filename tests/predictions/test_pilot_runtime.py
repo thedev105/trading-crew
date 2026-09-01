@@ -3,26 +3,31 @@ from __future__ import annotations
 import argparse
 import io
 import json
-from datetime import UTC, datetime
+from base64 import b64encode
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
 from polytrading.predictions.cli import add_predictions_subcommands
-from polytrading.predictions.execution.models import ExecutionOperation
+from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
 from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
+from polytrading.predictions.pilot.execution_port import ExecutionEvidence, GeoblockEvidence
 from polytrading.predictions.pilot.models import PILOT_CEILINGS
 from polytrading.predictions.pilot.passkeys import RP_ID
 from polytrading.predictions.pilot.runtime import (
     KilledPilotServices,
     PilotPosture,
     PilotRuntimeError,
+    _mutation_evidence_for,
     build_launch_runtime,
     build_pilot_runtime,
 )
+from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.server import (
     SESSION_COOKIE,
     PilotRequest,
@@ -35,8 +40,10 @@ from polytrading.predictions.pilot.signer_bootstrap import (
     SignerServiceFactory,
 )
 from polytrading.predictions.polymarket_execution.ipc import (
+    GeoblockEvidenceResult,
     IdentityResult,
     SanitizedOperationResult,
+    SignerCapabilityProof,
     SignerKillResult,
     SignerResponse,
     canonical_response_bytes,
@@ -56,6 +63,9 @@ from polytrading.predictions.polymarket_execution.routes import (
     TradesReadPayload,
 )
 from polytrading.predictions.storage.store import PredictionMarketStore
+from tests.predictions.execution_helpers import execution_intent_fields
+from tests.predictions.pilot_helpers import signer_capability_grant
+from tests.predictions.test_execution_authority import ELIGIBLE_MANIFEST
 
 PORT = 8788
 NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
@@ -208,6 +218,14 @@ class _LaunchSignerChannel:
                 RouteKey.READ_TRADES,
                 TradesReadPayload(kind="TRADES_READ", items=()),
             )
+        elif request.operation is ExecutionOperation.READ_GEOBLOCK:
+            result = GeoblockEvidenceResult(
+                operation=ExecutionOperation.READ_GEOBLOCK,
+                allowed=True,
+                evidence_hash="9" * 64,
+                observed_at=NOW,
+                expires_at=NOW + timedelta(minutes=5),
+            )
         elif request.operation is ExecutionOperation.SIGNER_KILL:
             result = SignerKillResult(
                 operation=ExecutionOperation.SIGNER_KILL,
@@ -337,6 +355,82 @@ def test_launch_composes_live_session_from_signer_account_state(database: Path) 
         runtime.close()
     assert channel.request_stream.closed
     assert channel.response_stream.closed
+
+
+def test_launch_wires_geoblock_evidence_into_mutation_evidence_without_trading(
+    database: Path,
+) -> None:
+    channel, bootstrap = live_launch_bootstrap()
+    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    try:
+        services = runtime.application.services
+        assert isinstance(services, LivePilotServices)
+        provider = services._environment.geoblock_provider
+        assert provider is not None
+        geoblock = provider()
+        assert geoblock == GeoblockEvidence(
+            allowed=True,
+            evidence_hash="9" * 64,
+            expires_at=NOW + timedelta(minutes=5),
+        )
+        grant = signer_capability_grant(account_fingerprint="a" * 64, now=NOW)
+        proof = SignerCapabilityProof(
+            grant=grant,
+            signature=b64encode(b"production-launch-proof"),
+        )
+        target = ExecutionIntent(
+            **execution_intent_fields(
+                account_fingerprint="a" * 64,
+                capability_fingerprint=grant.plan_hash,
+                created_at=NOW,
+                deadline=NOW + timedelta(seconds=30),
+                protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
+            )
+        )
+        account = PilotAccountState(
+            account_fingerprint="a" * 64,
+            wallet_fingerprint="b" * 64,
+            collateral_usd=Decimal("200"),
+            allowance_usd=Decimal("200"),
+            kill_engaged=False,
+            observed_at=NOW,
+        )
+        evidence = ExecutionEvidence(
+            manifest=ELIGIBLE_MANIFEST,
+            account=account,
+            geoblock_allowed=geoblock.allowed,
+            geoblock_evidence_hash=geoblock.evidence_hash,
+            geoblock_expires_at=geoblock.expires_at,
+            account_scope_evidence_hash="a" * 64,
+            account_scope_expires_at=NOW + timedelta(minutes=1),
+            kill_engaged=False,
+            operator_present=True,
+            reconciliation_hash="8" * 64,
+            reconciliation_observed_at=NOW,
+        )
+        assert runtime.issuer is not None
+        signed = _mutation_evidence_for(
+            issuer=runtime.issuer,
+            intent=target,
+            operation=ExecutionOperation.SUBMIT_ORDER,
+            proof=proof,
+            request_id=UUID("11111111-1111-4111-8111-111111111111"),
+            current_evidence=lambda: evidence,
+            clock=lambda: NOW,
+        )
+        assert signed.evidence.geoblock_allowed is True
+        assert signed.evidence.geoblock_evidence_hash == "9" * 64
+        assert signed.evidence.geoblock_expires_at == NOW + timedelta(minutes=5)
+    finally:
+        runtime.close()
+
+    operations = [request.operation for request in channel.request_stream._channel.requests]
+    assert ExecutionOperation.READ_GEOBLOCK in operations
+    assert {
+        ExecutionOperation.SIGN_ORDER,
+        ExecutionOperation.SUBMIT_ORDER,
+        ExecutionOperation.CANCEL_ORDER,
+    }.isdisjoint(operations)
 
 
 def test_launch_remains_killed_when_reconciliation_is_not_complete(database: Path) -> None:

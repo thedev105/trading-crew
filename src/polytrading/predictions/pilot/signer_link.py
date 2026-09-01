@@ -23,13 +23,16 @@ from polytrading.predictions.pilot.capabilities import (
     SignedMutationEvidence,
     SignerKillDirective,
 )
+from polytrading.predictions.pilot.execution_port import GeoblockEvidence
 from polytrading.predictions.pilot.selector import PilotAccountState
 from polytrading.predictions.pilot.sessions import LegOutcome
 from polytrading.predictions.polymarket_execution.ipc import (
     CancelOrderPayload,
     DescribeIdentityPayload,
+    GeoblockEvidenceResult,
     IdentityResult,
     ReadAccountPayload,
+    ReadGeoblockPayload,
     ReadOrdersPayload,
     ReadTradesPayload,
     SanitizedOperationResult,
@@ -192,6 +195,26 @@ class SignerLinkVenuePort:
         )
         return _sanitized_read_result(response, ExecutionOperation.READ_TRADES)
 
+    def geoblock_evidence(self) -> GeoblockEvidence:
+        """Read one current decision without exposing venue geolocation fields."""
+        response = self._exchange(
+            None,
+            ExecutionOperation.READ_GEOBLOCK,
+            ReadGeoblockPayload(operation=ExecutionOperation.READ_GEOBLOCK),
+            None,
+        )
+        result = response.result
+        if (
+            type(result) is not GeoblockEvidenceResult
+            or result.operation is not ExecutionOperation.READ_GEOBLOCK
+        ):
+            raise SignerLinkError("IPC_REQUEST_INVALID")
+        return GeoblockEvidence(
+            allowed=result.allowed,
+            evidence_hash=result.evidence_hash,
+            expires_at=result.expires_at,
+        )
+
     # -- internals ----------------------------------------------------------------------
 
     def _exchange(
@@ -234,9 +257,9 @@ class SignerLinkVenuePort:
         try:
             write_frame(self._request_stream, canonical_request_bytes(request))
             frame = read_frame(self._response_stream)
+            response = SignerResponse.model_validate_json(frame)
         except SignerProtocolError as error:
             raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
-        response = SignerResponse.model_validate_json(frame)
         return _verified_response(request.request_id, response)
 
     def _evidence_for(

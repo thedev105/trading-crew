@@ -8,7 +8,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from ipaddress import ip_address
 from threading import get_ident
@@ -66,8 +66,10 @@ if TYPE_CHECKING:
     from polytrading.predictions.execution.models import ExecutionOperation
     from polytrading.predictions.polymarket_execution.ipc import (
         CancelOrderPayload,
+        GeoblockEvidenceResult,
         HeartbeatPayload,
         ReadAccountPayload,
+        ReadGeoblockPayload,
         ReadOrdersPayload,
         ReadTradesPayload,
         SanitizedOperationResult,
@@ -111,6 +113,7 @@ _READ_RETRY_ROUTES = frozenset(
         RouteKey.GEOBLOCK,
     }
 )
+_GEOBLOCK_EVIDENCE_LIFETIME = timedelta(minutes=5)
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 
@@ -1390,6 +1393,7 @@ class SignerRestHandlers:
             read_orders=self._read_orders,
             read_trades=self._read_trades,
             read_account=self._read_account,
+            read_geoblock=self._read_geoblock,
             close=self.close,
         )
 
@@ -1523,6 +1527,39 @@ class SignerRestHandlers:
                 asset_type=payload.asset_type,
                 token_id=payload.token_id,
             )
+        )
+
+    def _read_geoblock(self, payload: ReadGeoblockPayload) -> GeoblockEvidenceResult:
+        from polytrading.predictions.execution.models import ExecutionOperation
+        from polytrading.predictions.polymarket_execution.ipc import (
+            GeoblockEvidenceResult,
+        )
+
+        del payload
+        self._require_available()
+        self._active = True
+        try:
+            restricted = self._runner.run(
+                self._transport.execute_geoblock_restricted(
+                    GeoblockRequest(route=RouteKey.GEOBLOCK)
+                )
+            )
+        finally:
+            self._active = False
+        result = restricted.result
+        evidence = restricted.evidence
+        if (
+            result.code is not RestCode.GEOBLOCK_OK
+            or type(result.payload) is not GeoblockResult
+            or type(evidence) is not RestrictedGeoblockEvidence
+        ):
+            raise ValueError("GEOBLOCK_READ_FAILED") from None
+        return GeoblockEvidenceResult(
+            operation=ExecutionOperation.READ_GEOBLOCK,
+            allowed=not result.payload.blocked,
+            evidence_hash=evidence.raw_evidence_hash,
+            observed_at=result.observed_at,
+            expires_at=result.observed_at + _GEOBLOCK_EVIDENCE_LIFETIME,
         )
 
     def _require_available(self) -> None:

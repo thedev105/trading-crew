@@ -31,6 +31,7 @@ from polytrading.predictions.polymarket_execution.signer import (
 _LIVE_READ_OPERATIONS = frozenset(
     {
         ExecutionOperation.READ_ACCOUNT,
+        ExecutionOperation.READ_GEOBLOCK,
         ExecutionOperation.READ_ORDERS,
         ExecutionOperation.READ_TRADES,
     }
@@ -125,6 +126,7 @@ def live_pilot_signer_service(
                 read_orders=_credentials_unreachable,
                 read_trades=_credentials_unreachable,
                 read_account=_credentials_unreachable,
+                read_geoblock=_credentials_unreachable,
             )
         return SignerService(
             secrets=secrets,
@@ -158,6 +160,7 @@ def offline_pilot_signer_service(secrets: SecretMaterial) -> SignerService:
             read_orders=_unreachable,
             read_trades=_unreachable,
             read_account=_unreachable,
+            read_geoblock=_unreachable,
         ),
         clock=lambda: datetime.now(UTC),
         snapshot=load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION),

@@ -372,6 +372,7 @@ def build_launch_runtime(
             executor_factory=executor_factory,
             manifest_provider=current_manifest,
             reconciliation_provider=current_reconciliation,
+            geoblock_provider=venue_port.geoblock_evidence,
         )
         runtime = build_pilot_runtime(
             database_path,

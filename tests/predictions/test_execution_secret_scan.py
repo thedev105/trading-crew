@@ -349,6 +349,7 @@ def test_runtime_canaries_never_cross_any_public_observable(
             ExecutionOperation.READ_ORDERS,
             ExecutionOperation.READ_TRADES,
             ExecutionOperation.READ_ACCOUNT,
+            ExecutionOperation.READ_GEOBLOCK,
         }:
             read_handler_calls.append(operation)
         raise RuntimeError(canaries.signed_body.decode("ascii"))
@@ -386,6 +387,7 @@ def test_runtime_canaries_never_cross_any_public_observable(
             read_orders=handler_failure,
             read_trades=handler_failure,
             read_account=handler_failure,
+            read_geoblock=handler_failure,  # type: ignore[arg-type]
         ),
         clock=lambda: NOW,
     )

@@ -20,7 +20,7 @@ _REVIEWED_SOURCE_SHA256 = {
         "execution/kill_switch.py"
     ): "2c718198102aceabf45437f07cb09ca44df081d98f67778c6029016be5307a42",
     Path("execution/ledger.py"): "3767947fd3a70eea588bff87a33442d662521fb0c8806dfa4d86d2322dee4e31",
-    Path("execution/models.py"): "53ce057ec1198494e2429f839991ca4dd2b90f360fb65cfab74e9165377b8ef6",
+    Path("execution/models.py"): "a74145dc0d7ae4c0bf59fbce153dedbac901a3450da90cf4669b1eaeb9dcae34",
     Path(
         "execution/reconciliation.py"
     ): "b49db0ea6c31cbb833b08eeac69ed1b8ad257e829ec6f95e8fc7af90f9c64dbc",
@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "3f0b48457620138613c822e1dd6bf7bbd4e074169b55b909e99047c426dc1523",
+    ): "568911250f12cdec4d7af9fecaf03b16a3d22a480d85b39f5601df59d100414d",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -56,7 +56,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "88ad4405fcda17afaea96bfdcde710c598b68823c10da532b3ee761ead6db9fa",
     Path(
         "polymarket_execution/rest.py"
-    ): "45eaec54dc3f9ea3a21e3b43612fb5b922a04ccbd14a26efef87e42aa97469b4",
+    ): "0114d8285617c6aa862abd6e43bd54b02d9674e896b70b070ac8e5a4dfd912d1",
     Path(
         "polymarket_execution/routes.py"
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
@@ -65,7 +65,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
     Path(
         "polymarket_execution/signer.py"
-    ): "4dff9154f95dd69d93eeebf5bc340f530f642070e0577bb7c106f1f16c63a81d",
+    ): "900b0220da76bcb891df3ad38f9a8f29f80b81def8de0101d3d51fef03d09a2e",
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
@@ -2077,6 +2077,7 @@ def test_coordinator_and_signer_make_independent_authority_decisions(tmp_path: P
             read_orders=unused_handler,
             read_trades=unused_handler,
             read_account=unused_handler,
+            read_geoblock=unused_handler,  # type: ignore[arg-type]
         ),
         clock=lambda: NOW,
     )

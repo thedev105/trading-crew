@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import pickle
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
@@ -22,7 +22,9 @@ from polytrading.predictions.polymarket_execution.auth import (
     sign_l2_request,
 )
 from polytrading.predictions.polymarket_execution.ipc import (
+    GeoblockEvidenceResult,
     ReadAccountPayload,
+    ReadGeoblockPayload,
     ReadOrdersPayload,
     ReadTradesPayload,
     SanitizedOperationResult,
@@ -1994,6 +1996,105 @@ def test_task7_private_route_handler_returns_only_the_closed_task8_result() -> N
     assert round_tripped.result.public_payload == result.public_payload
     with pytest.raises(ValidationError):
         result.public_payload.model_copy(update={"balance": "not-an-integer"})
+
+
+def test_signer_geoblock_handler_returns_only_restricted_evidence_without_auth() -> None:
+    captured: list[httpx.Request] = []
+    exact_body = b'{"blocked":false,"country":"US","ip":"192.0.2.1","region":"NY"}'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            content=exact_body,
+            headers={"content-type": "application/json"},
+        )
+
+    transport = HttpxPolymarketRestTransport._for_test(
+        httpx.MockTransport(handler),
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
+    )
+    owner = SignerRestHandlers(credentials=clob_credentials(), transport=transport)
+    handlers = owner.as_operation_handlers()
+    try:
+        result = handlers.read_geoblock(
+            ReadGeoblockPayload(operation=ExecutionOperation.READ_GEOBLOCK)
+        )
+    finally:
+        handlers.close()
+
+    assert type(result) is GeoblockEvidenceResult
+    assert result.model_dump(mode="python") == {
+        "operation": ExecutionOperation.READ_GEOBLOCK,
+        "allowed": True,
+        "evidence_hash": hashlib.sha256(exact_body).hexdigest(),
+        "observed_at": NOW,
+        "expires_at": NOW + timedelta(minutes=5),
+    }
+    assert len(captured) == 1
+    assert {
+        "poly_address",
+        "poly_api_key",
+        "poly_signature",
+        "poly_timestamp",
+        "poly_passphrase",
+    }.isdisjoint({name.casefold() for name in captured[0].headers})
+    rendered = result.model_dump_json()
+    assert "192.0.2.1" not in rendered
+    assert "country" not in rendered
+    assert "region" not in rendered
+
+
+def test_signer_geoblock_handler_fails_closed_when_restricted_read_fails() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            503,
+            content=b'{"private":"failure"}',
+            headers={"content-type": "application/json"},
+        )
+
+    transport = HttpxPolymarketRestTransport._for_test(
+        httpx.MockTransport(handler),
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
+    )
+    owner = SignerRestHandlers(credentials=clob_credentials(), transport=transport)
+    handlers = owner.as_operation_handlers()
+    try:
+        with pytest.raises(ValueError, match=r"^GEOBLOCK_READ_FAILED$"):
+            handlers.read_geoblock(
+                ReadGeoblockPayload(operation=ExecutionOperation.READ_GEOBLOCK)
+            )
+    finally:
+        handlers.close()
+
+
+def test_signer_geoblock_handler_preserves_a_blocked_decision() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            content=b'{"blocked":true,"country":"US","ip":"192.0.2.1","region":"NY"}',
+            headers={"content-type": "application/json"},
+        )
+
+    transport = HttpxPolymarketRestTransport._for_test(
+        httpx.MockTransport(handler),
+        timestamp=lambda: TIMESTAMP,
+        clock=lambda: NOW,
+    )
+    owner = SignerRestHandlers(credentials=clob_credentials(), transport=transport)
+    handlers = owner.as_operation_handlers()
+    try:
+        result = handlers.read_geoblock(
+            ReadGeoblockPayload(operation=ExecutionOperation.READ_GEOBLOCK)
+        )
+    finally:
+        handlers.close()
+
+    assert result.allowed is False
 
 
 def test_task7_submit_handler_is_fixed_to_submit_and_closes_with_owner() -> None:

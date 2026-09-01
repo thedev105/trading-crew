@@ -7,7 +7,7 @@ import os
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from multiprocessing import reduction
@@ -33,6 +33,7 @@ from polytrading.predictions.pilot.capabilities import (
 )
 from polytrading.predictions.pilot.models import AuthorizationMode
 from polytrading.predictions.pilot.verifier import verified_capability_from_grant
+from polytrading.predictions.polymarket_execution import ipc as ipc_module
 from polytrading.predictions.polymarket_execution import signer as signer_module
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError
 from polytrading.predictions.polymarket_execution.ipc import (
@@ -134,6 +135,74 @@ class _TestCapabilityIssuer:
 
 ISSUER = _TestCapabilityIssuer(b"\x01" * 32)
 OTHER_ISSUER = _TestCapabilityIssuer(b"\x02" * 32)
+
+
+def test_read_geoblock_ipc_exposes_only_sanitized_expiring_evidence() -> None:
+    operation = ExecutionOperation("READ_GEOBLOCK")
+    payload = ipc_module.ReadGeoblockPayload(operation=operation)
+    result = ipc_module.GeoblockEvidenceResult(
+        operation=operation,
+        allowed=True,
+        evidence_hash="9" * 64,
+        observed_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    raw_request = _request(ExecutionOperation.READ_ACCOUNT).model_dump(mode="python")
+    raw_request.update({"operation": operation, "payload": payload})
+
+    request = SignerRequest.model_validate(raw_request, strict=True)
+    response = SignerResponse.accepted(request.request_id, result)
+
+    assert json.loads(canonical_response_bytes(response))["result"] == {
+        "allowed": True,
+        "evidence_hash": "9" * 64,
+        "expires_at": "2026-08-25T16:05:00Z",
+        "observed_at": "2026-08-25T16:00:00Z",
+        "operation": "READ_GEOBLOCK",
+    }
+    malformed = result.model_dump(mode="python") | {"raw_ip": "203.0.113.7"}
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+        ipc_module.GeoblockEvidenceResult.model_validate(malformed, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "expires_at"),
+    (
+        (NOW.replace(tzinfo=None), NOW + timedelta(minutes=5)),
+        (NOW, (NOW + timedelta(minutes=5)).replace(tzinfo=None)),
+        (NOW, NOW),
+    ),
+    ids=("naive-observation", "naive-expiry", "nonpositive-lifetime"),
+)
+def test_read_geoblock_ipc_rejects_malformed_evidence_lifetime(
+    observed_at: datetime,
+    expires_at: datetime,
+) -> None:
+    operation = ExecutionOperation.READ_GEOBLOCK
+
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+        ipc_module.GeoblockEvidenceResult(
+            operation=operation,
+            allowed=True,
+            evidence_hash="9" * 64,
+            observed_at=observed_at,
+            expires_at=expires_at,
+        )
+
+
+def test_read_geoblock_ipc_normalizes_both_timestamps_to_utc() -> None:
+    eastern = timezone(-timedelta(hours=4))
+
+    result = ipc_module.GeoblockEvidenceResult(
+        operation=ExecutionOperation.READ_GEOBLOCK,
+        allowed=True,
+        evidence_hash="9" * 64,
+        observed_at=NOW.astimezone(eastern),
+        expires_at=(NOW + timedelta(minutes=5)).astimezone(eastern),
+    )
+
+    assert result.observed_at.tzinfo is UTC
+    assert result.expires_at.tzinfo is UTC
 
 
 def _protocol_fixture_hash() -> str:
@@ -442,6 +511,8 @@ def _payload(operation: ExecutionOperation) -> object:
             asset_type="COLLATERAL",
             token_id=None,
         )
+    if operation is ExecutionOperation.READ_GEOBLOCK:
+        return ipc_module.ReadGeoblockPayload(operation=operation)
     raise AssertionError("UNKNOWN_TEST_OPERATION") from None
 
 
@@ -457,6 +528,7 @@ def _request(
         ExecutionOperation.READ_ORDERS,
         ExecutionOperation.READ_TRADES,
         ExecutionOperation.READ_ACCOUNT,
+        ExecutionOperation.READ_GEOBLOCK,
     }
     fields: dict[str, object] = {
         "schema_version": 1,
@@ -547,6 +619,7 @@ def test_identity_and_reads_cannot_carry_mutation_evidence() -> None:
     for operation in (
         ExecutionOperation.DESCRIBE_IDENTITY,
         ExecutionOperation.READ_ACCOUNT,
+        ExecutionOperation.READ_GEOBLOCK,
         ExecutionOperation.READ_ORDERS,
         ExecutionOperation.READ_TRADES,
     ):
@@ -555,8 +628,16 @@ def test_identity_and_reads_cannot_carry_mutation_evidence() -> None:
 
 
 def _handlers(**overrides: object) -> SignerOperationHandlers:
-    def result(payload: object) -> SanitizedOperationResult:
+    def result(payload: object) -> object:
         operation = payload.operation  # type: ignore[attr-defined]
+        if operation is ExecutionOperation.READ_GEOBLOCK:
+            return ipc_module.GeoblockEvidenceResult(
+                operation=operation,
+                allowed=True,
+                evidence_hash="9" * 64,
+                observed_at=NOW,
+                expires_at=NOW + timedelta(minutes=5),
+            )
         return SanitizedOperationResult(
             operation=operation,
             result_code={
@@ -586,9 +667,67 @@ def _handlers(**overrides: object) -> SignerOperationHandlers:
         "read_orders": result,
         "read_trades": result,
         "read_account": result,
+        "read_geoblock": result,
     }
     fields.update(overrides)
     return SignerOperationHandlers(**fields)  # type: ignore[arg-type]
+
+
+def test_read_geoblock_uses_the_read_guard_and_its_exact_typed_handler() -> None:
+    read_calls: list[UUID] = []
+    handler_calls: list[object] = []
+    base = _handlers()
+
+    def read_geoblock(payload: object) -> object:
+        handler_calls.append(payload)
+        return ipc_module.GeoblockEvidenceResult(
+            operation=ExecutionOperation.READ_GEOBLOCK,
+            allowed=True,
+            evidence_hash="9" * 64,
+            observed_at=NOW,
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
+    handlers = SignerOperationHandlers(
+        submit_order=base.submit_order,
+        cancel_order=base.cancel_order,
+        heartbeat=base.heartbeat,
+        read_orders=base.read_orders,
+        read_trades=base.read_trades,
+        read_account=base.read_account,
+        read_geoblock=read_geoblock,
+    )
+    service = _service(read_calls=read_calls, handlers=handlers)
+    request = _request(ExecutionOperation.READ_GEOBLOCK)
+    try:
+        response = service.handle(request)
+    finally:
+        service.close()
+
+    assert response.ok is True
+    assert type(response.result) is ipc_module.GeoblockEvidenceResult
+    assert response.result.evidence_hash == "9" * 64
+    assert read_calls == [request.request_id]
+    assert len(handler_calls) == 1
+    assert type(handler_calls[0]) is ipc_module.ReadGeoblockPayload
+
+
+def test_read_geoblock_rejects_a_generic_authenticated_read_result() -> None:
+    handlers = _handlers(
+        read_geoblock=lambda _payload: SanitizedOperationResult(
+            operation=ExecutionOperation.READ_ACCOUNT,
+            result_code="READ_ACCOUNT_OK",
+            evidence_hashes=(),
+        )
+    )
+    service = _service(handlers=handlers)
+    try:
+        response = service.handle(_request(ExecutionOperation.READ_GEOBLOCK))
+    finally:
+        service.close()
+
+    assert response.ok is False
+    assert response.error_code == "IPC_OPERATION_RESULT_INVALID"
 
 
 def _balance_operation_result(
@@ -776,6 +915,14 @@ def _child_service_factory(
         operation = payload.operation  # type: ignore[attr-defined]
         if operation is crash_operation:
             raise SystemExit("SANITIZED_CHILD_CRASH")
+        if operation is ExecutionOperation.READ_GEOBLOCK:
+            return ipc_module.GeoblockEvidenceResult(
+                operation=operation,
+                allowed=True,
+                evidence_hash="9" * 64,
+                observed_at=NOW,
+                expires_at=NOW + timedelta(minutes=5),
+            )  # type: ignore[return-value]
         if oversized_balance and operation is ExecutionOperation.READ_ACCOUNT:
             return _balance_operation_result(entry_count=10_000, amount="1" * 56)
         return SanitizedOperationResult(
@@ -811,6 +958,7 @@ def _child_service_factory(
             read_orders=result,
             read_trades=result,
             read_account=result,
+            read_geoblock=result,  # type: ignore[arg-type]
         ),
         clock=lambda: NOW,
         capability_public_key=ISSUER.public_verification_key,
@@ -2724,6 +2872,7 @@ def test_service_close_closes_handler_owner_before_zeroizing_secrets() -> None:
         read_orders=base.read_orders,
         read_trades=base.read_trades,
         read_account=base.read_account,
+        read_geoblock=base.read_geoblock,
         close=close_handlers,
     )
     service = SignerService(
@@ -2761,6 +2910,7 @@ def test_service_close_contains_handler_close_failure_and_zeroizes_secrets() -> 
         read_orders=base.read_orders,
         read_trades=base.read_trades,
         read_account=base.read_account,
+        read_geoblock=base.read_geoblock,
         close=fail_close,
     )
     service = SignerService(

@@ -13,7 +13,9 @@ from polytrading.predictions.pilot import signer_services
 from polytrading.predictions.pilot.signer_services import offline_pilot_signer_service
 from polytrading.predictions.polymarket_execution.ipc import (
     DescribeIdentityPayload,
+    GeoblockEvidenceResult,
     ReadAccountPayload,
+    ReadGeoblockPayload,
     SanitizedOperationResult,
     SignerCapabilityProof,
     SignerRequest,
@@ -56,6 +58,8 @@ def _request(
         payload = DescribeIdentityPayload(operation=operation)
     elif operation is ExecutionOperation.SIGN_ORDER:
         payload = SignOrderPayload(operation=operation, intent=intent)
+    elif operation is ExecutionOperation.READ_GEOBLOCK:
+        payload = ReadGeoblockPayload(operation=operation)
     else:
         payload = ReadAccountPayload(
             operation=operation,
@@ -70,6 +74,7 @@ def _request(
                 ExecutionOperation.DESCRIBE_IDENTITY: "00000000-0000-4000-8000-000000000001",
                 ExecutionOperation.READ_ACCOUNT: "00000000-0000-4000-8000-000000000002",
                 ExecutionOperation.SIGN_ORDER: "00000000-0000-4000-8000-000000000003",
+                ExecutionOperation.READ_GEOBLOCK: "00000000-0000-4000-8000-000000000004",
             }[operation]
         ),
         intent_id=intent.intent_id,
@@ -77,12 +82,22 @@ def _request(
         capability_digest=grant.plan_hash,
         authority_digest=(
             "0" * 64
-            if operation in {ExecutionOperation.DESCRIBE_IDENTITY, ExecutionOperation.READ_ACCOUNT}
+            if operation
+            in {
+                ExecutionOperation.DESCRIBE_IDENTITY,
+                ExecutionOperation.READ_ACCOUNT,
+                ExecutionOperation.READ_GEOBLOCK,
+            }
             else grant.digest
         ),
         authority_proof=(
             None
-            if operation in {ExecutionOperation.DESCRIBE_IDENTITY, ExecutionOperation.READ_ACCOUNT}
+            if operation
+            in {
+                ExecutionOperation.DESCRIBE_IDENTITY,
+                ExecutionOperation.READ_ACCOUNT,
+                ExecutionOperation.READ_GEOBLOCK,
+            }
             else SignerCapabilityProof(
                 grant=grant,
                 signature=b"cHVibGljLXNpZ25hdHVyZQ==",
@@ -137,6 +152,17 @@ def test_offline_service_refuses_reads_with_execution_unavailable() -> None:
     assert response.error_code == "EXECUTION_UNAVAILABLE"
 
 
+def test_offline_service_refuses_the_geoblock_read_with_execution_unavailable() -> None:
+    service = offline_pilot_signer_service(_secrets())
+    try:
+        response = service.handle(_request(ExecutionOperation.READ_GEOBLOCK))
+    finally:
+        service.close()
+
+    assert response.ok is False
+    assert response.error_code == "EXECUTION_UNAVAILABLE"
+
+
 def test_offline_service_refuses_mutations_with_execution_unavailable() -> None:
     service = offline_pilot_signer_service(_secrets())
     try:
@@ -173,7 +199,7 @@ def test_live_factory_constructs_fixed_rest_handlers_only_when_credentials_exist
                 heartbeat=unreachable,
                 read_orders=unreachable,
                 read_trades=unreachable,
-                read_account=lambda _payload: SanitizedOperationResult(
+                    read_account=lambda _payload: SanitizedOperationResult(
                     operation=ExecutionOperation.READ_ACCOUNT,
                     result_code=RestCode.READ_OK,
                     evidence_hashes=("1" * 64,),
@@ -187,9 +213,16 @@ def test_live_factory_constructs_fixed_rest_handlers_only_when_credentials_exist
                         kind="BALANCE_ALLOWANCE",
                         balance="10",
                         allowances=(),
+                        ),
                     ),
-                ),
-            )
+                    read_geoblock=lambda _payload: GeoblockEvidenceResult(
+                        operation=ExecutionOperation.READ_GEOBLOCK,
+                        allowed=True,
+                        evidence_hash="9" * 64,
+                        observed_at=NOW,
+                        expires_at=NOW + timedelta(minutes=5),
+                    ),
+                )
 
     monkeypatch.setattr(
         signer_services,
@@ -207,12 +240,16 @@ def test_live_factory_constructs_fixed_rest_handlers_only_when_credentials_exist
     )(_full_secrets())
     try:
         response = service.handle(_request(ExecutionOperation.READ_ACCOUNT, now=NOW))
+        geoblock = service.handle(_request(ExecutionOperation.READ_GEOBLOCK, now=NOW))
     finally:
         service.close()
 
     assert response.ok is True
     assert response.result is not None
     assert response.result.result_code == "READ_OK"
+    assert geoblock.ok is True
+    assert type(geoblock.result) is GeoblockEvidenceResult
+    assert geoblock.result.evidence_hash == "9" * 64
 
 
 def test_wallet_only_live_factory_refuses_authenticated_operations_without_creating_transport(
@@ -256,6 +293,19 @@ def test_live_read_guard_expires_at_the_five_minute_boundary() -> None:
 
     assert decision.allowed is False
     assert decision.reason == "CAPABILITY_EXPIRED"
+
+
+def test_live_read_guard_accepts_only_the_fixed_geoblock_read() -> None:
+    guard = signer_services._live_read_guard(
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        credentials_present=True,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+    decision = guard(_request(ExecutionOperation.READ_GEOBLOCK, now=NOW), NOW)
+
+    assert decision.allowed is True
+    assert decision.reason is None
 
 
 def test_live_read_guard_never_allows_a_mutation() -> None:
