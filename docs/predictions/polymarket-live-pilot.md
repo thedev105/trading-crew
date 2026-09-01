@@ -5,10 +5,38 @@ tightly bounded Polymarket execution. Nothing in this document starts trading: e
 is an operator ceremony in the local UI, and the pilot starts killed on every launch.
 
 **Secrets never belong in the UI, the CLI, a `.env` file, logs, screenshots, tickets, chat, email,
-or a support message.** The only place a wallet key or CLOB credential lives is the macOS Keychain
-and the signer process that reads it through inherited descriptors.
+or a support message. Never paste a credential or key into a terminal or UI.** The only place a
+wallet key or CLOB credential lives is the macOS Keychain and the signer process that reads it
+through inherited descriptors.
 
-## 1. Ten-minute setup
+## 1. Mandatory preflight and first-strategy order
+
+The pilot remains killed until every one of these gates is current and succeeds: persisted
+45-day qualification evidence, 30-day queue-aware shadow-execution evidence, account eligibility,
+KYC, jurisdiction/geoblock evidence, protocol review, manual funding and venue allowance, exact
+reconciliation, passkey activation, and an explicit operator action. No launch, manifest, or
+passkey alone creates an execution capability.
+
+Perform this order exactly:
+
+1. Verify the persisted qualification and shadow evidence, then verify current eligibility, KYC,
+   geoblock, and protocol-review evidence.
+2. Unlock the required Keychain entries locally. Do not reveal, copy, paste, or type their values
+   into a terminal or the console.
+3. Launch the pilot in its killed posture and inspect the clean, exact startup reconciliation.
+4. Register and verify the platform passkey.
+5. Activate only if every readiness gate remains green. If any evidence is absent, stale, or
+   contradictory, stop and leave the kill engaged.
+6. Manually authorize one bounded, complete strategy in the local UI. Inspect its authoritative
+   reconciliation before considering any further action.
+7. Stop and engage/keep the kill on any uncertainty, including an ambiguous acknowledgement,
+   signer/transport problem, missing presence, or reconciliation difference.
+
+Automation is unavailable in this build. Do not attempt an automation-session ceremony, API,
+script, or workaround; it is deliberately rejected. The manual-first complete-strategy path is the
+only possible operating sequence once all gates have succeeded.
+
+## 2. Local setup
 
 1. Create and back up the dedicated wallet **outside this application**. It holds only pilot funds.
 2. Enrol the wallet key in the macOS Keychain with the native Keychain interface, under service
@@ -30,7 +58,7 @@ and the signer process that reads it through inherited descriptors.
    build constructs no venue transport. The browser, coordinator, database, and logs only ever see
    public fingerprints.
 
-## 2. What the console shows
+## 3. What the console shows
 
 ![Readiness view at 1440px: kill state, presence, manifest, protocol, secret store, live authority, and an empty blocker list](assets/polymarket-live-pilot/readiness-1440.png)
 
@@ -45,8 +73,7 @@ only lower a ceiling; an attempted increase is rejected, never clamped.
 | Dedicated wallet trading equity | USD 250 |
 | One order notional | USD 10 |
 | One complete strategy gross notional | USD 25 |
-| Automation-session duration | 15 minutes |
-| Automation-session deployed capital | USD 50 |
+| Automation session | Unavailable; deliberately disabled |
 | Concurrent active strategies | 1 |
 | Session realized plus unrealized loss | USD 5 |
 | UTC-day realized plus unrealized loss | USD 10 |
@@ -71,7 +98,7 @@ console says UNKNOWN rather than estimating.
 Screenshots come from the fake-data pilot server: no database, signer, keychain, or authenticated
 transport is involved in producing them.
 
-## 3. Concepts worth reading once
+## 4. Concepts worth reading once
 
 - **Proof families.** Only deterministic, exhaustive proofs are live-eligible: binary complement,
   exhaustive outcome coverage, implication, and within-Polymarket equivalence. AI may nominate a
@@ -83,7 +110,7 @@ transport is involved in producing them.
 - **Reconciliation.** P&L stays unavailable until venue, settlement, balance, allowance, position,
   and ledger agree exactly.
 
-## 4. The three modes
+## 5. Available authorization mode
 
 **Exact order** authorizes one precomputed FAK/FOK order that reduces a known existing position. It
 cannot open naked or directional exposure. The capability dies at the reconciled terminal result or
@@ -93,35 +120,41 @@ after 60 seconds, whichever comes first.
 The plan, leg order, sizes, prices, deadlines, and stop conditions are frozen before the passkey
 ceremony. The capability dies at reconciliation or after five minutes.
 
-**Automation session** authorizes multiple eligible strategies for 15 minutes with one approval at
-the start. Only one strategy runs at a time, no new strategy starts in the final minute, and the
-session cannot extend itself, raise a limit, switch wallets, enable another family, or add a venue.
+**Automation session is unavailable.** It is compiled disabled and its requests are rejected. No
+operator may substitute repeated approvals, a script, or another UI path for the manual-first
+complete-strategy ceremony.
 
 Every approval is: read the summary, type the exact confirmation text
-(`ORDER <amount> USD`, `STRATEGY <amount> USD`, or `SESSION 15 MIN <amount> USD`), then satisfy the
-platform passkey. The console never marks success optimistically; it re-reads a coherent snapshot.
+(`ORDER <amount> USD` or `STRATEGY <amount> USD`), then satisfy the platform passkey. The console
+never marks success optimistically; it re-reads a coherent snapshot.
 
-## 5. Presence
+## 6. Presence
 
 The page sends a heartbeat every two seconds. Two missed heartbeats, five seconds of silence, a
 screen lock, or a sleep-sized jump in the monotonic clock engages the kill state immediately. The
 control page must stay open, the machine awake, and the operator present.
 
-## 6. Checklists
+## 7. Checklists
 
 **Before authorizing**
-- Readiness shows no blockers, and evidence age is seconds, not minutes.
+- Verify the persisted 45-day qualification and 30-day shadow-execution evidence before opening
+  the Keychain or console.
+- Confirm current eligibility, KYC, jurisdiction/geoblock, and protocol-review evidence; readiness
+  shows no blockers and evidence age is seconds, not minutes.
+- Startup reconciliation is exact. Funding and allowance were performed manually outside the app.
+- The passkey has been registered and verified after the clean killed launch.
 - The requested limits are the ones you intend, and are at or below every ceiling.
 - The summary's legs, prices, sizes, and recovery branches are what you expect.
 - You are physically present and the machine will stay awake.
+- Choose one bounded complete strategy manually; automation is not an alternative.
 
 **After a run**
 - Every leg has an authoritative terminal result; nothing is UNKNOWN.
 - Reconciliation is exact and the ledger balances.
 - Deployed capital and losses are inside the session and UTC-day budgets.
-- If anything is off, leave the kill engaged and work through section 8.
+- If anything is off, stop, leave the kill engaged, and work through section 9.
 
-## 7. Staged activation
+## 8. Staged activation
 
 - **Stage 0 — offline verification.** Full suite, conformance, and authority scans pass.
 - **Stage 1 — shadow qualification.** 45 continuous days of synchronized rules and executable books
@@ -129,13 +162,14 @@ control page must stay open, the machine awake, and the operator present.
   proof family. Thresholds are never edited to fit results.
 - **Stage 2 — operator drills.** Practise stop, kill, recovery, and clearance with no live
   authority.
-- **Stage 3 — activation readiness.** A fresh protocol checkpoint, current attestation and geoblock
-  evidence, and a passkey ceremony append a `LIVE_ELIGIBLE` manifest. Promotion creates no
-  capability and submits nothing.
-- **Stage 4 — first live strategy.** Operator-only, in the UI, after acceptance. Keep the first
-  live size at `min(USD 5, the smallest venue-valid complete strategy)`.
+- **Stage 3 — activation readiness.** Current account eligibility, KYC, geoblock, protocol review,
+  manual funding/allowance, exact killed-launch reconciliation, and a verified passkey must all be
+  present. A `LIVE_ELIGIBLE` manifest creates no capability and submits nothing.
+- **Stage 4 — first live strategy.** Only after every gate remains current, the present operator
+  manually authorizes one bounded complete strategy in the UI. Keep the first live size at
+  `min(USD 5, the smallest venue-valid complete strategy)`. Automation remains unavailable.
 
-## 8. Recovery playbooks
+## 9. Recovery playbooks
 
 - **UNKNOWN order outcome.** Do not retry. Let recovery run its frozen branch, then reconcile from
   authoritative order, trade, balance, and allowance reads before anything else.
@@ -151,8 +185,9 @@ control page must stay open, the machine awake, and the operator present.
   a reviewed discrepancy record, the exact phrase `CLEAR POLYMARKET PILOT KILL`, and a fresh passkey
   assertion. Clearance creates no trading capability: the next action still needs its own approval.
 
-## 9. What this pilot never does
+## 10. What this pilot never does
 
 Funding, withdrawal, transfer, allowance mutation, approval, split, merge, conversion, redemption,
 bridging, relaying, and wallet generation are outside the application. So is any cross-venue live
-execution, any AI-originated trading decision, and any geographic circumvention.
+execution, any AI-originated trading decision, any automation-session execution, and any geographic
+circumvention.

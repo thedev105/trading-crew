@@ -2,15 +2,30 @@
 
 ## Current boundary
 
-This increment is an offline protocol and recovery proof. Polymarket execution remains
-`LIVE_DISABLED`: every shipped readiness model reports no production capability, no live action,
-and an engaged production kill switch. The production verifier has no configured key, there is no
-production capability issuer or kill-clear callable, and the CLI exposes only offline conformance.
-The public Polymarket collector remains separate from the authenticated execution package.
+This increment is capability- and evidence-gated. Polymarket execution starts killed on every
+launch and cannot become eligible merely because a process has started. The production verifier has
+no configured key, there is no production capability issuer or kill-clear callable, and the CLI
+exposes no credential, order, activation, or clearance flag. The public Polymarket collector remains
+separate from the authenticated execution package.
 
 This is not a live pilot or an activation procedure. It neither authorizes authenticated venue
 access nor exposes an operator surface or authorized production path to place, cancel, sign,
 activate, fund, or transfer anything.
+
+## Operator preflight boundary
+
+The following sequence records the gates a separate, explicitly approved operator pilot would have
+to satisfy; it does not create an authority path in this package. Keep the account killed until all
+of the following are current and successful: persisted 45-day qualification, 30-day queue-aware
+shadow execution, account eligibility, KYC, jurisdiction/geoblock review, protocol review, manual
+funding and allowance, exact reconciliation, passkey activation, and explicit operator action.
+
+The required order is: verify that evidence; unlock Keychain entries locally without ever pasting
+or printing keys/credentials in a terminal or UI; launch killed; inspect clean exact
+reconciliation; register and verify the passkey; activate only if every gate passes; manually
+authorize one bounded complete strategy; inspect reconciliation; and stop/kill on uncertainty.
+Automation is unavailable and must not be enabled, simulated with a script, or substituted for the
+manual-first strategy. A stale, missing, ambiguous, or contradictory item leaves the kill engaged.
 
 ## Secret isolation
 

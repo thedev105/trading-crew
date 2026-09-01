@@ -395,6 +395,28 @@ def test_an_unknown_outcome_recovers_through_the_port(store: PredictionMarketSto
     assert killed == ["UNKNOWN_OUTCOME"]
 
 
+def test_ambiguous_submit_engages_parent_and_signer_kill_without_retry(
+    store: PredictionMarketStore,
+) -> None:
+    signer = FakeSigner(outcomes=["UNKNOWN", "FILLED"])
+    port, grants, killed, _verifier = wired(store, signer=signer)
+    executor = PilotExecutor(port, clock=lambda: NOW)
+
+    result = executor.execute_complete_strategy(plan(), grants)
+
+    assert result.stop_reason == "UNKNOWN_OUTCOME"
+    assert len(signer.submitted) == 1
+    assert killed == ["UNKNOWN_OUTCOME"]
+    assert signer.kill_calls == [
+        tuple(
+            sorted(
+                (grants.primary.grant.capability_id, grants.recovery.grant.capability_id),
+                key=str,
+            )
+        )
+    ]
+
+
 def test_every_persisted_intent_is_immediate_and_bound_to_its_plan(
     store: PredictionMarketStore,
 ) -> None:
