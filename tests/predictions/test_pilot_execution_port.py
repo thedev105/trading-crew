@@ -399,7 +399,7 @@ def test_ambiguous_submit_engages_parent_and_signer_kill_without_retry(
     store: PredictionMarketStore,
 ) -> None:
     signer = FakeSigner(outcomes=["UNKNOWN", "FILLED"])
-    port, grants, killed, _verifier = wired(store, signer=signer)
+    port, grants, killed, verifier = wired(store, signer=signer)
     executor = PilotExecutor(port, clock=lambda: NOW)
 
     result = executor.execute_complete_strategy(plan(), grants)
@@ -407,6 +407,7 @@ def test_ambiguous_submit_engages_parent_and_signer_kill_without_retry(
     assert result.stop_reason == "UNKNOWN_OUTCOME"
     assert len(signer.submitted) == 1
     assert killed == ["UNKNOWN_OUTCOME"]
+    assert grants.primary.grant.capability_id in verifier.revoked_capability_ids
     assert signer.kill_calls == [
         tuple(
             sorted(

@@ -22,10 +22,14 @@ funding and allowance, exact reconciliation, passkey activation, and explicit op
 
 The required order is: verify that evidence; unlock Keychain entries locally without ever pasting
 or printing keys/credentials in a terminal or UI; launch killed; inspect clean exact
-reconciliation; register and verify the passkey; activate only if every gate passes; manually
-authorize one bounded complete strategy; inspect reconciliation; and stop/kill on uncertainty.
-Automation is unavailable and must not be enabled, simulated with a script, or substituted for the
-manual-first strategy. A stale, missing, ambiguous, or contradictory item leaves the kill engaged.
+reconciliation; register and verify the passkey; obtain a separately approved external activation
+decision only if every gate passes; manually authorize one bounded complete strategy in that
+separate pilot; inspect reconciliation; and stop/kill on uncertainty. The 45-day qualification,
+30-day shadow evidence, independent legal/KYC/venue-terms review, manual funding/allowance, and
+activation decision remain external prerequisites; completing this sequence in this repository does
+not authorize activation or trading. Automation is unavailable and must not be enabled, simulated
+with a script, or substituted for the manual-first strategy. A stale, missing, ambiguous, or
+contradictory item leaves the kill engaged.
 
 ## Secret isolation
 

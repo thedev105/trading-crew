@@ -37,3 +37,15 @@ The full suite also had one unrelated, non-reproducing concurrent test failure:
 `test_separate_coordinators_on_one_store_share_the_permanent_claim` raised `IndexError` from its
 one-result `FakeSigner` fixture, then passed in isolation. It is not part of this task and no
 production change was made for it.
+
+## Review round 1 corrections
+
+- The ambiguous-submit regression now retains the `PilotCapabilityVerifier` and proves that the
+  primary capability ID is in `revoked_capability_ids` after the `UNKNOWN_OUTCOME`, in addition to
+  proving the parent kill and signer kill directive. This exercises the recovery path rather than a
+  direct kill alone.
+- Both runbooks now state that the qualification/shadow evidence, independent legal/KYC/venue-terms
+  review, manual funding/allowance, and separately approved activation decision are external
+  prerequisites. Completing a checklist, launching killed, or passing a passkey ceremony in this
+  repository does not authorize activation or trading; no authenticated venue transport is built.
+- Review-round verification: `rtk .venv/bin/python -m pytest tests/predictions/test_pilot_execution_port.py tests/predictions/test_execution_secret_scan.py tests/predictions/test_polymarket_secret_boundary.py tests/predictions/test_execution_recovery.py tests/predictions/test_pilot_acceptance.py -q` reported 221 passed; `rtk .venv/bin/python -m pytest tests/predictions/test_execution_authority_scan.py -q` reported 68 passed.
