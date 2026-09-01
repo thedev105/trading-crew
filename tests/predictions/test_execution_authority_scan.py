@@ -47,7 +47,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
     Path(
         "polymarket_execution/ipc.py"
-    ): "568911250f12cdec4d7af9fecaf03b16a3d22a480d85b39f5601df59d100414d",
+    ): "c707695f9ab72b45b4601becdea8ce22beccb333f8cc52112f815ccd4a31485b",
     Path(
         "polymarket_execution/order.py"
     ): "fb2c507d97fd9175de1250f8d00a86a0bd85e58bedb129abcd783cec6f326131",
@@ -56,7 +56,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "88ad4405fcda17afaea96bfdcde710c598b68823c10da532b3ee761ead6db9fa",
     Path(
         "polymarket_execution/rest.py"
-    ): "0114d8285617c6aa862abd6e43bd54b02d9674e896b70b070ac8e5a4dfd912d1",
+    ): "8ea09d5ed144a1094f1d27b39e287cb9539d464c7a17e4372ba93b24284a80e5",
     Path(
         "polymarket_execution/routes.py"
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",

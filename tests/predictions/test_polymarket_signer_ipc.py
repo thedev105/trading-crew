@@ -190,6 +190,17 @@ def test_read_geoblock_ipc_rejects_malformed_evidence_lifetime(
         )
 
 
+def test_read_geoblock_ipc_rejects_evidence_lifetime_beyond_five_minutes() -> None:
+    with pytest.raises(SignerProtocolError, match=r"^IPC_MODEL_INVALID$"):
+        ipc_module.GeoblockEvidenceResult(
+            operation=ExecutionOperation.READ_GEOBLOCK,
+            allowed=True,
+            evidence_hash="9" * 64,
+            observed_at=NOW,
+            expires_at=NOW + timedelta(days=3650),
+        )
+
+
 def test_read_geoblock_ipc_normalizes_both_timestamps_to_utc() -> None:
     eastern = timezone(-timedelta(hours=4))
 

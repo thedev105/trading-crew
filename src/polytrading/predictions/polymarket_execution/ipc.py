@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, BinaryIO, Final, Literal, Self, get_args
 from uuid import UUID
 
@@ -52,6 +52,7 @@ from polytrading.predictions.polymarket_execution.routes import (
 )
 
 MAX_FRAME_BYTES: Final = 1_048_576
+MAX_GEOBLOCK_EVIDENCE_LIFETIME: Final = timedelta(minutes=5)
 _FRAME_HEADER_BYTES: Final = 4
 _MAX_JSON_DEPTH: Final = 32
 _PublicIdentifier = Annotated[
@@ -459,6 +460,8 @@ class GeoblockEvidenceResult(_SignerRecord):
     def _expiry_follows_observation(self) -> GeoblockEvidenceResult:
         if self.expires_at <= self.observed_at:
             raise ValueError("geoblock evidence expiry must follow observation")
+        if self.expires_at - self.observed_at > MAX_GEOBLOCK_EVIDENCE_LIFETIME:
+            raise ValueError("geoblock evidence lifetime exceeds maximum")
         return self
 
 
@@ -869,6 +872,7 @@ def parse_signer_request(payload: bytes) -> SignerRequest:
 
 __all__ = [
     "MAX_FRAME_BYTES",
+    "MAX_GEOBLOCK_EVIDENCE_LIFETIME",
     "CancelOrderPayload",
     "DescribeIdentityPayload",
     "GeoblockEvidenceResult",

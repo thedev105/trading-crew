@@ -167,10 +167,17 @@ def intent(**overrides: Any) -> ExecutionIntent:
 class FakeSignerChannel:
     """A framed, in-memory stand-in for the signer sidecar on the other end of the pipe."""
 
-    def __init__(self, *, codes: list[str] | None = None, ok: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        codes: list[str] | None = None,
+        ok: bool = True,
+        geoblock_observed_at: datetime = NOW,
+    ) -> None:
         self.requests: list[Any] = []
         self.codes = codes or []
         self.ok = ok
+        self.geoblock_observed_at = geoblock_observed_at
         self._responses = io.BytesIO()
         self._read_at = 0
 
@@ -212,8 +219,8 @@ class FakeSignerChannel:
                         operation=ExecutionOperation.READ_GEOBLOCK,
                         allowed=True,
                         evidence_hash="9" * 64,
-                        observed_at=NOW,
-                        expires_at=NOW + timedelta(minutes=5),
+                        observed_at=self.geoblock_observed_at,
+                        expires_at=self.geoblock_observed_at + timedelta(minutes=5),
                     ),
                 )
                 if self.ok
@@ -583,6 +590,24 @@ def test_geoblock_evidence_uses_only_the_fixed_sanitized_read() -> None:
         evidence_hash="9" * 64,
         expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def test_geoblock_evidence_rejects_an_observation_ahead_of_the_link_clock() -> None:
+    channel = FakeSignerChannel(geoblock_observed_at=NOW + timedelta(seconds=5))
+
+    with pytest.raises(SignerLinkError) as raised:
+        port(channel).geoblock_evidence()
+
+    assert raised.value.code == "IPC_REQUEST_INVALID"
+
+
+def test_geoblock_evidence_rejects_a_naive_link_clock() -> None:
+    channel = FakeSignerChannel()
+
+    with pytest.raises(SignerLinkError) as raised:
+        port(channel, clock=lambda: NOW.replace(tzinfo=None)).geoblock_evidence()
+
+    assert raised.value.code == "IPC_REQUEST_INVALID"
 
 
 def test_geoblock_evidence_fails_closed_on_a_malformed_ipc_result() -> None:

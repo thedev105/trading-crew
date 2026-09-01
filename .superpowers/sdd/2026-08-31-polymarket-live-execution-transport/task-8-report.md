@@ -168,3 +168,32 @@ and the envelope preserves reconciliation and account-scope hashes independently
   for `signer.py`.
 - No real venue request, network access, Keychain access, browser transport, parent transport,
   credential/authority/CLI surface, or subagent was used.
+
+## Fix round 3
+
+- `GeoblockEvidenceResult` now rejects evidence whose positive lifetime exceeds the shared fixed
+  five-minute maximum. UTC normalization and the existing nonpositive-lifetime rejection remain
+  intact. `SignerRestHandlers` uses the same exported protocol constant when it derives expiry,
+  removing the producer/validator drift risk.
+- `SignerLinkVenuePort` validates and normalizes its clock before constructing requests. Before
+  converting a typed geoblock result into pilot authority evidence, it rejects observations more
+  than two seconds ahead of that clock with the stable `IPC_REQUEST_INVALID` code. Invalid link
+  clocks fail with the same stable code.
+
+### Fix-round-3 regressions and verification
+
+- RED: a dedicated 3650-day evidence-lifetime regression failed because no
+  `SignerProtocolError` was raised. GREEN: the new maximum-lifetime validation passed together
+  with the existing UTC-normalization and nonpositive-lifetime cases (`5 passed`).
+- RED: a signer result observed five seconds ahead of the link clock was accepted, and a naive
+  link clock leaked `SignerProtocolError`. GREEN: current evidence still converts while both
+  invalid cases fail closed with `IPC_REQUEST_INVALID` (`3 passed`).
+- The geoblock-focused IPC, REST, signer-service, signer-link, and runtime slice passed
+  (`33 passed, 278 deselected`). The complete affected-module selection excluding only the eleven
+  known sandbox-incompatible spawned-sidecar cases passed (`300 passed, 11 deselected`).
+- Authority and secret scans passed (`71 passed`); targeted Ruff and `git diff --check` passed.
+  Refreshed reviewed hashes are
+  `c707695f9ab72b45b4601becdea8ce22beccb333f8cc52112f815ccd4a31485b` for `ipc.py` and
+  `8ea09d5ed144a1094f1d27b39e287cb9539d464c7a17e4372ba93b24284a80e5` for `rest.py`.
+- No real venue request, network access, Keychain access, browser or parent transport, CLI flag,
+  subagent, or real trade was used.

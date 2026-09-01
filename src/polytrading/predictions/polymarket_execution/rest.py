@@ -8,7 +8,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import sha256
 from ipaddress import ip_address
 from threading import get_ident
@@ -32,6 +32,7 @@ from polytrading.predictions.polymarket_execution.auth import (
     ClobCredentials,
     sign_l2_request,
 )
+from polytrading.predictions.polymarket_execution.ipc import MAX_GEOBLOCK_EVIDENCE_LIFETIME
 from polytrading.predictions.polymarket_execution.routes import (
     ROUTE_SPECS,
     AllowanceEntry,
@@ -113,7 +114,6 @@ _READ_RETRY_ROUTES = frozenset(
         RouteKey.GEOBLOCK,
     }
 )
-_GEOBLOCK_EVIDENCE_LIFETIME = timedelta(minutes=5)
 _RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 
@@ -1559,7 +1559,7 @@ class SignerRestHandlers:
             allowed=not result.payload.blocked,
             evidence_hash=evidence.raw_evidence_hash,
             observed_at=result.observed_at,
-            expires_at=result.observed_at + _GEOBLOCK_EVIDENCE_LIFETIME,
+            expires_at=result.observed_at + MAX_GEOBLOCK_EVIDENCE_LIFETIME,
         )
 
     def _require_available(self) -> None:

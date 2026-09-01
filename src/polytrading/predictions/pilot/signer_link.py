@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
+from polytrading.predictions.domain import normalize_utc_timestamp
 from polytrading.predictions.execution.models import (
     ExecutionIntent,
     ExecutionOperation,
@@ -57,6 +58,7 @@ IDENTITY_DEADLINE = timedelta(seconds=5)
 _FILLED_CODES = frozenset({"SUBMIT_ORDER_OK", "ORDER_ACK_MATCHED"})
 _REJECTED_CODES = frozenset({"ORDER_ACK_UNMATCHED", "AUTH_REJECTED", "PROTOCOL_RESPONSE_INVALID"})
 _CANCELLED_CODES = frozenset({"CANCEL_ORDER_OK", "CANCEL_ACKNOWLEDGED"})
+_MAXIMUM_GEOBLOCK_CLOCK_SKEW = timedelta(seconds=2)
 
 
 class SignerLinkError(ValueError):
@@ -209,6 +211,8 @@ class SignerLinkVenuePort:
             or result.operation is not ExecutionOperation.READ_GEOBLOCK
         ):
             raise SignerLinkError("IPC_REQUEST_INVALID")
+        if result.observed_at - self._current_utc() > _MAXIMUM_GEOBLOCK_CLOCK_SKEW:
+            raise SignerLinkError("IPC_REQUEST_INVALID")
         return GeoblockEvidence(
             allowed=result.allowed,
             evidence_hash=result.evidence_hash,
@@ -224,7 +228,7 @@ class SignerLinkVenuePort:
         payload: object,
         capability_id: UUID | None,
     ) -> SignerResponse:
-        now = self._clock()
+        now = self._current_utc()
         request_id = uuid4()
         authority_proof = self._mutation_proof(operation, capability_id)
         mutation_evidence = self._evidence_for(
@@ -261,6 +265,15 @@ class SignerLinkVenuePort:
         except SignerProtocolError as error:
             raise SignerLinkError("IPC_EXCHANGE_FAILED") from error
         return _verified_response(request.request_id, response)
+
+    def _current_utc(self) -> datetime:
+        try:
+            now = self._clock()
+            if not isinstance(now, datetime):
+                raise TypeError("link clock must return datetime")
+            return normalize_utc_timestamp(now)
+        except Exception as error:
+            raise SignerLinkError("IPC_REQUEST_INVALID") from error
 
     def _evidence_for(
         self,
