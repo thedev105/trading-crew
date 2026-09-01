@@ -169,6 +169,23 @@ class FakeSignerChannel:
         self._responses.seek(position)
 
 
+class RealSignerChannel(FakeSignerChannel):
+    """Frames requests through the production signer service instead of a canned response."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__()
+        self._service = service
+
+    def answer(self, frame: bytes) -> None:
+        request = parse_signer_request(frame)
+        self.requests.append(request)
+        response = self._service.handle(request)
+        position = self._responses.tell()
+        self._responses.seek(0, io.SEEK_END)
+        write_frame(self._responses, canonical_response_bytes(response))
+        self._responses.seek(position)
+
+
 def _flags_for(operation: str, code: RestCode, payload: object | None) -> dict[str, bool]:
     """Take the recovery/kill flags from the route contract itself, not from a guess."""
     from polytrading.predictions.polymarket_execution.routes import expected_route_result_flags
@@ -517,6 +534,103 @@ def test_submit_serializes_a_coordinator_intent_under_its_matching_grant() -> No
     request = channel.requests[0]
     assert request.capability_digest == target.capability_fingerprint
     assert request.authority_digest == proof.grant.digest
+    assert request.authority_proof == proof
+
+
+def test_a_real_signer_accepts_a_coordinator_intent_bound_to_the_frozen_plan() -> None:
+    from polytrading.predictions.execution.models import canonical_execution_hash
+    from polytrading.predictions.polymarket_execution import load_protocol_snapshot
+    from polytrading.predictions.polymarket_execution.order import sign_order
+    from tests.predictions.test_execution_authority import MANIFEST_HASH
+    from tests.predictions.test_polymarket_order_signing import (
+        ACCOUNT_FINGERPRINT as REAL_ACCOUNT_FINGERPRINT,
+    )
+    from tests.predictions.test_polymarket_order_signing import (
+        PRIVATE_KEY,
+    )
+    from tests.predictions.test_polymarket_signer_ipc import (
+        ISSUER,
+        _capability_grant,
+        _service,
+    )
+    from tests.predictions.test_polymarket_signer_ipc import (
+        NOW as SIGNER_NOW,
+    )
+
+    frozen = FrozenPilotPlan.model_validate(
+        {
+            "schema_version": 1,
+            "proof_id": UUID("00000000-0000-0000-0000-000000006001"),
+            "proposal_id": UUID("70000000-0000-0000-0000-000000000001"),
+            "account_fingerprint": REAL_ACCOUNT_FINGERPRINT,
+            "wallet_fingerprint": WALLET_FINGERPRINT,
+            "legs": (
+                PilotLeg(
+                    leg_index=0,
+                    outcome_token_id="217426",
+                    side="buy",
+                    limit_price=Decimal("0.40"),
+                    size=Decimal("10"),
+                    order_type=ImmediateOrderType.FAK,
+                ),
+            ),
+            "recovery_branches": (),
+            "gross_notional_usd": Decimal("4"),
+            "deployed_capital_usd": Decimal("4"),
+            "worst_case_incomplete_loss_usd": Decimal("0"),
+            "effective_limits": PILOT_CEILINGS,
+            "evidence_hashes": ("e" * 64,),
+            "deadline": SIGNER_NOW + timedelta(seconds=30),
+            "information_cutoff": SIGNER_NOW,
+        },
+        strict=True,
+    )
+    coordinator = CoordinatorExecutionPort(
+        store=object(),  # type: ignore[arg-type]
+        signer=object(),  # type: ignore[arg-type]
+        verifier=object(),  # type: ignore[arg-type]
+        grants={},
+        evidence=lambda: object(),  # type: ignore[return-value]
+        clock=lambda: SIGNER_NOW,
+    )
+    target = coordinator._intent_for(frozen, frozen.legs[0])
+    snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
+    fixture_hash = canonical_execution_hash(
+        {
+            "version": snapshot.version,
+            "fixtures": [item.model_dump(mode="json") for item in snapshot.fixture_hashes],
+        }
+    )
+    base_grant = _capability_grant()
+    grant = base_grant.model_copy(
+        update={
+            "plan_hash": frozen.plan_hash,
+            "venue_binding": base_grant.venue_binding.model_copy(
+                update={"protocol_fixture_hash": fixture_hash}
+            ),
+        }
+    )
+    proof = ISSUER.proof(grant)
+    service = _service(now=SIGNER_NOW, snapshot=snapshot)
+    channel = RealSignerChannel(service)
+    try:
+        outcome = port(
+            channel,
+            account_fingerprint=REAL_ACCOUNT_FINGERPRINT,
+            manifest_digest=MANIFEST_HASH,
+            clock=lambda: SIGNER_NOW,
+            signed_envelope=lambda intent: sign_order(
+                intent, PRIVATE_KEY, snapshot
+            ),
+            proof_for=lambda capability_id: {grant.capability_id: proof}[capability_id],
+        ).submit(target, grant.capability_id)
+    finally:
+        service.close()
+
+    request = channel.requests[0]
+    assert outcome.state == "FILLED"
+    assert request.capability_digest == frozen.plan_hash
+    assert request.authority_digest == grant.digest
     assert request.authority_proof == proof
 
 

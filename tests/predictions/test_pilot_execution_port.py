@@ -112,6 +112,7 @@ class FakeSigner:
         *,
         outcomes: list[str] | None = None,
         account: PilotAccountState | None = None,
+        account_fails: bool = False,
         kill_fails: bool = False,
     ) -> None:
         self.submitted: list[tuple[ExecutionIntent, UUID]] = []
@@ -119,7 +120,9 @@ class FakeSigner:
         self.kill_calls: list[tuple[UUID, ...]] = []
         self.outcomes = outcomes or []
         self._account = account
+        self._account_fails = account_fails
         self._kill_fails = kill_fails
+        self.account_reads = 0
 
     def _outcome(self, intent: ExecutionIntent) -> LegOutcome:
         state = self.outcomes.pop(0) if self.outcomes else "FILLED"
@@ -144,6 +147,9 @@ class FakeSigner:
         return self._outcome(intent)
 
     def account_state(self) -> PilotAccountState:
+        self.account_reads += 1
+        if self._account_fails:
+            raise RuntimeError("sanitized fake account read failure")
         return self._account or account_state()
 
     def positions(self) -> Mapping[str, Decimal]:
@@ -158,6 +164,7 @@ class FakeSigner:
 def evidence(**overrides: Any) -> ExecutionEvidence:
     fields: dict[str, Any] = {
         "manifest": ELIGIBLE_MANIFEST,
+        "account": account_state(),
         "geoblock_allowed": True,
         "geoblock_evidence_hash": "a" * 64,
         "geoblock_expires_at": NOW + timedelta(minutes=1),
@@ -269,6 +276,34 @@ def test_the_authority_boundary_stops_a_leg_before_the_venue(
 
     assert raised.value.code == "AUTHORITY_REFUSED"
     assert signer.submitted == []
+
+
+def test_unavailable_account_evidence_kills_once_and_returns_a_stable_refusal(
+    store: PredictionMarketStore,
+) -> None:
+    signer = FakeSigner(account_fails=True)
+
+    def current_evidence() -> ExecutionEvidence:
+        try:
+            account = signer.account_state()
+        except RuntimeError:
+            account = None
+        return evidence(account=account, kill_engaged=account is None)
+
+    port, grants, killed, verifier = wired(store, signer=signer, evidence=current_evidence)
+    executor = PilotExecutor(port, clock=lambda: NOW)
+    primary_id = grants.primary.grant.capability_id
+    recovery_id = grants.recovery.grant.capability_id
+
+    with pytest.raises(PilotExecutionPortError) as raised:
+        executor.execute_complete_strategy(plan(), grants)
+
+    assert raised.value.code == "AUTHORITY_REFUSED"
+    assert signer.account_reads == 1
+    assert signer.submitted == []
+    assert killed == ["EVIDENCE_STALE"]
+    assert verifier.revoked_capability_ids == frozenset({primary_id})
+    assert signer.kill_calls == [tuple(sorted((primary_id, recovery_id), key=str))]
 
 
 def test_revoking_primary_authority_blocks_the_next_leg(store: PredictionMarketStore) -> None:

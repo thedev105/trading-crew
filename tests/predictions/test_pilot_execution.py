@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
@@ -11,7 +12,13 @@ from uuid import UUID
 
 import pytest
 
-from polytrading.predictions.execution.models import ExecutionOperation, ImmediateOrderType
+from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.execution.models import (
+    ExecutionOperation,
+    ImmediateOrderType,
+    canonical_execution_hash,
+)
+from polytrading.predictions.manifest import AdapterImplementationState
 from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import (
     CapabilityRequest,
@@ -38,7 +45,7 @@ from polytrading.predictions.pilot.selector import (
     PilotLeg,
 )
 from polytrading.predictions.pilot.server import PilotRequestError
-from polytrading.predictions.pilot.services import LivePilotServices
+from polytrading.predictions.pilot.services import LivePilotServices, PilotEnvironment
 from polytrading.predictions.pilot.sessions import (
     RECOVERY_GRACE,
     ExecutionResult,
@@ -49,6 +56,7 @@ from polytrading.predictions.pilot.sessions import (
 from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
 from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
 from polytrading.predictions.storage.store import PredictionMarketStore
+from tests.predictions.manifest_helpers import venue_manifest
 from tests.predictions.pilot_helpers import (
     ACCOUNT_FINGERPRINT,
     BROWSER_SESSION_HASH,
@@ -322,6 +330,18 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
         reconciliation_hash="8" * 64,
         observed_at=NOW,
     )
+    manifest = venue_manifest(
+        venue=PredictionVenue.POLYMARKET,
+        implementation_state=AdapterImplementationState.LIVE_ELIGIBLE,
+        jurisdiction_review_status="ELIGIBILITY_REVIEWED",
+        source_hashes=(EVIDENCE_HASH,),
+        reviewed_at=NOW - timedelta(days=1),
+    )
+    provider_state: dict[str, Any] = {
+        "manifest": manifest,
+        "reconciliation": reconciliation,
+    }
+    provider_calls = {"manifest": 0, "reconciliation": 0}
     available = True
 
     def current_account() -> PilotAccountState:
@@ -329,18 +349,44 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
             raise PilotRequestError(HTTPStatus.CONFLICT, "ACCOUNT_UNAVAILABLE")
         return account_state
 
-    environment = SimpleNamespace(
+    def current_manifest() -> Any:
+        provider_calls["manifest"] += 1
+        current = provider_state["manifest"]
+        if isinstance(current, Exception):
+            raise current
+        return current
+
+    def current_reconciliation() -> Any:
+        provider_calls["reconciliation"] += 1
+        current = provider_state["reconciliation"]
+        if isinstance(current, Exception):
+            raise current
+        return current
+
+    environment = PilotEnvironment(
         account_fingerprint=ACCOUNT_FINGERPRINT,
         wallet_fingerprint=WALLET_FINGERPRINT,
+        venue_binding=VenueBinding.model_validate(
+            venue_binding_fields(
+                manifest_record_hash=canonical_execution_hash(manifest),
+                manifest_source_hashes=manifest.source_hashes,
+            ),
+            strict=True,
+        ),
+        manifest=manifest,
+        manifest_state="LIVE_ELIGIBLE",
+        protocol_state="CURRENT",
+        qualifications=(),
+        eligibility_expires_at=NOW + timedelta(minutes=1),
+        credentials_present=True,
         reconciliation=reconciliation,
         account_state=current_account,
-        manifest=SimpleNamespace(jurisdiction_review_status="ELIGIBILITY_REVIEWED"),
-        eligibility_expires_at=NOW + timedelta(minutes=1),
-        activation_inputs=SimpleNamespace(geoblock_allowed=True),
+        manifest_provider=current_manifest,
+        reconciliation_provider=current_reconciliation,
     )
     services = LivePilotServices(
         store=object(),  # type: ignore[arg-type]
-        environment=environment,  # type: ignore[arg-type]
+        environment=environment,
         passkeys=object(),  # type: ignore[arg-type]
         issuer=object(),  # type: ignore[arg-type]
         verifier=PilotCapabilityVerifier(pair.primary.public_verification_key),
@@ -359,17 +405,53 @@ def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() 
     assert set(proofs) == expected_ids
     assert all(isinstance(proof, SignerCapabilityProof) for proof in proofs.values())
     assert proofs[pair.primary.grant.capability_id].grant == pair.primary.grant
-    assert isinstance(evidence(), ExecutionEvidence)
-    assert evidence().kill_engaged is False
+    fresh = evidence()
+    assert isinstance(fresh, ExecutionEvidence)
+    assert fresh.account == account_state
+    assert fresh.kill_engaged is False
+    assert provider_calls == {"manifest": 1, "reconciliation": 1}
 
-    environment.reconciliation = reconciliation.model_copy(
+    provider_state["reconciliation"] = reconciliation.model_copy(
         update={"observed_at": NOW - timedelta(minutes=5, microseconds=1)}
     )
     assert evidence().kill_engaged is True
 
-    environment.reconciliation = reconciliation
-    available = False
+    provider_state["reconciliation"] = RuntimeError("reconciliation provider failed")
     assert evidence().kill_engaged is True
+
+    provider_state["reconciliation"] = None
+    assert evidence().kill_engaged is True
+
+    provider_state["reconciliation"] = reconciliation
+    provider_state["manifest"] = None
+    assert evidence().kill_engaged is True
+
+    provider_state["manifest"] = RuntimeError("manifest provider failed")
+    assert evidence().kill_engaged is True
+
+    provider_state["manifest"] = manifest
+    fallback_services = LivePilotServices(
+        store=object(),  # type: ignore[arg-type]
+        environment=replace(
+            environment,
+            manifest_provider=None,
+            reconciliation_provider=None,
+        ),
+        passkeys=object(),  # type: ignore[arg-type]
+        issuer=object(),  # type: ignore[arg-type]
+        verifier=PilotCapabilityVerifier(pair.primary.public_verification_key),
+        presence=_PresentMonitor(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    fallback_services._state.kill_engaged = False
+    assert fallback_services._execution_evidence().kill_engaged is False
+
+    available = False
+    unavailable_account = evidence()
+    assert unavailable_account.account is None
+    assert unavailable_account.kill_engaged is True
+    assert environment.manifest is manifest
+    assert environment.reconciliation is reconciliation
 
 
 def test_live_service_refuses_automation_before_executor_construction() -> None:
@@ -399,7 +481,7 @@ def test_live_service_refuses_automation_before_executor_construction() -> None:
     )
 
     with pytest.raises(PilotRequestError, match="AUTOMATION_NOT_ACTIVATED"):
-        services._run(challenge, pair)
+        services._run(challenge, pair, plan=plan(), now=NOW)
 
     assert factory_calls == 0
 

@@ -57,7 +57,10 @@ from polytrading.predictions.polymarket_execution.ipc import (
     write_frame,
 )
 from polytrading.predictions.polymarket_execution.order import OrderSigningError, sign_order
-from polytrading.predictions.polymarket_execution.protocol import load_protocol_snapshot
+from polytrading.predictions.polymarket_execution.protocol import (
+    PolymarketProtocolSnapshot,
+    load_protocol_snapshot,
+)
 from polytrading.predictions.polymarket_execution.routes import (
     AllowanceEntry,
     BalanceAllowancePayload,
@@ -544,6 +547,7 @@ def _service(
     api_key: bytes = API_KEY,
     api_secret: bytes = API_SECRET,
     passphrase: bytes = PASSPHRASE,
+    snapshot: PolymarketProtocolSnapshot | None = None,
 ) -> SignerService:
     def context_factory(request: SignerRequest, observed_at: datetime) -> object:
         if authority_calls is not None:
@@ -601,6 +605,7 @@ def _service(
         clock=lambda: now,
         capability_public_key=ISSUER.public_verification_key,
         max_cache_entries=max_cache_entries,
+        snapshot=snapshot,
     )
 
 

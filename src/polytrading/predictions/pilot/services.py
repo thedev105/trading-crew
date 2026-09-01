@@ -18,10 +18,10 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import ValidationError
 
-from polytrading.predictions.domain import Sha256
+from polytrading.predictions.domain import PredictionVenue, Sha256
 from polytrading.predictions.execution.authority import VerifiedExecutionCapability
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
-from polytrading.predictions.manifest import VenueManifest
+from polytrading.predictions.manifest import VenueManifest, evaluate_execution_gate
 from polytrading.predictions.pilot.activation import (
     ActivationError,
     ActivationInputs,
@@ -83,6 +83,7 @@ from polytrading.predictions.pilot.read_models import (
     build_session_view,
 )
 from polytrading.predictions.pilot.selector import (
+    FrozenPilotPlan,
     PilotAccountState,
     PilotOpportunity,
     PilotSelectionError,
@@ -142,6 +143,8 @@ class PilotEnvironment:
     # services never construct transport themselves.
     executor_factory: ExecutorFactory | None = None
     activation_inputs: ActivationInputs | None = None
+    manifest_provider: Callable[[], VenueManifest | None] | None = None
+    reconciliation_provider: Callable[[], PilotReconciliationState] | None = None
 
 
 @dataclass
@@ -353,8 +356,10 @@ class LivePilotServices:
         if not isinstance(credential, Mapping):
             raise PilotRequestError(HTTPStatus.BAD_REQUEST, "ASSERTION_INVALID")
         assertion = self._verified_assertion(challenge, dict(credential), payload)
-        grants = self._issue(challenge, assertion)
-        return self._run(challenge, grants)
+        now = self._clock()
+        plan = self._freeze_plan(challenge, now)
+        grants = self._issue(challenge, assertion, plan=plan, now=now)
+        return self._run(challenge, grants, plan=plan, now=now)
 
     def presence(self, payload: Mapping[str, object]) -> dict[str, Any]:
         now = self._clock()
@@ -509,6 +514,14 @@ class LivePilotServices:
         mode = _mode(payload.get("mode"))
         if mode is AuthorizationMode.AUTOMATION_SESSION:
             raise PilotRequestError(HTTPStatus.CONFLICT, "AUTOMATION_NOT_ACTIVATED")
+        try:
+            reconciliation = self._current_reconciliation()
+        except Exception as error:
+            self._engage_kill("EVIDENCE_STALE", now)
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE") from error
+        if not self._reconciliation_is_current(reconciliation, now):
+            self._engage_kill("EVIDENCE_STALE", now)
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE")
         opportunity = self._selected_opportunity(payload, now)
         amount = (
             opportunity.deployed_capital_usd
@@ -533,7 +546,7 @@ class LivePilotServices:
             grant_kind=GrantKind.PRIMARY,
             target_id=opportunity.proof_id if opportunity is not None else challenge_id,
             policy_id=self._state.policy.policy_id if self._state.policy else challenge_id,
-            evidence_hashes=self._evidence_hashes(),
+            evidence_hashes=self._evidence_hashes(reconciliation),
             requested_limits_hash=canonical_execution_hash(limits),
             ceiling_hash=PILOT_CEILING_HASH,
             allowed_operations=(
@@ -594,11 +607,15 @@ class LivePilotServices:
             raise PilotRequestError(HTTPStatus.FORBIDDEN, error.code) from error
 
     def _issue(
-        self, challenge: AuthorizationChallenge, assertion: VerifiedOperatorAssertion
+        self,
+        challenge: AuthorizationChallenge,
+        assertion: VerifiedOperatorAssertion,
+        *,
+        plan: FrozenPilotPlan,
+        now: datetime,
     ) -> IssuedGrantPair:
         if self._environment.venue_binding is None:
             raise PilotRequestError(HTTPStatus.CONFLICT, "MANIFEST_NOT_ELIGIBLE")
-        now = self._clock()
         limits = (
             COMPILED_PILOT_CEILINGS
             if self._state.policy is None
@@ -626,7 +643,7 @@ class LivePilotServices:
             effective_limits=limits,
             requested_limits_hash=challenge.requested_limits_hash,
             ceiling_hash=PILOT_CEILING_HASH,
-            plan_hash=self._environment.venue_binding.protocol_fixture_hash,
+            plan_hash=plan.plan_hash,
             strategy_hash=canonical_execution_hash({"strategy": str(challenge.target_id)}),
             proof_family_hash=canonical_execution_hash(
                 {"families": [family.value for family in self._qualified_families()]}
@@ -675,7 +692,14 @@ class LivePilotServices:
         self._state.grants[capability_id] = grants
         return grants
 
-    def _run(self, challenge: AuthorizationChallenge, grants: IssuedGrantPair) -> dict[str, Any]:
+    def _run(
+        self,
+        challenge: AuthorizationChallenge,
+        grants: IssuedGrantPair,
+        *,
+        plan: FrozenPilotPlan,
+        now: datetime,
+    ) -> dict[str, Any]:
         if challenge.mode is AuthorizationMode.AUTOMATION_SESSION:
             raise PilotRequestError(HTTPStatus.CONFLICT, "AUTOMATION_NOT_ACTIVATED")
         factory = self._environment.executor_factory
@@ -685,31 +709,6 @@ class LivePilotServices:
                 "executed": False,
                 "reason": "EXECUTION_UNAVAILABLE",
             }
-        now = self._clock()
-        opportunity = next(
-            (
-                item
-                for item in self._ranked_opportunities(now)
-                if item.proof_id == challenge.target_id
-            ),
-            None,
-        )
-        if opportunity is None:
-            raise PilotRequestError(HTTPStatus.CONFLICT, "OPPORTUNITY_NOT_ELIGIBLE")
-        limits = (
-            COMPILED_PILOT_CEILINGS
-            if self._state.policy is None
-            else self._state.policy.requested_limits
-        )
-        try:
-            plan = compile_frozen_pilot_plan(
-                opportunity,
-                limits,
-                self._environment.account_state(),
-                deadline=now + timedelta(seconds=30),
-            )
-        except PilotSelectionError as error:
-            raise PilotRequestError(HTTPStatus.CONFLICT, error.code) from error
         verified_grants, signer_proofs, evidence = self._executor_inputs(grants, now)
         executor = factory(verified_grants, signer_proofs, evidence)
         result = (
@@ -728,6 +727,68 @@ class LivePilotServices:
             "stop_reason": result.stop_reason,
             "plan_hash": result.plan_hash,
         }
+
+    def _freeze_plan(
+        self, challenge: AuthorizationChallenge, now: datetime
+    ) -> FrozenPilotPlan:
+        """Re-resolve current server evidence and freeze exactly what the grants authorize."""
+
+        if challenge.mode is AuthorizationMode.AUTOMATION_SESSION:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "AUTOMATION_NOT_ACTIVATED")
+        try:
+            manifest = self._current_manifest()
+            reconciliation = self._current_reconciliation()
+            account = self._current_account()
+        except Exception as error:
+            self._engage_kill("EVIDENCE_STALE", now)
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE") from error
+
+        if not self._manifest_is_current(manifest):
+            self._engage_kill("EVIDENCE_STALE", now)
+            raise PilotRequestError(HTTPStatus.CONFLICT, "MANIFEST_NOT_ELIGIBLE")
+
+        current_evidence_hashes = {reconciliation.reconciliation_hash}
+        for report in self._environment.qualifications:
+            current_evidence_hashes.update(report.evidence_hashes)
+        if (
+            not self._reconciliation_is_current(reconciliation, now)
+            or not self._account_is_current(account, now)
+            or not self._eligibility_is_current(now)
+            or challenge.evidence_hashes != tuple(sorted(current_evidence_hashes))
+        ):
+            self._engage_kill("EVIDENCE_STALE", now)
+            raise PilotRequestError(HTTPStatus.CONFLICT, "EVIDENCE_STALE")
+
+        limits = (
+            COMPILED_PILOT_CEILINGS
+            if self._state.policy is None
+            else self._state.policy.requested_limits
+        )
+        opportunity = next(
+            (
+                item
+                for item in eligible_opportunities(
+                    self._store,
+                    account,
+                    now,
+                    limits=limits,
+                    enabled_families=frozenset(self._qualified_families()),
+                )
+                if item.proof_id == challenge.target_id
+            ),
+            None,
+        )
+        if opportunity is None:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "OPPORTUNITY_NOT_ELIGIBLE")
+        try:
+            return compile_frozen_pilot_plan(
+                opportunity,
+                limits,
+                account,
+                deadline=now + timedelta(seconds=30),
+            )
+        except PilotSelectionError as error:
+            raise PilotRequestError(HTTPStatus.CONFLICT, error.code) from error
 
     def _executor_inputs(
         self,
@@ -762,26 +823,20 @@ class LivePilotServices:
 
         now = self._clock()
         environment = self._environment
-        reconciliation = environment.reconciliation
-        reconciliation_age = now - reconciliation.observed_at
-        reconciliation_fresh = (
-            -CHALLENGE_LIFETIME <= reconciliation_age <= CHALLENGE_LIFETIME
-        )
+        try:
+            manifest = self._current_manifest()
+        except Exception:
+            manifest = None
+        try:
+            reconciliation = self._current_reconciliation()
+        except Exception:
+            reconciliation = None
 
         account: PilotAccountState | None
         try:
-            account = environment.account_state()
+            account = self._current_account()
         except Exception:
             account = None
-        account_fresh = (
-            account is not None
-            and -MAXIMUM_EQUITY_EVIDENCE_AGE
-            <= now - account.observed_at
-            <= MAXIMUM_EQUITY_EVIDENCE_AGE
-        )
-        account_matches = (
-            account is not None and account.account_fingerprint == environment.account_fingerprint
-        )
 
         operator_present = False
         try:
@@ -792,7 +847,6 @@ class LivePilotServices:
         except Exception:
             pass
 
-        manifest = environment.manifest
         activation_inputs = environment.activation_inputs
         geoblock_allowed = (
             activation_inputs.geoblock_allowed
@@ -802,29 +856,101 @@ class LivePilotServices:
                 and manifest.jurisdiction_review_status == "ELIGIBILITY_REVIEWED"
             )
         )
-        reconciliation_expires_at = reconciliation.observed_at + CHALLENGE_LIFETIME
+        reconciliation_expires_at = (
+            None
+            if reconciliation is None
+            else reconciliation.observed_at + CHALLENGE_LIFETIME
+        )
         account_expires_at = (
-            reconciliation_expires_at
-            if account is None
-            else account.observed_at + MAXIMUM_EQUITY_EVIDENCE_AGE
+            None if account is None else account.observed_at + MAXIMUM_EQUITY_EVIDENCE_AGE
+        )
+        account_scope_expires_at = (
+            None
+            if reconciliation_expires_at is None or account_expires_at is None
+            else min(reconciliation_expires_at, account_expires_at)
         )
         return ExecutionEvidence(
             manifest=manifest,
+            account=account,
             geoblock_allowed=geoblock_allowed,
-            geoblock_evidence_hash=reconciliation.reconciliation_hash,
+            geoblock_evidence_hash=(
+                None if reconciliation is None else reconciliation.reconciliation_hash
+            ),
             geoblock_expires_at=environment.eligibility_expires_at,
-            account_scope_evidence_hash=reconciliation.reconciliation_hash,
-            account_scope_expires_at=min(reconciliation_expires_at, account_expires_at),
+            account_scope_evidence_hash=(
+                None if reconciliation is None else reconciliation.reconciliation_hash
+            ),
+            account_scope_expires_at=account_scope_expires_at,
             kill_engaged=(
                 self._state.kill_engaged
-                or not reconciliation.reconciliation_complete
-                or not reconciliation_fresh
-                or not account_fresh
-                or not account_matches
-                or (account is not None and account.kill_engaged)
+                or not self._manifest_is_current(manifest)
+                or not self._eligibility_is_current(now)
+                or not self._reconciliation_is_current(reconciliation, now)
+                or not self._account_is_current(account, now)
             ),
             operator_present=operator_present,
         )
+
+    def _current_manifest(self) -> VenueManifest | None:
+        provider = self._environment.manifest_provider
+        manifest = self._environment.manifest if provider is None else provider()
+        if manifest is not None and not isinstance(manifest, VenueManifest):
+            raise TypeError("MANIFEST_STATE_INVALID")
+        return manifest
+
+    def _current_reconciliation(self) -> PilotReconciliationState:
+        provider = self._environment.reconciliation_provider
+        reconciliation = self._environment.reconciliation if provider is None else provider()
+        if not isinstance(reconciliation, PilotReconciliationState):
+            raise TypeError("RECONCILIATION_STATE_INVALID")
+        return reconciliation
+
+    def _current_account(self) -> PilotAccountState:
+        account = self._environment.account_state()
+        if not isinstance(account, PilotAccountState):
+            raise TypeError("ACCOUNT_STATE_INVALID")
+        return account
+
+    def _manifest_is_current(self, manifest: VenueManifest | None) -> bool:
+        binding = self._environment.venue_binding
+        return bool(
+            manifest is not None
+            and binding is not None
+            and evaluate_execution_gate(manifest, venue=PredictionVenue.POLYMARKET).allowed
+            and canonical_execution_hash(manifest) == binding.manifest_record_hash
+            and manifest.source_hashes == binding.manifest_source_hashes
+        )
+
+    def _reconciliation_is_current(
+        self, reconciliation: PilotReconciliationState | None, now: datetime
+    ) -> bool:
+        if reconciliation is None:
+            return False
+        age = now - reconciliation.observed_at
+        return bool(
+            reconciliation.account_fingerprint == self._environment.account_fingerprint
+            and reconciliation.reconciliation_complete
+            and reconciliation.active_submissions == 0
+            and reconciliation.unknown_outcomes == 0
+            and reconciliation.unexplained_difference_usd == 0
+            and -CHALLENGE_LIFETIME <= age <= CHALLENGE_LIFETIME
+        )
+
+    def _account_is_current(
+        self, account: PilotAccountState | None, now: datetime
+    ) -> bool:
+        if account is None:
+            return False
+        age = now - account.observed_at
+        return bool(
+            account.account_fingerprint == self._environment.account_fingerprint
+            and not account.kill_engaged
+            and -MAXIMUM_EQUITY_EVIDENCE_AGE <= age <= MAXIMUM_EQUITY_EVIDENCE_AGE
+        )
+
+    def _eligibility_is_current(self, now: datetime) -> bool:
+        expires_at = self._environment.eligibility_expires_at
+        return expires_at is not None and now < expires_at
 
     def _persist_session(
         self, challenge: AuthorizationChallenge, result: ExecutionResult, now: datetime
@@ -895,8 +1021,11 @@ class LivePilotServices:
         modes = [grants.primary.grant.mode.value for grants in self._state.grants.values()]
         return modes[-1] if modes else None
 
-    def _evidence_hashes(self) -> tuple[Sha256, ...]:
-        hashes = {self._environment.reconciliation.reconciliation_hash}
+    def _evidence_hashes(
+        self, reconciliation: PilotReconciliationState | None = None
+    ) -> tuple[Sha256, ...]:
+        state = self._environment.reconciliation if reconciliation is None else reconciliation
+        hashes = {state.reconciliation_hash}
         for report in self._environment.qualifications:
             hashes.update(report.evidence_hashes)
         return tuple(sorted(hashes))

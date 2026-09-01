@@ -97,6 +97,7 @@ def reconciliation() -> PilotReconciliationState:
 def evidence() -> ExecutionEvidence:
     return ExecutionEvidence(
         manifest=ELIGIBLE_MANIFEST,
+        account=account_state(),
         geoblock_allowed=True,
         geoblock_evidence_hash="a" * 64,
         geoblock_expires_at=NOW + timedelta(minutes=1),
@@ -110,9 +111,10 @@ def evidence() -> ExecutionEvidence:
 class Cockpit:
     """Drives the real HTTP application exactly as the browser would."""
 
-    def __init__(self, runtime: Any) -> None:
+    def __init__(self, runtime: Any, execution_capture: dict[str, Any]) -> None:
         self.runtime = runtime
         self.application = runtime.application
+        self.execution_capture = execution_capture
         opened = self._respond("POST", "/api/v1/pilot/session")
         assert opened.status is HTTPStatus.CREATED
         self.token = opened.set_cookie.split(";", 1)[0].split("=", 1)[1]
@@ -167,13 +169,23 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
     signer = FakeSigner(account=account_state())
     passkeys = FakePasskeyService(port=PORT)
     runtime_holder: dict[str, Any] = {}
+    provider_state: dict[str, Any] = {
+        "manifest": ELIGIBLE_MANIFEST,
+        "reconciliation": reconciliation(),
+    }
+    execution_capture: dict[str, Any] = {"plans": [], "provider_state": provider_state}
+
+    class RecordingExecutor(PilotExecutor):
+        def execute_complete_strategy(self, plan: Any, grants: Any) -> Any:
+            execution_capture["plans"].append(plan)
+            return super().execute_complete_strategy(plan, grants)
 
     def executor_factory(
         grants: Mapping[UUID, VerifiedExecutionCapability],
         proofs: Mapping[UUID, SignerCapabilityProof],
         current_evidence: Callable[[], ExecutionEvidence],
     ) -> PilotExecutor:
-        del proofs
+        execution_capture["proofs"] = tuple(proofs.values())
         runtime = runtime_holder["runtime"]
         port = CoordinatorExecutionPort(
             store=runtime.store,
@@ -183,7 +195,7 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
             evidence=current_evidence,
             clock=lambda: NOW,
         )
-        return PilotExecutor(port, clock=lambda: NOW)
+        return RecordingExecutor(port, clock=lambda: NOW)
 
     environment = PilotEnvironment(
         account_fingerprint=ACCOUNT_FINGERPRINT,
@@ -201,6 +213,8 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
         reconciliation=reconciliation(),
         account_state=account_state,
         executor_factory=executor_factory,
+        manifest_provider=lambda: provider_state["manifest"],
+        reconciliation_provider=lambda: provider_state["reconciliation"],
     )
     runtime = build_pilot_runtime(
         database,
@@ -219,7 +233,7 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
         registered_at=NOW,
     )
     try:
-        yield Cockpit(runtime)
+        yield Cockpit(runtime, execution_capture)
     finally:
         runtime.close()
 
@@ -379,6 +393,88 @@ def test_an_approval_issues_a_capability_and_records_it(cockpit: Cockpit) -> Non
     assert body(approved)["capability_id"]
     audit = cockpit.get("/api/v1/pilot/audit")["events"]
     assert [event["outcome"] for event in audit] == ["ISSUED"]
+
+
+def test_an_approval_binds_both_signer_proofs_to_the_one_executed_frozen_plan(
+    cockpit: Cockpit, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from polytrading.predictions.pilot import services as services_module
+
+    compiled: list[Any] = []
+    real_compile = services_module.compile_frozen_pilot_plan
+
+    def record_compile(*args: Any, **kwargs: Any) -> Any:
+        frozen = real_compile(*args, **kwargs)
+        compiled.append(frozen)
+        return frozen
+
+    monkeypatch.setattr(services_module, "compile_frozen_pilot_plan", record_compile)
+    clear_kill(cockpit)
+
+    approved = approve(cockpit)
+
+    payload = body(approved)
+    executed_plans = cockpit.execution_capture["plans"]
+    proofs = cockpit.execution_capture["proofs"]
+    assert approved.status is HTTPStatus.OK, payload
+    assert len(compiled) == 1
+    assert executed_plans == [compiled[0]]
+    assert executed_plans[0] is compiled[0]
+    assert len(proofs) == 2
+    assert {
+        payload["plan_hash"],
+        executed_plans[0].plan_hash,
+        *(proof.grant.plan_hash for proof in proofs),
+    } == {compiled[0].plan_hash}
+
+
+def test_authorization_rechecks_current_provider_evidence_before_issuing(
+    cockpit: Cockpit,
+) -> None:
+    clear_kill(cockpit)
+    options = cockpit.post(
+        "/api/v1/pilot/passkeys/authenticate/options",
+        {
+            "mode": "COMPLETE_STRATEGY",
+            "opportunity_id": PROOF_ID,
+            "browser_session_hash": cockpit.session_hash,
+        },
+    )
+    assert options.status is HTTPStatus.OK, body(options)
+    payload = body(options)
+    cockpit.execution_capture["provider_state"]["reconciliation"] = reconciliation().model_copy(
+        update={"observed_at": NOW - timedelta(minutes=5, microseconds=1)}
+    )
+
+    refused = cockpit.post(
+        "/api/v1/pilot/authorizations",
+        {
+            "challenge_id": payload["challenge_id"],
+            "confirmation_text": payload["confirmation_text"],
+            "browser_session_hash": cockpit.session_hash,
+            "assertion": _assertion(cockpit, payload["challenge_id"]),
+        },
+    )
+
+    assert refused.status is HTTPStatus.CONFLICT
+    assert body(refused)["error"] == "EVIDENCE_STALE"
+    assert cockpit.execution_capture["plans"] == []
+    assert "proofs" not in cockpit.execution_capture
+    assert cockpit.get("/api/v1/pilot/audit")["events"] == []
+
+
+def test_a_new_challenge_binds_the_latest_provider_reconciliation(
+    cockpit: Cockpit,
+) -> None:
+    clear_kill(cockpit)
+    cockpit.execution_capture["provider_state"]["reconciliation"] = reconciliation().model_copy(
+        update={"reconciliation_hash": "7" * 64}
+    )
+
+    approved = approve(cockpit)
+
+    assert approved.status is HTTPStatus.OK, body(approved)
+    assert body(approved)["executed"] is True
 
 
 def test_a_replayed_challenge_is_refused(cockpit: Cockpit) -> None:

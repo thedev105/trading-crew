@@ -79,6 +79,7 @@ class ExecutionEvidence:
     """The fresh evidence the boundary must corroborate for every single leg."""
 
     manifest: VenueManifest | None
+    account: PilotAccountState | None
     geoblock_allowed: bool | None
     geoblock_evidence_hash: Sha256 | None
     geoblock_expires_at: datetime | None
@@ -187,8 +188,20 @@ class CoordinatorExecutionPort:
         capability: VerifiedExecutionCapability,
         operation: ExecutionOperation,
     ) -> AuthorityDecision:
-        evidence = self._evidence()
-        account = self._signer.account_state()
+        try:
+            evidence = self._evidence()
+        except Exception:
+            self.engage_kill("EVIDENCE_STALE")
+            return AuthorityDecision(False, "EXECUTION_KILL_ENGAGED", ())
+        account = evidence.account
+        if (
+            evidence.kill_engaged
+            or account is None
+            or account.account_fingerprint != plan.account_fingerprint
+            or account.kill_engaged
+        ):
+            self.engage_kill("EVIDENCE_STALE")
+            return AuthorityDecision(False, "EXECUTION_KILL_ENGAGED", ())
         context = build_authority_context(
             capability=capability,
             manifest=evidence.manifest,
@@ -206,7 +219,7 @@ class CoordinatorExecutionPort:
             geoblock_expires_at=evidence.geoblock_expires_at,
             account_scope_evidence_hash=evidence.account_scope_evidence_hash,
             account_scope_expires_at=evidence.account_scope_expires_at,
-            kill_engaged=evidence.kill_engaged or account.kill_engaged,
+            kill_engaged=False,
             operator_present=evidence.operator_present,
             evidence_hashes=plan.evidence_hashes,
         )
