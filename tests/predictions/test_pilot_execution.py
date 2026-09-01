@@ -3,22 +3,28 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from http import HTTPStatus
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import pytest
 
 from polytrading.predictions.execution.models import ExecutionOperation, ImmediateOrderType
+from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import (
     CapabilityRequest,
     PilotCapabilityIssuer,
     VenueBinding,
 )
+from polytrading.predictions.pilot.execution_port import ExecutionEvidence
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     PILOT_CEILINGS,
     AuthorizationChallenge,
     AuthorizationMode,
+    PresenceState,
 )
 from polytrading.predictions.pilot.passkeys import (
     RP_ID,
@@ -31,6 +37,8 @@ from polytrading.predictions.pilot.selector import (
     PilotAccountState,
     PilotLeg,
 )
+from polytrading.predictions.pilot.server import PilotRequestError
+from polytrading.predictions.pilot.services import LivePilotServices
 from polytrading.predictions.pilot.sessions import (
     RECOVERY_GRACE,
     ExecutionResult,
@@ -38,6 +46,9 @@ from polytrading.predictions.pilot.sessions import (
     PilotExecutionError,
     PilotExecutor,
 )
+from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
+from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
+from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.pilot_helpers import (
     ACCOUNT_FINGERPRINT,
     BROWSER_SESSION_HASH,
@@ -232,12 +243,165 @@ class FakeExecutionPort:
         self.events.append("revoke")
 
     def engage_kill(self, reason: str) -> None:
+        self.revoke_primary()
         self.killed.append(reason)
         self.events.append(f"kill:{reason}")
 
 
 def executor(port: FakeExecutionPort, **overrides: Any) -> PilotExecutor:
     return PilotExecutor(port, clock=lambda: NOW, **overrides)
+
+
+def test_live_service_refuses_automation_before_challenge_persistence(tmp_path: Path) -> None:
+    store = PredictionMarketStore(tmp_path / "automation-refusal.duckdb")
+    passkeys = FakePasskeyService(port=PORT)
+    passkeys.registration_options(account_fingerprint=ACCOUNT_FINGERPRINT, wallet_unlocked=True)
+    passkeys.complete_registration(
+        credential={"id": CREDENTIAL_ID, "public_key": "cHVibGlj", "sign_count": 0},
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        wallet_fingerprint=WALLET_FINGERPRINT,
+        registered_at=NOW,
+    )
+    services = LivePilotServices(
+        store=store,
+        environment=SimpleNamespace(
+            account_fingerprint=ACCOUNT_FINGERPRINT,
+            wallet_fingerprint=WALLET_FINGERPRINT,
+            reconciliation=SimpleNamespace(reconciliation_hash="8" * 64),
+            qualifications=(),
+        ),  # type: ignore[arg-type]
+        passkeys=passkeys,
+        issuer=object(),  # type: ignore[arg-type]
+        verifier=object(),  # type: ignore[arg-type]
+        presence=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    try:
+        with pytest.raises(PilotRequestError, match="AUTOMATION_NOT_ACTIVATED"):
+            services.auth_options(
+                {
+                    "mode": "AUTOMATION_SESSION",
+                    "browser_session_hash": BROWSER_SESSION_HASH,
+                }
+            )
+
+        assert store.verified_pilot_authorization_challenges(ACCOUNT_FINGERPRINT) == ()
+    finally:
+        store.close()
+
+
+class _PresentMonitor:
+    state = PresenceState.PRESENT
+
+    def evaluate(self, now: datetime) -> SimpleNamespace:
+        return SimpleNamespace(state=self.state, observed_at=now)
+
+    def record_native_state(self, now: datetime) -> SimpleNamespace:
+        return SimpleNamespace(state=self.state, observed_at=now)
+
+
+def test_executor_inputs_contain_only_freshly_issued_proofs_and_live_evidence() -> None:
+    pair = grants()
+    account_state = PilotAccountState.model_validate(
+        {
+            "account_fingerprint": ACCOUNT_FINGERPRINT,
+            "wallet_fingerprint": WALLET_FINGERPRINT,
+            "collateral_usd": Decimal("200"),
+            "allowance_usd": Decimal("200"),
+            "kill_engaged": False,
+            "observed_at": NOW,
+        },
+        strict=True,
+    )
+    reconciliation = PilotReconciliationState(
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        active_submissions=0,
+        unknown_outcomes=0,
+        reconciliation_complete=True,
+        unexplained_difference_usd=Decimal("0"),
+        reconciliation_hash="8" * 64,
+        observed_at=NOW,
+    )
+    available = True
+
+    def current_account() -> PilotAccountState:
+        if not available:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "ACCOUNT_UNAVAILABLE")
+        return account_state
+
+    environment = SimpleNamespace(
+        account_fingerprint=ACCOUNT_FINGERPRINT,
+        wallet_fingerprint=WALLET_FINGERPRINT,
+        reconciliation=reconciliation,
+        account_state=current_account,
+        manifest=SimpleNamespace(jurisdiction_review_status="ELIGIBILITY_REVIEWED"),
+        eligibility_expires_at=NOW + timedelta(minutes=1),
+        activation_inputs=SimpleNamespace(geoblock_allowed=True),
+    )
+    services = LivePilotServices(
+        store=object(),  # type: ignore[arg-type]
+        environment=environment,  # type: ignore[arg-type]
+        passkeys=object(),  # type: ignore[arg-type]
+        issuer=object(),  # type: ignore[arg-type]
+        verifier=PilotCapabilityVerifier(pair.primary.public_verification_key),
+        presence=_PresentMonitor(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    services._state.kill_engaged = False
+
+    verified, proofs, evidence = services._executor_inputs(pair, NOW)
+
+    expected_ids = {
+        pair.primary.grant.capability_id,
+        pair.recovery.grant.capability_id,
+    }
+    assert set(verified) == expected_ids
+    assert set(proofs) == expected_ids
+    assert all(isinstance(proof, SignerCapabilityProof) for proof in proofs.values())
+    assert proofs[pair.primary.grant.capability_id].grant == pair.primary.grant
+    assert isinstance(evidence(), ExecutionEvidence)
+    assert evidence().kill_engaged is False
+
+    environment.reconciliation = reconciliation.model_copy(
+        update={"observed_at": NOW - timedelta(minutes=5, microseconds=1)}
+    )
+    assert evidence().kill_engaged is True
+
+    environment.reconciliation = reconciliation
+    available = False
+    assert evidence().kill_engaged is True
+
+
+def test_live_service_refuses_automation_before_executor_construction() -> None:
+    pair = grants(AuthorizationMode.AUTOMATION_SESSION)
+    challenge = AuthorizationChallenge.model_validate(
+        challenge_fields(
+            credential_id_hash=CREDENTIAL_ID_HASH,
+            mode=AuthorizationMode.AUTOMATION_SESSION,
+        ),
+        strict=True,
+    )
+    factory_calls = 0
+
+    def factory(*args: object) -> PilotExecutor:
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("automation reached executor construction")
+
+    services = LivePilotServices(
+        store=object(),  # type: ignore[arg-type]
+        environment=SimpleNamespace(executor_factory=factory),  # type: ignore[arg-type]
+        passkeys=object(),  # type: ignore[arg-type]
+        issuer=object(),  # type: ignore[arg-type]
+        verifier=object(),  # type: ignore[arg-type]
+        presence=object(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(PilotRequestError, match="AUTOMATION_NOT_ACTIVATED"):
+        services._run(challenge, pair)
+
+    assert factory_calls == 0
 
 
 def test_a_complete_strategy_persists_before_every_submission() -> None:

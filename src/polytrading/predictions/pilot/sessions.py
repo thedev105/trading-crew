@@ -116,8 +116,6 @@ class ExecutionPort(Protocol):
 
     def positions(self, plan: FrozenPilotPlan) -> Mapping[str, Decimal]: ...
 
-    def revoke_primary(self) -> None: ...
-
     def engage_kill(self, reason: StopReason) -> None: ...
 
 
@@ -156,7 +154,6 @@ class PilotExecutor:
     def stop(self, reason: StopReason, *, now: datetime) -> StopResult:
         """Destroy primary authority and engage kill; recovery lives on for 120 seconds."""
 
-        self._port.revoke_primary()
         self._port.engage_kill(reason)
         return StopResult(
             reason=reason,
@@ -239,7 +236,6 @@ class PilotExecutor:
         else:
             state = "STOPPED"
         if stop_reason is not None:
-            self._port.revoke_primary()
             self._port.engage_kill(stop_reason)
         return ExecutionResult(
             state=state,

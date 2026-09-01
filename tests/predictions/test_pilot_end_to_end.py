@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 
 from polytrading.predictions.domain import PredictionVenue
+from polytrading.predictions.execution.authority import VerifiedExecutionCapability
 from polytrading.predictions.execution.models import (
     canonical_execution_hash,
 )
@@ -35,6 +36,7 @@ from polytrading.predictions.pilot.server import (
 )
 from polytrading.predictions.pilot.services import PilotEnvironment
 from polytrading.predictions.pilot.sessions import PilotExecutor
+from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
 from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.manifest_helpers import venue_manifest
 from tests.predictions.pilot_helpers import (
@@ -166,14 +168,19 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
     passkeys = FakePasskeyService(port=PORT)
     runtime_holder: dict[str, Any] = {}
 
-    def executor_factory(grants: Mapping[UUID, Any]) -> PilotExecutor:
+    def executor_factory(
+        grants: Mapping[UUID, VerifiedExecutionCapability],
+        proofs: Mapping[UUID, SignerCapabilityProof],
+        current_evidence: Callable[[], ExecutionEvidence],
+    ) -> PilotExecutor:
+        del proofs
         runtime = runtime_holder["runtime"]
         port = CoordinatorExecutionPort(
             store=runtime.store,
             signer=signer,
             verifier=runtime.verifier,
             grants=grants,
-            evidence=evidence,
+            evidence=current_evidence,
             clock=lambda: NOW,
         )
         return PilotExecutor(port, clock=lambda: NOW)

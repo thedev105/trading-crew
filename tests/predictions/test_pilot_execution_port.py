@@ -108,12 +108,18 @@ class FakeSigner:
     """Stands in for the signer sidecar: records intents, never builds transport."""
 
     def __init__(
-        self, *, outcomes: list[str] | None = None, account: PilotAccountState | None = None
+        self,
+        *,
+        outcomes: list[str] | None = None,
+        account: PilotAccountState | None = None,
+        kill_fails: bool = False,
     ) -> None:
         self.submitted: list[tuple[ExecutionIntent, UUID]] = []
         self.cancelled: list[tuple[ExecutionIntent, UUID]] = []
+        self.kill_calls: list[tuple[UUID, ...]] = []
         self.outcomes = outcomes or []
         self._account = account
+        self._kill_fails = kill_fails
 
     def _outcome(self, intent: ExecutionIntent) -> LegOutcome:
         state = self.outcomes.pop(0) if self.outcomes else "FILLED"
@@ -142,6 +148,11 @@ class FakeSigner:
 
     def positions(self) -> Mapping[str, Decimal]:
         return {"token-0": Decimal("10")}
+
+    def engage_kill(self, capability_ids: tuple[UUID, ...]) -> None:
+        self.kill_calls.append(capability_ids)
+        if self._kill_fails:
+            raise RuntimeError("sanitized fake IPC failure")
 
 
 def evidence(**overrides: Any) -> ExecutionEvidence:
@@ -273,6 +284,35 @@ def test_revoking_primary_authority_blocks_the_next_leg(store: PredictionMarketS
     assert raised.value.code == "AUTHORITY_REFUSED"
     assert "REVOKED" in str(raised.value)
     assert signer.submitted == []
+
+
+def test_coordinator_kill_propagates_to_the_signer_before_returning(
+    store: PredictionMarketStore,
+) -> None:
+    signer = FakeSigner()
+    port, grants, killed, verifier = wired(store, signer=signer)
+    primary_id = grants.primary.grant.capability_id
+    recovery_id = grants.recovery.grant.capability_id
+
+    port.engage_kill("UNKNOWN_OUTCOME")
+
+    assert verifier.revoked_capability_ids == frozenset({primary_id})
+    assert killed == ["UNKNOWN_OUTCOME"]
+    assert signer.kill_calls == [tuple(sorted((primary_id, recovery_id), key=str))]
+
+
+def test_coordinator_kill_remains_engaged_when_signer_ipc_fails(
+    store: PredictionMarketStore,
+) -> None:
+    signer = FakeSigner(kill_fails=True)
+    port, grants, killed, verifier = wired(store, signer=signer)
+    primary_id = grants.primary.grant.capability_id
+
+    port.engage_kill("UNKNOWN_OUTCOME")
+
+    assert verifier.revoked_capability_ids == frozenset({primary_id})
+    assert killed == ["UNKNOWN_OUTCOME"]
+    assert len(signer.kill_calls) == 1
 
 
 def test_recovery_runs_as_a_cancellation_under_the_recovery_grant(

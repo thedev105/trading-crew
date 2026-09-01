@@ -8,7 +8,8 @@ than from the submitting call's own optimism.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -69,6 +70,8 @@ class VenueSubmissionPort(Protocol):
     def orders(self) -> SanitizedOperationResult: ...
 
     def trades(self) -> SanitizedOperationResult: ...
+
+    def engage_kill(self, capability_ids: Iterable[UUID]) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,8 +168,15 @@ class CoordinatorExecutionPort:
                 self._verifier.revoke(capability_id)
 
     def engage_kill(self, reason: str) -> None:
-        if self._on_kill is not None:
-            self._on_kill(reason)
+        capability_ids = tuple(sorted(self._grants, key=str))
+        self.revoke_primary()
+        try:
+            if self._on_kill is not None:
+                self._on_kill(reason)
+        finally:
+            # Parent revocation and kill state are authoritative even when sidecar IPC fails.
+            with suppress(Exception):
+                self._signer.engage_kill(capability_ids)
 
     # -- internals ----------------------------------------------------------------------
 

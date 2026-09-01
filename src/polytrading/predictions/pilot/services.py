@@ -7,6 +7,7 @@ confirmation, and a passkey assertion — never a price, a route, a hash, or an 
 
 from __future__ import annotations
 
+from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ from uuid import UUID, uuid4, uuid5
 from pydantic import ValidationError
 
 from polytrading.predictions.domain import Sha256
+from polytrading.predictions.execution.authority import VerifiedExecutionCapability
 from polytrading.predictions.execution.models import ExecutionOperation, canonical_execution_hash
 from polytrading.predictions.manifest import VenueManifest
 from polytrading.predictions.pilot.activation import (
@@ -36,6 +38,7 @@ from polytrading.predictions.pilot.capabilities import (
     PilotCapabilityIssuer,
     VenueBinding,
 )
+from polytrading.predictions.pilot.execution_port import ExecutionEvidence
 from polytrading.predictions.pilot.models import (
     PILOT_CEILING_HASH,
     AuthorizationChallenge,
@@ -66,6 +69,7 @@ from polytrading.predictions.pilot.passkeys import (
 )
 from polytrading.predictions.pilot.policy import (
     COMPILED_PILOT_CEILINGS,
+    MAXIMUM_EQUITY_EVIDENCE_AGE,
     PilotPolicyError,
     RequestedPilotLimits,
     effective_limits,
@@ -87,15 +91,13 @@ from polytrading.predictions.pilot.selector import (
 )
 from polytrading.predictions.pilot.server import PilotRequestError
 from polytrading.predictions.pilot.sessions import ExecutionResult, PilotExecutor
-from polytrading.predictions.pilot.verifier import (
-    PilotCapabilityVerifier,
-    verified_capability_from_grant,
-)
+from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
 from polytrading.predictions.polymarket_execution.credentials import (
     CredentialProvisioner,
     CredentialProvisioningError,
     CredentialProvisioningGrant,
 )
+from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     AccountSignatureBinding,
@@ -109,6 +111,14 @@ CONFIRMATION_TEXTS: Mapping[AuthorizationMode, str] = {
     AuthorizationMode.COMPLETE_STRATEGY: "STRATEGY {amount} USD",
     AuthorizationMode.AUTOMATION_SESSION: "SESSION 15 MIN {amount} USD",
 }
+ExecutorFactory = Callable[
+    [
+        Mapping[UUID, VerifiedExecutionCapability],
+        Mapping[UUID, SignerCapabilityProof],
+        Callable[[], ExecutionEvidence],
+    ],
+    PilotExecutor,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +140,7 @@ class PilotEnvironment:
     credential_provisioner: CredentialProvisioner | None = None
     # Given the grants it just verified, this builds the executor that may spend them. The
     # services never construct transport themselves.
-    executor_factory: Callable[[Mapping[UUID, Any]], PilotExecutor] | None = None
+    executor_factory: ExecutorFactory | None = None
     activation_inputs: ActivationInputs | None = None
 
 
@@ -497,6 +507,8 @@ class LivePilotServices:
     def _build_challenge(self, payload: Mapping[str, object]) -> AuthorizationChallenge:
         now = self._clock()
         mode = _mode(payload.get("mode"))
+        if mode is AuthorizationMode.AUTOMATION_SESSION:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "AUTOMATION_NOT_ACTIVATED")
         opportunity = self._selected_opportunity(payload, now)
         amount = (
             opportunity.deployed_capital_usd
@@ -664,6 +676,8 @@ class LivePilotServices:
         return grants
 
     def _run(self, challenge: AuthorizationChallenge, grants: IssuedGrantPair) -> dict[str, Any]:
+        if challenge.mode is AuthorizationMode.AUTOMATION_SESSION:
+            raise PilotRequestError(HTTPStatus.CONFLICT, "AUTOMATION_NOT_ACTIVATED")
         factory = self._environment.executor_factory
         if factory is None:
             return {
@@ -696,16 +710,8 @@ class LivePilotServices:
             )
         except PilotSelectionError as error:
             raise PilotRequestError(HTTPStatus.CONFLICT, error.code) from error
-        executor = factory(
-            {
-                grants.primary.grant.capability_id: verified_capability_from_grant(
-                    grants.primary.grant, verified_at=now
-                ),
-                grants.recovery.grant.capability_id: verified_capability_from_grant(
-                    grants.recovery.grant, verified_at=now
-                ),
-            }
-        )
+        verified_grants, signer_proofs, evidence = self._executor_inputs(grants, now)
+        executor = factory(verified_grants, signer_proofs, evidence)
         result = (
             executor.execute_exact_order(plan, grants)
             if challenge.mode is AuthorizationMode.EXACT_ORDER
@@ -722,6 +728,103 @@ class LivePilotServices:
             "stop_reason": result.stop_reason,
             "plan_hash": result.plan_hash,
         }
+
+    def _executor_inputs(
+        self,
+        grants: IssuedGrantPair,
+        now: datetime,
+    ) -> tuple[
+        Mapping[UUID, VerifiedExecutionCapability],
+        Mapping[UUID, SignerCapabilityProof],
+        Callable[[], ExecutionEvidence],
+    ]:
+        """Build one executor's authority from this action's two ephemeral grants only."""
+
+        verified_grants: dict[UUID, VerifiedExecutionCapability] = {}
+        signer_proofs: dict[UUID, SignerCapabilityProof] = {}
+        for signed in (grants.primary, grants.recovery):
+            verified = self._verifier.verify(capability=signed, now=now)
+            if not isinstance(verified, VerifiedExecutionCapability):
+                raise PilotRequestError(
+                    HTTPStatus.FORBIDDEN,
+                    str(verified.reason or "CAPABILITY_INVALID"),
+                )
+            capability_id = signed.grant.capability_id
+            verified_grants[capability_id] = verified
+            signer_proofs[capability_id] = SignerCapabilityProof(
+                grant=signed.grant,
+                signature=b64encode(signed.signature),
+            )
+        return verified_grants, signer_proofs, self._execution_evidence
+
+    def _execution_evidence(self) -> ExecutionEvidence:
+        """Read the current fail-closed parent evidence for one mutation boundary check."""
+
+        now = self._clock()
+        environment = self._environment
+        reconciliation = environment.reconciliation
+        reconciliation_age = now - reconciliation.observed_at
+        reconciliation_fresh = (
+            -CHALLENGE_LIFETIME <= reconciliation_age <= CHALLENGE_LIFETIME
+        )
+
+        account: PilotAccountState | None
+        try:
+            account = environment.account_state()
+        except Exception:
+            account = None
+        account_fresh = (
+            account is not None
+            and -MAXIMUM_EQUITY_EVIDENCE_AGE
+            <= now - account.observed_at
+            <= MAXIMUM_EQUITY_EVIDENCE_AGE
+        )
+        account_matches = (
+            account is not None and account.account_fingerprint == environment.account_fingerprint
+        )
+
+        operator_present = False
+        try:
+            presence = self._presence.evaluate(now)
+            if presence.state is PresenceState.PRESENT:
+                presence = self._presence.record_native_state(now)
+            operator_present = presence.state is PresenceState.PRESENT
+        except Exception:
+            pass
+
+        manifest = environment.manifest
+        activation_inputs = environment.activation_inputs
+        geoblock_allowed = (
+            activation_inputs.geoblock_allowed
+            if activation_inputs is not None
+            else (
+                manifest is not None
+                and manifest.jurisdiction_review_status == "ELIGIBILITY_REVIEWED"
+            )
+        )
+        reconciliation_expires_at = reconciliation.observed_at + CHALLENGE_LIFETIME
+        account_expires_at = (
+            reconciliation_expires_at
+            if account is None
+            else account.observed_at + MAXIMUM_EQUITY_EVIDENCE_AGE
+        )
+        return ExecutionEvidence(
+            manifest=manifest,
+            geoblock_allowed=geoblock_allowed,
+            geoblock_evidence_hash=reconciliation.reconciliation_hash,
+            geoblock_expires_at=environment.eligibility_expires_at,
+            account_scope_evidence_hash=reconciliation.reconciliation_hash,
+            account_scope_expires_at=min(reconciliation_expires_at, account_expires_at),
+            kill_engaged=(
+                self._state.kill_engaged
+                or not reconciliation.reconciliation_complete
+                or not reconciliation_fresh
+                or not account_fresh
+                or not account_matches
+                or (account is not None and account.kill_engaged)
+            ),
+            operator_present=operator_present,
+        )
 
     def _persist_session(
         self, challenge: AuthorizationChallenge, result: ExecutionResult, now: datetime
