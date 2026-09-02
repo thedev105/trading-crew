@@ -22,7 +22,6 @@ from polytrading.predictions.polymarket_execution.keychain_macos import (
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     AccountSignatureBinding,
-    PolymarketProtocolSnapshot,
     load_protocol_snapshot,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretBuffer
@@ -44,44 +43,67 @@ class CredentialTransportError(ValueError):
         self.code = code
 
 
-def _production_client() -> httpx.Client:
-    """Construct the only production transport with its non-configurable timeout."""
-    return httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
-
-
 class HttpxCredentialClient:
     """One create-or-derive call, over the frozen route, with no other reachable surface."""
 
-    __slots__ = ("_client_factory", "_closed", "_private_key", "_snapshot", "_timestamp")
+    __slots__ = ("_client", "_closed", "_private_key", "_snapshot", "_timestamp")
 
     def __init__(
         self,
         *,
         private_key: bytes | bytearray,
         timestamp: Callable[[], str],
-        _client_factory: Callable[[], httpx.Client] | None = None,
-        snapshot: PolymarketProtocolSnapshot | None = None,
+    ) -> None:
+        self._initialize(
+            private_key=private_key,
+            timestamp=timestamp,
+            client=self._new_client(),
+        )
+
+    @classmethod
+    def _for_test(
+        cls,
+        *,
+        private_key: bytes | bytearray,
+        timestamp: Callable[[], str],
+        transport: httpx.MockTransport,
+    ) -> HttpxCredentialClient:
+        """Build the fixed client over an in-memory transport for tests only."""
+        instance = cls.__new__(cls)
+        instance._initialize(
+            private_key=private_key,
+            timestamp=timestamp,
+            client=cls._new_client(transport=transport),
+        )
+        return instance
+
+    @staticmethod
+    def _new_client(*, transport: httpx.MockTransport | None = None) -> httpx.Client:
+        """Construct the sole credential client; a fake transport is test-only."""
+        if transport is not None and type(transport) is not httpx.MockTransport:
+            raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")
+        return httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, transport=transport)
+
+    def _initialize(
+        self,
+        *,
+        private_key: bytes | bytearray,
+        timestamp: Callable[[], str],
+        client: httpx.Client,
     ) -> None:
         self._private_key = (
             private_key if type(private_key) is bytearray else bytearray(private_key)
         )
         self._closed = False
         self._timestamp = timestamp
-        self._snapshot = snapshot or load_protocol_snapshot(
-            version=POLYMARKET_PILOT_PROTOCOL_VERSION
-        )
-        self._client_factory = _client_factory or _production_client
+        self._snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
+        self._client = client
 
     def create_or_derive(
         self, *, operation: Literal["CREATE", "DERIVE"], binding: AccountSignatureBinding
     ) -> dict[str, SecretBuffer]:
         if self._closed:
             raise CredentialTransportError("CREDENTIAL_SIGNING_FAILED")
-        route = (
-            self._snapshot.routes.create_api_key
-            if operation == "CREATE"
-            else self._snapshot.routes.derive_api_key
-        )
         if binding.protocol_version != self._snapshot.version:
             raise CredentialTransportError("CREDENTIAL_PROTOCOL_MISMATCH")
         timestamp = self._timestamp()
@@ -98,21 +120,30 @@ class HttpxCredentialClient:
         if tuple(headers) != self._snapshot.authentication.clob_auth.l1_headers:
             raise CredentialTransportError("CREDENTIAL_HEADERS_INVALID")
 
-        payload = self._request(route.host, route.method, route.path, headers)
+        payload = self._request(operation=operation, headers=headers)
         return _buffers_from(payload)
 
     def close(self) -> None:
         """Best-effort zeroize the child-owned signing-key copy."""
         for index in range(len(self._private_key)):
             self._private_key[index] = 0
+        self._client.close()
         self._closed = True
 
     def _request(
-        self, host: str, method: str, path: str, headers: Mapping[str, str]
+        self, *, operation: Literal["CREATE", "DERIVE"], headers: Mapping[str, str]
     ) -> Mapping[str, Any]:
+        route = (
+            self._snapshot.routes.create_api_key
+            if operation == "CREATE"
+            else self._snapshot.routes.derive_api_key
+        )
         try:
-            with self._client_factory() as client:
-                response = client.request(method, f"{host}{path}", headers=dict(headers))
+            response = self._client.request(
+                route.method,
+                f"{route.host}{route.path}",
+                headers=dict(headers),
+            )
         except Exception as error:  # any transport failure, reduced to one stable code
             # The exception never carries the response body: only a stable code escapes.
             raise CredentialTransportError("CREDENTIAL_TRANSPORT_UNAVAILABLE") from error

@@ -219,6 +219,33 @@ observation-only and cannot reach the pilot, the signer, or any credential.
 See `docs/predictions/polymarket-live-pilot.md` for setup, the immutable ceilings, the three
 authorization modes, presence rules, staged activation, and the recovery playbooks.
 
+### macOS CLOB credential readiness and one-time creation
+
+This is a local, macOS-only Keychain ceremony for the designated operator. It is not a CI step,
+and it must not be run by an agent. Before any creation attempt, the operator must first run:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials check
+```
+
+Its only successful output categories are `wallet_ready=true|false` and
+`credentials=PRESENT|ABSENT|PARTIAL`; failures return a stable public code and never print a
+secret. The wallet Keychain item must contain exactly 64 hexadecimal characters, with an optional
+`0x` prefix. The command does not take a wallet, credential, URL, or network flag.
+
+Only when `check` reports a ready wallet and absent credentials, the operator may deliberately run:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials create --confirm
+```
+
+The successful output categories are `result=CREATED` and a public credential fingerprint. This
+makes one real external CLOB credential request, stores the returned values only in the macOS
+Keychain, and never trades. It fails rather than overwriting, rotating, or recovery-deriving an
+existing or partial credential set. Credential creation does not change the killed-by-default
+posture or satisfy any eligibility, legal/KYC/terms/geoblock, funding/allowance, shadow-evidence,
+separate-activation, passkey, or manual action gate.
+
 The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
 dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
 records exist. The economics table contains exactly one BTC, ETH, and SOL row selected from reports

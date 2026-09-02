@@ -64,6 +64,37 @@ separately approved outside this repository, is not an activation bypass.
    current evidence check, passkey ceremony, and explicit action approval succeeds. The browser,
    coordinator, database, and logs only ever see public fingerprints and sanitized results.
 
+### macOS CLOB credential ceremony
+
+Only the designated operator may run this macOS-only Keychain ceremony. Do not run it in CI, and
+do not ask an agent to run it. It is not a console command and does not start or activate the
+pilot. The wallet Keychain item is valid only as exactly 64 hexadecimal characters, optionally
+prefixed with `0x`; enter it through the native Keychain interface, never a terminal or UI.
+
+Run the local readiness command first:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials check
+```
+
+The successful output is limited to `wallet_ready=true|false` and
+`credentials=PRESENT|ABSENT|PARTIAL`. A refusal emits only a stable public error code. It makes no
+external CLOB request and displays no credential material.
+
+Only if the wallet is ready and all three credential slots are absent may the operator deliberately
+run:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials create --confirm
+```
+
+Its successful output is `result=CREATED` plus a public credential fingerprint. This command makes
+one real external CLOB credential request, writes the returned values only to the macOS Keychain,
+and never trades. It fails rather than overwrites, rotates, or recovery-derives any existing or
+partial credential set. Creation preserves every external eligibility, legal/KYC/venue-terms and
+geoblock review, manual funding/allowance, 45-day qualification, 30-day shadow-evidence, separate
+activation decision, passkey, explicit-action, and killed-by-default gate.
+
 ## 3. What the console shows
 
 ![Readiness view at 1440px: kill state, presence, manifest, protocol, secret store, live authority, and an empty blocker list](assets/polymarket-live-pilot/readiness-1440.png)

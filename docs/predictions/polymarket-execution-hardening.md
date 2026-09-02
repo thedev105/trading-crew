@@ -41,7 +41,34 @@ descriptor at startup. They do not enter command-line arguments, environment var
 files, DuckDB, logs, reports, dashboard payloads, or IPC request bodies. Startup reads the bounded
 descriptors once, closes them, overwrites mutable buffers where the runtime permits, and retains
 secret material only in signer memory. There is no credential import or credential-creation
-command.
+command that accepts a secret value from the terminal, browser, environment, or database.
+
+### macOS credential readiness and creation
+
+The designated operator, not CI or an agent, may run the macOS-only Keychain ceremony. First run:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials check
+```
+
+The only successful output categories are `wallet_ready=true|false` and
+`credentials=PRESENT|ABSENT|PARTIAL`; stable failure codes carry no secret data. The wallet item
+must be exactly 64 hexadecimal characters, optionally with an `0x` prefix. `check` is local-only:
+it makes no external CLOB request and must precede any creation attempt.
+
+Only when that command reports a ready wallet and absent credentials may the operator explicitly
+run:
+
+```bash
+.venv/bin/polytrading predictions pilot credentials create --confirm
+```
+
+The successful output categories are `result=CREATED` and a public credential fingerprint. The
+command makes one real external CLOB credential request, never trades, and writes returned values
+only to the macOS Keychain. It fails rather than overwrites, rotates, or recovery-derives existing
+or partial credentials. It does not satisfy or relax any external eligibility, legal/KYC/terms or
+geoblock review, manual funding/allowance, qualification or shadow-evidence, separate-activation,
+passkey, explicit-action, or killed-by-default gate.
 
 Signer and transport failures cross the boundary as stable codes and evidence hashes. They must
 not reflect authentication headers, signed bodies, arbitrary venue text, authenticated

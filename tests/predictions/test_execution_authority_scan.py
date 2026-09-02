@@ -29,19 +29,25 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "be3037b2f0f1f3ae77ee7b2d975aae897b72c32de62b7cdbee81ea477d36e41d",
     Path(
         "polymarket_execution/auth.py"
-    ): "52e5d9001f26989678e23a448bdf04ab0a249d471cb2f13e762509ef5ea15f4d",
+    ): "9f59fe955fd8a4cda60798811d37d6fb090eaea62c8007f13a147e6f2ed5864c",
     Path(
         "polymarket_execution/conformance.py"
     ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
         "polymarket_execution/credential_client.py"
-    ): "0ce3e5b31536236ed9bd736686f03ee3cd6781a117858bb1f0ad8a613001c25c",
+    ): "ef15bf27fa92fc1023167200e98ace45384eab569c62bc5e6c532120f8973d14",
+    Path(
+        "pilot/credential_commands.py"
+    ): "b8ec3212b5ebeac0327985800a43e422c0ee52ffb9da5a0c56c8cc1149fa3519",
+    Path(
+        "pilot/signer_bootstrap.py"
+    ): "63907ad949f49c7918c111fcbe2805641bf1a0595ef7e0bf66ce1386a7e83c38",
     Path(
         "polymarket_execution/credentials.py"
-    ): "2ca9e0735c66a1ad5cef5ea0aba5de8bb3b0e18409b4a0fabb982e1f9d6e89f6",
+    ): "53533f6497774468eef271dc22e740e62553b1eccb6306e13a5d53060fd34785",
     Path(
         "polymarket_execution/keychain_macos.py"
-    ): "cef992e7f01359e1aeb4828fc7b87b8e21299f66eb7b4d2e8d8200b65d5cf270",
+    ): "6c705ee959afb7f796e8438f392703284ff8f360f1227463512b059918c369b3",
     Path(
         "polymarket_execution/heartbeat.py"
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
@@ -62,7 +68,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
     Path(
         "polymarket_execution/secrets.py"
-    ): "94bcbb65c49198eabebebca4a2b317a2c1893a95de59d4d647cff57ebf6a1743",
+    ): "b8efe853affabb9070fa988adf3dc4e193652ff05e3d20f66c3e22e9ae9ea7a3",
     Path(
         "polymarket_execution/signer.py"
     ): "5bff3d0a9ec32f9db5865809e6d5fa7cc42b2d79882d253e0c5219553cb894c4",
@@ -89,6 +95,8 @@ _PREIMPORT_PREDICTIONS_ROOT = _PREIMPORT_REPOSITORY_ROOT / "src/polytrading/pred
 _PREIMPORT_SOURCE_PATHS = {
     *_PREIMPORT_PREDICTIONS_ROOT.joinpath("execution").glob("*.py"),
     *_PREIMPORT_PREDICTIONS_ROOT.joinpath("polymarket_execution").glob("*.py"),
+    _PREIMPORT_PREDICTIONS_ROOT / "pilot" / "credential_commands.py",
+    _PREIMPORT_PREDICTIONS_ROOT / "pilot" / "signer_bootstrap.py",
     *(
         (_PREIMPORT_PREDICTIONS_ROOT / "dashboard_server.py",)
         if (_PREIMPORT_PREDICTIONS_ROOT / "dashboard_server.py").is_file()
@@ -196,6 +204,8 @@ def _authority_sensitive_source_bytes() -> dict[Path, bytes]:
     python_paths = {
         *PREDICTIONS_ROOT.joinpath("execution").glob("*.py"),
         *PREDICTIONS_ROOT.joinpath("polymarket_execution").glob("*.py"),
+        PREDICTIONS_ROOT / "pilot" / "credential_commands.py",
+        PREDICTIONS_ROOT / "pilot" / "signer_bootstrap.py",
         PREDICTIONS_ROOT / "dashboard_server.py",
     }
     browser_paths = {
@@ -641,6 +651,106 @@ def _allowed_hardened_live_async_client_call(
         and isinstance(timeout.func.value, ast.Name)
         and timeout.func.value.id == "checked_timeouts"
         and timeout.func.attr == "as_httpx"
+    )
+
+
+def _allowed_hardened_credential_client_call(
+    source_path: Path,
+    tree: ast.Module,
+    call: ast.Call,
+) -> bool:
+    if source_path != Path("polymarket_execution/credential_client.py") or call.args:
+        return False
+    credential_client = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.ClassDef) and item.name == "HttpxCredentialClient"
+        ),
+        None,
+    )
+    if credential_client is None:
+        return False
+    methods = {
+        item.name: item for item in credential_client.body if isinstance(item, ast.FunctionDef)
+    }
+    factory = methods.get("_new_client")
+    initialize = methods.get("__init__")
+    for_test = methods.get("_for_test")
+    if (
+        factory is None
+        or initialize is None
+        or for_test is None
+        or not (
+            factory.lineno <= call.lineno <= (factory.end_lineno or 0)
+            and _method_arguments_are_exact(factory, positional=(), keyword_only=("transport",))
+            and _method_argument_annotation(factory, "transport") == "httpx.MockTransport | None"
+            and len(factory.args.kw_defaults) == 1
+            and isinstance(factory.args.kw_defaults[0], ast.Constant)
+            and factory.args.kw_defaults[0].value is None
+            and _method_arguments_are_exact(
+                initialize,
+                positional=("self",),
+                keyword_only=("private_key", "timestamp"),
+            )
+            and _method_arguments_are_exact(
+                for_test,
+                positional=("cls",),
+                keyword_only=("private_key", "timestamp", "transport"),
+            )
+            and any(
+                isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
+                for decorator in factory.decorator_list
+            )
+            and any(
+                isinstance(decorator, ast.Name) and decorator.id == "classmethod"
+                for decorator in for_test.decorator_list
+            )
+        )
+    ):
+        return False
+    exact_transport_guard = ast.parse(
+        "if transport is not None and type(transport) is not httpx.MockTransport:\n"
+        '    raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")\n'
+    ).body[0]
+    factory_statements = tuple(
+        item
+        for item in factory.body
+        if not (
+            isinstance(item, ast.Expr)
+            and isinstance(item.value, ast.Constant)
+            and isinstance(item.value.value, str)
+        )
+    )
+    if len(factory_statements) != 2 or ast.dump(
+        factory_statements[0], include_attributes=False
+    ) != ast.dump(
+        exact_transport_guard,
+        include_attributes=False,
+    ):
+        return False
+    timeout_constants = [
+        item
+        for item in tree.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+        and item.target.id == "REQUEST_TIMEOUT_SECONDS"
+        and isinstance(item.value, ast.Constant)
+        and item.value.value == 10.0
+    ]
+    if len(timeout_constants) != 1:
+        return False
+    keywords = {item.arg: item.value for item in call.keywords}
+    return (
+        set(keywords) == {"timeout", "transport"}
+        and isinstance(keywords["timeout"], ast.Name)
+        and keywords["timeout"].id == "REQUEST_TIMEOUT_SECONDS"
+        and isinstance(keywords["transport"], ast.Name)
+        and keywords["transport"].id == "transport"
+        and not any(
+            isinstance(item, ast.Name) and item.id == "_client_factory"
+            for item in ast.walk(credential_client)
+        )
     )
 
 
@@ -1226,14 +1336,22 @@ def _production_policy_violations(sources: dict[Path, str]) -> tuple[str, ...]:
             ):
                 violations.append(f"transport-composition:{source_path}:{node.lineno}")
             if resolved is not None and resolved.startswith("httpx."):
-                allowed_httpx_call = resolved in {
-                    "httpx.Request",
-                    "httpx.Timeout",
-                } or (
-                    resolved == "httpx.AsyncClient"
-                    and (
-                        _allowed_mock_async_client_call(source_path, tree, node)
-                        or _allowed_hardened_live_async_client_call(source_path, tree, node)
+                allowed_httpx_call = (
+                    resolved
+                    in {
+                        "httpx.Request",
+                        "httpx.Timeout",
+                    }
+                    or (
+                        resolved == "httpx.AsyncClient"
+                        and (
+                            _allowed_mock_async_client_call(source_path, tree, node)
+                            or _allowed_hardened_live_async_client_call(source_path, tree, node)
+                        )
+                    )
+                    or (
+                        resolved == "httpx.Client"
+                        and _allowed_hardened_credential_client_call(source_path, tree, node)
                     )
                 )
                 if not allowed_httpx_call:
@@ -1513,8 +1631,9 @@ def test_shipped_posture_is_live_disabled_unverifiable_and_killed(tmp_path: Path
 
 def test_production_httpx_constructor_inventory_is_mock_only_and_nonvacuous() -> None:
     inventory = _httpx_constructor_inventory(_python_trees())
-    assert len(inventory) == 4
+    assert len(inventory) == 5
     assert {(source_path, resolved) for source_path, _line, resolved in inventory} == {
+        (Path("polymarket_execution/credential_client.py"), "httpx.Client"),
         (Path("polymarket_execution/rest.py"), "httpx.AsyncClient"),
         (Path("polymarket_execution/rest.py"), "httpx.Request"),
         (Path("polymarket_execution/rest.py"), "httpx.Timeout"),
@@ -1573,6 +1692,16 @@ def test_reviewed_authority_sensitive_source_manifest_is_exact_and_fail_closed()
         "extra": {**sources, Path("execution/unreviewed.py"): b"pass\n"},
     }.items():
         assert _reviewed_source_manifest_violations(mutated), name
+
+
+def test_credential_command_source_has_one_fixed_create_route_and_no_secret_ingress() -> None:
+    source = (PREDICTIONS_ROOT / "pilot" / "credential_commands.py").read_text()
+
+    assert "derive-api-key" not in source
+    assert "os.environ" not in source
+    assert "sys.argv" not in source
+    assert "submit_order" not in source
+    assert "cancel_order" not in source
 
 
 def test_stale_authority_source_is_rejected_before_import_time_effect(

@@ -12,7 +12,6 @@ from polytrading.predictions.polymarket_execution.credential_client import (
     REQUEST_TIMEOUT_SECONDS,
     CredentialTransportError,
     HttpxCredentialClient,
-    _production_client,
 )
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_API_KEY_ACCOUNT,
@@ -50,15 +49,15 @@ def binding(**overrides: Any):
 
 
 def client(handler: httpx.MockTransport) -> HttpxCredentialClient:
-    return HttpxCredentialClient(
+    return HttpxCredentialClient._for_test(
         private_key=PRIVATE_KEY,
         timestamp=lambda: TIMESTAMP,
-        _client_factory=lambda: httpx.Client(transport=handler),
+        transport=handler,
     )
 
 
 def test_production_httpx_client_uses_the_fixed_timeout() -> None:
-    with _production_client() as production:
+    with HttpxCredentialClient._new_client() as production:
         assert production.timeout.connect == REQUEST_TIMEOUT_SECONDS
         assert production.timeout.read == REQUEST_TIMEOUT_SECONDS
         assert production.timeout.write == REQUEST_TIMEOUT_SECONDS
@@ -83,18 +82,16 @@ def test_client_signs_with_owned_mutable_key_then_zeroizes_it(
     handed_to_signer: list[bytearray] = []
     private_key = bytearray(PRIVATE_KEY)
 
-    def sign_mutable_key(
-        key: bytearray, timestamp: str, snapshot: object
-    ) -> str:
+    def sign_mutable_key(key: bytearray, timestamp: str, snapshot: object) -> str:
         del timestamp, snapshot
         handed_to_signer.append(key)
         return "0x" + "0" * 130
 
     monkeypatch.setattr(client_module, "sign_clob_auth", sign_mutable_key)
-    credential_client = HttpxCredentialClient(
+    credential_client = HttpxCredentialClient._for_test(
         private_key=private_key,
         timestamp=lambda: TIMESTAMP,
-        _client_factory=lambda: httpx.Client(transport=responder()),
+        transport=responder(),
     )
 
     buffers = credential_client.create_or_derive(operation="CREATE", binding=binding())
