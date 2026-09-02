@@ -121,6 +121,89 @@ def test_create_dispatches_without_parent_secret_store_access_and_returns_a_fing
     assert CLOB_CANARY.decode() not in repr(result)
 
 
+def test_create_without_a_parent_store_dispatches_to_the_clean_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = CredentialFingerprint(
+        account_fingerprint="a" * 64,
+        credential_fingerprint=sha256(CLOB_CANARY).hexdigest(),
+        operation="CREATE",
+        result="CREATED",
+    )
+    monkeypatch.setattr(
+        credential_commands,
+        "_create_credentials_in_clean_sidecar",
+        lambda **_kwargs: expected,
+        raising=False,
+    )
+
+    result = create_credentials(confirmed=True)
+
+    assert result == expected
+
+
+def test_derive_without_a_parent_store_dispatches_to_the_clean_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = CredentialFingerprint(
+        account_fingerprint="a" * 64,
+        credential_fingerprint=sha256(CLOB_CANARY).hexdigest(),
+        operation="DERIVE",
+        result="DERIVED",
+    )
+    monkeypatch.setattr(
+        credential_commands,
+        "_derive_credentials_in_clean_sidecar",
+        lambda **_kwargs: expected,
+        raising=False,
+    )
+
+    result = credential_commands.derive_credentials(confirmed=True)
+
+    assert result == expected
+
+
+def test_derive_requires_confirmation_before_keychain_or_child_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_started: list[bool] = []
+    monkeypatch.setattr(
+        credential_commands,
+        "_derive_credentials_in_clean_sidecar",
+        lambda **_kwargs: child_started.append(True),
+        raising=False,
+    )
+
+    with pytest.raises(CredentialCommandError) as raised:
+        credential_commands.derive_credentials(confirmed=False)
+
+    assert raised.value.code == "CONFIRMATION_REQUIRED"
+    assert child_started == []
+
+
+def test_create_does_not_fallback_to_derive_after_a_request_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    derive_attempted: list[bool] = []
+
+    def reject_create() -> CredentialFingerprint:
+        raise SignerBootstrapError("CREDENTIAL_REQUEST_REJECTED")
+
+    monkeypatch.setattr(credential_commands, "_create_credentials_in_clean_sidecar", reject_create)
+    monkeypatch.setattr(
+        credential_commands,
+        "_derive_credentials_in_clean_sidecar",
+        lambda: derive_attempted.append(True),
+        raising=False,
+    )
+
+    with pytest.raises(CredentialCommandError) as raised:
+        create_credentials(confirmed=True)
+
+    assert raised.value.code == "CREDENTIAL_REQUEST_REJECTED"
+    assert derive_attempted == []
+
+
 @pytest.mark.parametrize(
     ("store_factory", "code"),
     [
@@ -152,6 +235,10 @@ def test_existing_or_partial_child_results_are_sanitized_without_parent_keychain
     [
         ("SECRET_DESCRIPTOR_READ_FAILED", "SIGNER_BOOTSTRAP_FAILED"),
         ("CREDENTIAL_CREATE_FAILED", "CREDENTIAL_CREATE_FAILED"),
+        ("CREDENTIAL_TRANSPORT_UNAVAILABLE", "CREDENTIAL_TRANSPORT_UNAVAILABLE"),
+        ("CREDENTIAL_REQUEST_REJECTED", "CREDENTIAL_REQUEST_REJECTED"),
+        ("CREDENTIAL_RESPONSE_INVALID", "CREDENTIAL_RESPONSE_INVALID"),
+        ("CREDENTIAL_SIGNING_FAILED", "CREDENTIAL_SIGNING_FAILED"),
         ("CREDENTIAL_STORE_FAILED", "CREDENTIAL_STORE_FAILED"),
         ("CREDENTIAL_ROLLBACK_FAILED", "CREDENTIAL_ROLLBACK_FAILED"),
         ("CREDENTIALS_CREATE_IN_PROGRESS", "CREDENTIALS_CREATE_IN_PROGRESS"),

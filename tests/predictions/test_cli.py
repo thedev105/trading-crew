@@ -88,7 +88,7 @@ def test_predictions_command_does_not_collide_with_existing_top_level_names() ->
     assert "predictions" not in existing
 
 
-def test_pilot_credentials_command_has_only_check_and_confirmed_create() -> None:
+def test_pilot_credentials_command_has_only_check_and_confirmed_create_or_derive() -> None:
     parsed = build_parser().parse_args(
         ["predictions", "pilot", "credentials", "create", "--confirm"]
     )
@@ -96,6 +96,11 @@ def test_pilot_credentials_command_has_only_check_and_confirmed_create() -> None
     assert parsed.predictions_pilot_command == "credentials"
     assert parsed.predictions_pilot_credentials_command == "create"
     assert parsed.confirm is True
+    derived = build_parser().parse_args(
+        ["predictions", "pilot", "credentials", "derive", "--confirm"]
+    )
+    assert derived.predictions_pilot_credentials_command == "derive"
+    assert derived.confirm is True
 
 
 @pytest.mark.parametrize(
@@ -152,9 +157,9 @@ def test_pilot_credentials_check_uses_cli_keychain_boundary_and_renders_only_sta
     output = StringIO()
     errors = StringIO()
 
-    assert predictions_cli._run_pilot_credentials(
-        arguments, stream=output, error_stream=errors
-    ) == 0
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 0
+    )
     assert output.getvalue() == "wallet_ready=true\ncredentials=ABSENT\n"
     assert errors.getvalue() == ""
 
@@ -162,13 +167,16 @@ def test_pilot_credentials_check_uses_cli_keychain_boundary_and_renders_only_sta
 def test_pilot_credentials_create_renders_only_stable_result_and_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = object()
     fingerprint = "a" * 64
-    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", lambda: store)
+    monkeypatch.setattr(
+        predictions_cli,
+        "MacOSKeychainSecretStore",
+        lambda: pytest.fail("create constructed the Keychain adapter in the command parent"),
+    )
     monkeypatch.setattr(
         predictions_cli,
         "create_credentials",
-        lambda *, store, confirmed: CredentialFingerprint(
+        lambda *, confirmed: CredentialFingerprint(
             account_fingerprint="b" * 64,
             credential_fingerprint=fingerprint,
             operation="CREATE",
@@ -181,10 +189,43 @@ def test_pilot_credentials_create_renders_only_stable_result_and_fingerprint(
     output = StringIO()
     errors = StringIO()
 
-    assert predictions_cli._run_pilot_credentials(
-        arguments, stream=output, error_stream=errors
-    ) == 0
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 0
+    )
     assert output.getvalue() == f"result=CREATED\ncredential_fingerprint={fingerprint}\n"
+    assert errors.getvalue() == ""
+
+
+def test_pilot_credentials_derive_renders_only_stable_result_and_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprint = "a" * 64
+    monkeypatch.setattr(
+        predictions_cli,
+        "MacOSKeychainSecretStore",
+        lambda: pytest.fail("derive constructed the Keychain adapter in the command parent"),
+    )
+    monkeypatch.setattr(
+        predictions_cli,
+        "derive_credentials",
+        lambda *, confirmed: CredentialFingerprint(
+            account_fingerprint="b" * 64,
+            credential_fingerprint=fingerprint,
+            operation="DERIVE",
+            result="DERIVED",
+        ),
+        raising=False,
+    )
+    arguments = build_parser().parse_args(
+        ["predictions", "pilot", "credentials", "derive", "--confirm"]
+    )
+    output = StringIO()
+    errors = StringIO()
+
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 0
+    )
+    assert output.getvalue() == f"result=DERIVED\ncredential_fingerprint={fingerprint}\n"
     assert errors.getvalue() == ""
 
 
@@ -204,9 +245,9 @@ def test_pilot_credentials_error_boundary_never_renders_sensitive_values(
     output = StringIO()
     errors = StringIO()
 
-    assert predictions_cli._run_pilot_credentials(
-        arguments, stream=output, error_stream=errors
-    ) == 64
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 64
+    )
     captured = output.getvalue() + errors.getvalue()
     assert captured == "polytrading: credential command failed: KEYCHAIN_UNAVAILABLE\n"
     for forbidden in (
@@ -235,9 +276,9 @@ def test_pilot_credentials_renders_public_command_codes_only(
     output = StringIO()
     errors = StringIO()
 
-    assert predictions_cli._run_pilot_credentials(
-        arguments, stream=output, error_stream=errors
-    ) == 64
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 64
+    )
     assert output.getvalue() == ""
     assert errors.getvalue() == "polytrading: credential command failed: WALLET_MISSING\n"
 

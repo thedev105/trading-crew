@@ -147,8 +147,61 @@ def test_one_shot_credential_child_runs_only_create_and_returns_public_fingerpri
     assert not hasattr(result, "passphrase")
 
 
-@pytest.mark.parametrize("failure", ["transport", "invalid_response", "second_write"])
-def test_create_failure_leaves_no_clob_trio(failure: str) -> None:
+def test_one_shot_credential_child_runs_only_derive_and_returns_public_fingerprints() -> None:
+    memory = store(missing=set(SECRET_ACCOUNTS[1:]))
+    client = CreateOnlyCredentialClient()
+
+    result = _launch_credential_ceremony(
+        store=memory,
+        now=lambda: NOW,
+        operation="DERIVE",
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: client,
+    )
+
+    assert result == CredentialCeremonyResult(
+        ok=True,
+        code="DERIVED",
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=sha256(VALUES[CLOB_API_KEY_ACCOUNT]).hexdigest(),
+    )
+    assert [operation for operation, _binding in client.calls] == ["DERIVE"]
+    assert all(buffer.closed for buffer in client.response_buffers)
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected"),
+    [
+        (set(), "CREDENTIALS_ALREADY_PRESENT"),
+        ({CLOB_API_SECRET_ACCOUNT}, "CREDENTIALS_PARTIAL"),
+    ],
+)
+def test_derive_refuses_nonempty_local_credential_state_before_remote_recovery(
+    missing: set[str], expected: str
+) -> None:
+    client = CreateOnlyCredentialClient()
+
+    result = _launch_credential_ceremony(
+        store=store(missing=missing),
+        now=lambda: NOW,
+        operation="DERIVE",
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: client,
+    )
+
+    assert result == CredentialCeremonyResult(False, expected)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("transport", "CREDENTIAL_TRANSPORT_UNAVAILABLE"),
+        ("invalid_response", "CREDENTIAL_RESPONSE_INVALID"),
+        ("second_write", "CREDENTIAL_STORE_FAILED"),
+    ],
+)
+def test_create_failure_leaves_no_clob_trio(failure: str, expected: str) -> None:
     response_buffers: list[SecretBuffer] = []
 
     class FailingClient:
@@ -178,9 +231,6 @@ def test_create_failure_leaves_no_clob_trio(failure: str) -> None:
         _client_factory=lambda **_kwargs: FailingClient(),
     )
 
-    expected = (
-        "CREDENTIAL_STORE_FAILED" if failure == "second_write" else "CREDENTIAL_CREATE_FAILED"
-    )
     assert result == CredentialCeremonyResult(False, expected)
     assert clob_slots_are_absent(memory)
     assert all(buffer.closed for buffer in response_buffers)

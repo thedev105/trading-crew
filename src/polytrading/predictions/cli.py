@@ -63,6 +63,7 @@ from polytrading.predictions.pilot.credential_commands import (
     CredentialCommandError,
     check_credential_readiness,
     create_credentials,
+    derive_credentials,
     render_credential_readiness,
 )
 from polytrading.predictions.pilot.runtime import serve_polymarket_pilot
@@ -369,7 +370,7 @@ def add_predictions_subcommands(
     pilot_polymarket.add_argument("--port", required=True, type=int)
     credentials = pilot_commands.add_parser(
         "credentials",
-        help="check or explicitly create CLOB credentials",
+        help="check, create, or explicitly recover CLOB credentials",
         allow_abbrev=False,
     )
     credentials.error = _credential_parser_error  # type: ignore[method-assign]
@@ -383,6 +384,10 @@ def add_predictions_subcommands(
         "create", help="create CLOB credentials once", allow_abbrev=False
     )
     create.add_argument("--confirm", action="store_true")
+    derive = credentials_commands.add_parser(
+        "derive", help="recover existing CLOB credentials once", allow_abbrev=False
+    )
+    derive.add_argument("--confirm", action="store_true")
 
 
 def run_predictions_command(arguments: argparse.Namespace) -> int:
@@ -426,24 +431,29 @@ def _run_pilot_credentials(
 ) -> int:
     """Run the fixed local credential ceremony without rendering secret-derived data."""
     command = getattr(arguments, "predictions_pilot_credentials_command", None)
-    if command not in {"check", "create"}:
+    if command not in {"check", "create", "derive"}:
         return _render_credential_command_error("LOCAL_INVOCATION_INVALID", error_stream)
-    if command == "create" and getattr(arguments, "confirm", False) is not True:
+    if command in {"create", "derive"} and getattr(arguments, "confirm", False) is not True:
         return _render_credential_command_error("CONFIRMATION_REQUIRED", error_stream)
     try:
-        store = MacOSKeychainSecretStore()
-    except Exception:
-        return _render_credential_command_error("KEYCHAIN_UNAVAILABLE", error_stream)
-    try:
         if command == "check":
+            store = MacOSKeychainSecretStore()
             print(render_credential_readiness(check_credential_readiness(store)), file=stream)
             return 0
-        result = create_credentials(store=store, confirmed=True)
-        if result.result != "CREATED" or not _CREDENTIAL_FINGERPRINT_PATTERN.fullmatch(
-            result.credential_fingerprint
+        result = (
+            create_credentials(confirmed=True)
+            if command == "create"
+            else derive_credentials(confirmed=True)
+        )
+        expected_operation = "CREATE" if command == "create" else "DERIVE"
+        expected_result = "CREATED" if command == "create" else "DERIVED"
+        if (
+            result.operation != expected_operation
+            or result.result != expected_result
+            or not _CREDENTIAL_FINGERPRINT_PATTERN.fullmatch(result.credential_fingerprint)
         ):
             return _render_credential_command_error("CREDENTIAL_CREATE_FAILED", error_stream)
-        print("result=CREATED", file=stream)
+        print(f"result={expected_result}", file=stream)
         print(f"credential_fingerprint={result.credential_fingerprint}", file=stream)
         return 0
     except CredentialCommandError as error:

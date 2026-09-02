@@ -38,10 +38,10 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "6722e9ca8f383068e53438c0e66d972bb439ebbce08c6972423f3da4499dd39f",
     Path(
         "pilot/credential_commands.py"
-    ): "8956ce29af4a561984e4163a3cdcf38f273eabdce26a0bb2af02b971713491bc",
+    ): "24f1125e247b4380de1609184b9b0fd039b1b70d05f93aac822f05059f07cda4",
     Path(
         "pilot/signer_bootstrap.py"
-    ): "065e8b7a989db33572dfbbfc48943816fad8fa8d675cfc2b99ee61e34fc556c7",
+    ): "70deda5af9cc8b877d7244bbfef4ecb43ee6c5c29fe42d093d919d15b564fdb8",
     Path(
         "polymarket_execution/credentials.py"
     ): "28cc4e1054f3a26df7037c5f04ac1ae15b7806b77a3b0ec4b29c5bdfca8a1109",
@@ -1721,10 +1721,13 @@ def test_reviewed_authority_sensitive_source_manifest_is_exact_and_fail_closed()
         assert _reviewed_source_manifest_violations(mutated), name
 
 
-def test_credential_command_source_has_one_fixed_create_route_and_no_secret_ingress() -> None:
+def test_credential_command_source_has_only_explicit_fixed_ceremonies_and_no_secret_ingress() -> (
+    None
+):
     source = (PREDICTIONS_ROOT / "pilot" / "credential_commands.py").read_text()
 
-    assert "derive-api-key" not in source
+    assert "create_credentials" in source
+    assert "derive_credentials" in source
     assert "os.environ" not in source
     assert "sys.argv" not in source
     assert "submit_order" not in source

@@ -30,6 +30,20 @@ _CREDENTIAL_ACCOUNTS: Final = (
 _SECP256K1_ORDER: Final = int(
     "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
 )
+_PUBLIC_CREDENTIAL_CEREMONY_CODES: Final = frozenset(
+    {
+        "CREDENTIALS_ALREADY_PRESENT",
+        "CREDENTIALS_PARTIAL",
+        "CREDENTIALS_CREATE_IN_PROGRESS",
+        "CREDENTIAL_CREATE_FAILED",
+        "CREDENTIAL_TRANSPORT_UNAVAILABLE",
+        "CREDENTIAL_REQUEST_REJECTED",
+        "CREDENTIAL_RESPONSE_INVALID",
+        "CREDENTIAL_SIGNING_FAILED",
+        "CREDENTIAL_STORE_FAILED",
+        "CREDENTIAL_ROLLBACK_FAILED",
+    }
+)
 
 
 class CredentialCommandError(ValueError):
@@ -68,34 +82,36 @@ def render_credential_readiness(result: CredentialReadiness) -> str:
 
 def create_credentials(
     *,
-    store: SecretStore,
     confirmed: bool,
+    store: SecretStore | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> CredentialFingerprint:
     """Run the explicitly confirmed absent-only create ceremony."""
     if confirmed is not True:
         raise CredentialCommandError("CONFIRMATION_REQUIRED")
     try:
+        if store is None:
+            return _create_credentials_in_clean_sidecar()
         return _create_credentials_in_sidecar(store=store, now=now or _utc_now)
     except Exception as error:
-        from polytrading.predictions.pilot.signer_bootstrap import SignerBootstrapError
+        _raise_credential_ceremony_error(error)
 
-        if not isinstance(error, SignerBootstrapError):
-            raise
-        code = (
-            error.code
-            if error.code
-            in {
-                "CREDENTIALS_ALREADY_PRESENT",
-                "CREDENTIALS_PARTIAL",
-                "CREDENTIALS_CREATE_IN_PROGRESS",
-                "CREDENTIAL_CREATE_FAILED",
-                "CREDENTIAL_STORE_FAILED",
-                "CREDENTIAL_ROLLBACK_FAILED",
-            }
-            else "SIGNER_BOOTSTRAP_FAILED"
-        )
-        raise CredentialCommandError(code) from None
+
+def derive_credentials(
+    *,
+    confirmed: bool,
+    store: SecretStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> CredentialFingerprint:
+    """Explicitly recover remote credentials only when all local slots are absent."""
+    if confirmed is not True:
+        raise CredentialCommandError("CONFIRMATION_REQUIRED")
+    try:
+        if store is None:
+            return _derive_credentials_in_clean_sidecar()
+        return _derive_credentials_in_sidecar(store=store, now=now or _utc_now)
+    except Exception as error:
+        _raise_credential_ceremony_error(error)
 
 
 def _utc_now() -> datetime:
@@ -108,6 +124,41 @@ def _create_credentials_in_sidecar(
     from polytrading.predictions.pilot.signer_bootstrap import create_credentials_in_sidecar
 
     return create_credentials_in_sidecar(store=store, now=now)
+
+
+def _create_credentials_in_clean_sidecar() -> CredentialFingerprint:
+    from polytrading.predictions.pilot.signer_bootstrap import (
+        create_credentials_in_clean_sidecar,
+    )
+
+    return create_credentials_in_clean_sidecar()
+
+
+def _derive_credentials_in_sidecar(
+    *, store: SecretStore, now: Callable[[], datetime]
+) -> CredentialFingerprint:
+    from polytrading.predictions.pilot.signer_bootstrap import derive_credentials_in_sidecar
+
+    return derive_credentials_in_sidecar(store=store, now=now)
+
+
+def _derive_credentials_in_clean_sidecar() -> CredentialFingerprint:
+    from polytrading.predictions.pilot.signer_bootstrap import (
+        derive_credentials_in_clean_sidecar,
+    )
+
+    return derive_credentials_in_clean_sidecar()
+
+
+def _raise_credential_ceremony_error(error: Exception) -> None:
+    from polytrading.predictions.pilot.signer_bootstrap import SignerBootstrapError
+
+    if not isinstance(error, SignerBootstrapError):
+        raise error
+    code = (
+        error.code if error.code in _PUBLIC_CREDENTIAL_CEREMONY_CODES else "SIGNER_BOOTSTRAP_FAILED"
+    )
+    raise CredentialCommandError(code) from None
 
 
 def _item_is_valid_wallet(store: SecretStore) -> bool:
@@ -161,5 +212,6 @@ __all__ = [
     "CredentialReadiness",
     "check_credential_readiness",
     "create_credentials",
+    "derive_credentials",
     "render_credential_readiness",
 ]

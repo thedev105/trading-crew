@@ -10,12 +10,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import BinaryIO, Final, Protocol
+from typing import BinaryIO, Final, Literal, Protocol
 from uuid import uuid4
 
 from eth_account import Account
@@ -76,15 +77,34 @@ _SECP256K1_ORDER: Final = int(
 _CEREMONY_RESULT_CODES: Final = frozenset(
     {
         "CREATED",
+        "DERIVED",
         "CREDENTIALS_ALREADY_PRESENT",
         "CREDENTIALS_PARTIAL",
         "CREDENTIALS_CREATE_IN_PROGRESS",
         "SIGNER_BOOTSTRAP_FAILED",
         "CREDENTIAL_CREATE_FAILED",
+        "CREDENTIAL_TRANSPORT_UNAVAILABLE",
+        "CREDENTIAL_REQUEST_REJECTED",
+        "CREDENTIAL_RESPONSE_INVALID",
+        "CREDENTIAL_SIGNING_FAILED",
         "CREDENTIAL_STORE_FAILED",
         "CREDENTIAL_ROLLBACK_FAILED",
     }
 )
+_PUBLIC_CREDENTIAL_FAILURE_CODES: Final = frozenset(
+    {
+        "CREDENTIAL_TRANSPORT_UNAVAILABLE",
+        "CREDENTIAL_REQUEST_REJECTED",
+        "CREDENTIAL_RESPONSE_INVALID",
+        "CREDENTIAL_SIGNING_FAILED",
+    }
+)
+_CREDENTIAL_CHILD_BOOTSTRAP: Final = (
+    "from polytrading.predictions.pilot.signer_bootstrap import _run_clean_credential_child;"
+    "import sys;raise SystemExit(_run_clean_credential_child(int(sys.argv[1]),sys.argv[2]))"
+)
+_CREDENTIAL_CHILD_ENVIRONMENT: Final = {"PATH": "/usr/bin:/bin"}
+_CredentialCeremonyOperation = Literal["CREATE", "DERIVE"]
 
 
 class SignerBootstrapError(RuntimeError):
@@ -218,7 +238,7 @@ def create_credentials_in_sidecar(
     *, store: SecretStore, now: Callable[[], datetime]
 ) -> CredentialFingerprint:
     """Run the fixed CREATE ceremony and return only its public fingerprint."""
-    result = _launch_credential_ceremony(store=store, now=now)
+    result = _launch_credential_ceremony(store=store, now=now, operation="CREATE")
     if not result.ok:
         raise SignerBootstrapError(result.code)
     if result.account_fingerprint is None or result.credential_fingerprint is None:
@@ -231,10 +251,58 @@ def create_credentials_in_sidecar(
     )
 
 
+def create_credentials_in_clean_sidecar() -> CredentialFingerprint:
+    """Run credential creation in a fresh interpreter before loading macOS Keychain APIs."""
+    result = _launch_clean_credential_ceremony(operation="CREATE")
+    if not result.ok:
+        raise SignerBootstrapError(result.code)
+    if result.account_fingerprint is None or result.credential_fingerprint is None:
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED")
+    return CredentialFingerprint(
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=result.credential_fingerprint,
+        operation="CREATE",
+        result="CREATED",
+    )
+
+
+def derive_credentials_in_sidecar(
+    *, store: SecretStore, now: Callable[[], datetime]
+) -> CredentialFingerprint:
+    """Run the fixed DERIVE recovery ceremony and return only its public fingerprint."""
+    result = _launch_credential_ceremony(store=store, now=now, operation="DERIVE")
+    if not result.ok:
+        raise SignerBootstrapError(result.code)
+    if result.account_fingerprint is None or result.credential_fingerprint is None:
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED")
+    return CredentialFingerprint(
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=result.credential_fingerprint,
+        operation="DERIVE",
+        result="DERIVED",
+    )
+
+
+def derive_credentials_in_clean_sidecar() -> CredentialFingerprint:
+    """Run credential recovery in a fresh interpreter before loading macOS Keychain APIs."""
+    result = _launch_clean_credential_ceremony(operation="DERIVE")
+    if not result.ok:
+        raise SignerBootstrapError(result.code)
+    if result.account_fingerprint is None or result.credential_fingerprint is None:
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED")
+    return CredentialFingerprint(
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=result.credential_fingerprint,
+        operation="DERIVE",
+        result="DERIVED",
+    )
+
+
 def _launch_credential_ceremony(
     *,
     store: SecretStore,
     now: Callable[[], datetime],
+    operation: _CredentialCeremonyOperation = "CREATE",
     _spawn: Callable[[_CredentialChildLaunch], int | None] | None = None,
     _client_factory: CredentialClientFactory | None = None,
 ) -> CredentialCeremonyResult:
@@ -250,12 +318,14 @@ def _launch_credential_ceremony(
             response_fd=response_pipe[1],
             store=store,
             now=now,
+            operation=operation,
             client_factory=_client_factory,
         ),
         run_until_exit=lambda: _run_credential_child(
             response_fd=response_pipe[1],
             store=store,
             now=now,
+            operation=operation,
             client_factory=_client_factory,
             release_lock_on_return=False,
         ),
@@ -276,11 +346,87 @@ def _launch_credential_ceremony(
                 os.waitpid(child_pid, 0)
 
 
+def _launch_clean_credential_ceremony(
+    *, operation: _CredentialCeremonyOperation
+) -> CredentialCeremonyResult:
+    """Exec a clean child before it imports the macOS Security framework."""
+    response_pipe = os.pipe()
+    try:
+        child_pid = _spawn_clean_credential_child(*response_pipe, operation=operation)
+    except BaseException:
+        _close(response_pipe[0])
+        _close(response_pipe[1])
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED") from None
+    _close(response_pipe[1])
+    try:
+        return _read_credential_result(response_pipe[0])
+    finally:
+        _close(response_pipe[0])
+        with suppress(OSError):
+            os.waitpid(child_pid, 0)
+
+
+def _spawn_clean_credential_child(
+    read_fd: int, write_fd: int, *, operation: _CredentialCeremonyOperation
+) -> int:
+    """Use ``posix_spawn`` so Objective-C state is never copied with ``fork``."""
+    child_response_fd = max(read_fd, write_fd) + 1
+    return os.posix_spawn(
+        sys.executable,
+        (
+            sys.executable,
+            "-I",
+            "-c",
+            _CREDENTIAL_CHILD_BOOTSTRAP,
+            str(child_response_fd),
+            operation,
+        ),
+        _CREDENTIAL_CHILD_ENVIRONMENT,
+        file_actions=(
+            (os.POSIX_SPAWN_CLOSE, read_fd),
+            (os.POSIX_SPAWN_DUP2, write_fd, child_response_fd),
+            (os.POSIX_SPAWN_CLOSE, write_fd),
+        ),
+    )
+
+
+def _run_clean_credential_child(response_fd: int, operation: str) -> int:
+    """Construct the Keychain boundary only in the clean, exec'd process."""
+    if operation not in {"CREATE", "DERIVE"}:
+        _write_credential_result(
+            response_fd, CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+        )
+        _close(response_fd)
+        return 1
+    try:
+        from polytrading.predictions.polymarket_execution.keychain_macos import (
+            MacOSKeychainSecretStore,
+        )
+
+        store = MacOSKeychainSecretStore()
+    except BaseException:
+        _write_credential_result(
+            response_fd, CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+        )
+        _close(response_fd)
+        return 1
+    _run_credential_child(
+        response_fd=response_fd,
+        store=store,
+        now=lambda: datetime.now(UTC),
+        operation=operation,
+        client_factory=None,
+        release_lock_on_return=False,
+    )
+    return 0
+
+
 def _run_credential_child(
     *,
     response_fd: int,
     store: SecretStore,
     now: Callable[[], datetime],
+    operation: _CredentialCeremonyOperation = "CREATE",
     client_factory: CredentialClientFactory | None,
     release_lock_on_return: bool = True,
 ) -> None:
@@ -319,7 +465,7 @@ def _run_credential_child(
         grant = CredentialProvisioningGrant(
             grant_id=uuid4(),
             grant_kind="CREDENTIAL_PROVISIONING",
-            operation="CREATE",
+            operation=operation,
             wallet_fingerprint=account_fingerprint,
             account_fingerprint=account_fingerprint,
             protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
@@ -341,7 +487,7 @@ def _run_credential_child(
         )
         result = CredentialCeremonyResult(
             True,
-            "CREATED",
+            "CREATED" if fingerprint.result == "CREATED" else "DERIVED",
             account_fingerprint=fingerprint.account_fingerprint,
             credential_fingerprint=fingerprint.credential_fingerprint,
         )
@@ -349,12 +495,18 @@ def _run_credential_child(
         result = complete.result
     except CredentialProvisioningError as error:
         code = {
+            "CREDENTIAL_RESPONSE_INVALID": "CREDENTIAL_RESPONSE_INVALID",
             "CREDENTIAL_STORE_FAILED": "CREDENTIAL_STORE_FAILED",
             "CREDENTIAL_ROLLBACK_FAILED": "CREDENTIAL_ROLLBACK_FAILED",
         }.get(error.code, "CREDENTIAL_CREATE_FAILED")
         result = CredentialCeremonyResult(False, code)
-    except CredentialTransportError:
-        result = CredentialCeremonyResult(False, "CREDENTIAL_CREATE_FAILED")
+    except CredentialTransportError as error:
+        code = (
+            error.code
+            if error.code in _PUBLIC_CREDENTIAL_FAILURE_CODES
+            else "CREDENTIAL_CREATE_FAILED"
+        )
+        result = CredentialCeremonyResult(False, code)
     except SecretBoundaryError:
         result = CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
     except BaseException:
@@ -377,7 +529,7 @@ def _run_credential_child(
 
 
 def _try_acquire_credential_ceremony_lock() -> int | None:
-    """Acquire the public, non-secret, child-lifetime cooperative create lock."""
+    """Acquire the public, non-secret, child-lifetime cooperative ceremony lock."""
     descriptor = os.open(_CREDENTIAL_CEREMONY_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
