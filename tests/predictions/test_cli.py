@@ -119,6 +119,21 @@ def test_pilot_credentials_rejects_missing_confirmation_and_secret_or_network_fl
     assert main(argv) == 64
 
 
+def test_pilot_credentials_create_rejects_abbreviated_confirmation_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        predictions_cli,
+        "MacOSKeychainSecretStore",
+        lambda: pytest.fail("abbreviated confirmation reached the Keychain boundary"),
+    )
+    assert main(["predictions", "pilot", "credentials", "create", "--conf"]) == 64
+    assert capsys.readouterr().err == (
+        "polytrading: credential command failed: LOCAL_INVOCATION_INVALID\n"
+    )
+
+
 def test_pilot_credentials_check_uses_cli_keychain_boundary_and_renders_only_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

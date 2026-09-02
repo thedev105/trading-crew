@@ -370,6 +370,7 @@ def add_predictions_subcommands(
     credentials = pilot_commands.add_parser(
         "credentials",
         help="check or explicitly create CLOB credentials",
+        allow_abbrev=False,
     )
     credentials.error = _credential_parser_error  # type: ignore[method-assign]
     credentials_commands = credentials.add_subparsers(
@@ -378,7 +379,9 @@ def add_predictions_subcommands(
         parser_class=_CredentialArgumentParser,
     )
     credentials_commands.add_parser("check", help="check local Keychain credential readiness")
-    create = credentials_commands.add_parser("create", help="create CLOB credentials once")
+    create = credentials_commands.add_parser(
+        "create", help="create CLOB credentials once", allow_abbrev=False
+    )
     create.add_argument("--confirm", action="store_true")
 
 
