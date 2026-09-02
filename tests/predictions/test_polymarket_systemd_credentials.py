@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import pytest
 
 from polytrading.predictions.polymarket_execution.secret_labels import (
     CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
     CLOB_SERVICE,
     WALLET_PRIVATE_KEY_ACCOUNT,
 )
@@ -15,6 +18,7 @@ from polytrading.predictions.polymarket_execution.secrets import SecretBuffer, S
 from polytrading.predictions.polymarket_execution.systemd_credentials_linux import (
     MAXIMUM_ITEM_BYTES,
     SystemdCredentialSecretStore,
+    SystemdCredsRunner,
 )
 
 
@@ -217,3 +221,186 @@ def test_runtime_store_never_reveals_a_secret_canary(
     assert canary.decode() not in repr(raised.value)
     assert canary.decode() not in captured.out
     assert canary.decode() not in captured.err
+
+
+class FakeSystemdCredsRunner:
+    def __init__(self, encrypted_output: bytes = b"encrypted-systemd-credential") -> None:
+        self.calls: list[tuple[str, bytes]] = []
+        self.encrypted_output = encrypted_output
+
+    def encrypt(self, *, account: str, value: SecretBuffer) -> bytearray:
+        self.calls.append((account, value.use(bytes)))
+        return bytearray(self.encrypted_output)
+
+
+def writable_store(
+    directories: tuple[Path, Path], runner: FakeSystemdCredsRunner
+) -> SystemdCredentialSecretStore:
+    runtime, encrypted = directories
+    return SystemdCredentialSecretStore(runtime, encrypted, runner=runner)
+
+
+def test_systemd_creds_runner_uses_only_fixed_process_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], bytes, object, object, dict[str, str], bool]] = []
+    canary = b"runner-secret-canary"
+
+    def fake_run(
+        arguments: list[str],
+        *,
+        input: memoryview,
+        stdout: object,
+        stderr: object,
+        env: dict[str, str],
+        check: bool,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((arguments, bytes(input), stdout, stderr, env, check))
+        return subprocess.CompletedProcess(arguments, 0, b"encrypted-output", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    value = SecretBuffer.from_bytes(canary)
+    try:
+        encrypted = SystemdCredsRunner().encrypt(account=CLOB_API_KEY_ACCOUNT, value=value)
+    finally:
+        value.close()
+
+    assert encrypted == bytearray(b"encrypted-output")
+    assert calls == [
+        (
+            [
+                "/usr/bin/systemd-creds",
+                "encrypt",
+                "--with-key=host",
+                f"--name={CLOB_API_KEY_ACCOUNT}",
+                "-",
+                "-",
+            ],
+            canary,
+            subprocess.PIPE,
+            subprocess.DEVNULL,
+            {"PATH": "/usr/bin:/bin"},
+            False,
+        )
+    ]
+    assert canary.decode() not in repr(calls[0][0])
+    assert canary.decode() not in repr(calls[0][4])
+
+
+def test_create_protected_encrypts_a_new_fixed_clob_slot(
+    credential_directories: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = FakeSystemdCredsRunner()
+    opened = writable_store(credential_directories, runner)
+    canary = b"clob-secret-canary"
+    value = SecretBuffer.from_bytes(canary)
+    try:
+        creation = opened.create_protected(CLOB_SERVICE, CLOB_API_SECRET_ACCOUNT, value)
+    finally:
+        value.close()
+        opened.close()
+
+    _, encrypted = credential_directories
+    target = encrypted / f"{CLOB_API_SECRET_ACCOUNT}.cred"
+    assert runner.calls == [(CLOB_API_SECRET_ACCOUNT, canary)]
+    assert target.read_bytes() == runner.encrypted_output
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert canary.decode() not in repr(creation)
+    captured = capsys.readouterr()
+    assert canary.decode() not in captured.out
+    assert canary.decode() not in captured.err
+
+
+@pytest.mark.parametrize("location", ["runtime", "encrypted"])
+def test_create_protected_refuses_an_existing_slot(
+    location: str, credential_directories: tuple[Path, Path]
+) -> None:
+    runtime, encrypted = credential_directories
+    if location == "runtime":
+        write_runtime_credential(runtime, CLOB_API_KEY_ACCOUNT, b"existing")
+    else:
+        (encrypted / f"{CLOB_API_KEY_ACCOUNT}.cred").write_bytes(b"existing-encrypted")
+    runner = FakeSystemdCredsRunner()
+    opened = writable_store(credential_directories, runner)
+    value = SecretBuffer.from_bytes(b"new")
+    try:
+        with pytest.raises(SecretStoreError) as raised:
+            opened.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, value)
+    finally:
+        value.close()
+        opened.close()
+
+    assert raised.value.code == "SECRET_ITEM_EXISTS"
+    assert runner.calls == []
+
+
+def test_create_protected_refuses_the_wallet_slot(
+    credential_directories: tuple[Path, Path],
+) -> None:
+    opened = writable_store(credential_directories, FakeSystemdCredsRunner())
+    value = SecretBuffer.from_bytes(b"wallet")
+    try:
+        with pytest.raises(SecretStoreError) as raised:
+            opened.create_protected(CLOB_SERVICE, WALLET_PRIVATE_KEY_ACCOUNT, value)
+    finally:
+        value.close()
+        opened.close()
+    assert raised.value.code == "SECRET_LABEL_INVALID"
+
+
+def test_delete_created_removes_only_its_own_encrypted_blob(
+    credential_directories: tuple[Path, Path],
+) -> None:
+    opened = writable_store(credential_directories, FakeSystemdCredsRunner())
+    value = SecretBuffer.from_bytes(b"key")
+    try:
+        creation = opened.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, value)
+        _, encrypted = credential_directories
+        target = encrypted / f"{CLOB_API_KEY_ACCOUNT}.cred"
+        target.unlink()
+        target.write_bytes(b"external-encrypted-replacement")
+        target.chmod(0o600)
+
+        with pytest.raises(SecretStoreError) as raised:
+            opened.delete_created(creation)
+    finally:
+        value.close()
+        opened.close()
+
+    assert raised.value.code == "SECRET_OWNERSHIP_LOST"
+    assert target.read_bytes() == b"external-encrypted-replacement"
+
+
+def test_delete_created_removes_the_unchanged_owned_blob(
+    credential_directories: tuple[Path, Path],
+) -> None:
+    opened = writable_store(credential_directories, FakeSystemdCredsRunner())
+    value = SecretBuffer.from_bytes(b"key")
+    try:
+        creation = opened.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, value)
+        opened.delete_created(creation)
+    finally:
+        value.close()
+        opened.close()
+
+    _, encrypted = credential_directories
+    assert not (encrypted / f"{CLOB_API_KEY_ACCOUNT}.cred").exists()
+
+
+@pytest.mark.parametrize("account", [CLOB_API_KEY_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT])
+def test_linux_store_refuses_rotation_and_arbitrary_deletion(
+    account: str, credential_directories: tuple[Path, Path]
+) -> None:
+    opened = writable_store(credential_directories, FakeSystemdCredsRunner())
+    value = SecretBuffer.from_bytes(b"value")
+    try:
+        for operation in (
+            lambda: opened.write_protected(CLOB_SERVICE, account, value),
+            lambda: opened.delete(CLOB_SERVICE, account),
+        ):
+            with pytest.raises(SecretStoreError) as raised:
+                operation()
+            assert raised.value.code == "SECRET_WRITE_FAILED"
+    finally:
+        value.close()
+        opened.close()

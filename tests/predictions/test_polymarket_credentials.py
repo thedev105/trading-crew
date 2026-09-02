@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +31,9 @@ from polytrading.predictions.polymarket_execution.secrets import (
     InMemorySecretStore,
     SecretBuffer,
     SecretStoreError,
+)
+from polytrading.predictions.polymarket_execution.systemd_credentials_linux import (
+    SystemdCredentialSecretStore,
 )
 
 NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
@@ -345,3 +349,68 @@ def test_a_credential_grant_is_not_an_execution_capability() -> None:
     assert not isinstance(grant, ExecutionCapability)
     assert not hasattr(grant, "allowed_operations")
     assert not hasattr(grant, "maximum_capital")
+
+
+class FailingLinuxEncryptionRunner:
+    def __init__(self, encrypted_directory: Path, *, replace_first: bool = False) -> None:
+        self.encrypted_directory = encrypted_directory
+        self.replace_first = replace_first
+        self.calls: list[str] = []
+
+    def encrypt(self, *, account: str, value: SecretBuffer) -> bytearray:
+        assert len(value) > 0
+        self.calls.append(account)
+        if account == CLOB_API_SECRET_ACCOUNT:
+            if self.replace_first:
+                target = self.encrypted_directory / f"{CLOB_API_KEY_ACCOUNT}.cred"
+                target.unlink()
+                target.write_bytes(b"external-encrypted-replacement")
+                target.chmod(0o600)
+            raise SecretStoreError("SECRET_WRITE_FAILED")
+        return bytearray(f"encrypted-{account}".encode("ascii"))
+
+
+def linux_store(
+    tmp_path: Path, runner: FailingLinuxEncryptionRunner
+) -> SystemdCredentialSecretStore:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    return SystemdCredentialSecretStore(runtime, runner.encrypted_directory, runner=runner)
+
+
+def test_linux_encrypted_store_rolls_back_a_partial_credential_set(tmp_path: Path) -> None:
+    encrypted = tmp_path / "encrypted"
+    encrypted.mkdir(mode=0o700)
+    runner = FailingLinuxEncryptionRunner(encrypted)
+    store = linux_store(tmp_path, runner)
+    try:
+        with pytest.raises(CredentialProvisioningError) as raised:
+            provisioner(store, FakeCredentialClient()).provision(
+                valid_credential_grant(), account_model(), now=NOW
+            )
+    finally:
+        store.close()
+
+    assert raised.value.code == "CREDENTIAL_STORE_FAILED"
+    assert runner.calls == [CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT]
+    assert list(encrypted.iterdir()) == []
+
+
+def test_linux_rollback_preserves_a_replacement_and_reports_ownership_loss(
+    tmp_path: Path,
+) -> None:
+    encrypted = tmp_path / "encrypted"
+    encrypted.mkdir(mode=0o700)
+    runner = FailingLinuxEncryptionRunner(encrypted, replace_first=True)
+    store = linux_store(tmp_path, runner)
+    try:
+        with pytest.raises(CredentialProvisioningError) as raised:
+            provisioner(store, FakeCredentialClient()).provision(
+                valid_credential_grant(), account_model(), now=NOW
+            )
+    finally:
+        store.close()
+
+    replacement = encrypted / f"{CLOB_API_KEY_ACCOUNT}.cred"
+    assert raised.value.code == "CREDENTIAL_ROLLBACK_FAILED"
+    assert replacement.read_bytes() == b"external-encrypted-replacement"
