@@ -20,6 +20,7 @@ from polytrading.predictions.execution.models import (
     canonical_execution_hash,
 )
 from polytrading.predictions.manifest import AdapterImplementationState
+from polytrading.predictions.pilot import runtime as runtime_module
 from polytrading.predictions.pilot.activation import PilotReconciliationState
 from polytrading.predictions.pilot.capabilities import VenueBinding
 from polytrading.predictions.pilot.execution_port import (
@@ -66,6 +67,11 @@ ELIGIBLE_MANIFEST = venue_manifest(
     source_hashes=(EVIDENCE_HASH,),
     reviewed_at=NOW - timedelta(days=1),
 )
+
+
+@pytest.fixture(autouse=True)
+def reviewed_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_module, "open_pilot_secret_store", lambda *, platform: object())
 
 
 def account_state() -> PilotAccountState:
@@ -229,6 +235,7 @@ def cockpit(tmp_path: Path) -> Iterator[Cockpit]:
     runtime = build_pilot_runtime(
         database,
         PORT,
+        platform="darwin",
         now=lambda: NOW,
         environment=environment,
         passkeys=passkeys,
@@ -264,7 +271,9 @@ def test_live_launch_reconciles_killed_and_kills_the_signer_on_shutdown(
     store.close()
     channel, bootstrap = live_launch_bootstrap()
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     issuer = runtime.issuer
     assert issuer is not None
     requests = channel.request_stream._channel.requests  # type: ignore[attr-defined]

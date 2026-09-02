@@ -212,8 +212,7 @@ locally present operator:
 
 `--db` and `--port` are the entire CLI surface: there is no credential, order, activation,
 capability, or kill-clearance flag. Every launch starts killed. Secrets live only in the macOS
-Keychain or systemd's private runtime credential directory and in the signer process; only the
-operator can trigger a live action, from the UI, after a typed confirmation and a platform-passkey
+Keychain or systemd's private runtime credential directory and in the signer process; only the operator can trigger a live action, from the UI, after a typed confirmation and a platform-passkey
 ceremony. The evidence dashboard above stays observation-only and cannot reach the pilot, the
 signer, or any credential.
 

@@ -18,6 +18,7 @@ import polytrading
 from polytrading.predictions.execution.authority import AuthorityReason
 from polytrading.predictions.execution.kill_switch import derive_kill_state
 from polytrading.predictions.execution.models import ExecutionOperation, ImmediateOrderType
+from polytrading.predictions.pilot import runtime as runtime_module
 from polytrading.predictions.pilot.capabilities import (
     MAXIMUM_PRIMARY_LIFETIME,
     MAXIMUM_RECOVERY_LIFETIME,
@@ -177,12 +178,15 @@ def test_presence_is_a_kill_input() -> None:
     assert MAXIMUM_MISSED_HEARTBEATS == 2
 
 
-def test_every_launch_starts_killed_and_an_empty_history_stays_killed(tmp_path: Path) -> None:
+def test_every_launch_starts_killed_and_an_empty_history_stays_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from polytrading.predictions.pilot.runtime import build_pilot_runtime
 
     path = tmp_path / "acceptance.duckdb"
     PredictionMarketStore(path).close()
-    runtime = build_pilot_runtime(path, 8788)
+    monkeypatch.setattr(runtime_module, "open_pilot_secret_store", lambda *, platform: object())
+    runtime = build_pilot_runtime(path, 8788, platform="darwin")
     try:
         assert runtime.posture.kill_engaged is True
     finally:
