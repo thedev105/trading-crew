@@ -56,6 +56,7 @@ from polytrading.lifecycle import (
 )
 from polytrading.predictions.cli import add_predictions_subcommands, run_predictions_command
 from polytrading.predictions.domain import PredictionSource
+from polytrading.predictions.pilot.credential_commands import CredentialCommandError
 from polytrading.registry.instruments import InstrumentRegistry
 from polytrading.replay import replay_file
 from polytrading.storage.store import ConflictingRecordError, DuckDBStore
@@ -405,6 +406,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AIInputError as error:
         print(f"polytrading: AI input rejected: {error}", file=sys.stderr)
         return 1
+    except CredentialCommandError as error:
+        print(f"polytrading: credential command failed: {error.code}", file=sys.stderr)
+        return 64
     except (CliUsageError, ValueError, OSError) as error:
         print(f"polytrading: error: {error}", file=sys.stderr)
         return 2

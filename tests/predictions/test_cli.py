@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from uuid import UUID
 
@@ -15,6 +16,11 @@ from polytrading.predictions.domain import PredictionVenue
 from polytrading.predictions.economics_models import ScanReport, deterministic_scan_report_id
 from polytrading.predictions.experiments import TrialFamily
 from polytrading.predictions.manifest import AdapterImplementationState
+from polytrading.predictions.pilot.credential_commands import (
+    CredentialCommandError,
+    CredentialReadiness,
+)
+from polytrading.predictions.polymarket_execution.credentials import CredentialFingerprint
 from polytrading.predictions.risk import PredictionRiskPolicy
 from polytrading.predictions.shadow_models import ShadowState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
@@ -80,6 +86,145 @@ def test_predictions_command_does_not_collide_with_existing_top_level_names() ->
     parsed = build_parser().parse_args(["predictions", "venues", "status", "--db", "x.duckdb"])
     assert parsed.command == "predictions"
     assert "predictions" not in existing
+
+
+def test_pilot_credentials_command_has_only_check_and_confirmed_create() -> None:
+    parsed = build_parser().parse_args(
+        ["predictions", "pilot", "credentials", "create", "--confirm"]
+    )
+
+    assert parsed.predictions_pilot_command == "credentials"
+    assert parsed.predictions_pilot_credentials_command == "create"
+    assert parsed.confirm is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["predictions", "pilot", "credentials", "create"],
+        ["predictions", "pilot", "credentials", "check", "--private-key", "x"],
+        [
+            "predictions",
+            "pilot",
+            "credentials",
+            "create",
+            "--endpoint",
+            "https://example.test",
+        ],
+    ],
+)
+def test_pilot_credentials_rejects_missing_confirmation_and_secret_or_network_flags(
+    argv: list[str],
+) -> None:
+    assert main(argv) == 64
+
+
+def test_pilot_credentials_check_uses_cli_keychain_boundary_and_renders_only_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = object()
+    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", lambda: store)
+    monkeypatch.setattr(
+        predictions_cli,
+        "check_credential_readiness",
+        lambda received: (
+            CredentialReadiness(wallet_ready=True, credentials_state="ABSENT")
+            if received is store
+            else pytest.fail("unexpected secret store")
+        ),
+    )
+    arguments = build_parser().parse_args(["predictions", "pilot", "credentials", "check"])
+    output = StringIO()
+    errors = StringIO()
+
+    assert predictions_cli._run_pilot_credentials(
+        arguments, stream=output, error_stream=errors
+    ) == 0
+    assert output.getvalue() == "wallet_ready=true\ncredentials=ABSENT\n"
+    assert errors.getvalue() == ""
+
+
+def test_pilot_credentials_create_renders_only_stable_result_and_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = object()
+    fingerprint = "a" * 64
+    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", lambda: store)
+    monkeypatch.setattr(
+        predictions_cli,
+        "create_credentials",
+        lambda *, store, confirmed: CredentialFingerprint(
+            account_fingerprint="b" * 64,
+            credential_fingerprint=fingerprint,
+            operation="CREATE",
+            result="CREATED",
+        ),
+    )
+    arguments = build_parser().parse_args(
+        ["predictions", "pilot", "credentials", "create", "--confirm"]
+    )
+    output = StringIO()
+    errors = StringIO()
+
+    assert predictions_cli._run_pilot_credentials(
+        arguments, stream=output, error_stream=errors
+    ) == 0
+    assert output.getvalue() == f"result=CREATED\ncredential_fingerprint={fingerprint}\n"
+    assert errors.getvalue() == ""
+
+
+def test_pilot_credentials_error_boundary_never_renders_sensitive_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = (
+        "wallet api-key secret passphrase headers response-body exception-text "
+        "/Users/me/Library/Keychains/login.keychain-db"
+    )
+    monkeypatch.setattr(
+        predictions_cli,
+        "MacOSKeychainSecretStore",
+        lambda: (_ for _ in ()).throw(RuntimeError(canary)),
+    )
+    arguments = build_parser().parse_args(["predictions", "pilot", "credentials", "check"])
+    output = StringIO()
+    errors = StringIO()
+
+    assert predictions_cli._run_pilot_credentials(
+        arguments, stream=output, error_stream=errors
+    ) == 64
+    captured = output.getvalue() + errors.getvalue()
+    assert captured == "polytrading: credential command failed: KEYCHAIN_UNAVAILABLE\n"
+    for forbidden in (
+        "wallet",
+        "api-key",
+        "secret",
+        "passphrase",
+        "headers",
+        "response-body",
+        "exception-text",
+        "/Users/me/Library/Keychains/login.keychain-db",
+    ):
+        assert forbidden not in captured
+
+
+def test_pilot_credentials_renders_public_command_codes_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", object)
+    monkeypatch.setattr(
+        predictions_cli,
+        "check_credential_readiness",
+        lambda _store: (_ for _ in ()).throw(CredentialCommandError("WALLET_MISSING")),
+    )
+    arguments = build_parser().parse_args(["predictions", "pilot", "credentials", "check"])
+    output = StringIO()
+    errors = StringIO()
+
+    assert predictions_cli._run_pilot_credentials(
+        arguments, stream=output, error_stream=errors
+    ) == 64
+    assert output.getvalue() == ""
+    assert errors.getvalue() == "polytrading: credential command failed: WALLET_MISSING\n"
 
 
 def test_execution_conformance_polymarket_is_the_only_accepted_execution_branch() -> None:

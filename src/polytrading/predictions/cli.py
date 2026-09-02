@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -58,9 +59,16 @@ from polytrading.predictions.health_report import (
 from polytrading.predictions.kalshi import KalshiAdapter
 from polytrading.predictions.limitless import LimitlessAdapter
 from polytrading.predictions.manifest import evaluate_collection_gate
+from polytrading.predictions.pilot.credential_commands import (
+    CredentialCommandError,
+    check_credential_readiness,
+    create_credentials,
+    render_credential_readiness,
+)
 from polytrading.predictions.pilot.runtime import serve_polymarket_pilot
 from polytrading.predictions.polymarket import PolymarketAdapter
 from polytrading.predictions.polymarket_execution.conformance import run_conformance
+from polytrading.predictions.polymarket_execution.keychain_macos import MacOSKeychainSecretStore
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PROTOCOL_VERSION,
     bundled_fixture_path,
@@ -134,6 +142,7 @@ _SHADOW_SCENARIOS: dict[str, StressScenario] = {
     )
 }
 _SHADOW_EXPERIMENT_NAMESPACE = UUID("f0a29b77-1936-4b83-994c-129eaeb0ee08")
+_CREDENTIAL_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class PredictionsUsageError(ValueError):
@@ -185,6 +194,29 @@ class _ExecutionArgumentParser(argparse.ArgumentParser):
 def _execution_parser_error(message: str) -> None:
     del message
     raise SystemExit(64) from None
+
+
+def _credential_parser_error(message: str) -> None:
+    del message
+    raise CredentialCommandError("LOCAL_INVOCATION_INVALID") from None
+
+
+class _CredentialArgumentParser(argparse.ArgumentParser):
+    """Map the fixed credential CLI surface to a sanitized local failure."""
+
+    def parse_known_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        parsed, remaining = super().parse_known_args(args, namespace)
+        if remaining:
+            self.error("CREDENTIAL_ARGUMENT_INVALID")
+        return parsed, remaining
+
+    def error(self, message: str) -> None:
+        del message
+        raise CredentialCommandError("LOCAL_INVOCATION_INVALID") from None
 
 
 def _utc_now() -> datetime:
@@ -330,13 +362,24 @@ def add_predictions_subcommands(
         "pilot", help="serve the loopback-only Polymarket pilot control plane"
     )
     pilot_commands = pilot.add_subparsers(dest="predictions_pilot_command", required=True)
-    # Deliberately the only pilot command, and deliberately without any credential, order,
-    # activation, capability, or kill-clearance argument: those are operator UI ceremonies.
     pilot_polymarket = pilot_commands.add_parser(
         "polymarket", help="serve the local Polymarket pilot"
     )
     pilot_polymarket.add_argument("--db", required=True, type=Path)
     pilot_polymarket.add_argument("--port", required=True, type=int)
+    credentials = pilot_commands.add_parser(
+        "credentials",
+        help="check or explicitly create CLOB credentials",
+    )
+    credentials.error = _credential_parser_error  # type: ignore[method-assign]
+    credentials_commands = credentials.add_subparsers(
+        dest="predictions_pilot_credentials_command",
+        required=True,
+        parser_class=_CredentialArgumentParser,
+    )
+    credentials_commands.add_parser("check", help="check local Keychain credential readiness")
+    create = credentials_commands.add_parser("create", help="create CLOB credentials once")
+    create.add_argument("--confirm", action="store_true")
 
 
 def run_predictions_command(arguments: argparse.Namespace) -> int:
@@ -365,9 +408,51 @@ def run_predictions_command(arguments: argparse.Namespace) -> int:
         serve_prediction_dashboard(arguments.db, arguments.port)
         return 0
     if arguments.predictions_command == "pilot":
+        if arguments.predictions_pilot_command == "credentials":
+            return _run_pilot_credentials(arguments, stream=sys.stdout, error_stream=sys.stderr)
         serve_polymarket_pilot(arguments.db, arguments.port)
         return 0
     return _run_health(arguments)
+
+
+def _run_pilot_credentials(
+    arguments: argparse.Namespace,
+    *,
+    stream: TextIO,
+    error_stream: TextIO,
+) -> int:
+    """Run the fixed local credential ceremony without rendering secret-derived data."""
+    command = getattr(arguments, "predictions_pilot_credentials_command", None)
+    if command not in {"check", "create"}:
+        return _render_credential_command_error("LOCAL_INVOCATION_INVALID", error_stream)
+    if command == "create" and getattr(arguments, "confirm", False) is not True:
+        return _render_credential_command_error("CONFIRMATION_REQUIRED", error_stream)
+    try:
+        store = MacOSKeychainSecretStore()
+    except Exception:
+        return _render_credential_command_error("KEYCHAIN_UNAVAILABLE", error_stream)
+    try:
+        if command == "check":
+            print(render_credential_readiness(check_credential_readiness(store)), file=stream)
+            return 0
+        result = create_credentials(store=store, confirmed=True)
+        if result.result != "CREATED" or not _CREDENTIAL_FINGERPRINT_PATTERN.fullmatch(
+            result.credential_fingerprint
+        ):
+            return _render_credential_command_error("CREDENTIAL_CREATE_FAILED", error_stream)
+        print("result=CREATED", file=stream)
+        print(f"credential_fingerprint={result.credential_fingerprint}", file=stream)
+        return 0
+    except CredentialCommandError as error:
+        return _render_credential_command_error(error.code, error_stream)
+    except Exception:
+        code = "KEYCHAIN_UNAVAILABLE" if command == "check" else "CREDENTIAL_CREATE_FAILED"
+        return _render_credential_command_error(code, error_stream)
+
+
+def _render_credential_command_error(code: str, error_stream: TextIO) -> int:
+    print(f"polytrading: credential command failed: {code}", file=error_stream)
+    return 64
 
 
 def _render_polymarket_conformance(
