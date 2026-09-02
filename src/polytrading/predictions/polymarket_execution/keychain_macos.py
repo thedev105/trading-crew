@@ -12,6 +12,14 @@ import sys
 from threading import RLock
 from typing import Final, Protocol
 
+from polytrading.predictions.polymarket_execution.secret_labels import (
+    ALLOWED_ACCOUNTS,
+    CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
+    CLOB_SERVICE,
+    WALLET_PRIVATE_KEY_ACCOUNT,
+)
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBuffer,
     SecretCreation,
@@ -19,19 +27,6 @@ from polytrading.predictions.polymarket_execution.secrets import (
 )
 
 # The exact labels this pilot may address. An unknown label is refused before any OS call.
-CLOB_SERVICE: Final = "polytrading.polymarket.pilot"
-WALLET_PRIVATE_KEY_ACCOUNT: Final = "wallet-private-key"
-CLOB_API_KEY_ACCOUNT: Final = "clob-api-key"
-CLOB_API_SECRET_ACCOUNT: Final = "clob-api-secret"
-CLOB_PASSPHRASE_ACCOUNT: Final = "clob-passphrase"
-ALLOWED_ACCOUNTS: Final = frozenset(
-    {
-        WALLET_PRIVATE_KEY_ACCOUNT,
-        CLOB_API_KEY_ACCOUNT,
-        CLOB_API_SECRET_ACCOUNT,
-        CLOB_PASSPHRASE_ACCOUNT,
-    }
-)
 MAXIMUM_ITEM_BYTES: Final = 4096
 _CREDENTIAL_ACCOUNTS: Final = frozenset(
     {CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT}
