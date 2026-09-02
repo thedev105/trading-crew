@@ -33,13 +33,6 @@ from polytrading.predictions.polymarket_execution.credentials import (
     CredentialProvisioningError,
     CredentialProvisioningGrant,
 )
-from polytrading.predictions.polymarket_execution.keychain_macos import (
-    CLOB_API_KEY_ACCOUNT,
-    CLOB_API_SECRET_ACCOUNT,
-    CLOB_PASSPHRASE_ACCOUNT,
-    CLOB_SERVICE,
-    WALLET_PRIVATE_KEY_ACCOUNT,
-)
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     AccountSignatureBinding,
@@ -47,6 +40,17 @@ from polytrading.predictions.polymarket_execution.protocol import (
     load_protocol_snapshot,
 )
 from polytrading.predictions.polymarket_execution.routes import CREDENTIAL_ROUTE_SET_HASH
+from polytrading.predictions.polymarket_execution.secret_labels import (
+    CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
+    CLOB_SERVICE,
+    WALLET_PRIVATE_KEY_ACCOUNT,
+)
+from polytrading.predictions.polymarket_execution.secret_store_factory import (
+    _credential_child_environment,
+    open_pilot_secret_store,
+)
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBoundaryError,
     SecretBuffer,
@@ -103,7 +107,6 @@ _CREDENTIAL_CHILD_BOOTSTRAP: Final = (
     "from polytrading.predictions.pilot.signer_bootstrap import _run_clean_credential_child;"
     "import sys;raise SystemExit(_run_clean_credential_child(int(sys.argv[1]),sys.argv[2]))"
 )
-_CREDENTIAL_CHILD_ENVIRONMENT: Final = {"PATH": "/usr/bin:/bin"}
 _CredentialCeremonyOperation = Literal["CREATE", "DERIVE"]
 
 
@@ -381,7 +384,7 @@ def _spawn_clean_credential_child(
             str(child_response_fd),
             operation,
         ),
-        _CREDENTIAL_CHILD_ENVIRONMENT,
+        _credential_child_environment(),
         file_actions=(
             (os.POSIX_SPAWN_CLOSE, read_fd),
             (os.POSIX_SPAWN_DUP2, write_fd, child_response_fd),
@@ -391,7 +394,7 @@ def _spawn_clean_credential_child(
 
 
 def _run_clean_credential_child(response_fd: int, operation: str) -> int:
-    """Construct the Keychain boundary only in the clean, exec'd process."""
+    """Construct the platform secret boundary only in the clean, exec'd process."""
     if operation not in {"CREATE", "DERIVE"}:
         _write_credential_result(
             response_fd, CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
@@ -399,11 +402,7 @@ def _run_clean_credential_child(response_fd: int, operation: str) -> int:
         _close(response_fd)
         return 1
     try:
-        from polytrading.predictions.polymarket_execution.keychain_macos import (
-            MacOSKeychainSecretStore,
-        )
-
-        store = MacOSKeychainSecretStore()
+        store = open_pilot_secret_store()
     except BaseException:
         _write_credential_result(
             response_fd, CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")

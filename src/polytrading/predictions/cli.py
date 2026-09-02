@@ -69,10 +69,12 @@ from polytrading.predictions.pilot.credential_commands import (
 from polytrading.predictions.pilot.runtime import serve_polymarket_pilot
 from polytrading.predictions.polymarket import PolymarketAdapter
 from polytrading.predictions.polymarket_execution.conformance import run_conformance
-from polytrading.predictions.polymarket_execution.keychain_macos import MacOSKeychainSecretStore
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PROTOCOL_VERSION,
     bundled_fixture_path,
+)
+from polytrading.predictions.polymarket_execution.secret_store_factory import (
+    open_pilot_secret_store,
 )
 from polytrading.predictions.proofs import compile_proof
 from polytrading.predictions.proofs_models import ProofArtifact
@@ -437,7 +439,7 @@ def _run_pilot_credentials(
         return _render_credential_command_error("CONFIRMATION_REQUIRED", error_stream)
     try:
         if command == "check":
-            store = MacOSKeychainSecretStore()
+            store = open_pilot_secret_store()
             print(render_credential_readiness(check_credential_readiness(store)), file=stream)
             return 0
         result = (

@@ -25,9 +25,7 @@ def test_factory_selects_linux_store_with_only_fixed_paths(
     )
 
     assert secret_store_factory.open_pilot_secret_store(platform="linux") is expected
-    assert observed == [
-        (Path("/run/credentials/test"), Path("/var/lib/polytrading/credentials"))
-    ]
+    assert observed == [(Path("/run/credentials/test"), Path("/var/lib/polytrading/credentials"))]
 
 
 @pytest.mark.parametrize("value", [None, "", "relative/credentials"])
@@ -59,3 +57,15 @@ def test_keychain_reexports_the_canonical_fixed_labels() -> None:
     assert keychain_macos.CLOB_API_SECRET_ACCOUNT == secret_labels.CLOB_API_SECRET_ACCOUNT
     assert keychain_macos.CLOB_PASSPHRASE_ACCOUNT == secret_labels.CLOB_PASSPHRASE_ACCOUNT
     assert keychain_macos.ALLOWED_ACCOUNTS is secret_labels.ALLOWED_ACCOUNTS
+
+
+def test_linux_clean_child_environment_carries_only_path_and_credential_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", "/run/credentials/test")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "must-not-propagate")
+
+    assert secret_store_factory._credential_child_environment(platform="linux") == {
+        "PATH": "/usr/bin:/bin",
+        "CREDENTIALS_DIRECTORY": "/run/credentials/test",
+    }

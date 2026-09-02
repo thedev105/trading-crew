@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Final, Literal
 
 from polytrading.predictions.polymarket_execution.credentials import CredentialFingerprint
-from polytrading.predictions.polymarket_execution.keychain_macos import (
+from polytrading.predictions.polymarket_execution.secret_labels import (
     CLOB_API_KEY_ACCOUNT,
     CLOB_API_SECRET_ACCOUNT,
     CLOB_PASSPHRASE_ACCOUNT,

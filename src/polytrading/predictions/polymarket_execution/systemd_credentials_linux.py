@@ -210,9 +210,7 @@ class SystemdCredentialSecretStore:
         self._require_label(service, account)
         raise SecretStoreError("SECRET_WRITE_FAILED") from None
 
-    def create_protected(
-        self, service: str, account: str, value: SecretBuffer
-    ) -> SecretCreation:
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> SecretCreation:
         self._require_clob_label(service, account)
         if (
             type(value) is not SecretBuffer
@@ -388,9 +386,7 @@ def _write_all(descriptor: int, value: bytearray) -> None:
         view.release()
 
 
-def _unlink_if_identity(
-    directory_fd: int, name: str, identity: tuple[int, int]
-) -> None:
+def _unlink_if_identity(directory_fd: int, name: str, identity: tuple[int, int]) -> None:
     try:
         status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if (status.st_dev, status.st_ino) == identity:

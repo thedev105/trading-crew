@@ -76,12 +76,12 @@ from polytrading.predictions.pilot.signer_link import (
 from polytrading.predictions.pilot.signer_services import live_pilot_signer_service
 from polytrading.predictions.pilot.verifier import PilotCapabilityVerifier
 from polytrading.predictions.polymarket_execution.ipc import SignerCapabilityProof
-from polytrading.predictions.polymarket_execution.keychain_macos import (
-    MacOSKeychainSecretStore,
-)
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     verify_protocol_sources,
+)
+from polytrading.predictions.polymarket_execution.secret_store_factory import (
+    open_pilot_secret_store,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretStoreError
 from polytrading.predictions.storage.store import PredictionMarketStore
@@ -190,7 +190,7 @@ def build_pilot_runtime(
     database_path: Path,
     port: int,
     *,
-    platform: str = "darwin",
+    platform: str = sys.platform,
     now: Callable[[], datetime] | None = None,
     environment: PilotEnvironment | None = None,
     passkeys: PasskeyService | None = None,
@@ -275,7 +275,7 @@ def build_launch_runtime(
     database_path: Path,
     port: int,
     *,
-    platform: str = "darwin",
+    platform: str = sys.platform,
     bootstrap: Callable[[SignerServiceFactory], SignerChannel] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> PilotRuntime:
@@ -413,7 +413,7 @@ def _bootstrap_signer(
     platform: str,
 ) -> Callable[[SignerServiceFactory], SignerChannel]:
     return lambda service_factory: launch_signer_sidecar(
-        store=MacOSKeychainSecretStore(platform=platform),
+        store=open_pilot_secret_store(platform=platform),
         service_factory=service_factory,
     )
 
@@ -488,26 +488,13 @@ def _mutation_evidence_for(
 def _secret_store_available(platform: str) -> bool:
     """Probe the secret-store boundary without reading, unlocking, or creating any item."""
     try:
-        MacOSKeychainSecretStore(library=_UnavailableKeychainLibrary(), platform=platform)
+        store = open_pilot_secret_store(platform=platform)
     except SecretStoreError:
         return False
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
     return True
-
-
-class _UnavailableKeychainLibrary:
-    """A construction-time placeholder: startup proves the platform, never touches an item."""
-
-    def find_generic_password(self, service: bytes, account: bytes) -> tuple[int, bytes]:
-        raise SecretStoreError("SECRET_STORE_UNAVAILABLE")
-
-    def add_generic_password(self, service: bytes, account: bytes, value: bytes) -> int:
-        raise SecretStoreError("SECRET_STORE_UNAVAILABLE")
-
-    def update_generic_password(self, service: bytes, account: bytes, value: bytes) -> int:
-        raise SecretStoreError("SECRET_STORE_UNAVAILABLE")
-
-    def delete_generic_password(self, service: bytes, account: bytes) -> int:
-        raise SecretStoreError("SECRET_STORE_UNAVAILABLE")
 
 
 def _handler_for(application: PilotApplication) -> type[BaseHTTPRequestHandler]:
@@ -573,7 +560,7 @@ def _parse_cookies(header: str | None) -> dict[str, tuple[str, ...]]:
     return {name: tuple(values) for name, values in cookies.items()}
 
 
-def serve_polymarket_pilot(database_path: Path, port: int, *, platform: str = "darwin") -> None:
+def serve_polymarket_pilot(database_path: Path, port: int, *, platform: str = sys.platform) -> None:
     """Serve the pilot on loopback only, refusing to start if any launch gate fails."""
 
     runtime = build_launch_runtime(database_path, port, platform=platform)

@@ -13,6 +13,7 @@ from uuid import UUID
 
 import pytest
 
+import polytrading.predictions.pilot.runtime as runtime_module
 from polytrading.predictions.cli import add_predictions_subcommands
 from polytrading.predictions.execution.models import ExecutionIntent, ExecutionOperation
 from polytrading.predictions.pilot.capabilities import PilotCapabilityIssuer
@@ -62,6 +63,7 @@ from polytrading.predictions.polymarket_execution.routes import (
     RouteKey,
     TradesReadPayload,
 )
+from polytrading.predictions.polymarket_execution.secrets import SecretStoreError
 from polytrading.predictions.storage.store import PredictionMarketStore
 from tests.predictions.execution_helpers import execution_intent_fields
 from tests.predictions.pilot_helpers import signer_capability_grant
@@ -79,6 +81,16 @@ def database(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def reviewed_darwin_secret_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    def open_store(*, platform: str) -> object:
+        if platform == "darwin":
+            return object()
+        raise SecretStoreError("SECRET_STORE_UNAVAILABLE")
+
+    monkeypatch.setattr(runtime_module, "open_pilot_secret_store", open_store)
+
+
 def test_a_missing_database_never_starts_a_server(tmp_path: Path) -> None:
     with pytest.raises(PilotRuntimeError) as raised:
         build_pilot_runtime(tmp_path / "absent.duckdb", PORT)
@@ -87,8 +99,28 @@ def test_a_missing_database_never_starts_a_server(tmp_path: Path) -> None:
 
 def test_an_unsupported_platform_fails_closed(database: Path) -> None:
     with pytest.raises(PilotRuntimeError) as raised:
-        build_pilot_runtime(database, PORT, platform="linux")
+        build_pilot_runtime(database, PORT, platform="freebsd")
     assert raised.value.code == "PILOT_SECRET_STORE_UNAVAILABLE"
+
+
+def test_linux_runtime_uses_the_platform_factory_and_remains_killed(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[str] = []
+    store = object()
+    monkeypatch.setattr(
+        runtime_module,
+        "open_pilot_secret_store",
+        lambda *, platform: observed.append(platform) or store,
+    )
+
+    built = build_pilot_runtime(database, PORT, platform="linux")
+    try:
+        assert built.posture.kill_engaged is True
+        assert built.posture.secret_store_available is True
+        assert observed == ["linux"]
+    finally:
+        built.close()
 
 
 @pytest.mark.parametrize("port", [0, -1, 70000])
@@ -106,12 +138,12 @@ def test_a_stale_schema_fails_closed(tmp_path: Path) -> None:
         connection.execute("CREATE TABLE prediction_raw_envelopes (event_id VARCHAR)")
 
     with pytest.raises(PilotRuntimeError) as raised:
-        build_pilot_runtime(path, PORT)
+        build_pilot_runtime(path, PORT, platform="darwin")
     assert raised.value.code == "PILOT_DATABASE_SCHEMA_STALE"
 
 
 def test_a_launched_pilot_starts_killed_on_the_reviewed_checkpoint(database: Path) -> None:
-    runtime = build_pilot_runtime(database, PORT)
+    runtime = build_pilot_runtime(database, PORT, platform="darwin")
     try:
         assert runtime.posture == PilotPosture(
             kill_engaged=True,
@@ -126,7 +158,7 @@ def test_a_launched_pilot_starts_killed_on_the_reviewed_checkpoint(database: Pat
 
 
 def test_the_runtime_opens_its_database_read_only(database: Path) -> None:
-    runtime = build_pilot_runtime(database, PORT)
+    runtime = build_pilot_runtime(database, PORT, platform="darwin")
     try:
         assert runtime.store._read_only is True
     finally:
@@ -139,7 +171,7 @@ def test_launch_falls_back_to_posture_only_when_signer_bootstrap_fails(
     def unavailable(_service_factory: SignerServiceFactory) -> object:
         raise SignerBootstrapError("SECRET_ITEM_MISSING")
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=unavailable)  # type: ignore[arg-type]
+    runtime = build_launch_runtime(database, PORT, platform="darwin", bootstrap=unavailable)  # type: ignore[arg-type]
     try:
         assert isinstance(runtime.application._services, KilledPilotServices)
         diagnostics = capsys.readouterr().err
@@ -155,7 +187,9 @@ def test_launch_composes_live_services_when_the_signer_bootstraps(
     del monkeypatch
     channel, bootstrap = live_launch_bootstrap()
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         assert isinstance(runtime.application._services, LivePilotServices)
         readiness = runtime.application._services.readiness()
@@ -173,7 +207,9 @@ def test_operator_stop_sends_signer_kill_and_parent_kill_survives_link_failure(
     channel, bootstrap = live_launch_bootstrap(
         fail_operation=ExecutionOperation.SIGNER_KILL,
     )
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         services = runtime.application.services
         assert isinstance(services, LivePilotServices)
@@ -191,7 +227,9 @@ def test_operator_stop_sends_signer_kill_and_parent_kill_survives_link_failure(
 
 def test_terminal_presence_sends_signer_kill_before_returning(database: Path) -> None:
     channel, bootstrap = live_launch_bootstrap()
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         services = runtime.application.services
         assert isinstance(services, LivePilotServices)
@@ -366,7 +404,9 @@ def live_launch_bootstrap(
 def test_launch_composes_live_session_from_signer_account_state(database: Path) -> None:
     channel, bootstrap = live_launch_bootstrap()
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         services = runtime.application.services
         assert isinstance(services, LivePilotServices)
@@ -402,7 +442,9 @@ def test_launch_wires_geoblock_evidence_into_mutation_evidence_without_trading(
     database: Path,
 ) -> None:
     channel, bootstrap = live_launch_bootstrap()
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         services = runtime.application.services
         assert isinstance(services, LivePilotServices)
@@ -477,7 +519,9 @@ def test_launch_wires_geoblock_evidence_into_mutation_evidence_without_trading(
 def test_launch_remains_killed_when_reconciliation_is_not_complete(database: Path) -> None:
     _channel, bootstrap = live_launch_bootstrap(ambiguous=True)
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         services = runtime.application.services
         assert isinstance(services, LivePilotServices)
@@ -503,7 +547,9 @@ def test_reconciliation_exception_closes_the_writer_before_posture_fallback(
         fail_composition,
     )
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         assert isinstance(runtime.application.services, KilledPilotServices)
         assert runtime.store._read_only is True
@@ -532,7 +578,9 @@ def test_signer_read_exception_serves_only_killed_posture(
         fail_operation=ExecutionOperation.READ_ORDERS,
     )
 
-    runtime = build_launch_runtime(database, PORT, bootstrap=bootstrap, now=lambda: NOW)
+    runtime = build_launch_runtime(
+        database, PORT, platform="darwin", bootstrap=bootstrap, now=lambda: NOW
+    )
     try:
         assert isinstance(runtime.application.services, KilledPilotServices)
         assert runtime.store._read_only is True
@@ -590,7 +638,7 @@ def test_every_mutating_route_refuses_while_killed(route: str) -> None:
 
 
 def test_a_killed_pilot_still_answers_reads_over_the_control_plane(database: Path) -> None:
-    runtime = build_pilot_runtime(database, PORT)
+    runtime = build_pilot_runtime(database, PORT, platform="darwin")
     try:
         application = runtime.application
         opened = application.respond(

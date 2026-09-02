@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from hashlib import sha256
 from multiprocessing import get_context
@@ -8,6 +10,7 @@ from typing import Any
 
 import pytest
 
+import polytrading.predictions.pilot.signer_bootstrap as signer_bootstrap
 from polytrading.predictions.pilot.signer_bootstrap import (
     SECRET_ACCOUNTS,
     UNLOCK_PROMPT,
@@ -145,6 +148,43 @@ def test_one_shot_credential_child_runs_only_create_and_returns_public_fingerpri
     assert not hasattr(result, "api_key")
     assert not hasattr(result, "api_secret")
     assert not hasattr(result, "passphrase")
+
+
+def test_linux_clean_credential_child_uses_the_platform_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = wallet_only_memory()
+    observed: list[tuple[object, str]] = []
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(signer_bootstrap, "open_pilot_secret_store", lambda: memory)
+
+    def run_child(**arguments: object) -> None:
+        observed.append((arguments["store"], str(arguments["operation"])))
+        os.close(int(arguments["response_fd"]))
+
+    monkeypatch.setattr(signer_bootstrap, "_run_credential_child", run_child)
+    try:
+        assert signer_bootstrap._run_clean_credential_child(write_fd, "DERIVE") == 0
+    finally:
+        os.close(read_fd)
+
+    assert observed == [(memory, "DERIVE")]
+
+
+def test_clean_credential_child_import_graph_excludes_the_macos_adapter() -> None:
+    script = (
+        "import sys; import polytrading.predictions.pilot.signer_bootstrap; "
+        "raise SystemExit("
+        "'polytrading.predictions.polymarket_execution.keychain_macos' in sys.modules)"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
 
 
 def test_one_shot_credential_child_runs_only_derive_and_returns_public_fingerprints() -> None:

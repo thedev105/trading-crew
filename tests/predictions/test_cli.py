@@ -21,6 +21,9 @@ from polytrading.predictions.pilot.credential_commands import (
     CredentialReadiness,
 )
 from polytrading.predictions.polymarket_execution.credentials import CredentialFingerprint
+from polytrading.predictions.polymarket_execution.secret_store_factory import (
+    open_pilot_secret_store,
+)
 from polytrading.predictions.risk import PredictionRiskPolicy
 from polytrading.predictions.shadow_models import ShadowState
 from polytrading.predictions.storage.store import ConflictingRecordError, PredictionMarketStore
@@ -130,7 +133,7 @@ def test_pilot_credentials_create_rejects_abbreviated_confirmation_flag(
 ) -> None:
     monkeypatch.setattr(
         predictions_cli,
-        "MacOSKeychainSecretStore",
+        "open_pilot_secret_store",
         lambda: pytest.fail("abbreviated confirmation reached the Keychain boundary"),
     )
     assert main(["predictions", "pilot", "credentials", "create", "--conf"]) == 64
@@ -139,11 +142,11 @@ def test_pilot_credentials_create_rejects_abbreviated_confirmation_flag(
     )
 
 
-def test_pilot_credentials_check_uses_cli_keychain_boundary_and_renders_only_status(
+def test_pilot_credentials_check_uses_platform_store_boundary_and_renders_only_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = object()
-    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", lambda: store)
+    monkeypatch.setattr(predictions_cli, "open_pilot_secret_store", lambda: store)
     monkeypatch.setattr(
         predictions_cli,
         "check_credential_readiness",
@@ -170,7 +173,7 @@ def test_pilot_credentials_create_renders_only_stable_result_and_fingerprint(
     fingerprint = "a" * 64
     monkeypatch.setattr(
         predictions_cli,
-        "MacOSKeychainSecretStore",
+        "open_pilot_secret_store",
         lambda: pytest.fail("create constructed the Keychain adapter in the command parent"),
     )
     monkeypatch.setattr(
@@ -202,7 +205,7 @@ def test_pilot_credentials_derive_renders_only_stable_result_and_fingerprint(
     fingerprint = "a" * 64
     monkeypatch.setattr(
         predictions_cli,
-        "MacOSKeychainSecretStore",
+        "open_pilot_secret_store",
         lambda: pytest.fail("derive constructed the Keychain adapter in the command parent"),
     )
     monkeypatch.setattr(
@@ -238,7 +241,7 @@ def test_pilot_credentials_error_boundary_never_renders_sensitive_values(
     )
     monkeypatch.setattr(
         predictions_cli,
-        "MacOSKeychainSecretStore",
+        "open_pilot_secret_store",
         lambda: (_ for _ in ()).throw(RuntimeError(canary)),
     )
     arguments = build_parser().parse_args(["predictions", "pilot", "credentials", "check"])
@@ -263,10 +266,30 @@ def test_pilot_credentials_error_boundary_never_renders_sensitive_values(
         assert forbidden not in captured
 
 
+def test_linux_credential_check_without_systemd_directory_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+    monkeypatch.setattr(
+        predictions_cli,
+        "open_pilot_secret_store",
+        lambda: open_pilot_secret_store(platform="linux"),
+    )
+    arguments = build_parser().parse_args(["predictions", "pilot", "credentials", "check"])
+    output = StringIO()
+    errors = StringIO()
+
+    assert (
+        predictions_cli._run_pilot_credentials(arguments, stream=output, error_stream=errors) == 64
+    )
+    assert output.getvalue() == ""
+    assert errors.getvalue() == ("polytrading: credential command failed: KEYCHAIN_UNAVAILABLE\n")
+
+
 def test_pilot_credentials_renders_public_command_codes_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(predictions_cli, "MacOSKeychainSecretStore", object)
+    monkeypatch.setattr(predictions_cli, "open_pilot_secret_store", object)
     monkeypatch.setattr(
         predictions_cli,
         "check_credential_readiness",

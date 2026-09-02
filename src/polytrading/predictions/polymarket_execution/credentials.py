@@ -13,15 +13,15 @@ from hashlib import sha256
 from typing import Literal, Protocol
 from uuid import UUID
 
-from polytrading.predictions.polymarket_execution.keychain_macos import (
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    AccountSignatureBinding,
+)
+from polytrading.predictions.polymarket_execution.secret_labels import (
     CLOB_API_KEY_ACCOUNT,
     CLOB_API_SECRET_ACCOUNT,
     CLOB_PASSPHRASE_ACCOUNT,
     CLOB_SERVICE,
-)
-from polytrading.predictions.polymarket_execution.protocol import (
-    POLYMARKET_PILOT_PROTOCOL_VERSION,
-    AccountSignatureBinding,
 )
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBuffer,

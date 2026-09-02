@@ -263,9 +263,7 @@ class MacOSKeychainSecretStore:
             self._raise_for_status(status)
             self._discard_creations(service, account)
 
-    def create_protected(
-        self, service: str, account: str, value: SecretBuffer
-    ) -> SecretCreation:
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> SecretCreation:
         """Add one absent reviewed slot without updating an existing credential."""
         if service != CLOB_SERVICE or account not in _CREDENTIAL_ACCOUNTS:
             raise SecretStoreError("SECRET_LABEL_INVALID") from None

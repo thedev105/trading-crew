@@ -14,15 +14,15 @@ from typing import Any, Final, Literal
 import httpx
 
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError, sign_clob_auth
-from polytrading.predictions.polymarket_execution.keychain_macos import (
-    CLOB_API_KEY_ACCOUNT,
-    CLOB_API_SECRET_ACCOUNT,
-    CLOB_PASSPHRASE_ACCOUNT,
-)
 from polytrading.predictions.polymarket_execution.protocol import (
     POLYMARKET_PILOT_PROTOCOL_VERSION,
     AccountSignatureBinding,
     load_protocol_snapshot,
+)
+from polytrading.predictions.polymarket_execution.secret_labels import (
+    CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretBuffer
 
