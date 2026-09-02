@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
+from threading import RLock
 from typing import Final, Literal, Protocol
 
 _DESCRIPTOR_HEADER_BYTES: Final = 4
@@ -13,6 +15,20 @@ _REDACTED: Final = "<redacted>"
 
 class SecretBoundaryError(ValueError):
     """A context-free secret-boundary rejection identified by a stable code."""
+
+
+@dataclass(frozen=True, slots=True)
+class SecretCreation:
+    """Opaque proof that this store instance created one add-only secret slot."""
+
+    service: str
+    account: str
+    token: object
+
+    def __repr__(self) -> str:
+        return "SecretCreation(<redacted>)"
+
+    __str__ = __repr__
 
 
 def _zeroize(value: bytearray) -> None:
@@ -119,6 +135,8 @@ SecretStoreCode = Literal[
     "SECRET_VALUE_INVALID",
     "SECRET_WRITE_FAILED",
     "SECRET_BUFFER_CLOSED",
+    "SECRET_ITEM_EXISTS",
+    "SECRET_OWNERSHIP_LOST",
 ]
 
 
@@ -221,6 +239,16 @@ class SecretStore(Protocol):
     def write_protected(self, service: str, account: str, value: SecretBuffer) -> None:
         raise SecretStoreError("ABSTRACT_SECRET_STORE")
 
+    def create_protected(
+        self, service: str, account: str, value: SecretBuffer
+    ) -> SecretCreation:
+        """Atomically create an absent slot and return proof of its ownership."""
+        raise SecretStoreError("ABSTRACT_SECRET_STORE")
+
+    def delete_created(self, creation: SecretCreation) -> None:
+        """Delete only the exact slot this store instance created for this ceremony."""
+        raise SecretStoreError("ABSTRACT_SECRET_STORE")
+
     def delete(self, service: str, account: str) -> None:
         raise SecretStoreError("ABSTRACT_SECRET_STORE")
 
@@ -232,11 +260,13 @@ class InMemorySecretStore:
     so no test can reach a real operating-system keychain.
     """
 
-    __slots__ = ("_denied", "_items")
+    __slots__ = ("_creations", "_denied", "_items", "_lock")
 
     def __init__(self, *, denied: frozenset[tuple[str, str]] = frozenset()) -> None:
         self._items: dict[tuple[str, str], SecretBuffer] = {}
+        self._creations: dict[tuple[str, str], object] = {}
         self._denied = denied
+        self._lock = RLock()
 
     def _key(self, service: str, account: str) -> tuple[str, str]:
         if (
@@ -261,20 +291,53 @@ class InMemorySecretStore:
         key = self._key(service, account)
         if type(value) is not SecretBuffer or value.closed:
             raise SecretStoreError("SECRET_VALUE_INVALID") from None
-        previous = self._items.get(key)
-        self._items[key] = value.copy()
-        if previous is not None:
-            previous.close()
+        with self._lock:
+            previous = self._items.get(key)
+            self._items[key] = value.copy()
+            self._creations.pop(key, None)
+            if previous is not None:
+                previous.close()
+
+    def create_protected(
+        self, service: str, account: str, value: SecretBuffer
+    ) -> SecretCreation:
+        key = self._key(service, account)
+        if type(value) is not SecretBuffer or value.closed:
+            raise SecretStoreError("SECRET_VALUE_INVALID") from None
+        with self._lock:
+            if key in self._items:
+                raise SecretStoreError("SECRET_ITEM_EXISTS") from None
+            token = object()
+            self._items[key] = value.copy()
+            self._creations[key] = token
+            return SecretCreation(service=service, account=account, token=token)
+
+    def delete_created(self, creation: SecretCreation) -> None:
+        if type(creation) is not SecretCreation:
+            raise SecretStoreError("SECRET_OWNERSHIP_LOST") from None
+        key = self._key(creation.service, creation.account)
+        with self._lock:
+            if self._creations.get(key) is not creation.token:
+                raise SecretStoreError("SECRET_OWNERSHIP_LOST") from None
+            stored = self._items.pop(key, None)
+            self._creations.pop(key, None)
+            if stored is not None:
+                stored.close()
 
     def delete(self, service: str, account: str) -> None:
-        stored = self._items.pop(self._key(service, account), None)
-        if stored is not None:
-            stored.close()
+        key = self._key(service, account)
+        with self._lock:
+            stored = self._items.pop(key, None)
+            self._creations.pop(key, None)
+            if stored is not None:
+                stored.close()
 
     def close(self) -> None:
-        for stored in self._items.values():
-            stored.close()
-        self._items.clear()
+        with self._lock:
+            for stored in self._items.values():
+                stored.close()
+            self._items.clear()
+            self._creations.clear()
 
 
 def redact_sensitive(value: object) -> str:

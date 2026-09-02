@@ -25,6 +25,7 @@ from polytrading.predictions.polymarket_execution.protocol import (
 )
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBuffer,
+    SecretCreation,
     SecretStore,
     SecretStoreError,
 )
@@ -50,6 +51,7 @@ CredentialProvisioningCode = Literal[
     "GRANT_IS_NOT_A_CREDENTIAL_GRANT",
     "CREDENTIAL_RESPONSE_INVALID",
     "CREDENTIAL_STORE_FAILED",
+    "CREDENTIAL_ROLLBACK_FAILED",
 ]
 
 
@@ -193,17 +195,21 @@ class CredentialProvisioner:
     def _store_atomically(self, returned: dict[str, SecretBuffer]) -> None:
         """Write all three fields or none: a partial credential is worse than no credential."""
         self._require_empty_store()
-        written: list[str] = []
+        created: list[SecretCreation] = []
         try:
             for account in _CREDENTIAL_ACCOUNTS:
-                self._store.write_protected(self._service, account, returned[account])
-                written.append(account)
+                created.append(
+                    self._store.create_protected(self._service, account, returned[account])
+                )
         except (SecretStoreError, OSError) as error:
-            for account in written:
+            rollback_failed = False
+            for creation in created:
                 try:
-                    self._store.delete(self._service, account)
+                    self._store.delete_created(creation)
                 except SecretStoreError:
-                    continue
+                    rollback_failed = True
+            if rollback_failed:
+                raise CredentialProvisioningError("CREDENTIAL_ROLLBACK_FAILED") from error
             raise CredentialProvisioningError("CREDENTIAL_STORE_FAILED") from error
 
     def _require_empty_store(self) -> None:

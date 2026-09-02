@@ -30,6 +30,7 @@ class FakeKeychainLibrary:
 
     def __init__(self, *, status: int | None = None, oversize: bool = False) -> None:
         self.items: dict[tuple[bytes, bytes], bytes] = {}
+        self.created_items: dict[object, tuple[tuple[bytes, bytes], bytes]] = {}
         self.status = status
         self.oversize = oversize
         self.calls: list[str] = []
@@ -52,6 +53,16 @@ class FakeKeychainLibrary:
         self.items[(service, account)] = value
         return 0
 
+    def add_generic_password_item(
+        self, service: bytes, account: bytes, value: bytes
+    ) -> tuple[int, object | None]:
+        status = self.add_generic_password(service, account, value)
+        if status != 0:
+            return status, None
+        item = object()
+        self.created_items[item] = ((service, account), value)
+        return 0, item
+
     def update_generic_password(self, service: bytes, account: bytes, value: bytes) -> int:
         self.calls.append("update")
         if self.status is not None:
@@ -64,6 +75,16 @@ class FakeKeychainLibrary:
         if self.status is not None:
             return self.status
         return 0 if self.items.pop((service, account), None) is not None else ITEM_NOT_FOUND
+
+    def delete_created_generic_password(self, item: object) -> int:
+        created = self.created_items.pop(item, None)
+        if created is None:
+            return ITEM_NOT_FOUND
+        key, value = created
+        if self.items.get(key) != value:
+            return ITEM_NOT_FOUND
+        self.items.pop(key)
+        return 0
 
 
 def store(**overrides: object) -> MacOSKeychainSecretStore:
@@ -117,6 +138,41 @@ def test_writing_twice_updates_rather_than_duplicating() -> None:
         )
         == b"two"
     )
+
+
+def test_credential_creation_is_add_only_and_refuses_the_wallet_slot() -> None:
+    keychain = store()
+    first = SecretBuffer.from_bytes(b"first")
+    second = SecretBuffer.from_bytes(b"second")
+    try:
+        creation = keychain.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, first)
+        with pytest.raises(SecretStoreError) as duplicate:
+            keychain.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, second)
+        with pytest.raises(SecretStoreError) as wallet:
+            keychain.create_protected(CLOB_SERVICE, WALLET_PRIVATE_KEY_ACCOUNT, second)
+    finally:
+        first.close()
+        second.close()
+
+    assert duplicate.value.code == "SECRET_ITEM_EXISTS"
+    assert wallet.value.code == "SECRET_LABEL_INVALID"
+    keychain.delete_created(creation)
+
+
+def test_credential_rollback_ticket_cannot_delete_a_replaced_keychain_item() -> None:
+    library = FakeKeychainLibrary()
+    keychain = store(library=library)
+    created = SecretBuffer.from_bytes(b"created")
+    try:
+        creation = keychain.create_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, created)
+        library.items[(CLOB_SERVICE.encode(), CLOB_API_KEY_ACCOUNT.encode())] = b"replacement"
+        keychain.delete_created(creation)
+    finally:
+        created.close()
+
+    retained = keychain.read_required(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, "unlock")
+    assert retained.use(bytes) == b"replacement"
+    retained.close()
 
 
 @pytest.mark.parametrize(

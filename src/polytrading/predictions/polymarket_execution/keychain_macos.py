@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import binascii
 import sys
+from threading import RLock
 from typing import Final, Protocol
 
 from polytrading.predictions.polymarket_execution.secrets import (
     SecretBuffer,
+    SecretCreation,
     SecretStoreError,
 )
 
@@ -31,6 +33,9 @@ ALLOWED_ACCOUNTS: Final = frozenset(
     }
 )
 MAXIMUM_ITEM_BYTES: Final = 4096
+_CREDENTIAL_ACCOUNTS: Final = frozenset(
+    {CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT}
+)
 
 # Security framework OSStatus values this adapter translates.
 _ERR_SEC_SUCCESS: Final = 0
@@ -51,9 +56,15 @@ class KeychainLibrary(Protocol):
 
     def add_generic_password(self, service: bytes, account: bytes, value: bytes) -> int: ...
 
+    def add_generic_password_item(
+        self, service: bytes, account: bytes, value: bytes
+    ) -> tuple[int, object | None]: ...
+
     def update_generic_password(self, service: bytes, account: bytes, value: bytes) -> int: ...
 
     def delete_generic_password(self, service: bytes, account: bytes) -> int: ...
+
+    def delete_created_generic_password(self, item: object) -> int: ...
 
 
 class CtypesKeychainLibrary:
@@ -99,9 +110,18 @@ class CtypesKeychainLibrary:
         return status, value
 
     def add_generic_password(self, service: bytes, account: bytes, value: bytes) -> int:
+        status, item = self.add_generic_password_item(service, account, value)
+        if item is not None:
+            self._security.CFRelease(item)
+        return status
+
+    def add_generic_password_item(
+        self, service: bytes, account: bytes, value: bytes
+    ) -> tuple[int, object | None]:
         import ctypes
 
-        return int(
+        item = ctypes.c_void_p()
+        status = int(
             self._security.SecKeychainAddGenericPassword(
                 None,
                 ctypes.c_uint32(len(service)),
@@ -110,9 +130,10 @@ class CtypesKeychainLibrary:
                 account,
                 ctypes.c_uint32(len(value)),
                 value,
-                None,
+                ctypes.byref(item),
             )
         )
+        return status, item if status == _ERR_SEC_SUCCESS else None
 
     def update_generic_password(self, service: bytes, account: bytes, value: bytes) -> int:
         import ctypes
@@ -164,11 +185,21 @@ class CtypesKeychainLibrary:
         finally:
             self._security.CFRelease(item)
 
+    def delete_created_generic_password(self, item: object) -> int:
+        import ctypes
+
+        if type(item) is not ctypes.c_void_p:
+            return -50
+        try:
+            return int(self._security.SecKeychainItemDelete(item))
+        finally:
+            self._security.CFRelease(item)
+
 
 class MacOSKeychainSecretStore:
     """The pilot's operating-system secret boundary on macOS."""
 
-    __slots__ = ("_library", "_service")
+    __slots__ = ("_creations", "_library", "_lock", "_service")
 
     def __init__(
         self,
@@ -184,6 +215,8 @@ class MacOSKeychainSecretStore:
             raise SecretStoreError("SECRET_LABEL_INVALID") from None
         self._service = service
         self._library = library if library is not None else CtypesKeychainLibrary()
+        self._creations: dict[SecretCreation, object] = {}
+        self._lock = RLock()
 
     def _labels(self, service: str, account: str) -> tuple[bytes, bytes]:
         if service != self._service or account not in ALLOWED_ACCOUNTS:
@@ -228,17 +261,68 @@ class MacOSKeychainSecretStore:
                 status = self._library.update_generic_password(service_bytes, account_bytes, raw)
             return status
 
-        status = int(value.use(_store))  # type: ignore[arg-type]
-        if status == _ERR_SEC_ITEM_NOT_FOUND:
-            raise SecretStoreError("SECRET_WRITE_FAILED") from None
-        self._raise_for_status(status)
+        with self._lock:
+            status = int(value.use(_store))  # type: ignore[arg-type]
+            if status == _ERR_SEC_ITEM_NOT_FOUND:
+                raise SecretStoreError("SECRET_WRITE_FAILED") from None
+            self._raise_for_status(status)
+            self._discard_creations(service, account)
+
+    def create_protected(
+        self, service: str, account: str, value: SecretBuffer
+    ) -> SecretCreation:
+        """Add one absent reviewed slot without updating an existing credential."""
+        if service != CLOB_SERVICE or account not in _CREDENTIAL_ACCOUNTS:
+            raise SecretStoreError("SECRET_LABEL_INVALID") from None
+        service_bytes, account_bytes = self._labels(service, account)
+        if type(value) is not SecretBuffer or value.closed or len(value) > MAXIMUM_ITEM_BYTES:
+            raise SecretStoreError("SECRET_VALUE_INVALID") from None
+
+        def _create(view: memoryview) -> tuple[int, object | None]:
+            return self._library.add_generic_password_item(
+                service_bytes, account_bytes, bytes(view)
+            )
+
+        with self._lock:
+            status, item = value.use(_create)  # type: ignore[misc]
+            if status == _ERR_SEC_DUPLICATE_ITEM:
+                raise SecretStoreError("SECRET_ITEM_EXISTS") from None
+            self._raise_for_status(status)
+            if item is None:
+                raise SecretStoreError("SECRET_STORE_UNAVAILABLE") from None
+            creation = SecretCreation(service=service, account=account, token=object())
+            self._creations[creation] = item
+            return creation
+
+    def delete_created(self, creation: SecretCreation) -> None:
+        """Rollback only a credential slot created by this store instance."""
+        if type(creation) is not SecretCreation:
+            raise SecretStoreError("SECRET_OWNERSHIP_LOST") from None
+        with self._lock:
+            item = self._creations.get(creation)
+            if item is None:
+                raise SecretStoreError("SECRET_OWNERSHIP_LOST") from None
+            status = self._library.delete_created_generic_password(item)
+            if status == _ERR_SEC_ITEM_NOT_FOUND:
+                self._creations.pop(creation, None)
+                return
+            self._raise_for_status(status)
+            self._creations.pop(creation, None)
 
     def delete(self, service: str, account: str) -> None:
         service_bytes, account_bytes = self._labels(service, account)
-        status = self._library.delete_generic_password(service_bytes, account_bytes)
-        if status == _ERR_SEC_ITEM_NOT_FOUND:
-            return
-        self._raise_for_status(status)
+        with self._lock:
+            status = self._library.delete_generic_password(service_bytes, account_bytes)
+            if status == _ERR_SEC_ITEM_NOT_FOUND:
+                self._discard_creations(service, account)
+                return
+            self._raise_for_status(status)
+            self._discard_creations(service, account)
+
+    def _discard_creations(self, service: str, account: str) -> None:
+        for creation in tuple(self._creations):
+            if creation.service == service and creation.account == account:
+                self._creations.pop(creation, None)
 
 
 def _normalize_wallet_private_key(value: bytes) -> bytes:

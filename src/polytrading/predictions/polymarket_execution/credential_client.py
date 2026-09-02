@@ -86,7 +86,7 @@ class HttpxCredentialClient:
             raise CredentialTransportError("CREDENTIAL_PROTOCOL_MISMATCH")
         timestamp = self._timestamp()
         try:
-            signature = sign_clob_auth(bytes(self._private_key), timestamp, self._snapshot)
+            signature = sign_clob_auth(self._private_key, timestamp, self._snapshot)
         except ClobAuthError as error:
             raise CredentialTransportError("CREDENTIAL_SIGNING_FAILED") from error
         headers = {

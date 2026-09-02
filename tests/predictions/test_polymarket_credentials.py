@@ -99,10 +99,36 @@ class RefusingStore(InMemorySecretStore):
         super().__init__()
         self.failing_account = failing_account
 
-    def write_protected(self, service: str, account: str, value: SecretBuffer) -> None:
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
         if account == self.failing_account:
             raise SecretStoreError("SECRET_WRITE_FAILED")
-        super().write_protected(service, account, value)
+        return super().create_protected(service, account, value)
+
+
+class RollbackRefusingStore(InMemorySecretStore):
+    """Simulates a second create failure followed by a non-removable first slot."""
+
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
+        if account == CLOB_API_SECRET_ACCOUNT:
+            raise SecretStoreError("SECRET_WRITE_FAILED")
+        return super().create_protected(service, account, value)
+
+    def delete_created(self, creation: object) -> None:
+        del creation
+        raise SecretStoreError("SECRET_WRITE_FAILED")
+
+
+class ConcurrentCredentialStore(InMemorySecretStore):
+    """Claims the first slot after preflight but before this ceremony can create it."""
+
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
+        if account == CLOB_API_KEY_ACCOUNT:
+            competing = SecretBuffer.from_bytes(b"concurrent-credential")
+            try:
+                super().create_protected(service, account, competing)
+            finally:
+                competing.close()
+        return super().create_protected(service, account, value)
 
 
 def stored(store: InMemorySecretStore, account: str) -> bytes:
@@ -230,6 +256,33 @@ def test_a_partial_write_is_rolled_back() -> None:
     for account in (CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT):
         with pytest.raises(SecretStoreError):
             store.read_required(CLOB_SERVICE, account, "unlock")
+
+
+def test_rollback_failure_is_never_reported_as_an_ordinary_store_failure() -> None:
+    store = RollbackRefusingStore()
+
+    with pytest.raises(CredentialProvisioningError) as raised:
+        provisioner(store, FakeCredentialClient()).provision(
+            valid_credential_grant(), account_model(), now=NOW
+        )
+
+    assert raised.value.code == "CREDENTIAL_ROLLBACK_FAILED"
+    retained = store.read_required(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, "unlock")
+    retained.close()
+
+
+def test_add_only_creation_preserves_a_concurrent_credential() -> None:
+    store = ConcurrentCredentialStore()
+
+    with pytest.raises(CredentialProvisioningError) as raised:
+        provisioner(store, FakeCredentialClient()).provision(
+            valid_credential_grant(), account_model(), now=NOW
+        )
+
+    assert raised.value.code == "CREDENTIAL_STORE_FAILED"
+    retained = store.read_required(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, "unlock")
+    assert len(retained) > 0
+    retained.close()
 
 
 def test_rollback_never_deletes_a_preexisting_credential() -> None:

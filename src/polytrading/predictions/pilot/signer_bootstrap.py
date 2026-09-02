@@ -324,11 +324,10 @@ def _run_credential_child(
             credential_fingerprint=fingerprint.credential_fingerprint,
         )
     except CredentialProvisioningError as error:
-        code = (
-            "CREDENTIAL_STORE_FAILED"
-            if error.code == "CREDENTIAL_STORE_FAILED"
-            else "CREDENTIAL_CREATE_FAILED"
-        )
+        code = {
+            "CREDENTIAL_STORE_FAILED": "CREDENTIAL_STORE_FAILED",
+            "CREDENTIAL_ROLLBACK_FAILED": "SIGNER_BOOTSTRAP_FAILED",
+        }.get(error.code, "CREDENTIAL_CREATE_FAILED")
         result = CredentialCeremonyResult(False, code)
     except CredentialTransportError:
         result = CredentialCeremonyResult(False, "CREDENTIAL_CREATE_FAILED")

@@ -389,6 +389,13 @@ def test_a_failed_credential_ceremony_raises_a_code_without_its_canary() -> None
             if account == CLOB_API_KEY_ACCOUNT:
                 raise SecretStoreError("SECRET_WRITE_FAILED")
 
+        def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
+            self.write_protected(service, account, value)
+            return object()
+
+        def delete_created(self, creation: object) -> None:
+            del creation
+
         def delete(self, service: str, account: str) -> None:
             del service, account
 

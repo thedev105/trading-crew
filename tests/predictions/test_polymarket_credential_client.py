@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
+from polytrading.predictions.polymarket_execution import credential_client as client_module
 from polytrading.predictions.polymarket_execution.credential_client import (
     MAXIMUM_RESPONSE_BYTES,
     REQUEST_TIMEOUT_SECONDS,
@@ -74,6 +75,35 @@ def test_closing_the_client_destroys_its_signing_key_before_any_request() -> Non
         credential_client.create_or_derive(operation="CREATE", binding=binding())
     assert raised.value.code == "CREDENTIAL_SIGNING_FAILED"
     assert captured == []
+
+
+def test_client_signs_with_owned_mutable_key_then_zeroizes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handed_to_signer: list[bytearray] = []
+    private_key = bytearray(PRIVATE_KEY)
+
+    def sign_mutable_key(
+        key: bytearray, timestamp: str, snapshot: object
+    ) -> str:
+        del timestamp, snapshot
+        handed_to_signer.append(key)
+        return "0x" + "0" * 130
+
+    monkeypatch.setattr(client_module, "sign_clob_auth", sign_mutable_key)
+    credential_client = HttpxCredentialClient(
+        private_key=private_key,
+        timestamp=lambda: TIMESTAMP,
+        _client_factory=lambda: httpx.Client(transport=responder()),
+    )
+
+    buffers = credential_client.create_or_derive(operation="CREATE", binding=binding())
+    for buffer in buffers.values():
+        buffer.close()
+    credential_client.close()
+
+    assert handed_to_signer == [private_key]
+    assert not any(private_key)
 
 
 def responder(

@@ -292,14 +292,14 @@ def clob_auth_typed_data(
 
 
 def sign_clob_auth(
-    private_key: bytes,
+    private_key: bytes | bytearray,
     timestamp: str,
     snapshot: PolymarketProtocolSnapshot,
     *,
     nonce: int = 0,
 ) -> str:
     """Sign and self-recover one frozen ClobAuth message with eth-account."""
-    if type(private_key) is not bytes or len(private_key) != 32:
+    if type(private_key) not in (bytes, bytearray) or len(private_key) != 32:
         raise ClobAuthError("PRIVATE_KEY_INVALID") from None
     account = None
     with suppress(ValueError):

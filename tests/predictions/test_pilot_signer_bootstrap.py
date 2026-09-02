@@ -64,10 +64,16 @@ class CreateOnlyCredentialClient:
 
 
 class SecondWriteRefusingStore(InMemorySecretStore):
-    def write_protected(self, service: str, account: str, value: SecretBuffer) -> None:
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
         if account == CLOB_API_SECRET_ACCOUNT:
             raise SecretStoreError("SECRET_WRITE_FAILED")
-        super().write_protected(service, account, value)
+        return super().create_protected(service, account, value)
+
+
+class RollbackRefusingStore(SecondWriteRefusingStore):
+    def delete_created(self, creation: object) -> None:
+        del creation
+        raise SecretStoreError("SECRET_WRITE_FAILED")
 
 
 def wallet_only_memory(store_type: type[InMemorySecretStore] = InMemorySecretStore) -> Any:
@@ -165,6 +171,17 @@ def test_create_failure_leaves_no_clob_trio(failure: str) -> None:
     assert result == CredentialCeremonyResult(False, expected)
     assert clob_slots_are_absent(memory)
     assert all(buffer.closed for buffer in response_buffers)
+
+
+def test_rollback_integrity_failure_refuses_to_report_an_ordinary_create_failure() -> None:
+    result = _launch_credential_ceremony(
+        store=wallet_only_memory(RollbackRefusingStore),
+        now=lambda: NOW,
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: CreateOnlyCredentialClient(),
+    )
+
+    assert result == CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
 
 
 def test_parent_closes_credential_buffers_before_starting_the_child() -> None:
