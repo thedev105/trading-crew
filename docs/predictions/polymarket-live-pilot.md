@@ -7,9 +7,9 @@ Every fresh launch starts killed. Completing local preflight alone creates no ca
 no live request.
 
 **Secrets never belong in the UI, the CLI, a `.env` file, logs, screenshots, tickets, chat, email,
-or a support message. Never paste a credential or key into a terminal or UI.** The only place a
-wallet key or CLOB credential lives is the macOS Keychain and the signer process that reads it
-through inherited descriptors.
+or a support message. Never paste a credential or key into a terminal or UI.** Plaintext wallet and
+CLOB values may exist only in the macOS Keychain or systemd's private runtime credential directory,
+and in the signer process that reads them through inherited descriptors.
 
 ## 1. Mandatory preflight and first-strategy order
 
@@ -99,6 +99,80 @@ The ceremony locks concurrent `polytrading` create attempts. It cannot coordinat
 Keychain editor or another program changing those items: close Keychain Access and do not modify
 the reviewed items while it runs. On any failure, run `check`, keep the pilot killed, and do not
 retry or attempt manual recovery through this product.
+
+### Ubuntu 24.04 headless deployment
+
+The supported Linux target is Ubuntu 24.04 LTS with systemd 255 or newer and
+`/usr/bin/systemd-creds`. Confirm both versions before installation. The host has no TPM 2.0, so
+the fixed units use `--with-key=host`; encrypted files are protected at rest, but root can read the
+host key and running-process memory. Treat root access or a copied host key as a full credential
+compromise.
+
+Create the non-login service account and its fixed state directory:
+
+```bash
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin polytrading
+sudo install -d -o polytrading -g polytrading -m 0700 \
+  /var/lib/polytrading /var/lib/polytrading/credentials
+```
+
+Install the reviewed checkout and virtual environment at `/opt/polytrading`. Generate
+`wallet-private-key.cred` outside this application by connecting a trusted non-terminal secret
+source to standard input of the following fixed command. Do not type or paste the wallet into a
+shell, command argument, environment value, journal, file, ticket, or chat:
+
+```bash
+sudo /usr/bin/systemd-creds encrypt \
+  --with-key=host --name=wallet-private-key - \
+  /var/lib/polytrading/credentials/wallet-private-key.cred
+sudo chown polytrading:polytrading \
+  /var/lib/polytrading/credentials/wallet-private-key.cred
+sudo chmod 0600 /var/lib/polytrading/credentials/wallet-private-key.cred
+```
+
+Install the three non-templated units and reload systemd:
+
+```bash
+sudo install -o root -g root -m 0644 deploy/systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+For a new account, run the create one-shot. `derive` is an explicit recovery alternative when the
+remote credentials already exist and all three local encrypted CLOB slots are absent; never run
+both, and never run either against a partial or present local set:
+
+```bash
+sudo systemctl start polytrading-credentials-create.service
+# Explicit recovery alternative only:
+sudo systemctl start polytrading-credentials-derive.service
+```
+
+The one-shot loads the wallet and a read-only copy of systemd's root-only host key. The host key is
+bound to its standard path only inside that unit's private mount namespace, allowing the
+unprivileged ceremony process to encrypt the new blobs; the long-running pilot never receives it.
+Use a dedicated pilot host and treat compromise during a ceremony as compromise of all
+host-key-encrypted credentials on that host. The one-shot sends wallet/CLOB plaintext only through
+process memory and pipes, and persists only the three fixed host-key encrypted `.cred` blobs. Its
+public output remains limited to `result=CREATED|DERIVED`, a credential fingerprint, or a stable
+failure code. After success, a new service invocation is mandatory because systemd does not add
+new blobs to the already-running credential directory:
+
+```bash
+sudo systemctl restart polytrading-pilot.service
+sudo systemctl status polytrading-pilot.service
+```
+
+The pilot unit loads all four fixed blobs, mounts the encrypted-blob directory read-only, binds the
+console to loopback, and still starts killed. Successful credential setup does not satisfy the
+45-day/30-day evidence, eligibility, legal/KYC/terms, geoblock, funding/allowance, passkey,
+separate-activation, explicit-action, presence, reconciliation, or kill-clearance gates.
+
+On any partial write, unexpected owner/mode, missing runtime directory, suspected root compromise,
+or ambiguous result: stop the pilot, leave the kill engaged, do not retry blindly, revoke the CLOB
+credentials through the venue's independent operator process, and preserve the encrypted blobs and
+sanitized journal for incident review. Rotate the wallet, credentials, and host key on a rebuilt
+host when root or host-key compromise is possible. The application intentionally provides no
+plaintext fallback, arbitrary delete, overwrite, or rotation command.
 
 ## 3. What the console shows
 

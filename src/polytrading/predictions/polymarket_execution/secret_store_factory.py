@@ -9,7 +9,7 @@ from pathlib import Path
 from polytrading.predictions.polymarket_execution.secrets import SecretStore, SecretStoreError
 
 _ENCRYPTED_CREDENTIAL_DIRECTORY = Path("/var/lib/polytrading/credentials")
-_CREDENTIALS_DIRECTORY_ENVIRONMENT = "CREDENTIALS_DIRECTORY"
+_SYSTEMD_RUNTIME_DIRECTORY_VARIABLE = "CREDENTIALS_DIRECTORY"
 _CLEAN_CHILD_PATH = "/usr/bin:/bin"
 
 
@@ -33,7 +33,7 @@ def _open_systemd_store(runtime: Path, encrypted: Path) -> SecretStore:
 
 
 def _systemd_credentials_directory() -> Path:
-    configured = os.environ.get(_CREDENTIALS_DIRECTORY_ENVIRONMENT)
+    configured = os.environ.get(_SYSTEMD_RUNTIME_DIRECTORY_VARIABLE)
     if not configured:
         raise SecretStoreError("SECRET_STORE_UNAVAILABLE") from None
     directory = Path(configured)
@@ -47,7 +47,7 @@ def _credential_child_environment(*, platform: str = sys.platform) -> dict[str, 
     if platform == "darwin":
         return environment
     if platform == "linux":
-        environment[_CREDENTIALS_DIRECTORY_ENVIRONMENT] = str(_systemd_credentials_directory())
+        environment[_SYSTEMD_RUNTIME_DIRECTORY_VARIABLE] = str(_systemd_credentials_directory())
         return environment
     raise SecretStoreError("SECRET_STORE_UNAVAILABLE") from None
 

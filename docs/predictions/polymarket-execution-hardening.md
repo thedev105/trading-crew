@@ -76,6 +76,37 @@ subscription frames, descriptor values, or secret-bearing exceptions. The regres
 distinct runtime-only canaries for every secret class; the values are generated during the test,
 never persisted, and never printed on a failed absence check.
 
+### Ubuntu headless credential boundary
+
+Ubuntu support is limited to Ubuntu 24.04 LTS, systemd 255 or newer, and the fixed units under
+`deploy/systemd/`. The `polytrading` service account reads plaintext only from systemd's private
+`CREDENTIALS_DIRECTORY`. The factory rejects a missing, relative, symlinked, wrongly owned, or
+non-private runtime directory; the reader also rejects unknown labels, symlinks, non-regular or
+multiply linked files, wrong ownership/modes, empty values, and values larger than 4096 bytes.
+Direct shell execution fails closed and there is no `.env`, desktop keyring, plaintext-file, remote
+provider, secret flag, or arbitrary-path fallback.
+
+Persistent Linux artifacts are limited to the fixed `.cred` files in
+`/var/lib/polytrading/credentials`. The application can create only absent CLOB slots, by sending
+plaintext over standard input to `/usr/bin/systemd-creds encrypt --with-key=host`; encrypted output
+is published with mode `0600`, no-replace semantics, and identity-checked rollback. Wallet creation,
+rotation, overwrite, generic deletion, and arbitrary service/account names are refused. The pilot
+unit has the encrypted directory read-only; the create and derive one-shots alone receive the fixed
+write path. During a ceremony, systemd also copies its root-only host key into the unit's private
+credential directory and bind-mounts that copy read-only at systemd-creds' standard path. This is
+required for the unprivileged process to encrypt, is scoped to the one-shot mount namespace, and is
+never provided to the long-running pilot.
+
+Host-key encryption protects blobs at rest without a TPM, but not against root: root can read the
+host key and service memory. A ceremony compromise can also read the temporary host-key copy, so
+this deployment requires a dedicated host and treats that event as compromise of all host-key
+credentials on it. An operator must provision the wallet blob from a trusted non-terminal
+source outside the application, reload systemd, run exactly one fixed create-or-derive one-shot,
+and restart the pilot so systemd constructs a fresh runtime credential directory. Credential
+success neither authorizes trading nor changes the killed posture. On compromise or a partial or
+ambiguous state, stop and keep killed, revoke credentials independently at the venue, preserve
+encrypted evidence, and rebuild/rotate the host and wallet as the incident requires.
+
 ## Immediate-order policy
 
 Only fill-and-kill (`FAK`) and fill-or-kill (`FOK`) order semantics are modeled. `GTC`, `GTD`,

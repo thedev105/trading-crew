@@ -35,19 +35,19 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
         "polymarket_execution/credential_client.py"
-    ): "6722e9ca8f383068e53438c0e66d972bb439ebbce08c6972423f3da4499dd39f",
+    ): "13df12bb3ee4722b5fd11f00d031c2ed0dcc7c4dbdff9d7b64d1396d2dd4d788",
     Path(
         "pilot/credential_commands.py"
-    ): "24f1125e247b4380de1609184b9b0fd039b1b70d05f93aac822f05059f07cda4",
+    ): "847ee7f515fdeceddbd64d080c7e0cbbec2e50601d6dce1401b8dea2ae94bffd",
     Path(
         "pilot/signer_bootstrap.py"
-    ): "70deda5af9cc8b877d7244bbfef4ecb43ee6c5c29fe42d093d919d15b564fdb8",
+    ): "3a6d455e10fe5c6835a08647cb1a8806debdbefbd7b499d0378ef4b24ac7972b",
     Path(
         "polymarket_execution/credentials.py"
-    ): "28cc4e1054f3a26df7037c5f04ac1ae15b7806b77a3b0ec4b29c5bdfca8a1109",
+    ): "73012ed3ed574d6205e60e0945d6c69a96d30f27e2d6737b5fc74ac5bb0274c5",
     Path(
         "polymarket_execution/keychain_macos.py"
-    ): "6c705ee959afb7f796e8438f392703284ff8f360f1227463512b059918c369b3",
+    ): "a5df81ff636ba37cd012f6b83f00c0e23aefe7aa85ed5be07213c985b36f03b4",
     Path(
         "polymarket_execution/heartbeat.py"
     ): "47b74b57f6518acad5654c303bb4bd26bab35f140f842e2e673d7c1db023157d",
@@ -67,6 +67,12 @@ _REVIEWED_SOURCE_SHA256 = {
         "polymarket_execution/routes.py"
     ): "24a970b295ad02484bba1132d6826e6f1c9dad1f7bac35dd17080e1e9b14c324",
     Path(
+        "polymarket_execution/secret_labels.py"
+    ): "4d15daa71aefbf4c8456a9c6aa162ce4023cd2c4e9da428fd63040eb1d5dfa74",
+    Path(
+        "polymarket_execution/secret_store_factory.py"
+    ): "3ea7707409f4942922490d052b97514638ad51b8392b6566c5e06b5af27f2894",
+    Path(
         "polymarket_execution/secrets.py"
     ): "b8efe853affabb9070fa988adf3dc4e193652ff05e3d20f66c3e22e9ae9ea7a3",
     Path(
@@ -75,6 +81,9 @@ _REVIEWED_SOURCE_SHA256 = {
     Path(
         "polymarket_execution/user_stream.py"
     ): "e1079354acef4210c564011f037907e77bc293642ba79704602977206ac900e5",
+    Path(
+        "polymarket_execution/systemd_credentials_linux.py"
+    ): "750ae24fade0f098243806cb600de552d0feaa81e4fd7c05f6e92db043f45e47",
     Path("web_assets/api.js"): "834c1b5714da4bd534f901b1c4af3679889a4184b601a6fac2fb87e3897021ad",
     Path("web_assets/app.css"): "85b61f1ea0a74588bc1add20f0fb861342719ed232ffcbcc0f6c0868b450e5ed",
     Path("web_assets/app.js"): "b9bb0d52ba332f10fe363ed393d84f57a0c44b33ee72db9b670cd2d3b00fc4af",

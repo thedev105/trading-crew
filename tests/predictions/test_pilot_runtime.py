@@ -71,6 +71,7 @@ from tests.predictions.test_execution_authority import ELIGIBLE_MANIFEST
 
 PORT = 8788
 NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
+SYSTEMD_UNIT_ROOT = Path(__file__).resolve().parents[2] / "deploy/systemd"
 
 
 @pytest.fixture
@@ -664,6 +665,81 @@ def test_a_killed_pilot_still_answers_reads_over_the_control_plane(database: Pat
         assert b'"kill_engaged":true' in readiness.body
     finally:
         runtime.close()
+
+
+def _systemd_unit(name: str) -> str:
+    return (SYSTEMD_UNIT_ROOT / name).read_text(encoding="utf-8")
+
+
+def test_linux_pilot_unit_loads_fixed_encrypted_credentials_read_only() -> None:
+    pilot = _systemd_unit("polytrading-pilot.service")
+    for account in (
+        "wallet-private-key",
+        "clob-api-key",
+        "clob-api-secret",
+        "clob-passphrase",
+    ):
+        assert (
+            f"LoadCredentialEncrypted={account}:/var/lib/polytrading/credentials/{account}.cred"
+        ) in pilot
+    assert "ReadOnlyPaths=/var/lib/polytrading/credentials" in pilot
+    assert "ReadWritePaths=/var/lib/polytrading/credentials" not in pilot
+    assert "predictions pilot polymarket --db" in pilot
+
+
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        ("polytrading-credentials-create.service", "credentials create --confirm"),
+        ("polytrading-credentials-derive.service", "credentials derive --confirm"),
+    ],
+)
+def test_linux_credential_units_load_wallet_host_key_and_one_fixed_ceremony(
+    name: str, command: str
+) -> None:
+    unit = _systemd_unit(name)
+    assert unit.count("LoadCredentialEncrypted=") == 1
+    assert (
+        "LoadCredentialEncrypted=wallet-private-key:"
+        "/var/lib/polytrading/credentials/wallet-private-key.cred"
+    ) in unit
+    assert "ReadWritePaths=/var/lib/polytrading/credentials" in unit
+    assert ("LoadCredential=systemd-credential-host-key:/var/lib/systemd/credential.secret") in unit
+    assert (
+        "BindReadOnlyPaths=%d/systemd-credential-host-key:/var/lib/systemd/credential.secret"
+    ) in unit
+    assert command in unit
+    assert "%i" not in unit
+
+
+def test_linux_pilot_unit_does_not_receive_the_systemd_host_key() -> None:
+    pilot = _systemd_unit("polytrading-pilot.service")
+
+    assert "systemd-credential-host-key" not in pilot
+    assert "BindReadOnlyPaths=" not in pilot
+
+
+def test_linux_units_share_the_required_hardening_baseline() -> None:
+    for name in (
+        "polytrading-pilot.service",
+        "polytrading-credentials-create.service",
+        "polytrading-credentials-derive.service",
+    ):
+        unit = _systemd_unit(name)
+        for directive in (
+            "User=polytrading",
+            "Group=polytrading",
+            "UMask=0077",
+            "StateDirectory=polytrading",
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "ProtectHome=true",
+            "ProtectSystem=strict",
+            "CapabilityBoundingSet=",
+        ):
+            assert directive in unit
+        assert "EnvironmentFile=" not in unit
+        assert "Environment=" not in unit
 
 
 def test_the_pilot_cli_accepts_only_a_database_and_a_port() -> None:

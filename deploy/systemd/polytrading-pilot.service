@@ -1,0 +1,27 @@
+[Unit]
+Description=Polytrading killed-by-default Polymarket pilot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=polytrading
+Group=polytrading
+UMask=0077
+WorkingDirectory=/opt/polytrading
+StateDirectory=polytrading
+StateDirectoryMode=0700
+LoadCredentialEncrypted=wallet-private-key:/var/lib/polytrading/credentials/wallet-private-key.cred
+LoadCredentialEncrypted=clob-api-key:/var/lib/polytrading/credentials/clob-api-key.cred
+LoadCredentialEncrypted=clob-api-secret:/var/lib/polytrading/credentials/clob-api-secret.cred
+LoadCredentialEncrypted=clob-passphrase:/var/lib/polytrading/credentials/clob-passphrase.cred
+ExecStart=/opt/polytrading/.venv/bin/polytrading predictions pilot polymarket --db /var/lib/polytrading/predictions.duckdb --port 8788
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/polytrading/credentials
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

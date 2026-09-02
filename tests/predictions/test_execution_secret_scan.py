@@ -81,6 +81,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = Path(polytrading.__file__).resolve().parent
 WEB_ASSETS_ROOT = PACKAGE_ROOT / "predictions/web_assets"
 RUNBOOK = REPOSITORY_ROOT / "docs/predictions/polymarket-execution-hardening.md"
+PREDICTIONS_ROOT = PACKAGE_ROOT / "predictions"
 
 
 def _submit_material(
@@ -788,3 +789,18 @@ def test_runtime_only_secret_scan_is_documented_without_example_values() -> None
     assert "runtime-only" in text
     assert "canaries" in text
     assert "never persisted" in text
+
+
+def test_linux_secret_store_allows_only_the_nonsecret_systemd_directory_lookup() -> None:
+    factory = (PREDICTIONS_ROOT / "polymarket_execution/secret_store_factory.py").read_text(
+        encoding="utf-8"
+    )
+    linux_store = (
+        PREDICTIONS_ROOT / "polymarket_execution/systemd_credentials_linux.py"
+    ).read_text(encoding="utf-8")
+
+    assert factory.count("CREDENTIALS_DIRECTORY") == 1
+    assert "POLYMARKET" not in factory
+    assert "private_key" not in factory
+    assert "os.environ" not in linux_store
+    assert "getenv" not in linux_store

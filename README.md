@@ -211,10 +211,11 @@ locally present operator:
 ```
 
 `--db` and `--port` are the entire CLI surface: there is no credential, order, activation,
-capability, or kill-clearance flag. Every launch starts killed, secrets live only in the macOS
-Keychain and the signer process, and only the operator can trigger a live action, from the UI,
-after a typed confirmation and a platform-passkey ceremony. The evidence dashboard above stays
-observation-only and cannot reach the pilot, the signer, or any credential.
+capability, or kill-clearance flag. Every launch starts killed. Secrets live only in the macOS
+Keychain or systemd's private runtime credential directory and in the signer process; only the
+operator can trigger a live action, from the UI, after a typed confirmation and a platform-passkey
+ceremony. The evidence dashboard above stays observation-only and cannot reach the pilot, the
+signer, or any credential.
 
 See `docs/predictions/polymarket-live-pilot.md` for setup, the immutable ceilings, the three
 authorization modes, presence rules, staged activation, and the recovery playbooks.
@@ -251,6 +252,47 @@ creation command while one is active. That lock cannot coordinate an external Ke
 another program that changes the same items. Close Keychain Access and do not modify the four
 reviewed items during the ceremony. If it reports a failure, run `check` and leave the pilot killed;
 there is no automatic repair or recovery command.
+
+### Ubuntu 24.04 headless pilot
+
+Ubuntu support requires Ubuntu 24.04 LTS, systemd 255 or newer, `/usr/bin/systemd-creds`, and the
+dedicated unprivileged `polytrading` account. It is supported only through the three fixed units in
+`deploy/systemd/`; a direct shell launch has no systemd credential directory and fails closed. The
+units use host-key encryption because this deployment has no TPM 2.0. That protects credential
+blobs at rest, but it does not protect secrets from root or from compromise of the running service.
+
+Install the application at `/opt/polytrading`, create `/var/lib/polytrading/credentials` owned by
+`polytrading:polytrading` with mode `0700`, and provision `wallet-private-key.cred` outside the
+application. Feed the wallet key to this exact encryption operation from a trusted non-terminal
+secret source—never by pasting it into an interactive shell—and make the resulting blob mode
+`0600`, owned by `polytrading`:
+
+```bash
+sudo /usr/bin/systemd-creds encrypt \
+  --with-key=host --name=wallet-private-key - \
+  /var/lib/polytrading/credentials/wallet-private-key.cred
+sudo chown polytrading:polytrading \
+  /var/lib/polytrading/credentials/wallet-private-key.cred
+sudo chmod 0600 /var/lib/polytrading/credentials/wallet-private-key.cred
+```
+
+Copy the fixed units to `/etc/systemd/system/`, run `sudo systemctl daemon-reload`, and invoke
+exactly one absent-only ceremony:
+
+```bash
+sudo systemctl start polytrading-credentials-create.service
+# Recovery alternative only; do not run after create succeeds:
+sudo systemctl start polytrading-credentials-derive.service
+```
+
+The ceremony unit temporarily exposes the root-only systemd host key, read-only and only inside its
+private mount namespace, so its unprivileged process can encrypt the new blobs. The long-running
+pilot never receives that key. On success, start or restart `polytrading-pilot.service`; a new service invocation is required so
+systemd can load the three newly encrypted CLOB blobs. Credential success does not clear the kill,
+create trading eligibility, satisfy legal/KYC/terms or geoblock review, fund the wallet, set venue
+allowance, satisfy evidence/passkey gates, or authorize an action. For compromise or ambiguity,
+stop the pilot, keep it killed, revoke the CLOB credentials at the venue outside this application,
+preserve the encrypted blobs for incident review, and rotate the wallet and host as required.
 
 The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
 dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
