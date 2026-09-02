@@ -37,6 +37,7 @@ _CREDENTIAL_ACCOUNTS = (
     CLOB_API_SECRET_ACCOUNT,
     CLOB_PASSPHRASE_ACCOUNT,
 )
+_STORE_PREFLIGHT_PROMPT = "Confirm the CLOB credential slots are empty for this create"
 
 CredentialProvisioningCode = Literal[
     "GRANT_INVALID",
@@ -191,6 +192,7 @@ class CredentialProvisioner:
 
     def _store_atomically(self, returned: dict[str, SecretBuffer]) -> None:
         """Write all three fields or none: a partial credential is worse than no credential."""
+        self._require_empty_store()
         written: list[str] = []
         try:
             for account in _CREDENTIAL_ACCOUNTS:
@@ -203,6 +205,21 @@ class CredentialProvisioner:
                 except SecretStoreError:
                     continue
             raise CredentialProvisioningError("CREDENTIAL_STORE_FAILED") from error
+
+    def _require_empty_store(self) -> None:
+        """Establish rollback ownership before any ceremony-owned write occurs."""
+        for account in _CREDENTIAL_ACCOUNTS:
+            try:
+                existing = self._store.read_required(
+                    self._service, account, _STORE_PREFLIGHT_PROMPT
+                )
+            except SecretStoreError as error:
+                if error.code == "SECRET_ITEM_MISSING":
+                    continue
+                raise CredentialProvisioningError("CREDENTIAL_STORE_FAILED") from error
+            else:
+                existing.close()
+                raise CredentialProvisioningError("CREDENTIAL_STORE_FAILED")
 
 
 def _address_fingerprint(address: str) -> str:

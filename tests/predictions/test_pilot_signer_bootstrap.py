@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 import pytest
@@ -9,10 +11,20 @@ from polytrading.predictions.pilot.signer_bootstrap import (
     SECRET_ACCOUNTS,
     UNLOCK_PROMPT,
     ChildLaunch,
+    CredentialCeremonyResult,
     SignerBootstrapError,
+    _launch_credential_ceremony,
     launch_signer_sidecar,
 )
-from polytrading.predictions.polymarket_execution.keychain_macos import CLOB_SERVICE
+from polytrading.predictions.polymarket_execution.credential_client import CredentialTransportError
+from polytrading.predictions.polymarket_execution.keychain_macos import (
+    CLOB_API_KEY_ACCOUNT,
+    CLOB_API_SECRET_ACCOUNT,
+    CLOB_PASSPHRASE_ACCOUNT,
+    CLOB_SERVICE,
+    WALLET_PRIVATE_KEY_ACCOUNT,
+)
+from polytrading.predictions.polymarket_execution.protocol import AccountSignatureBinding
 from polytrading.predictions.polymarket_execution.secrets import (
     InMemorySecretStore,
     SecretBuffer,
@@ -30,6 +42,160 @@ VALUES = {
     "clob-api-secret": API_SECRET,
     "clob-passphrase": PASSPHRASE,
 }
+
+NOW = datetime(2026, 8, 29, 12, tzinfo=UTC)
+
+
+class CreateOnlyCredentialClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, AccountSignatureBinding]] = []
+        self.response_buffers: list[SecretBuffer] = []
+
+    def create_or_derive(
+        self, *, operation: str, binding: AccountSignatureBinding
+    ) -> dict[str, SecretBuffer]:
+        self.calls.append((operation, binding))
+        returned = {
+            account: SecretBuffer.from_bytes(VALUES[account])
+            for account in (CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT)
+        }
+        self.response_buffers.extend(returned.values())
+        return returned
+
+
+class SecondWriteRefusingStore(InMemorySecretStore):
+    def write_protected(self, service: str, account: str, value: SecretBuffer) -> None:
+        if account == CLOB_API_SECRET_ACCOUNT:
+            raise SecretStoreError("SECRET_WRITE_FAILED")
+        super().write_protected(service, account, value)
+
+
+def wallet_only_memory(store_type: type[InMemorySecretStore] = InMemorySecretStore) -> Any:
+    memory = store_type()
+    wallet = SecretBuffer.from_bytes(VALUES[WALLET_PRIVATE_KEY_ACCOUNT])
+    memory.write_protected(CLOB_SERVICE, WALLET_PRIVATE_KEY_ACCOUNT, wallet)
+    wallet.close()
+    return memory
+
+
+def clob_slots_are_absent(memory: InMemorySecretStore) -> bool:
+    for account in (CLOB_API_KEY_ACCOUNT, CLOB_API_SECRET_ACCOUNT, CLOB_PASSPHRASE_ACCOUNT):
+        try:
+            buffer = memory.read_required(CLOB_SERVICE, account, "verify absence")
+        except SecretStoreError as error:
+            if error.code == "SECRET_ITEM_MISSING":
+                continue
+            raise
+        else:
+            buffer.close()
+            return False
+    return True
+
+
+def test_one_shot_credential_child_runs_only_create_and_returns_public_fingerprints() -> None:
+    memory = store(missing=set(SECRET_ACCOUNTS[1:]))
+    client = CreateOnlyCredentialClient()
+    handed_off_private_keys: list[bytearray] = []
+
+    def client_factory(*, private_key: bytearray, timestamp: Any) -> CreateOnlyCredentialClient:
+        del timestamp
+        handed_off_private_keys.append(private_key)
+        return client
+
+    result = _launch_credential_ceremony(
+        store=memory,
+        now=lambda: NOW,
+        _spawn=lambda launch: launch.run(),
+        _client_factory=client_factory,
+    )
+
+    assert result == CredentialCeremonyResult(
+        ok=True,
+        code="CREATED",
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=sha256(VALUES[CLOB_API_KEY_ACCOUNT]).hexdigest(),
+    )
+    assert result.account_fingerprint is not None
+    assert client.calls[0][0] == "CREATE"
+    assert client.calls[0][1].signer_address == client.calls[0][1].funder_address
+    assert all(buffer.closed for buffer in client.response_buffers)
+    assert handed_off_private_keys
+    assert all(not any(private_key) for private_key in handed_off_private_keys)
+    assert not hasattr(result, "api_key")
+    assert not hasattr(result, "api_secret")
+    assert not hasattr(result, "passphrase")
+
+
+@pytest.mark.parametrize("failure", ["transport", "invalid_response", "second_write"])
+def test_create_failure_leaves_no_clob_trio(failure: str) -> None:
+    response_buffers: list[SecretBuffer] = []
+
+    class FailingClient:
+        def create_or_derive(
+            self, *, operation: str, binding: AccountSignatureBinding
+        ) -> dict[str, SecretBuffer]:
+            assert operation == "CREATE"
+            if failure == "transport":
+                raise CredentialTransportError("CREDENTIAL_TRANSPORT_UNAVAILABLE")
+            if failure == "invalid_response":
+                buffer = SecretBuffer.from_bytes(VALUES[CLOB_API_KEY_ACCOUNT])
+                response_buffers.append(buffer)
+                return {CLOB_API_KEY_ACCOUNT: buffer}
+            return CreateOnlyCredentialClient().create_or_derive(
+                operation=operation, binding=binding
+            )
+
+    memory = (
+        wallet_only_memory(SecondWriteRefusingStore)
+        if failure == "second_write"
+        else wallet_only_memory()
+    )
+    result = _launch_credential_ceremony(
+        store=memory,
+        now=lambda: NOW,
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: FailingClient(),
+    )
+
+    expected = (
+        "CREDENTIAL_STORE_FAILED"
+        if failure == "second_write"
+        else "CREDENTIAL_CREATE_FAILED"
+    )
+    assert result == CredentialCeremonyResult(False, expected)
+    assert clob_slots_are_absent(memory)
+    assert all(buffer.closed for buffer in response_buffers)
+
+
+def test_parent_closes_credential_buffers_before_starting_the_child() -> None:
+    memory = wallet_only_memory()
+    handed_out: list[SecretBuffer] = []
+
+    class TrackingStore:
+        def read_required(self, service: str, account: str, prompt: str) -> SecretBuffer:
+            buffer = memory.read_required(service, account, prompt)
+            handed_out.append(buffer)
+            return buffer
+
+        def write_protected(self, service: str, account: str, value: SecretBuffer) -> None:
+            memory.write_protected(service, account, value)
+
+        def delete(self, service: str, account: str) -> None:
+            memory.delete(service, account)
+
+    client = CreateOnlyCredentialClient()
+
+    def spawn(launch: Any) -> None:
+        assert handed_out
+        assert all(buffer.closed for buffer in handed_out)
+        launch.run()
+
+    _launch_credential_ceremony(
+        store=TrackingStore(),
+        now=lambda: NOW,
+        _spawn=spawn,
+        _client_factory=lambda **_kwargs: client,
+    )
 
 
 def store(*, missing: str | set[str] | None = None, denied: str | None = None) -> Any:

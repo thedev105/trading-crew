@@ -7,11 +7,30 @@ holds no secret bytes: only the two framed IPC streams the pilot talks to.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
 from typing import BinaryIO, Final, Protocol
+from uuid import uuid4
 
+from eth_account import Account
+
+from polytrading.predictions.polymarket_execution.credential_client import (
+    CredentialTransportError,
+    HttpxCredentialClient,
+)
+from polytrading.predictions.polymarket_execution.credentials import (
+    MAXIMUM_GRANT_LIFETIME,
+    CredentialClient,
+    CredentialFingerprint,
+    CredentialProvisioner,
+    CredentialProvisioningError,
+    CredentialProvisioningGrant,
+)
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_API_KEY_ACCOUNT,
     CLOB_API_SECRET_ACCOUNT,
@@ -19,11 +38,20 @@ from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_SERVICE,
     WALLET_PRIVATE_KEY_ACCOUNT,
 )
+from polytrading.predictions.polymarket_execution.protocol import (
+    POLYMARKET_PILOT_PROTOCOL_VERSION,
+    AccountSignatureBinding,
+    bind_account_signature,
+    load_protocol_snapshot,
+)
+from polytrading.predictions.polymarket_execution.routes import CREDENTIAL_ROUTE_SET_HASH
 from polytrading.predictions.polymarket_execution.secrets import (
+    SecretBoundaryError,
     SecretBuffer,
     SecretMaterial,
     SecretStore,
     SecretStoreError,
+    read_secret_descriptors,
 )
 from polytrading.predictions.polymarket_execution.signer import (
     SignerService,
@@ -40,6 +68,10 @@ SECRET_ACCOUNTS: Final = (
 UNLOCK_PROMPT: Final = "Unlock the Polymarket pilot wallet and credentials for this launch"
 _LENGTH_HEADER_BYTES: Final = 4
 MAXIMUM_SECRET_BYTES: Final = 4096
+_MAXIMUM_CEREMONY_RESULT_BYTES: Final = 512
+_CEREMONY_RESULT_CODES: Final = frozenset(
+    {"CREATED", "SIGNER_BOOTSTRAP_FAILED", "CREDENTIAL_CREATE_FAILED", "CREDENTIAL_STORE_FAILED"}
+)
 
 
 class SignerBootstrapError(RuntimeError):
@@ -54,11 +86,34 @@ class SignerServiceFactory(Protocol):
     def __call__(self, secrets: SecretMaterial) -> SignerService: ...
 
 
+class CredentialClientFactory(Protocol):
+    def __call__(
+        self, *, private_key: bytearray, timestamp: Callable[[], str]
+    ) -> CredentialClient: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ChildLaunch:
     """Exactly what a child needs, so a spawner never has to introspect a closure."""
 
     request_fd: int
+    response_fd: int
+    secret_descriptors: tuple[int, int, int, int]
+    run: Callable[[], None]
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialCeremonyResult:
+    """The complete public-only response the one-shot child may return."""
+
+    ok: bool
+    code: str
+    account_fingerprint: str | None = None
+    credential_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialChildLaunch:
     response_fd: int
     secret_descriptors: tuple[int, int, int, int]
     run: Callable[[], None]
@@ -137,6 +192,252 @@ def launch_signer_sidecar(
         child_pid=child,
         credentials_present=credentials_present,
     )
+
+
+def create_credentials_in_sidecar(
+    *, store: SecretStore, now: Callable[[], datetime]
+) -> CredentialFingerprint:
+    """Run the fixed CREATE ceremony and return only its public fingerprint."""
+    result = _launch_credential_ceremony(store=store, now=now)
+    if not result.ok:
+        raise SignerBootstrapError(result.code)
+    if result.account_fingerprint is None or result.credential_fingerprint is None:
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED")
+    return CredentialFingerprint(
+        account_fingerprint=result.account_fingerprint,
+        credential_fingerprint=result.credential_fingerprint,
+        operation="CREATE",
+        result="CREATED",
+    )
+
+
+def _launch_credential_ceremony(
+    *,
+    store: SecretStore,
+    now: Callable[[], datetime],
+    _spawn: Callable[[_CredentialChildLaunch], int | None] | None = None,
+    _client_factory: CredentialClientFactory | None = None,
+) -> CredentialCeremonyResult:
+    """Launch one fixed-operation child through the inherited four-descriptor contract."""
+    secrets = _read_secrets(store, service=CLOB_SERVICE, prompt=UNLOCK_PROMPT)
+    if any(len(buffer) > 0 for buffer in secrets[1:]):
+        for buffer in secrets:
+            buffer.close()
+        raise SignerBootstrapError("CREDENTIALS_ALREADY_PRESENT")
+    secret_pipes = [os.pipe() for _ in SECRET_ACCOUNTS]
+    response_pipe = os.pipe()
+    try:
+        for buffer, (_read_fd, write_fd) in zip(secrets, secret_pipes, strict=True):
+            _write_framed_secret(write_fd, buffer)
+    except BaseException:
+        _close_all(secret_pipes, response_pipe)
+        raise
+    finally:
+        for buffer in secrets:
+            buffer.close()
+        for _read_fd, write_fd in secret_pipes:
+            _close(write_fd)
+
+    descriptors = tuple(read_fd for read_fd, _write_fd in secret_pipes)
+    launch = _CredentialChildLaunch(
+        response_fd=response_pipe[1],
+        secret_descriptors=descriptors,  # type: ignore[arg-type]
+        run=lambda: _run_credential_child(
+            response_fd=response_pipe[1],
+            secret_descriptors=descriptors,
+            store=store,
+            now=now,
+            client_factory=_client_factory,
+        ),
+    )
+    try:
+        child_pid = (_spawn or _fork_credential_child)(launch)
+    except BaseException:
+        _close_all(secret_pipes, response_pipe)
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED") from None
+    for read_fd, _write_fd in secret_pipes:
+        _close(read_fd)
+    _close(response_pipe[1])
+    try:
+        return _read_credential_result(response_pipe[0])
+    finally:
+        _close(response_pipe[0])
+        if child_pid is not None:
+            with suppress(OSError):
+                os.waitpid(child_pid, 0)
+
+
+def _run_credential_child(
+    *,
+    response_fd: int,
+    secret_descriptors: tuple[int, ...],
+    store: SecretStore,
+    now: Callable[[], datetime],
+    client_factory: CredentialClientFactory | None,
+) -> None:
+    material: SecretMaterial | None = None
+    client: CredentialClient | None = None
+    result = CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+    try:
+        material = read_secret_descriptors(*secret_descriptors)  # type: ignore[arg-type]
+        if material.credentials_present:
+            raise SecretBoundaryError("SECRET_MATERIAL_INVALID")
+        observed_at = _credential_time(now)
+        private_key = material.private_key
+        address = Account.from_key(private_key).address
+        snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
+        binding = bind_account_signature(
+            snapshot,
+            signer_address=address,
+            funder_address=address,
+            signature_type=0,
+            negative_risk=False,
+            credential_route_hash=CREDENTIAL_ROUTE_SET_HASH,
+        )
+        account_fingerprint = _credential_account_fingerprint(binding)
+        grant = CredentialProvisioningGrant(
+            grant_id=uuid4(),
+            grant_kind="CREDENTIAL_PROVISIONING",
+            operation="CREATE",
+            wallet_fingerprint=account_fingerprint,
+            account_fingerprint=account_fingerprint,
+            protocol_version=POLYMARKET_PILOT_PROTOCOL_VERSION,
+            grant_digest=CREDENTIAL_ROUTE_SET_HASH,
+            issued_at=observed_at,
+            expires_at=observed_at + MAXIMUM_GRANT_LIFETIME,
+        )
+        def timestamp() -> str:
+            return str(int(observed_at.timestamp()))
+
+        client = (
+            client_factory(private_key=private_key, timestamp=timestamp)
+            if client_factory is not None
+            else HttpxCredentialClient(private_key=private_key, timestamp=timestamp)
+        )
+        fingerprint = CredentialProvisioner(store, client).provision(
+            grant, binding, now=observed_at
+        )
+        result = CredentialCeremonyResult(
+            True,
+            "CREATED",
+            account_fingerprint=fingerprint.account_fingerprint,
+            credential_fingerprint=fingerprint.credential_fingerprint,
+        )
+    except CredentialProvisioningError as error:
+        code = (
+            "CREDENTIAL_STORE_FAILED"
+            if error.code == "CREDENTIAL_STORE_FAILED"
+            else "CREDENTIAL_CREATE_FAILED"
+        )
+        result = CredentialCeremonyResult(False, code)
+    except CredentialTransportError:
+        result = CredentialCeremonyResult(False, "CREDENTIAL_CREATE_FAILED")
+    except SecretBoundaryError:
+        result = CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+    except BaseException:
+        result = CredentialCeremonyResult(False, "CREDENTIAL_CREATE_FAILED")
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+        if material is not None:
+            material.close()
+    try:
+        _write_credential_result(response_fd, result)
+    finally:
+        _close(response_fd)
+
+
+def _credential_time(now: Callable[[], datetime]) -> datetime:
+    observed = now()
+    if (
+        not isinstance(observed, datetime)
+        or observed.tzinfo is None
+        or observed.utcoffset() is None
+    ):
+        raise ValueError("CREDENTIAL_CLOCK_INVALID")
+    return observed.astimezone(UTC)
+
+
+def _credential_account_fingerprint(binding: AccountSignatureBinding) -> str:
+    return sha256(binding.signer_address.casefold().encode("ascii")).hexdigest()
+
+
+def _write_credential_result(descriptor: int, result: CredentialCeremonyResult) -> None:
+    payload = json.dumps(
+        {
+            "account_fingerprint": result.account_fingerprint,
+            "code": result.code,
+            "credential_fingerprint": result.credential_fingerprint,
+            "ok": result.ok,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    if len(payload) > _MAXIMUM_CEREMONY_RESULT_BYTES:
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED")
+    _write_all(descriptor, len(payload).to_bytes(_LENGTH_HEADER_BYTES, "big"))
+    _write_all(descriptor, payload)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        written += os.write(descriptor, payload[written:])
+
+
+def _read_credential_result(descriptor: int) -> CredentialCeremonyResult:
+    try:
+        header = _read_exact(descriptor, _LENGTH_HEADER_BYTES)
+        length = int.from_bytes(header, "big")
+        if not 0 < length <= _MAXIMUM_CEREMONY_RESULT_BYTES:
+            raise ValueError
+        payload = json.loads(_read_exact(descriptor, length).decode("ascii"))
+        if type(payload) is not dict or set(payload) != {
+            "account_fingerprint",
+            "code",
+            "credential_fingerprint",
+            "ok",
+        }:
+            raise ValueError
+        result = CredentialCeremonyResult(**payload)
+        if type(result.ok) is not bool or result.code not in _CEREMONY_RESULT_CODES:
+            raise ValueError
+        fingerprints = (result.account_fingerprint, result.credential_fingerprint)
+        if result.ok != all(
+            type(value) is str
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in fingerprints
+        ):
+            raise ValueError
+        return result
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED") from None
+
+
+def _read_exact(descriptor: int, size: int) -> bytes:
+    value = bytearray()
+    while len(value) < size:
+        chunk = os.read(descriptor, size - len(value))
+        if not chunk:
+            raise ValueError
+        value.extend(chunk)
+    return bytes(value)
+
+
+def _fork_credential_child(launch: _CredentialChildLaunch) -> int:
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - the child never returns to the test process
+        code = 0
+        try:
+            launch.run()
+        except BaseException:
+            code = 1
+        finally:
+            os._exit(code)
+    return pid
 
 
 def _read_secrets(store: SecretStore, *, service: str, prompt: str) -> list[SecretBuffer]:

@@ -8,8 +8,10 @@ import pytest
 
 from polytrading.predictions.polymarket_execution.credential_client import (
     MAXIMUM_RESPONSE_BYTES,
+    REQUEST_TIMEOUT_SECONDS,
     CredentialTransportError,
     HttpxCredentialClient,
+    _production_client,
 )
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_API_KEY_ACCOUNT,
@@ -50,8 +52,28 @@ def client(handler: httpx.MockTransport) -> HttpxCredentialClient:
     return HttpxCredentialClient(
         private_key=PRIVATE_KEY,
         timestamp=lambda: TIMESTAMP,
-        client_factory=lambda: httpx.Client(transport=handler),
+        _client_factory=lambda: httpx.Client(transport=handler),
     )
+
+
+def test_production_httpx_client_uses_the_fixed_timeout() -> None:
+    with _production_client() as production:
+        assert production.timeout.connect == REQUEST_TIMEOUT_SECONDS
+        assert production.timeout.read == REQUEST_TIMEOUT_SECONDS
+        assert production.timeout.write == REQUEST_TIMEOUT_SECONDS
+        assert production.timeout.pool == REQUEST_TIMEOUT_SECONDS
+
+
+def test_closing_the_client_destroys_its_signing_key_before_any_request() -> None:
+    captured: list[httpx.Request] = []
+    credential_client = client(responder(capture=captured))
+
+    credential_client.close()
+
+    with pytest.raises(CredentialTransportError) as raised:
+        credential_client.create_or_derive(operation="CREATE", binding=binding())
+    assert raised.value.code == "CREDENTIAL_SIGNING_FAILED"
+    assert captured == []
 
 
 def responder(

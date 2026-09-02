@@ -232,6 +232,21 @@ def test_a_partial_write_is_rolled_back() -> None:
             store.read_required(CLOB_SERVICE, account, "unlock")
 
 
+def test_rollback_never_deletes_a_preexisting_credential() -> None:
+    store = RefusingStore(CLOB_PASSPHRASE_ACCOUNT)
+    existing = SecretBuffer.from_bytes(TEST_API_KEY)
+    store.write_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, existing)
+    existing.close()
+
+    with pytest.raises(CredentialProvisioningError) as raised:
+        provisioner(store, FakeCredentialClient()).provision(
+            valid_credential_grant(), account_model(), now=NOW
+        )
+
+    assert raised.value.code == "CREDENTIAL_STORE_FAILED"
+    assert stored(store, CLOB_API_KEY_ACCOUNT) == TEST_API_KEY
+
+
 def test_response_buffers_are_closed_even_when_storing_fails() -> None:
     store = RefusingStore(CLOB_API_KEY_ACCOUNT)
     handed_out: list[SecretBuffer] = []

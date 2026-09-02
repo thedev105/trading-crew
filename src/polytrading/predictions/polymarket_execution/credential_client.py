@@ -9,7 +9,9 @@ logs, or formats a credential value.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import Any, Final, Literal
+
+import httpx
 
 from polytrading.predictions.polymarket_execution.auth import ClobAuthError, sign_clob_auth
 from polytrading.predictions.polymarket_execution.keychain_macos import (
@@ -24,9 +26,6 @@ from polytrading.predictions.polymarket_execution.protocol import (
     load_protocol_snapshot,
 )
 from polytrading.predictions.polymarket_execution.secrets import SecretBuffer
-
-if TYPE_CHECKING:  # transport types are referenced, never constructed, in this package
-    import httpx
 
 MAXIMUM_RESPONSE_BYTES: Final = 8192
 REQUEST_TIMEOUT_SECONDS: Final = 10.0
@@ -45,31 +44,39 @@ class CredentialTransportError(ValueError):
         self.code = code
 
 
+def _production_client() -> httpx.Client:
+    """Construct the only production transport with its non-configurable timeout."""
+    return httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
+
+
 class HttpxCredentialClient:
     """One create-or-derive call, over the frozen route, with no other reachable surface."""
 
-    __slots__ = ("_client_factory", "_private_key", "_snapshot", "_timestamp")
+    __slots__ = ("_client_factory", "_closed", "_private_key", "_snapshot", "_timestamp")
 
     def __init__(
         self,
         *,
-        private_key: bytes,
+        private_key: bytes | bytearray,
         timestamp: Callable[[], str],
-        client_factory: Callable[[], httpx.Client],
+        _client_factory: Callable[[], httpx.Client] | None = None,
         snapshot: PolymarketProtocolSnapshot | None = None,
     ) -> None:
-        # The client is always injected: this package never constructs a socket-opening
-        # transport, so a repository scan can prove no shipped module opens one by itself.
-        self._private_key = private_key
+        self._private_key = (
+            private_key if type(private_key) is bytearray else bytearray(private_key)
+        )
+        self._closed = False
         self._timestamp = timestamp
         self._snapshot = snapshot or load_protocol_snapshot(
             version=POLYMARKET_PILOT_PROTOCOL_VERSION
         )
-        self._client_factory = client_factory
+        self._client_factory = _client_factory or _production_client
 
     def create_or_derive(
         self, *, operation: Literal["CREATE", "DERIVE"], binding: AccountSignatureBinding
     ) -> dict[str, SecretBuffer]:
+        if self._closed:
+            raise CredentialTransportError("CREDENTIAL_SIGNING_FAILED")
         route = (
             self._snapshot.routes.create_api_key
             if operation == "CREATE"
@@ -79,7 +86,7 @@ class HttpxCredentialClient:
             raise CredentialTransportError("CREDENTIAL_PROTOCOL_MISMATCH")
         timestamp = self._timestamp()
         try:
-            signature = sign_clob_auth(self._private_key, timestamp, self._snapshot)
+            signature = sign_clob_auth(bytes(self._private_key), timestamp, self._snapshot)
         except ClobAuthError as error:
             raise CredentialTransportError("CREDENTIAL_SIGNING_FAILED") from error
         headers = {
@@ -93,6 +100,12 @@ class HttpxCredentialClient:
 
         payload = self._request(route.host, route.method, route.path, headers)
         return _buffers_from(payload)
+
+    def close(self) -> None:
+        """Best-effort zeroize the child-owned signing-key copy."""
+        for index in range(len(self._private_key)):
+            self._private_key[index] = 0
+        self._closed = True
 
     def _request(
         self, host: str, method: str, path: str, headers: Mapping[str, str]

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Final, Literal
 
+from polytrading.predictions.polymarket_execution.credentials import CredentialFingerprint
 from polytrading.predictions.polymarket_execution.keychain_macos import (
     CLOB_API_KEY_ACCOUNT,
     CLOB_API_SECRET_ACCOUNT,
@@ -60,6 +63,61 @@ def render_credential_readiness(result: CredentialReadiness) -> str:
     return f"wallet_ready={wallet_ready}\ncredentials={result.credentials_state}"
 
 
+def create_credentials(
+    *,
+    store: SecretStore,
+    confirmed: bool,
+    now: Callable[[], datetime] | None = None,
+) -> CredentialFingerprint:
+    """Run the explicitly confirmed absent-only create ceremony."""
+    if confirmed is not True:
+        raise CredentialCommandError("CONFIRMATION_REQUIRED")
+    state = _credential_state(store)
+    if state == "PRESENT":
+        raise CredentialCommandError("CREDENTIALS_ALREADY_PRESENT")
+    if state == "PARTIAL":
+        raise CredentialCommandError("CREDENTIALS_PARTIAL")
+    try:
+        return _create_credentials_in_sidecar(store=store, now=now or _utc_now)
+    except Exception as error:
+        from polytrading.predictions.pilot.signer_bootstrap import SignerBootstrapError
+
+        if not isinstance(error, SignerBootstrapError):
+            raise
+        code = (
+            error.code
+            if error.code
+            in {
+                "CREDENTIALS_ALREADY_PRESENT",
+                "CREDENTIAL_CREATE_FAILED",
+                "CREDENTIAL_STORE_FAILED",
+            }
+            else "SIGNER_BOOTSTRAP_FAILED"
+        )
+        raise CredentialCommandError(code) from None
+
+
+def _credential_state(store: SecretStore) -> Literal["PRESENT", "ABSENT", "PARTIAL"]:
+    present = tuple(_item_is_present(store, account) for account in _CREDENTIAL_ACCOUNTS)
+    if all(present):
+        return "PRESENT"
+    if any(present):
+        return "PARTIAL"
+    return "ABSENT"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _create_credentials_in_sidecar(
+    *, store: SecretStore, now: Callable[[], datetime]
+) -> CredentialFingerprint:
+    from polytrading.predictions.pilot.signer_bootstrap import create_credentials_in_sidecar
+
+    return create_credentials_in_sidecar(store=store, now=now)
+
+
 def _item_is_valid_wallet(store: SecretStore) -> bool:
     buffer = _read_required(store, WALLET_PRIVATE_KEY_ACCOUNT, wallet=True)
     try:
@@ -104,5 +162,6 @@ __all__ = [
     "CredentialCommandError",
     "CredentialReadiness",
     "check_credential_readiness",
+    "create_credentials",
     "render_credential_readiness",
 ]
