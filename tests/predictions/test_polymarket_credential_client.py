@@ -9,7 +9,6 @@ import pytest
 from polytrading.predictions.polymarket_execution import credential_client as client_module
 from polytrading.predictions.polymarket_execution.credential_client import (
     MAXIMUM_RESPONSE_BYTES,
-    REQUEST_TIMEOUT_SECONDS,
     CredentialTransportError,
     HttpxCredentialClient,
 )
@@ -56,12 +55,17 @@ def client(handler: httpx.MockTransport) -> HttpxCredentialClient:
     )
 
 
-def test_production_httpx_client_uses_the_fixed_timeout() -> None:
-    with HttpxCredentialClient._new_client() as production:
-        assert production.timeout.connect == REQUEST_TIMEOUT_SECONDS
-        assert production.timeout.read == REQUEST_TIMEOUT_SECONDS
-        assert production.timeout.write == REQUEST_TIMEOUT_SECONDS
-        assert production.timeout.pool == REQUEST_TIMEOUT_SECONDS
+def test_production_http_client_is_request_scoped_and_ignores_environment_transport() -> None:
+    source = json.dumps(
+        __import__("pathlib")
+        .Path("src/polytrading/predictions/polymarket_execution/credential_client.py")
+        .read_text(encoding="utf-8")
+    )
+
+    assert "def _new_client" not in source
+    assert "return httpx.Client" not in source
+    assert "with httpx.Client(" in source
+    assert "trust_env=False" in source
 
 
 def test_closing_the_client_destroys_its_signing_key_before_any_request() -> None:

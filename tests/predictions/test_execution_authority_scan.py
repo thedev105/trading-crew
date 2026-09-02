@@ -35,7 +35,7 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "14195af77ad2f5fb18d0e5a9ef55865b84812ddd4d0fc5e7e9d0e974a85b0175",
     Path(
         "polymarket_execution/credential_client.py"
-    ): "ef15bf27fa92fc1023167200e98ace45384eab569c62bc5e6c532120f8973d14",
+    ): "6722e9ca8f383068e53438c0e66d972bb439ebbce08c6972423f3da4499dd39f",
     Path(
         "pilot/credential_commands.py"
     ): "b8ec3212b5ebeac0327985800a43e422c0ee52ffb9da5a0c56c8cc1149fa3519",
@@ -674,20 +674,15 @@ def _allowed_hardened_credential_client_call(
     methods = {
         item.name: item for item in credential_client.body if isinstance(item, ast.FunctionDef)
     }
-    factory = methods.get("_new_client")
     initialize = methods.get("__init__")
     for_test = methods.get("_for_test")
+    request = methods.get("_request")
     if (
-        factory is None
-        or initialize is None
+        initialize is None
         or for_test is None
+        or request is None
         or not (
-            factory.lineno <= call.lineno <= (factory.end_lineno or 0)
-            and _method_arguments_are_exact(factory, positional=(), keyword_only=("transport",))
-            and _method_argument_annotation(factory, "transport") == "httpx.MockTransport | None"
-            and len(factory.args.kw_defaults) == 1
-            and isinstance(factory.args.kw_defaults[0], ast.Constant)
-            and factory.args.kw_defaults[0].value is None
+            request.lineno <= call.lineno <= (request.end_lineno or 0)
             and _method_arguments_are_exact(
                 initialize,
                 positional=("self",),
@@ -698,9 +693,10 @@ def _allowed_hardened_credential_client_call(
                 positional=("cls",),
                 keyword_only=("private_key", "timestamp", "transport"),
             )
-            and any(
-                isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
-                for decorator in factory.decorator_list
+            and _method_arguments_are_exact(
+                request,
+                positional=("self",),
+                keyword_only=("operation", "headers"),
             )
             and any(
                 isinstance(decorator, ast.Name) and decorator.id == "classmethod"
@@ -710,20 +706,20 @@ def _allowed_hardened_credential_client_call(
     ):
         return False
     exact_transport_guard = ast.parse(
-        "if transport is not None and type(transport) is not httpx.MockTransport:\n"
+        "if type(transport) is not httpx.MockTransport:\n"
         '    raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")\n'
     ).body[0]
-    factory_statements = tuple(
+    for_test_statements = tuple(
         item
-        for item in factory.body
+        for item in for_test.body
         if not (
             isinstance(item, ast.Expr)
             and isinstance(item.value, ast.Constant)
             and isinstance(item.value.value, str)
         )
     )
-    if len(factory_statements) != 2 or ast.dump(
-        factory_statements[0], include_attributes=False
+    if len(for_test_statements) != 4 or ast.dump(
+        for_test_statements[0], include_attributes=False
     ) != ast.dump(
         exact_transport_guard,
         include_attributes=False,
@@ -740,15 +736,46 @@ def _allowed_hardened_credential_client_call(
     ]
     if len(timeout_constants) != 1:
         return False
+    scoped_clients = [
+        item
+        for with_statement in ast.walk(request)
+        if isinstance(with_statement, ast.With)
+        for item in with_statement.items
+        if item.context_expr is call
+        and isinstance(item.optional_vars, ast.Name)
+        and item.optional_vars.id == "client"
+    ]
+    client_calls = [
+        item
+        for item in ast.walk(credential_client)
+        if isinstance(item, ast.Call)
+        and _resolved_python_name(item.func, {"httpx": "httpx"}) == "httpx.Client"
+    ]
+    if (
+        len(scoped_clients) != 1
+        or client_calls != [call]
+        or any(
+            isinstance(item, ast.Return)
+            and any(
+                isinstance(value, ast.Name) and value.id == "client" for value in ast.walk(item)
+            )
+            for item in ast.walk(request)
+        )
+    ):
+        return False
     keywords = {item.arg: item.value for item in call.keywords}
     return (
-        set(keywords) == {"timeout", "transport"}
+        set(keywords) == {"timeout", "trust_env", "transport"}
         and isinstance(keywords["timeout"], ast.Name)
         and keywords["timeout"].id == "REQUEST_TIMEOUT_SECONDS"
-        and isinstance(keywords["transport"], ast.Name)
-        and keywords["transport"].id == "transport"
+        and isinstance(keywords["trust_env"], ast.Constant)
+        and keywords["trust_env"].value is False
+        and isinstance(keywords["transport"], ast.Attribute)
+        and isinstance(keywords["transport"].value, ast.Name)
+        and keywords["transport"].value.id == "self"
+        and keywords["transport"].attr == "_test_transport"
         and not any(
-            isinstance(item, ast.Name) and item.id == "_client_factory"
+            isinstance(item, ast.Name) and item.id in {"_client", "_client_factory", "_new_client"}
             for item in ast.walk(credential_client)
         )
     )

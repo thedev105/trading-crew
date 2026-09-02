@@ -46,7 +46,7 @@ class CredentialTransportError(ValueError):
 class HttpxCredentialClient:
     """One create-or-derive call, over the frozen route, with no other reachable surface."""
 
-    __slots__ = ("_client", "_closed", "_private_key", "_snapshot", "_timestamp")
+    __slots__ = ("_closed", "_private_key", "_snapshot", "_test_transport", "_timestamp")
 
     def __init__(
         self,
@@ -54,11 +54,13 @@ class HttpxCredentialClient:
         private_key: bytes | bytearray,
         timestamp: Callable[[], str],
     ) -> None:
-        self._initialize(
-            private_key=private_key,
-            timestamp=timestamp,
-            client=self._new_client(),
+        self._private_key = (
+            private_key if type(private_key) is bytearray else bytearray(private_key)
         )
+        self._closed = False
+        self._timestamp = timestamp
+        self._snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
+        self._test_transport: httpx.MockTransport | None = None
 
     @classmethod
     def _for_test(
@@ -69,35 +71,11 @@ class HttpxCredentialClient:
         transport: httpx.MockTransport,
     ) -> HttpxCredentialClient:
         """Build the fixed client over an in-memory transport for tests only."""
-        instance = cls.__new__(cls)
-        instance._initialize(
-            private_key=private_key,
-            timestamp=timestamp,
-            client=cls._new_client(transport=transport),
-        )
-        return instance
-
-    @staticmethod
-    def _new_client(*, transport: httpx.MockTransport | None = None) -> httpx.Client:
-        """Construct the sole credential client; a fake transport is test-only."""
-        if transport is not None and type(transport) is not httpx.MockTransport:
+        if type(transport) is not httpx.MockTransport:
             raise TypeError("HTTPX_MOCK_TRANSPORT_REQUIRED")
-        return httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, transport=transport)
-
-    def _initialize(
-        self,
-        *,
-        private_key: bytes | bytearray,
-        timestamp: Callable[[], str],
-        client: httpx.Client,
-    ) -> None:
-        self._private_key = (
-            private_key if type(private_key) is bytearray else bytearray(private_key)
-        )
-        self._closed = False
-        self._timestamp = timestamp
-        self._snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
-        self._client = client
+        instance = cls(private_key=private_key, timestamp=timestamp)
+        instance._test_transport = transport
+        return instance
 
     def create_or_derive(
         self, *, operation: Literal["CREATE", "DERIVE"], binding: AccountSignatureBinding
@@ -127,7 +105,6 @@ class HttpxCredentialClient:
         """Best-effort zeroize the child-owned signing-key copy."""
         for index in range(len(self._private_key)):
             self._private_key[index] = 0
-        self._client.close()
         self._closed = True
 
     def _request(
@@ -139,11 +116,16 @@ class HttpxCredentialClient:
             else self._snapshot.routes.derive_api_key
         )
         try:
-            response = self._client.request(
-                route.method,
-                f"{route.host}{route.path}",
-                headers=dict(headers),
-            )
+            with httpx.Client(
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                trust_env=False,
+                transport=self._test_transport,
+            ) as client:
+                response = client.request(
+                    route.method,
+                    f"{route.host}{route.path}",
+                    headers=dict(headers),
+                )
         except Exception as error:  # any transport failure, reduced to one stable code
             # The exception never carries the response body: only a stable code escapes.
             raise CredentialTransportError("CREDENTIAL_TRANSPORT_UNAVAILABLE") from error
