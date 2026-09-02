@@ -27,6 +27,9 @@ _CREDENTIAL_ACCOUNTS: Final = (
     CLOB_API_SECRET_ACCOUNT,
     CLOB_PASSPHRASE_ACCOUNT,
 )
+_SECP256K1_ORDER: Final = int(
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
+)
 
 
 class CredentialCommandError(ValueError):
@@ -72,11 +75,6 @@ def create_credentials(
     """Run the explicitly confirmed absent-only create ceremony."""
     if confirmed is not True:
         raise CredentialCommandError("CONFIRMATION_REQUIRED")
-    state = _credential_state(store)
-    if state == "PRESENT":
-        raise CredentialCommandError("CREDENTIALS_ALREADY_PRESENT")
-    if state == "PARTIAL":
-        raise CredentialCommandError("CREDENTIALS_PARTIAL")
     try:
         return _create_credentials_in_sidecar(store=store, now=now or _utc_now)
     except Exception as error:
@@ -89,21 +87,15 @@ def create_credentials(
             if error.code
             in {
                 "CREDENTIALS_ALREADY_PRESENT",
+                "CREDENTIALS_PARTIAL",
+                "CREDENTIALS_CREATE_IN_PROGRESS",
                 "CREDENTIAL_CREATE_FAILED",
                 "CREDENTIAL_STORE_FAILED",
+                "CREDENTIAL_ROLLBACK_FAILED",
             }
             else "SIGNER_BOOTSTRAP_FAILED"
         )
         raise CredentialCommandError(code) from None
-
-
-def _credential_state(store: SecretStore) -> Literal["PRESENT", "ABSENT", "PARTIAL"]:
-    present = tuple(_item_is_present(store, account) for account in _CREDENTIAL_ACCOUNTS)
-    if all(present):
-        return "PRESENT"
-    if any(present):
-        return "PARTIAL"
-    return "ABSENT"
 
 
 def _utc_now() -> datetime:
@@ -121,7 +113,13 @@ def _create_credentials_in_sidecar(
 def _item_is_valid_wallet(store: SecretStore) -> bool:
     buffer = _read_required(store, WALLET_PRIVATE_KEY_ACCOUNT, wallet=True)
     try:
-        return len(buffer) == 32
+        return bool(
+            buffer.use(
+                lambda value: (
+                    len(value) == 32 and 0 < int.from_bytes(value, "big") < _SECP256K1_ORDER
+                )
+            )
+        )
     finally:
         buffer.close()
 

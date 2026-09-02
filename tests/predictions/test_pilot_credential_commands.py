@@ -26,6 +26,8 @@ from polytrading.predictions.polymarket_execution.secrets import SecretBuffer, S
 
 WALLET_CANARY = b"wallet-canary" + b"-" * 19
 CLOB_CANARY = b"clob-canary"
+
+
 class FakeSecretStore:
     """A local fake with a network tripwire and observable returned-buffer ownership."""
 
@@ -96,7 +98,7 @@ def test_create_requires_confirmation_before_keychain_or_child_access(
     assert child_started == []
 
 
-def test_create_preflights_only_clob_presence_and_returns_the_public_fingerprint(
+def test_create_dispatches_without_parent_secret_store_access_and_returns_a_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = wallet_only_store()
@@ -115,12 +117,7 @@ def test_create_preflights_only_clob_presence_and_returns_the_public_fingerprint
     result = create_credentials(store=store, confirmed=True)
 
     assert result == expected
-    assert [account for _operation, account in store.calls] == [
-        CLOB_API_KEY_ACCOUNT,
-        CLOB_API_SECRET_ACCOUNT,
-        CLOB_PASSPHRASE_ACCOUNT,
-    ]
-    assert WALLET_PRIVATE_KEY_ACCOUNT not in {account for _operation, account in store.calls}
+    assert store.calls == []
     assert CLOB_CANARY.decode() not in repr(result)
 
 
@@ -131,24 +128,23 @@ def test_create_preflights_only_clob_presence_and_returns_the_public_fingerprint
         (wallet_and_one_clob_item_store, "CREDENTIALS_PARTIAL"),
     ],
 )
-def test_existing_or_partial_credentials_fail_before_the_child(
+def test_existing_or_partial_child_results_are_sanitized_without_parent_keychain_reads(
     monkeypatch: pytest.MonkeyPatch,
     store_factory: Callable[[], FakeSecretStore],
     code: str,
 ) -> None:
     store = store_factory()
-    child_started: list[bool] = []
-    monkeypatch.setattr(
-        credential_commands,
-        "_create_credentials_in_sidecar",
-        lambda **_kwargs: child_started.append(True),
-    )
+
+    def fail(**_kwargs: object) -> CredentialFingerprint:
+        raise SignerBootstrapError(code)
+
+    monkeypatch.setattr(credential_commands, "_create_credentials_in_sidecar", fail)
 
     with pytest.raises(CredentialCommandError) as raised:
         create_credentials(store=store, confirmed=True)
 
     assert raised.value.code == code
-    assert child_started == []
+    assert store.calls == []
 
 
 @pytest.mark.parametrize(
@@ -157,6 +153,8 @@ def test_existing_or_partial_credentials_fail_before_the_child(
         ("SECRET_DESCRIPTOR_READ_FAILED", "SIGNER_BOOTSTRAP_FAILED"),
         ("CREDENTIAL_CREATE_FAILED", "CREDENTIAL_CREATE_FAILED"),
         ("CREDENTIAL_STORE_FAILED", "CREDENTIAL_STORE_FAILED"),
+        ("CREDENTIAL_ROLLBACK_FAILED", "CREDENTIAL_ROLLBACK_FAILED"),
+        ("CREDENTIALS_CREATE_IN_PROGRESS", "CREDENTIALS_CREATE_IN_PROGRESS"),
     ],
 )
 def test_create_maps_sidecar_failures_to_the_fixed_public_codes(
@@ -246,3 +244,18 @@ def test_readiness_rejects_a_wallet_buffer_that_is_not_32_bytes() -> None:
 
     assert result == CredentialReadiness(wallet_ready=False, credentials_state="ABSENT")
     assert all(buffer.closed for buffer in store.handed_out)
+
+
+@pytest.mark.parametrize(
+    "wallet",
+    [
+        (0).to_bytes(32, "big"),
+        (int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)).to_bytes(
+            32, "big"
+        ),
+    ],
+)
+def test_readiness_rejects_zero_and_out_of_range_secp256k1_scalars(wallet: bytes) -> None:
+    result = check_credential_readiness(FakeSecretStore({WALLET_PRIVATE_KEY_ACCOUNT: wallet}))
+
+    assert result == CredentialReadiness(wallet_ready=False, credentials_state="ABSENT")

@@ -7,6 +7,7 @@ holds no secret bytes: only the two framed IPC streams the pilot talks to.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from collections.abc import Callable
@@ -51,7 +52,6 @@ from polytrading.predictions.polymarket_execution.secrets import (
     SecretMaterial,
     SecretStore,
     SecretStoreError,
-    read_secret_descriptors,
 )
 from polytrading.predictions.polymarket_execution.signer import (
     SignerService,
@@ -69,8 +69,21 @@ UNLOCK_PROMPT: Final = "Unlock the Polymarket pilot wallet and credentials for t
 _LENGTH_HEADER_BYTES: Final = 4
 MAXIMUM_SECRET_BYTES: Final = 4096
 _MAXIMUM_CEREMONY_RESULT_BYTES: Final = 512
+_CREDENTIAL_CEREMONY_LOCK_PATH: Final = "/tmp/polytrading-polymarket-credential-create.lock"
+_SECP256K1_ORDER: Final = int(
+    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
+)
 _CEREMONY_RESULT_CODES: Final = frozenset(
-    {"CREATED", "SIGNER_BOOTSTRAP_FAILED", "CREDENTIAL_CREATE_FAILED", "CREDENTIAL_STORE_FAILED"}
+    {
+        "CREATED",
+        "CREDENTIALS_ALREADY_PRESENT",
+        "CREDENTIALS_PARTIAL",
+        "CREDENTIALS_CREATE_IN_PROGRESS",
+        "SIGNER_BOOTSTRAP_FAILED",
+        "CREDENTIAL_CREATE_FAILED",
+        "CREDENTIAL_STORE_FAILED",
+        "CREDENTIAL_ROLLBACK_FAILED",
+    }
 )
 
 
@@ -80,6 +93,13 @@ class SignerBootstrapError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _CredentialCeremonyComplete(Exception):
+    """Stop a child ceremony after constructing its public-only result."""
+
+    def __init__(self, result: CredentialCeremonyResult) -> None:
+        self.result = result
 
 
 class SignerServiceFactory(Protocol):
@@ -115,8 +135,8 @@ class CredentialCeremonyResult:
 @dataclass(frozen=True, slots=True)
 class _CredentialChildLaunch:
     response_fd: int
-    secret_descriptors: tuple[int, int, int, int]
     run: Callable[[], None]
+    run_until_exit: Callable[[], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,45 +238,34 @@ def _launch_credential_ceremony(
     _spawn: Callable[[_CredentialChildLaunch], int | None] | None = None,
     _client_factory: CredentialClientFactory | None = None,
 ) -> CredentialCeremonyResult:
-    """Launch one fixed-operation child through the inherited four-descriptor contract."""
-    secrets = _read_secrets(store, service=CLOB_SERVICE, prompt=UNLOCK_PROMPT)
-    if any(len(buffer) > 0 for buffer in secrets[1:]):
-        for buffer in secrets:
-            buffer.close()
-        raise SignerBootstrapError("CREDENTIALS_ALREADY_PRESENT")
-    secret_pipes = [os.pipe() for _ in SECRET_ACCOUNTS]
-    response_pipe = os.pipe()
-    try:
-        for buffer, (_read_fd, write_fd) in zip(secrets, secret_pipes, strict=True):
-            _write_framed_secret(write_fd, buffer)
-    except BaseException:
-        _close_all(secret_pipes, response_pipe)
-        raise
-    finally:
-        for buffer in secrets:
-            buffer.close()
-        for _read_fd, write_fd in secret_pipes:
-            _close(write_fd)
+    """Fork a dedicated child before any credential-store or secret access.
 
-    descriptors = tuple(read_fd for read_fd, _write_fd in secret_pipes)
+    Unlike the long-lived signing sidecar, this command deliberately does not transfer
+    descriptors: doing so would require the parent to read the wallet and CLOB values.
+    """
+    response_pipe = os.pipe()
     launch = _CredentialChildLaunch(
         response_fd=response_pipe[1],
-        secret_descriptors=descriptors,  # type: ignore[arg-type]
         run=lambda: _run_credential_child(
             response_fd=response_pipe[1],
-            secret_descriptors=descriptors,
             store=store,
             now=now,
             client_factory=_client_factory,
+        ),
+        run_until_exit=lambda: _run_credential_child(
+            response_fd=response_pipe[1],
+            store=store,
+            now=now,
+            client_factory=_client_factory,
+            release_lock_on_return=False,
         ),
     )
     try:
         child_pid = (_spawn or _fork_credential_child)(launch)
     except BaseException:
-        _close_all(secret_pipes, response_pipe)
+        _close(response_pipe[0])
+        _close(response_pipe[1])
         raise SignerBootstrapError("SIGNER_BOOTSTRAP_FAILED") from None
-    for read_fd, _write_fd in secret_pipes:
-        _close(read_fd)
     _close(response_pipe[1])
     try:
         return _read_credential_result(response_pipe[0])
@@ -270,20 +279,32 @@ def _launch_credential_ceremony(
 def _run_credential_child(
     *,
     response_fd: int,
-    secret_descriptors: tuple[int, ...],
     store: SecretStore,
     now: Callable[[], datetime],
     client_factory: CredentialClientFactory | None,
+    release_lock_on_return: bool = True,
 ) -> None:
-    material: SecretMaterial | None = None
+    private_key: bytearray | None = None
     client: CredentialClient | None = None
     result = CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+    lock_fd: int | None = None
     try:
-        material = read_secret_descriptors(*secret_descriptors)  # type: ignore[arg-type]
-        if material.credentials_present:
-            raise SecretBoundaryError("SECRET_MATERIAL_INVALID")
+        lock_fd = _try_acquire_credential_ceremony_lock()
+        if lock_fd is None:
+            raise _CredentialCeremonyComplete(
+                CredentialCeremonyResult(False, "CREDENTIALS_CREATE_IN_PROGRESS")
+            )
+        state = _credential_state_in_child(store)
+        if state == "PRESENT":
+            raise _CredentialCeremonyComplete(
+                CredentialCeremonyResult(False, "CREDENTIALS_ALREADY_PRESENT")
+            )
+        if state == "PARTIAL":
+            raise _CredentialCeremonyComplete(
+                CredentialCeremonyResult(False, "CREDENTIALS_PARTIAL")
+            )
         observed_at = _credential_time(now)
-        private_key = material.private_key
+        private_key = _read_valid_wallet_private_key(store)
         address = Account.from_key(private_key).address
         snapshot = load_protocol_snapshot(version=POLYMARKET_PILOT_PROTOCOL_VERSION)
         binding = bind_account_signature(
@@ -306,6 +327,7 @@ def _run_credential_child(
             issued_at=observed_at,
             expires_at=observed_at + MAXIMUM_GRANT_LIFETIME,
         )
+
         def timestamp() -> str:
             return str(int(observed_at.timestamp()))
 
@@ -323,10 +345,12 @@ def _run_credential_child(
             account_fingerprint=fingerprint.account_fingerprint,
             credential_fingerprint=fingerprint.credential_fingerprint,
         )
+    except _CredentialCeremonyComplete as complete:
+        result = complete.result
     except CredentialProvisioningError as error:
         code = {
             "CREDENTIAL_STORE_FAILED": "CREDENTIAL_STORE_FAILED",
-            "CREDENTIAL_ROLLBACK_FAILED": "SIGNER_BOOTSTRAP_FAILED",
+            "CREDENTIAL_ROLLBACK_FAILED": "CREDENTIAL_ROLLBACK_FAILED",
         }.get(error.code, "CREDENTIAL_CREATE_FAILED")
         result = CredentialCeremonyResult(False, code)
     except CredentialTransportError:
@@ -339,12 +363,74 @@ def _run_credential_child(
         close = getattr(client, "close", None)
         if callable(close):
             close()
-        if material is not None:
-            material.close()
+        if private_key is not None:
+            _zeroize(private_key)
     try:
         _write_credential_result(response_fd, result)
     finally:
         _close(response_fd)
+        # Production uses ``run_until_exit`` so this descriptor survives to ``os._exit``;
+        # inline fake children close it here to keep tests isolated.  The advisory lock has no
+        # secret-bearing name or content.
+        if lock_fd is not None and release_lock_on_return:
+            _close(lock_fd)
+
+
+def _try_acquire_credential_ceremony_lock() -> int | None:
+    """Acquire the public, non-secret, child-lifetime cooperative create lock."""
+    descriptor = os.open(_CREDENTIAL_CEREMONY_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        _close(descriptor)
+        return None
+    return descriptor
+
+
+def _credential_state_in_child(store: SecretStore) -> str:
+    present: list[bool] = []
+    for account in SECRET_ACCOUNTS[1:]:
+        try:
+            buffer = store.read_required(CLOB_SERVICE, account, UNLOCK_PROMPT)
+        except SecretStoreError as error:
+            if error.code == "SECRET_ITEM_MISSING":
+                present.append(False)
+                continue
+            raise SecretBoundaryError("SECRET_CREDENTIAL_STATE_UNAVAILABLE") from None
+        try:
+            present.append(True)
+        finally:
+            buffer.close()
+    if all(present):
+        return "PRESENT"
+    if any(present):
+        return "PARTIAL"
+    return "ABSENT"
+
+
+def _read_valid_wallet_private_key(store: SecretStore) -> bytearray:
+    try:
+        buffer = store.read_required(CLOB_SERVICE, WALLET_PRIVATE_KEY_ACCOUNT, UNLOCK_PROMPT)
+    except SecretStoreError:
+        raise SecretBoundaryError("SECRET_WALLET_UNAVAILABLE") from None
+    try:
+        private_key = buffer.use(lambda value: bytearray(value))
+    finally:
+        buffer.close()
+    if (
+        type(private_key) is not bytearray
+        or len(private_key) != 32
+        or not 0 < int.from_bytes(private_key, "big") < _SECP256K1_ORDER
+    ):
+        if type(private_key) is bytearray:
+            _zeroize(private_key)
+        raise SecretBoundaryError("SECRET_PRIVATE_KEY_INVALID") from None
+    return private_key
+
+
+def _zeroize(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0
 
 
 def _credential_time(now: Callable[[], datetime]) -> datetime:
@@ -431,7 +517,7 @@ def _fork_credential_child(launch: _CredentialChildLaunch) -> int:
     if pid == 0:  # pragma: no cover - the child never returns to the test process
         code = 0
         try:
-            launch.run()
+            launch.run_until_exit()
         except BaseException:
             code = 1
         finally:

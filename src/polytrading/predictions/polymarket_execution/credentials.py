@@ -207,6 +207,10 @@ class CredentialProvisioner:
                 try:
                     self._store.delete_created(creation)
                 except SecretStoreError:
+                    # A non-cooperating Keychain writer can replace a ceremony-created item
+                    # between add and rollback.  Its opaque creation ticket then refuses to
+                    # delete the replacement; preserve it and fail closed rather than claim
+                    # all-or-none success that the local store cannot guarantee.
                     rollback_failed = True
             if rollback_failed:
                 raise CredentialProvisioningError("CREDENTIAL_ROLLBACK_FAILED") from error

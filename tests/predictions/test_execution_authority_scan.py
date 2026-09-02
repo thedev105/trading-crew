@@ -38,13 +38,13 @@ _REVIEWED_SOURCE_SHA256 = {
     ): "6722e9ca8f383068e53438c0e66d972bb439ebbce08c6972423f3da4499dd39f",
     Path(
         "pilot/credential_commands.py"
-    ): "b8ec3212b5ebeac0327985800a43e422c0ee52ffb9da5a0c56c8cc1149fa3519",
+    ): "8956ce29af4a561984e4163a3cdcf38f273eabdce26a0bb2af02b971713491bc",
     Path(
         "pilot/signer_bootstrap.py"
-    ): "63907ad949f49c7918c111fcbe2805641bf1a0595ef7e0bf66ce1386a7e83c38",
+    ): "065e8b7a989db33572dfbbfc48943816fad8fa8d675cfc2b99ee61e34fc556c7",
     Path(
         "polymarket_execution/credentials.py"
-    ): "53533f6497774468eef271dc22e740e62553b1eccb6306e13a5d53060fd34785",
+    ): "28cc4e1054f3a26df7037c5f04ac1ae15b7806b77a3b0ec4b29c5bdfca8a1109",
     Path(
         "polymarket_execution/keychain_macos.py"
     ): "6c705ee959afb7f796e8438f392703284ff8f360f1227463512b059918c369b3",

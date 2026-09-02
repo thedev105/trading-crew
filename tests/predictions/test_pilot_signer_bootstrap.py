@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from hashlib import sha256
+from multiprocessing import get_context
 from typing import Any
 
 import pytest
@@ -74,6 +75,20 @@ class RollbackRefusingStore(SecondWriteRefusingStore):
     def delete_created(self, creation: object) -> None:
         del creation
         raise SecretStoreError("SECRET_WRITE_FAILED")
+
+
+class ExternalUpdateDuringRollbackStore(InMemorySecretStore):
+    """A non-cooperating writer replaces the first slot before our failed rollback."""
+
+    def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
+        if account == CLOB_API_SECRET_ACCOUNT:
+            replacement = SecretBuffer.from_bytes(b"external-replacement")
+            try:
+                self.write_protected(service, CLOB_API_KEY_ACCOUNT, replacement)
+            finally:
+                replacement.close()
+            raise SecretStoreError("SECRET_WRITE_FAILED")
+        return super().create_protected(service, account, value)
 
 
 def wallet_only_memory(store_type: type[InMemorySecretStore] = InMemorySecretStore) -> Any:
@@ -164,9 +179,7 @@ def test_create_failure_leaves_no_clob_trio(failure: str) -> None:
     )
 
     expected = (
-        "CREDENTIAL_STORE_FAILED"
-        if failure == "second_write"
-        else "CREDENTIAL_CREATE_FAILED"
+        "CREDENTIAL_STORE_FAILED" if failure == "second_write" else "CREDENTIAL_CREATE_FAILED"
     )
     assert result == CredentialCeremonyResult(False, expected)
     assert clob_slots_are_absent(memory)
@@ -181,10 +194,28 @@ def test_rollback_integrity_failure_refuses_to_report_an_ordinary_create_failure
         _client_factory=lambda **_kwargs: CreateOnlyCredentialClient(),
     )
 
-    assert result == CredentialCeremonyResult(False, "SIGNER_BOOTSTRAP_FAILED")
+    assert result == CredentialCeremonyResult(False, "CREDENTIAL_ROLLBACK_FAILED")
 
 
-def test_parent_closes_credential_buffers_before_starting_the_child() -> None:
+def test_rollback_never_deletes_an_external_update_and_fails_closed() -> None:
+    memory = wallet_only_memory(ExternalUpdateDuringRollbackStore)
+
+    result = _launch_credential_ceremony(
+        store=memory,
+        now=lambda: NOW,
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: CreateOnlyCredentialClient(),
+    )
+
+    retained = memory.read_required(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, "verify")
+    try:
+        assert retained.use(bytes) == b"external-replacement"
+    finally:
+        retained.close()
+    assert result == CredentialCeremonyResult(False, "CREDENTIAL_ROLLBACK_FAILED")
+
+
+def test_create_parent_forks_before_any_secret_store_read() -> None:
     memory = wallet_only_memory()
     handed_out: list[SecretBuffer] = []
 
@@ -203,8 +234,7 @@ def test_parent_closes_credential_buffers_before_starting_the_child() -> None:
     client = CreateOnlyCredentialClient()
 
     def spawn(launch: Any) -> None:
-        assert handed_out
-        assert all(buffer.closed for buffer in handed_out)
+        assert handed_out == []
         launch.run()
 
     _launch_credential_ceremony(
@@ -213,6 +243,91 @@ def test_parent_closes_credential_buffers_before_starting_the_child() -> None:
         _spawn=spawn,
         _client_factory=lambda **_kwargs: client,
     )
+
+
+def test_post_lock_partial_state_refuses_before_remote_create() -> None:
+    memory = wallet_only_memory()
+    child_started = False
+    client = CreateOnlyCredentialClient()
+
+    class PostLockPartialStore:
+        def read_required(self, service: str, account: str, prompt: str) -> SecretBuffer:
+            nonlocal child_started
+            if child_started and account == CLOB_API_KEY_ACCOUNT:
+                inserted = SecretBuffer.from_bytes(b"post-lock-external-update")
+                try:
+                    memory.write_protected(CLOB_SERVICE, CLOB_API_KEY_ACCOUNT, inserted)
+                finally:
+                    inserted.close()
+            return memory.read_required(service, account, prompt)
+
+        def create_protected(self, service: str, account: str, value: SecretBuffer) -> object:
+            return memory.create_protected(service, account, value)
+
+        def delete_created(self, creation: object) -> None:
+            memory.delete_created(creation)  # type: ignore[arg-type]
+
+    def spawn(launch: Any) -> None:
+        nonlocal child_started
+        child_started = True
+        launch.run()
+
+    result = _launch_credential_ceremony(
+        store=PostLockPartialStore(),
+        now=lambda: NOW,
+        _spawn=spawn,
+        _client_factory=lambda **_kwargs: client,
+    )
+
+    assert result == CredentialCeremonyResult(False, "CREDENTIALS_PARTIAL")
+    assert client.calls == []
+
+
+def _concurrent_ceremony_worker(started: Any, release: Any, count: Any, results: Any) -> None:
+    memory = wallet_only_memory()
+
+    class BlockingClient(CreateOnlyCredentialClient):
+        def create_or_derive(
+            self, *, operation: str, binding: AccountSignatureBinding
+        ) -> dict[str, SecretBuffer]:
+            with count.get_lock():
+                count.value += 1
+            started.set()
+            assert release.wait(5)
+            return super().create_or_derive(operation=operation, binding=binding)
+
+    result = _launch_credential_ceremony(
+        store=memory,
+        now=lambda: NOW,
+        _spawn=lambda launch: launch.run(),
+        _client_factory=lambda **_kwargs: BlockingClient(),
+    )
+    results.put(result.code)
+
+
+def test_concurrent_create_ceremonies_issue_one_remote_create() -> None:
+    context = get_context("fork")
+    started = context.Event()
+    release = context.Event()
+    count = context.Value("i", 0)
+    results = context.Queue()
+    worker_args = (started, release, count, results)
+    first = context.Process(target=_concurrent_ceremony_worker, args=worker_args)
+    second = context.Process(target=_concurrent_ceremony_worker, args=worker_args)
+    first.start()
+    assert started.wait(5)
+    second.start()
+    second.join(5)
+    release.set()
+    first.join(5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    assert count.value == 1
+    assert {results.get(timeout=1), results.get(timeout=1)} == {
+        "CREATED",
+        "CREDENTIALS_CREATE_IN_PROGRESS",
+    }
 
 
 def store(*, missing: str | set[str] | None = None, denied: str | None = None) -> Any:
@@ -413,7 +528,9 @@ def test_the_bootstrap_never_writes_a_secret_to_a_file() -> None:
 
     source = inspect.getsource(signer_bootstrap)
 
-    assert "open(" not in source.replace("os.fdopen(", "")
+    # The only file descriptor created here is the public, empty advisory lock used by the
+    # credential child.  It has no secret-bearing path or content.
+    assert "open(" not in source.replace("os.fdopen(", "").replace("os.open(", "")
     assert "Path(" not in source
 
 
