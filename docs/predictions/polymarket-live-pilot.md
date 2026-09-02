@@ -95,6 +95,11 @@ partial credential set. Creation preserves every external eligibility, legal/KYC
 geoblock review, manual funding/allowance, 45-day qualification, 30-day shadow-evidence, separate
 activation decision, passkey, explicit-action, and killed-by-default gate.
 
+The ceremony locks concurrent `polytrading` create attempts. It cannot coordinate an external
+Keychain editor or another program changing those items: close Keychain Access and do not modify
+the reviewed items while it runs. On any failure, run `check`, keep the pilot killed, and do not
+retry or attempt manual recovery through this product.
+
 ## 3. What the console shows
 
 ![Readiness view at 1440px: kill state, presence, manifest, protocol, secret store, live authority, and an empty blocker list](assets/polymarket-live-pilot/readiness-1440.png)

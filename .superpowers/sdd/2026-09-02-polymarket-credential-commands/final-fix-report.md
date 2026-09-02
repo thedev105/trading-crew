@@ -72,7 +72,9 @@ fix; none were reformatted or included in the commit.
 ## Residual impossibilities
 
 The advisory lock coordinates application command children only. An arbitrary non-cooperating
-external Keychain writer cannot be made transactionally atomic with the macOS Keychain API. If it
-replaces a ceremony-owned item during rollback, the opaque creation ticket refuses to delete that
-replacement; the code retains the replacement and returns `CREDENTIAL_ROLLBACK_FAILED`, never
-claiming all-or-none success. The regression test covers that fail-closed behavior.
+external Keychain writer cannot be made transactionally atomic with the macOS Keychain API. An
+in-place external update of a ceremony-owned item can still race the Keychain item-reference
+rollback; this build therefore provides a cooperative-command guarantee only, not an absolute
+cross-program transaction. The operator-approved limitation is documented in the runbook and
+README: keep external Keychain editors closed, run `check` after a failure, and do not retry or
+attempt recovery through this product.

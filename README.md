@@ -246,6 +246,12 @@ existing or partial credential set. Credential creation does not change the kill
 posture or satisfy any eligibility, legal/KYC/terms/geoblock, funding/allowance, shadow-evidence,
 separate-activation, passkey, or manual action gate.
 
+The command holds a lock across concurrent `polytrading` creation attempts, so do not run a second
+creation command while one is active. That lock cannot coordinate an external Keychain editor or
+another program that changes the same items. Close Keychain Access and do not modify the four
+reviewed items during the ceremony. If it reports a failure, run `check` and leave the pilot killed;
+there is no automatic repair or recovery command.
+
 The market grid contains twelve canonical rows: BTC, ETH, and SOL for each of Bybit, Hyperliquid,
 dYdX, and Lighter. Lighter rows show settled signed funding and locally timed REST depth when those
 records exist. The economics table contains exactly one BTC, ETH, and SOL row selected from reports
